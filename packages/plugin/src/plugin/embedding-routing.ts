@@ -4,6 +4,7 @@ import type {
     MagicContextConfig,
 } from "../config/schema/magic-context";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../config/schema/magic-context";
+import { getLocalEmbeddingUnavailableReason } from "../features/magic-context/memory/embedding-local";
 import {
     getSynapseLaneIdentity,
     SYNAPSE_DEFAULT_MODEL,
@@ -41,6 +42,12 @@ export interface ResolvedEmbeddingRouting {
     warnings: string[];
 }
 
+function warnIfLocalUnavailable(config: EmbeddingConfig, warnings: string[]): void {
+    if (config.provider !== "local") return;
+    const reason = getLocalEmbeddingUnavailableReason();
+    if (reason) warnings.push(`${reason}; configure embedding.provider=openai-compatible or off`);
+}
+
 function fallbackConfig(
     config: EmbeddingConfig,
     provider: EmbeddingFallbackProvider | undefined,
@@ -49,6 +56,10 @@ function fallbackConfig(
     const model = typeof raw.model === "string" ? raw.model.trim() : "";
     const endpoint = typeof raw.endpoint === "string" ? raw.endpoint.trim() : "";
     const apiKey = typeof raw.api_key === "string" ? raw.api_key.trim() : "";
+    const headers =
+        typeof raw.headers === "object" && raw.headers !== null && !Array.isArray(raw.headers)
+            ? (raw.headers as Record<string, string>)
+            : undefined;
     const inputType = typeof raw.input_type === "string" ? raw.input_type.trim() : "";
     const queryInputType =
         typeof raw.query_input_type === "string" ? raw.query_input_type.trim() : "";
@@ -63,6 +74,7 @@ function fallbackConfig(
             model,
             endpoint,
             ...(apiKey ? { api_key: apiKey } : {}),
+            ...(headers ? { headers } : {}),
             ...(inputType ? { input_type: inputType } : {}),
             ...(queryInputType ? { query_input_type: queryInputType } : {}),
             ...(truncate ? { truncate } : {}),
@@ -190,6 +202,7 @@ export async function resolveEmbeddingRouting(args: {
                 );
             }
         }
+        warnIfLocalUnavailable(config, warnings);
         return { primary: config, shadow, warnings };
     }
 
@@ -201,13 +214,16 @@ export async function resolveEmbeddingRouting(args: {
     const fallback = fallbackConfig(config, fallbackProvider);
     if (!subc) {
         warnings.push("embedding.provider synapse requires a subc block; using fallback provider");
+        warnIfLocalUnavailable(fallback, warnings);
         return { primary: fallback, shadow: null, warnings };
     }
     if (!fallbackProvider) {
         warnings.push(
             "embedding.provider synapse requires embedding.fallback_provider; using local fallback",
         );
-        return { primary: fallbackConfig(config, "local"), shadow: null, warnings };
+        const localFallback = fallbackConfig(config, "local");
+        warnIfLocalUnavailable(localFallback, warnings);
+        return { primary: localFallback, shadow: null, warnings };
     }
 
     try {
@@ -232,6 +248,7 @@ export async function resolveEmbeddingRouting(args: {
             `Synapse is not ready; using embedding.fallback_provider=${fallbackProvider}: ${error instanceof Error ? error.message : String(error)}`,
         );
         log(`[magic-context] Synapse routing fell back: ${warnings.at(-1)}`);
+        warnIfLocalUnavailable(fallback, warnings);
         return { primary: fallback, shadow: null, warnings };
     }
 }

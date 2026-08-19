@@ -12,6 +12,7 @@ import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magi
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
     type EmbeddingProbeOutcome,
+    parseEmbeddingHeaders,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -39,6 +40,7 @@ import { collectDiagnostics } from "../lib/diagnostics-pi";
 import {
     checkLocalEmbeddingRuntimeByResolution,
     formatLocalEmbeddingRuntimeDoctorWarning,
+    getLocalEmbeddingRuntimeDoctorWarning,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
 import { bundleIssueReport } from "../lib/logs-pi";
@@ -107,6 +109,7 @@ interface DoctorDeps {
     getLatestNpmVersion: () => string | null;
     selfVersion: () => string;
     probeEmbeddingEndpoint: typeof probeEmbeddingEndpoint;
+    getLocalEmbeddingRuntimeDoctorWarning: () => string | null;
     openExistingContextDatabase: typeof openExistingContextDatabase;
     now: () => Date;
     execFileSync: typeof execFileSync;
@@ -130,6 +133,7 @@ const DEFAULT_DEPS: DoctorDeps = {
     getLatestNpmVersion: () => getLatestNpmVersion(PACKAGE_NAME),
     selfVersion,
     probeEmbeddingEndpoint,
+    getLocalEmbeddingRuntimeDoctorWarning: () => getLocalEmbeddingRuntimeDoctorWarning(),
     openExistingContextDatabase,
     now: () => new Date(),
     execFileSync,
@@ -693,6 +697,7 @@ async function runHealthChecks(options: {
         const model = typeof mergedEmbedding.model === "string" ? mergedEmbedding.model.trim() : "";
         const apiKey =
             typeof mergedEmbedding.api_key === "string" ? mergedEmbedding.api_key : undefined;
+        const headers = parseEmbeddingHeaders(mergedEmbedding.headers);
         const inputType =
             typeof mergedEmbedding.input_type === "string"
                 ? mergedEmbedding.input_type.trim()
@@ -713,6 +718,7 @@ async function runHealthChecks(options: {
                     endpoint,
                     model,
                     apiKey,
+                    ...(headers ? { headers } : {}),
                     ...(inputType ? { inputType } : {}),
                     ...(truncateMode ? { truncate: truncateMode } : {}),
                     timeoutMs: 10_000,
@@ -735,25 +741,29 @@ async function runHealthChecks(options: {
         // Windows it sometimes fails to install and the plugin's static import
         // throws on every embedding (#128). Layout-agnostic resolution from the
         // installed plugin dir; stays silent if no plugin dir can be inspected.
-        let runtimeReported = false;
+        const unavailableWarning = options.deps.getLocalEmbeddingRuntimeDoctorWarning();
+        if (unavailableWarning) add(results, "warn", unavailableWarning);
+        let runtimeReported = unavailableWarning !== null;
         let runtimeUnverifiedReason = "no installed plugin tree found to inspect";
-        for (const pluginDir of piPluginDirCandidates(packages, options.cwd)) {
-            const runtime = checkLocalEmbeddingRuntimeByResolution(pluginDir);
-            if (runtime.state === "ok") {
-                add(
-                    results,
-                    "pass",
-                    `Embedding provider: ${loadedConfig.config.embedding.provider} (native runtime present)`,
-                );
-                runtimeReported = true;
-                break;
+        if (!runtimeReported) {
+            for (const pluginDir of piPluginDirCandidates(packages, options.cwd)) {
+                const runtime = checkLocalEmbeddingRuntimeByResolution(pluginDir);
+                if (runtime.state === "ok") {
+                    add(
+                        results,
+                        "pass",
+                        `Embedding provider: ${loadedConfig.config.embedding.provider} (native runtime present)`,
+                    );
+                    runtimeReported = true;
+                    break;
+                }
+                if (isLocalEmbeddingRuntimeBroken(runtime)) {
+                    add(results, "warn", formatLocalEmbeddingRuntimeDoctorWarning(runtime));
+                    runtimeReported = true;
+                    break;
+                }
+                if (runtime.state === "unknown") runtimeUnverifiedReason = runtime.reason;
             }
-            if (isLocalEmbeddingRuntimeBroken(runtime)) {
-                add(results, "warn", formatLocalEmbeddingRuntimeDoctorWarning(runtime));
-                runtimeReported = true;
-                break;
-            }
-            if (runtime.state === "unknown") runtimeUnverifiedReason = runtime.reason;
         }
         if (!runtimeReported) {
             add(

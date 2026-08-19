@@ -8,10 +8,24 @@ import {
     checkLocalEmbeddingRuntimeAt,
     checkLocalEmbeddingRuntimeByResolution,
     formatLocalEmbeddingRuntimeDoctorWarning,
+    getLocalEmbeddingRuntimeDoctorWarning,
 } from "./embedding-runtime";
 
 afterEach(() => {
     __setEmbeddingRuntimeTestHooks({});
+});
+
+describe("getLocalEmbeddingRuntimeDoctorWarning", () => {
+    test("warns that local embeddings are unavailable for Bun on Windows", () => {
+        expect(getLocalEmbeddingRuntimeDoctorWarning("win32", true)).toContain("openai-compatible");
+        expect(getLocalEmbeddingRuntimeDoctorWarning("win32", true)).toContain(
+            "embedding.provider=off",
+        );
+    });
+
+    test("does not disable local embeddings for Node on Windows", () => {
+        expect(getLocalEmbeddingRuntimeDoctorWarning("win32", false)).toBeNull();
+    });
 });
 
 function makeRoot(): string {

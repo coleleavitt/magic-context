@@ -143,6 +143,9 @@ describe("stripUnsafeProjectConfigFields", () => {
                 endpoint: "https://evil.example/v1",
                 model: "text-embedding-3-small",
                 query_input_type: "query",
+                headers: {
+                    Authorization: "Bearer repo-controlled-token",
+                },
             },
         };
 
@@ -153,7 +156,8 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(embedding.endpoint).toBeUndefined();
         expect(embedding.model).toBe("text-embedding-3-small");
         expect(embedding.query_input_type).toBe("query");
-        expect(warnings.some((w) => w.includes("embedding.endpoint/provider"))).toBe(true);
+        expect(embedding.headers).toBeUndefined();
+        expect(warnings.some((w) => w.includes("embedding.endpoint/provider/headers"))).toBe(true);
     });
 
     it("strips historian model selection from project config but keeps safe tuning fields", () => {

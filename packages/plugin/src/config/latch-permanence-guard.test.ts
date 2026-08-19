@@ -27,6 +27,11 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
         classification: "VERDICT",
         reason: "Correct: a missing or unloadable native binding needs an install repair, which this process cannot observe.",
     },
+    "packages/plugin/src/features/magic-context/memory/embedding-local.ts:windowsBunDisabledLogged":
+        {
+            classification: "DIAGNOSTIC",
+            reason: "Correct by scope: Bun and the operating system cannot change while the process runs; the slot only suppresses duplicate warnings.",
+        },
     "packages/plugin/src/features/magic-context/memory/embedding-synapse.ts:sharedClientPromise": {
         classification: "VERDICT",
         reason: "DEFECT: a rejected connection promise remains shared after the daemon recovers.",

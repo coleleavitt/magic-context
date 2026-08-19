@@ -1398,6 +1398,18 @@
           "description": "API key for remote embedding provider (optional)",
           "type": "string"
         },
+        "headers": {
+          "description": "USER-LEVEL ONLY custom HTTP headers for openai-compatible embedding requests. Use config variable substitution for secrets (for example Authorization: {env:EMBEDDING_AUTHORIZATION}). Custom Authorization takes precedence over api_key. Project config cannot set headers, and status/doctor diagnostics never print header values.",
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
         "input_type": {
           "description": "Default input_type for stored/indexed (passage) embeddings in the request body. Required by some openai-compatible providers (e.g. NVIDIA NIM). Omitted from the request when unset.",
           "type": "string"

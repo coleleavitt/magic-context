@@ -271,8 +271,46 @@ describe("probeEmbeddingEndpoint", () => {
             fetch,
         });
 
-        const headers = capture.init?.headers as Record<string, string> | undefined;
-        expect(headers?.authorization).toBe("Bearer sk-real");
+        const headers = new Headers(capture.init?.headers);
+        expect(headers.get("authorization")).toBe("Bearer sk-real");
+    });
+
+    it("sends custom headers without an apiKey", async () => {
+        const capture: FetchCapture = {};
+        const fetch = mockFetch(
+            new Response(JSON.stringify({ data: [{ embedding: [0.1] }] }), { status: 200 }),
+            capture,
+        );
+
+        await probeEmbeddingEndpoint({
+            endpoint: "https://api.example.com/v1",
+            model: "m",
+            headers: { "X-API-Key": "header-only-token" },
+            fetch,
+        });
+
+        const headers = new Headers(capture.init?.headers);
+        expect(headers.get("x-api-key")).toBe("header-only-token");
+        expect(headers.get("authorization")).toBeNull();
+    });
+
+    it("lets custom Authorization override apiKey", async () => {
+        const capture: FetchCapture = {};
+        const fetch = mockFetch(
+            new Response(JSON.stringify({ data: [{ embedding: [0.1] }] }), { status: 200 }),
+            capture,
+        );
+
+        await probeEmbeddingEndpoint({
+            endpoint: "https://api.example.com/v1",
+            model: "m",
+            apiKey: "fallback-key",
+            headers: { Authorization: "Token custom-authorization" },
+            fetch,
+        });
+
+        const headers = new Headers(capture.init?.headers);
+        expect(headers.get("authorization")).toBe("Token custom-authorization");
     });
 
     it("omits authorization header when no apiKey", async () => {
@@ -288,8 +326,8 @@ describe("probeEmbeddingEndpoint", () => {
             fetch,
         });
 
-        const headers = capture.init?.headers as Record<string, string> | undefined;
-        expect(headers?.authorization).toBeUndefined();
+        const headers = new Headers(capture.init?.headers);
+        expect(headers.get("authorization")).toBeNull();
     });
 
     it("does not send empty apiKey as a header", async () => {
@@ -306,8 +344,8 @@ describe("probeEmbeddingEndpoint", () => {
             fetch,
         });
 
-        const headers = capture.init?.headers as Record<string, string> | undefined;
-        expect(headers?.authorization).toBeUndefined();
+        const headers = new Headers(capture.init?.headers);
+        expect(headers.get("authorization")).toBeNull();
     });
 
     it("truncates very long error body previews", async () => {

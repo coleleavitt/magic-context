@@ -3,11 +3,13 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { EmbeddingProbeOptions } from "@magic-context/core/features/magic-context/memory/embedding-probe";
 import { LATEST_SUPPORTED_VERSION } from "@magic-context/core/features/magic-context/storage-db";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { parse as parseJsonc } from "comment-json";
 import { openExistingContextDatabase } from "../lib/database-access";
 import type { PiDiagnosticReport } from "../lib/diagnostics-pi";
+import { getLocalEmbeddingRuntimeDoctorWarning } from "../lib/embedding-runtime";
 import type { PromptIO, PromptSpinner, SelectOption } from "../lib/prompts";
 import { parseDoctorArgs, type RunDoctorOptions, runDoctor } from "./doctor-pi";
 
@@ -173,6 +175,7 @@ function baseOptions(root: string, cwd: string, prompts: MockPrompts): RunDoctor
             }),
             getPiVersion: () => "0.74.0",
             getLatestNpmVersion: () => "0.1.0",
+            getLocalEmbeddingRuntimeDoctorWarning: () => null,
             openExistingContextDatabase: () => createMockDb(),
             now: () => new Date("2026-04-28T12:34:56Z"),
             execFileSync: () => {
@@ -346,6 +349,33 @@ describe("Pi doctor", () => {
         expect(code).toBe(0);
         const output = prompts.messages.join("\n");
         expect(output).toContain("PASS Embedding provider: local (native runtime present)");
+    });
+
+    it("warns instead of passing local embeddings under Bun on Windows", async () => {
+        // Given
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        createInstalledPiPlugin(agentDir, true);
+        const prompts = new MockPrompts();
+
+        // When
+        const options = baseOptions(root, cwd, prompts);
+        if (!options.deps) throw new Error("expected doctor dependencies");
+        options.deps.getLocalEmbeddingRuntimeDoctorWarning = () =>
+            getLocalEmbeddingRuntimeDoctorWarning("win32", true);
+        const code = await runDoctor(options);
+
+        // Then
+        expect(code).toBe(0);
+        const output = prompts.messages.join("\n");
+        expect(output).toContain(
+            "WARN Embedding provider: local is unavailable under Bun on Windows",
+        );
+        expect(output).toContain("openai-compatible");
+        expect(output).toContain("embedding.provider=off");
+        expect(output).not.toContain("PASS Embedding provider: local (native runtime present)");
     });
 
     it("repairs missing package entry and missing user config in --force mode", async () => {
@@ -694,6 +724,49 @@ describe("Pi doctor", () => {
         expect(output).toContain("ftp://example.com/v1");
         expect(output).not.toContain("user:pass");
         expect(output).not.toContain("api_key=secret");
+    });
+
+    it("passes header-only auth and custom Authorization precedence to the embedding probe", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        writeFileSync(
+            join(root, ".config", "cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                embedding: {
+                    provider: "openai-compatible",
+                    endpoint: "https://example.com/v1",
+                    model: "text-embedding-3-small",
+                    api_key: "fallback-key",
+                    headers: {
+                        Authorization: "Token custom-authorization",
+                        "X-API-Key": "header-only-token",
+                    },
+                },
+            }),
+        );
+        const prompts = new MockPrompts();
+        const options = baseOptions(root, cwd, prompts);
+        let probeOptions: EmbeddingProbeOptions | undefined;
+
+        const code = await runDoctor({
+            ...options,
+            deps: {
+                ...options.deps,
+                probeEmbeddingEndpoint: async (received) => {
+                    probeOptions = received;
+                    return { kind: "ok", status: 200, dimensions: 3 };
+                },
+            },
+        });
+
+        expect(code).toBe(0);
+        expect(probeOptions?.headers).toEqual({
+            Authorization: "Token custom-authorization",
+            "X-API-Key": "header-only-token",
+        });
+        expect(probeOptions?.apiKey).toBe("fallback-key");
     });
 
     it("sanitizes thrown embedding probe errors before printing them", async () => {

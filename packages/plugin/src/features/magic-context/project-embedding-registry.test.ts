@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
+import { formatEmbedStatusText } from "../../hooks/magic-context/format-embed-status";
 import {
     chunkCanonicalText,
     loadCompartmentChunkEmbeddingsForSearch,
@@ -26,6 +27,7 @@ import {
 } from "./memory/storage-memory-embeddings";
 import {
     _resetProjectEmbeddingRegistryForTests,
+    _setTestLocalEmbeddingUnavailableReasonForProject,
     _setTestProviderFactoryForProject,
     drainCommitBacklogForProject,
     embedSessionCompartmentChunks,
@@ -33,6 +35,7 @@ import {
     embedUnembeddedCompartmentChunksForProject,
     embedUnembeddedMemoriesForProject,
     flushShadowEmbeddingBacklog,
+    getEmbeddingCoverageStatus,
     getProjectEmbeddingSnapshot,
     getShadowBackfillStopReason,
     markProjectLoadUntrusted,
@@ -210,6 +213,7 @@ describe("project embedding registry", () => {
         const dir = mkdtempSync(join(tmpdir(), "project-embedding-registry-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
+        _setTestLocalEmbeddingUnavailableReasonForProject(() => null);
         return openDatabase();
     }
 
@@ -225,6 +229,43 @@ describe("project embedding registry", () => {
             }
         }
         tempDirs.length = 0;
+    });
+
+    it("marks local embeddings unavailable without creating a provider under Bun on Windows", async () => {
+        // Given
+        const db = useTempDb();
+        let providerCreations = 0;
+        _setTestProviderFactoryForProject(() => {
+            providerCreations += 1;
+            return new FakeEmbeddingProvider("must-not-load");
+        });
+        _setTestLocalEmbeddingUnavailableReasonForProject(
+            () =>
+                "local embeddings are unavailable under Bun on Windows because onnxruntime-node can crash the host process",
+        );
+
+        // When
+        const snapshot = registerProjectEmbedding(
+            db,
+            "windows-bun-local",
+            localConfig("Xenova/all-MiniLM-L6-v2"),
+            { memoryEnabled: true, gitCommitEnabled: true },
+            "/repo",
+        );
+        const embedded = await embedTextForProject("windows-bun-local", "query");
+        const coverage = getEmbeddingCoverageStatus(db, "windows-bun-local", "session-1");
+        const statusText = formatEmbedStatusText(coverage, { status: "idle" });
+
+        // Then
+        expect(snapshot.enabled).toBe(false);
+        expect(snapshot.provider).toBe("local");
+        expect(snapshot.model).toBe("Xenova/all-MiniLM-L6-v2");
+        expect(snapshot.unavailableReason).toContain("Bun on Windows");
+        expect(coverage.unavailableReason).toBe(snapshot.unavailableReason);
+        expect(statusText).toContain("Embedding unavailable");
+        expect(statusText).toContain("openai-compatible or off");
+        expect(embedded).toBeNull();
+        expect(providerCreations).toBe(0);
     });
 
     it("preserves existing provider and runtime identity goldens", () => {

@@ -1,10 +1,25 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import {
     isNativeRuntimeMissingError,
     type LocalEmbeddingDtype,
     LocalEmbeddingProvider,
 } from "./embedding-local";
+
+const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+const originalBunVersionDescriptor = Object.getOwnPropertyDescriptor(process.versions, "bun");
+
+afterEach(() => {
+    if (originalPlatformDescriptor) {
+        Object.defineProperty(process, "platform", originalPlatformDescriptor);
+    }
+    if (originalBunVersionDescriptor) {
+        Object.defineProperty(process.versions, "bun", originalBunVersionDescriptor);
+    } else {
+        delete process.versions.bun;
+    }
+    mock.restore();
+});
 
 // Part A of issue #128: classify the PERMANENT "native runtime not installed"
 // failure so the provider degrades once (one actionable log line) instead of
@@ -143,5 +158,39 @@ describe("LocalEmbeddingProvider dtype threading (#259)", () => {
             "int8" as LocalEmbeddingDtype,
         );
         expect(q8.modelId).not.toBe(int8.modelId);
+    });
+});
+
+describe("LocalEmbeddingProvider Windows safety", () => {
+    test("never enters transformers inference under Bun on Windows", async () => {
+        // Given
+        let inferenceEntries = 0;
+        mock.module("@huggingface/transformers", () => ({
+            env: {},
+            LogLevel: { ERROR: "error" },
+            pipeline: () => {
+                inferenceEntries += 1;
+                throw new Error("unsafe local inference entered");
+            },
+        }));
+        Object.defineProperty(process, "platform", {
+            ...originalPlatformDescriptor,
+            value: "win32",
+        });
+        Object.defineProperty(process.versions, "bun", {
+            configurable: true,
+            enumerable: true,
+            value: undefined,
+            writable: true,
+        });
+        const provider = new LocalEmbeddingProvider();
+
+        // When
+        const initialized = await provider.initialize();
+
+        // Then
+        expect(initialized).toBe(false);
+        expect(inferenceEntries).toBe(0);
+        expect(provider.isLoaded()).toBe(false);
     });
 });

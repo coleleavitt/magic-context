@@ -315,6 +315,12 @@ const BaseEmbeddingConfigSchema = z
             .optional()
             .describe("API endpoint URL. Required when provider is openai-compatible."),
         api_key: z.string().optional().describe("API key for remote embedding provider (optional)"),
+        headers: z
+            .record(z.string().trim().min(1), z.string().min(1))
+            .optional()
+            .describe(
+                "USER-LEVEL ONLY custom HTTP headers for openai-compatible embedding requests. Use config variable substitution for secrets (for example Authorization: {env:EMBEDDING_AUTHORIZATION}). Custom Authorization takes precedence over api_key. Project config cannot set headers, and status/doctor diagnostics never print header values.",
+            ),
         input_type: z
             .string()
             .optional()
@@ -387,6 +393,7 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
         const model = data.model?.trim();
         const endpoint = data.endpoint?.trim();
         const apiKey = data.api_key?.trim();
+        const headers = data.headers;
         const inputType = data.input_type?.trim();
         const queryInputType = data.query_input_type?.trim();
         const truncate = data.truncate?.trim();
@@ -396,6 +403,7 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
             ...(model ? { model } : {}),
             ...(endpoint ? { endpoint } : {}),
             ...(apiKey ? { api_key: apiKey } : {}),
+            ...(headers ? { headers } : {}),
             ...(inputType ? { input_type: inputType } : {}),
             ...(queryInputType ? { query_input_type: queryInputType } : {}),
             ...(truncate ? { truncate } : {}),
@@ -420,6 +428,7 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
 
     if (data.provider === "openai-compatible") {
         const apiKey = data.api_key?.trim();
+        const headers = data.headers;
         const inputType = data.input_type?.trim();
         const queryInputType = data.query_input_type?.trim();
         const truncate = data.truncate?.trim();
@@ -428,6 +437,7 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
             model: data.model?.trim() ?? "",
             endpoint: data.endpoint?.trim() ?? "",
             ...(apiKey ? { api_key: apiKey } : {}),
+            ...(headers ? { headers } : {}),
             ...(inputType ? { input_type: inputType } : {}),
             ...(queryInputType ? { query_input_type: queryInputType } : {}),
             ...(truncate ? { truncate } : {}),

@@ -305,6 +305,16 @@ async function withQuietConsole<T>(fn: () => Promise<T>): Promise<T> {
 // re-importing transformers and re-failing. Process-global (not per-instance)
 // because the missing package affects the whole install, not one model.
 let nativeRuntimeMissing = false;
+let windowsBunDisabledLogged = false;
+
+export function getLocalEmbeddingUnavailableReason(
+    platform: NodeJS.Platform = process.platform,
+    bunHost: boolean = Boolean(process.versions.bun) || "Bun" in globalThis,
+): string | null {
+    return platform === "win32" && bunHost
+        ? "local embeddings are unavailable under Bun on Windows because onnxruntime-node can crash the host process"
+        : null;
+}
 
 export function isNativeRuntimeMissingError(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error ?? "");
@@ -440,6 +450,20 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
 
     async initialize(): Promise<boolean> {
         if (this.disposing) {
+            return false;
+        }
+
+        // Bun on Windows can segfault the whole host process inside
+        // onnxruntime-node, which JavaScript cannot catch or recover from. Refuse
+        // local inference before importing transformers; remote providers and
+        // keyword/full-text search remain available.
+        if (getLocalEmbeddingUnavailableReason()) {
+            if (!windowsBunDisabledLogged) {
+                windowsBunDisabledLogged = true;
+                log(
+                    "[magic-context] local embeddings are disabled under Bun on Windows to avoid an onnxruntime-node process crash; configure embedding.provider=openai-compatible or off",
+                );
+            }
             return false;
         }
 

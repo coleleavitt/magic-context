@@ -67,6 +67,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
 
     if (config.provider === "openai-compatible") {
         const apiKey = config.api_key?.trim();
+        const headers = config.headers;
         const inputType = config.input_type?.trim();
         const queryInputType = config.query_input_type?.trim();
         const truncate = config.truncate?.trim();
@@ -75,6 +76,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
             model: config.model.trim(),
             endpoint: config.endpoint.trim(),
             ...(apiKey ? { api_key: apiKey } : {}),
+            ...(headers ? { headers } : {}),
             ...(inputType ? { input_type: inputType } : {}),
             ...(queryInputType ? { query_input_type: queryInputType } : {}),
             ...(truncate ? { truncate } : {}),
@@ -113,6 +115,7 @@ function createProvider(config: EmbeddingConfig): EmbeddingProvider | null {
             endpoint: config.endpoint,
             model: config.model,
             apiKey: config.api_key,
+            headers: config.headers,
             inputType: config.input_type,
             queryInputType: config.query_input_type,
             truncate: config.truncate,

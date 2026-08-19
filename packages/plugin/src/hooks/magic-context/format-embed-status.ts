@@ -6,6 +6,9 @@ export function formatEmbedStatusText(
     drain: { status: EmbedDrainUiStatus; embedded?: number; total?: number; failed?: number },
 ): string {
     if (!coverage.enabled) {
+        if (coverage.unavailableReason) {
+            return `Embedding unavailable — model: ${coverage.model} (${coverage.provider}). ${coverage.unavailableReason}. Configure embedding.provider=openai-compatible or off.`;
+        }
         return "Embedding is off (no provider configured).";
     }
 

@@ -27,6 +27,7 @@ export interface EmbeddingProbeOptions {
     endpoint: string;
     model: string;
     apiKey?: string;
+    headers?: Readonly<Record<string, string>>;
     /** Optional `input_type` body field — required by some providers (NVIDIA NIM)
      *  for the probe to succeed. Omitted from the body when unset. */
     inputType?: string;
@@ -44,6 +45,30 @@ export interface EmbeddingProbeOptions {
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_PREVIEW_CHARS = 240;
+
+export function buildEmbeddingRequestHeaders(
+    customHeaders?: Readonly<Record<string, string>>,
+    apiKey?: string,
+): Headers {
+    const headers = new Headers(customHeaders);
+    headers.set("content-type", "application/json");
+    const normalizedApiKey = apiKey?.trim();
+    if (normalizedApiKey && !headers.has("authorization")) {
+        headers.set("authorization", `Bearer ${normalizedApiKey}`);
+    }
+    return headers;
+}
+
+export function parseEmbeddingHeaders(
+    value: unknown,
+): Readonly<Record<string, string>> | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const entries = Object.entries(value);
+    if (!entries.every((entry): entry is [string, string] => typeof entry[1] === "string")) {
+        return undefined;
+    }
+    return Object.fromEntries(entries);
+}
 
 /**
  * Probe an embeddings endpoint and classify the outcome.
@@ -73,11 +98,7 @@ export async function probeEmbeddingEndpoint(
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const url = `${endpoint}/embeddings`;
 
-    const apiKey = options.apiKey?.trim();
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    if (apiKey) {
-        headers.authorization = `Bearer ${apiKey}`;
-    }
+    const headers = buildEmbeddingRequestHeaders(options.headers, options.apiKey);
 
     // Use a short fixed probe string. Providers bill by tokens, so minimal
     // input keeps the check cheap even on metered accounts.

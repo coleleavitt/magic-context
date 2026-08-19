@@ -42,7 +42,12 @@ const PROMPT_SURFACE_USER_ONLY_FIELDS = ["guidance_override_path", "tool_descrip
  * historian spend on the user's dime.
  */
 const AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools", "system_prompt"] as const;
-const EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider", "fallback_provider"] as const;
+const EMBEDDING_DESTINATION_FIELDS = [
+    "endpoint",
+    "provider",
+    "fallback_provider",
+    "headers",
+] as const;
 const PERCENTAGE_THRESHOLD_REASON =
     "security: a repository may only raise compaction thresholds above the user's effective value; it cannot force earlier historian work or cloned-repo cost escalation.";
 const TOKEN_THRESHOLD_REASON =
@@ -207,9 +212,9 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    owner-private to group-readable changes every session and memory's local
  *    confidentiality. Only the machine operator's user config may opt into an
  *    externally managed trusted-group deployment.
- *  - `embedding.endpoint` / `embedding.provider` — a repo must not choose
+ *  - `embedding.endpoint` / `embedding.provider` / `embedding.headers` — a repo must not choose
  *    where private memory/search/commit text is embedded. User-level config is
- *    the trust boundary for embedding destinations.
+ *    the trust boundary for embedding destinations and authentication headers.
  *  - `transform_mode` is intentionally allowed at project tier so a repository
  *    can opt its own runtime into the experimental Rust pipeline. The resolver
  *    requires trusted user-level `subc` configuration before Rust can activate.

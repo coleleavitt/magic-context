@@ -178,6 +178,49 @@ describe("OpenAICompatibleEmbeddingProvider request body (NVIDIA NIM fields, iss
         expect(body.input).toBeDefined();
     });
 
+    test("sends trusted custom headers and lets custom authorization replace api_key", async () => {
+        // Given
+        const provider = new OpenAICompatibleEmbeddingProvider({
+            endpoint: "http://127.0.0.1:65535",
+            model: "text-embedding-3-small",
+            apiKey: "legacy-key",
+            headers: {
+                Authorization: "Bearer custom-token",
+                "X-Embedding-Tenant": "tenant-a",
+            },
+        });
+        fetchSpy.mockImplementation((async () => successResponse()) as FetchLike);
+
+        // When
+        await provider.embed("hello");
+
+        // Then
+        const init = fetchSpy.mock.calls[0]?.[1];
+        const headers = new Headers(init?.headers);
+        expect(headers.get("authorization")).toBe("Bearer custom-token");
+        expect(headers.get("x-embedding-tenant")).toBe("tenant-a");
+        expect(headers.get("content-type")).toBe("application/json");
+    });
+
+    test("supports header-only authentication without api_key", async () => {
+        // Given
+        const provider = new OpenAICompatibleEmbeddingProvider({
+            endpoint: "http://127.0.0.1:65535",
+            model: "text-embedding-3-small",
+            headers: { "X-API-Key": "header-only-token" },
+        });
+        fetchSpy.mockImplementation((async () => successResponse()) as FetchLike);
+
+        // When
+        await provider.embed("hello");
+
+        // Then
+        const init = fetchSpy.mock.calls[0]?.[1];
+        const headers = new Headers(init?.headers);
+        expect(headers.get("x-api-key")).toBe("header-only-token");
+        expect(headers.get("authorization")).toBeNull();
+    });
+
     test("coerces empty / whitespace-only input to a space so the provider can't 400 the batch", async () => {
         const provider = new OpenAICompatibleEmbeddingProvider({
             endpoint: "http://127.0.0.1:65535",

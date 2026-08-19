@@ -1,5 +1,6 @@
 import { log } from "../../../shared/logger";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
+import { buildEmbeddingRequestHeaders } from "./embedding-probe";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
 import { blockedEmbeddingEndpointReason } from "./embedding-ssrf";
 
@@ -7,6 +8,7 @@ interface OpenAICompatibleEmbeddingProviderOptions {
     endpoint?: string;
     model?: string;
     apiKey?: string;
+    headers?: Readonly<Record<string, string>>;
     /** Default/passage `input_type` body field (e.g. NVIDIA NIM 'passage'). */
     inputType?: string;
     /** Optional query `input_type` for search embeddings; falls back to inputType when unset. */
@@ -137,6 +139,7 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
     private readonly endpoint: string;
     private readonly model: string;
     private readonly apiKey: string;
+    private readonly headers: Readonly<Record<string, string>>;
     private readonly inputType: string;
     private readonly queryInputType: string;
     private readonly truncate: string;
@@ -160,6 +163,7 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
         this.endpoint = normalizeEndpoint(options.endpoint);
         this.model = options.model?.trim() ?? "";
         this.apiKey = options.apiKey?.trim() ?? "";
+        this.headers = { ...options.headers };
         this.inputType = options.inputType?.trim() ?? "";
         this.queryInputType = options.queryInputType?.trim() ?? "";
         this.truncate = options.truncate?.trim() ?? "";
@@ -172,6 +176,7 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
             endpoint: this.endpoint,
             model: this.model,
             ...(this.apiKey ? { api_key: this.apiKey } : {}),
+            ...(Object.keys(this.headers).length > 0 ? { headers: this.headers } : {}),
             ...(this.inputType ? { input_type: this.inputType } : {}),
             // truncate participates in identity (it changes which text an
             // over-long input embeds). MUST mirror getEmbeddingProviderIdentity
@@ -282,12 +287,10 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
             }
 
             const inputTypeForRequest = this.resolveInputTypeForPurpose(purpose);
+            const headers = buildEmbeddingRequestHeaders(this.headers, this.apiKey);
             const response = await fetch(`${this.endpoint}/embeddings`, {
                 method: "POST",
-                headers: {
-                    "content-type": "application/json",
-                    ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
-                },
+                headers,
                 body: JSON.stringify({
                     model: this.model,
                     input: requestTexts,

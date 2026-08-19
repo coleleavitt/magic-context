@@ -103,7 +103,7 @@ function collectLeaves(schema: JsonSchema, prefix: string, rows: LeafRow[]): voi
     }
 }
 
-const SECTION_ORDER: Array<{ keys: string[]; title: string; intro: string }> = [
+const SECTION_ORDER: Array<{ keys: string[]; title: string; intro: string; notes?: string }> = [
     {
         keys: [
             "enabled",
@@ -144,6 +144,7 @@ const SECTION_ORDER: Array<{ keys: string[]; title: string; intro: string }> = [
         keys: ["memory", "embedding"],
         title: "Memory & recall",
         intro: "Durable project memory, semantic search, and recall features.",
+        notes: "Magic Context does not inherit or delegate to OpenCode, Pi, or OMP model-provider OAuth sessions or credentials. Configure authentication for `openai-compatible` embeddings explicitly with `api_key` or user-level `headers`.\n\nWhen the plugin host is **Bun on Windows**, the in-process `local` provider is unavailable because `onnxruntime-node` can crash the host before JavaScript can recover. The guard is limited to that runtime combination: Windows under Node and Bun on macOS/Linux remain eligible. Keyword/FTS search and context management continue; use `openai-compatible` for semantic search or `off` to make keyword-only operation explicit. `doctor` reports a warning with both remedies and never reports the bundled local provider as passing in this mode.",
     },
     {
         keys: ["dreamer", "sidekick"],
@@ -219,7 +220,9 @@ export function buildConfigDocs(): string {
             }
         }
         if (rows.length > 0) {
-            sections.push(`## ${section.title}\n\n${section.intro}\n\n${renderTable(rows)}`);
+            sections.push(
+                `## ${section.title}\n\n${section.intro}\n\n${renderTable(rows)}${section.notes ? `\n\n${section.notes}` : ""}`,
+            );
         }
     }
 

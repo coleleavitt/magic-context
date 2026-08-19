@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, sep } from "node:path";
+import { getLocalEmbeddingUnavailableReason } from "@magic-context/core/features/magic-context/memory/embedding-local";
 
 /**
  * Detects whether the local-embedding native runtime (`onnxruntime-node`) is
@@ -27,6 +28,16 @@ export type BrokenLocalEmbeddingRuntimeStatus = Extract<
     LocalEmbeddingRuntimeStatus,
     { state: "package-missing" | "binary-missing" | "load-failed" }
 >;
+
+export function getLocalEmbeddingRuntimeDoctorWarning(
+    platform: NodeJS.Platform = process.platform,
+    bunHost: boolean = Boolean(process.versions.bun) || "Bun" in globalThis,
+): string | null {
+    const reason = getLocalEmbeddingUnavailableReason(platform, bunHost);
+    return reason
+        ? `Embedding provider: local is unavailable under Bun on Windows — ${reason}. Configure embedding.provider=openai-compatible, or set embedding.provider=off to keep keyword search without semantic embeddings.`
+        : null;
+}
 
 function describeError(error: unknown): string {
     const message = error instanceof Error ? error.message : String(error ?? "unknown error");

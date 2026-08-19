@@ -19,6 +19,7 @@ import { runV22BackfillCommands } from "../lib/v22-backfill-commands";
 import {
     checkUserMemoriesDreamerCompatibility,
     collectNpmReleaseAgeWarnings,
+    getOpenCodeLocalEmbeddingRuntimeDoctorWarning,
     getUserNpmrcPath,
     isPinnedOpenCodePluginSpecifier,
     migrateLegacyAgentEnabledConfigForDoctor,
@@ -33,6 +34,38 @@ function migrate(input: Record<string, unknown>) {
     });
     return { config: input, logs, result };
 }
+
+describe("OpenCode doctor embedding runtime target", () => {
+    it("warns for a Windows OpenCode CLI even when doctor itself runs under Node", () => {
+        expect(
+            getOpenCodeLocalEmbeddingRuntimeDoctorWarning(
+                {
+                    path: "C:\\Users\\test\\.opencode\\bin\\opencode.exe",
+                    source: "home-bin",
+                    kind: "cli",
+                    version: "1.2.3",
+                    active: true,
+                },
+                "win32",
+            ),
+        ).toContain("Bun on Windows");
+    });
+
+    it("does not classify OpenCode Desktop's Electron host as Bun", () => {
+        expect(
+            getOpenCodeLocalEmbeddingRuntimeDoctorWarning(
+                {
+                    path: "C:\\Users\\test\\AppData\\Roaming\\ai.opencode.desktop",
+                    source: "desktop",
+                    kind: "desktop",
+                    version: "unknown",
+                    active: true,
+                },
+                "win32",
+            ),
+        ).toBeNull();
+    });
+});
 
 describe("doctor OpenCode legacy agent enabled migration", () => {
     it("migrates legacy enabled fields with conflict rules and warning text", () => {

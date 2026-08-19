@@ -104,6 +104,8 @@ Session discovery follows the active host. Relative `pi.subagent_extensions` are
 
 For the full configuration reference (including dreamer, sidekick, auto-search, and experimental features), see [CONFIGURATION.md](https://github.com/cortexkit/magic-context/blob/master/CONFIGURATION.md) in the main repository — OpenCode, Pi, and OMP share the same schema.
 
+The in-process `local` embedding provider is unavailable when the extension host is Bun on Windows because its native ONNX runtime can crash the host. Keyword search remains available; configure `openai-compatible` or `off`. Remote embedding authentication is explicit: the extension cannot reuse the host's model-provider OAuth session or credentials, so provide an embedding-specific `api_key` or user-level `headers`.
+
 ---
 
 ## Slash commands

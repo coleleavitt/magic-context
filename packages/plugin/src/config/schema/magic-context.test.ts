@@ -122,6 +122,10 @@ describe("MagicContextConfigSchema", () => {
                     endpoint: "http://localhost:1234/v1",
                     model: "text-embedding-3-small",
                     api_key: "secret-embedding",
+                    headers: {
+                        Authorization: "Bearer custom-token",
+                        "X-Embedding-Tenant": "tenant-a",
+                    },
                 },
                 memory: {
                     enabled: true,

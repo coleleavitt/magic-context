@@ -1,9 +1,35 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { homedir } from "node:os";
 import { MagicContextConfigSchema } from "../config/schema/magic-context";
 import { resolveEmbeddingRouting } from "./embedding-routing";
 
+const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+
+afterEach(() => {
+    if (originalPlatformDescriptor) {
+        Object.defineProperty(process, "platform", originalPlatformDescriptor);
+    }
+});
+
 describe("embedding routing", () => {
+    it("reports the local lane unavailable under Bun on Windows", async () => {
+        // Given
+        Object.defineProperty(process, "platform", {
+            ...originalPlatformDescriptor,
+            value: "win32",
+        });
+        const config = MagicContextConfigSchema.parse({
+            embedding: { provider: "local" },
+        });
+
+        // When
+        const routing = await resolveEmbeddingRouting({ config, projectRoot: "C:\\repo" });
+
+        // Then
+        expect(routing.primary.provider).toBe("local");
+        expect(routing.warnings.join(" ")).toContain("Bun on Windows");
+    });
+
     it("keeps Synapse transport settings out of the resolved fallback config", async () => {
         const config = MagicContextConfigSchema.parse({
             embedding: { provider: "synapse", fallback_provider: "local" },

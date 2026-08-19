@@ -8,6 +8,7 @@ import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
     type EmbeddingProbeOutcome,
+    parseEmbeddingHeaders,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
 import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
@@ -34,6 +35,7 @@ import { collectDiagnostics } from "../lib/diagnostics-opencode";
 import {
     checkLocalEmbeddingRuntime,
     formatLocalEmbeddingRuntimeDoctorWarning,
+    getLocalEmbeddingRuntimeDoctorWarning,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
 import { bundleIssueReport } from "../lib/logs-opencode";
@@ -406,11 +408,23 @@ async function runIssueFlow(): Promise<number> {
 // resolver error in the log. Shared by the explicit-`local` branch AND the
 // no-config / default-provider path (local is the default, so a missing config
 // still means local embeddings).
-function checkLocalEmbeddingRuntimeForDoctor(): {
+export function getOpenCodeLocalEmbeddingRuntimeDoctorWarning(
+    installation: OpenCodeInstallationReport,
+    platform: NodeJS.Platform = process.platform,
+): string | null {
+    return getLocalEmbeddingRuntimeDoctorWarning(platform, installation.kind === "cli");
+}
+
+function checkLocalEmbeddingRuntimeForDoctor(installation: OpenCodeInstallationReport): {
     issues: number;
     localRuntimeBroken?: boolean;
     unverified?: boolean;
 } {
+    const unavailableWarning = getOpenCodeLocalEmbeddingRuntimeDoctorWarning(installation);
+    if (unavailableWarning) {
+        log.warn(unavailableWarning);
+        return { issues: 0, unverified: true };
+    }
     const runtime = checkLocalEmbeddingRuntime(getOpenCodePluginCacheRoots());
     if (isLocalEmbeddingRuntimeBroken(runtime)) {
         log.warn(formatLocalEmbeddingRuntimeDoctorWarning(runtime));
@@ -426,12 +440,13 @@ function checkLocalEmbeddingRuntimeForDoctor(): {
 
 async function checkEmbeddingConfig(
     magicContextConfigPath: string,
+    installation: OpenCodeInstallationReport,
 ): Promise<{ issues: number; localRuntimeBroken?: boolean; unverified?: boolean }> {
     if (!existsSync(magicContextConfigPath)) {
         // No config → local provider defaults apply. Still verify the local
         // runtime: local is the DEFAULT, so "no config" means local embeddings,
         // and a broken onnxruntime-node would silently fail (#128/#6).
-        return checkLocalEmbeddingRuntimeForDoctor();
+        return checkLocalEmbeddingRuntimeForDoctor(installation);
     }
 
     let rawText: string;
@@ -469,7 +484,7 @@ async function checkEmbeddingConfig(
     }
 
     if (provider === undefined || provider === "local") {
-        return checkLocalEmbeddingRuntimeForDoctor();
+        return checkLocalEmbeddingRuntimeForDoctor(installation);
     }
 
     if (provider !== "openai-compatible") {
@@ -482,6 +497,7 @@ async function checkEmbeddingConfig(
     const endpoint = typeof embedding?.endpoint === "string" ? embedding.endpoint.trim() : "";
     const model = typeof embedding?.model === "string" ? embedding.model.trim() : "";
     const apiKey = typeof embedding?.api_key === "string" ? embedding.api_key : undefined;
+    const headers = parseEmbeddingHeaders(embedding?.headers);
     const inputType =
         typeof embedding?.input_type === "string" ? embedding.input_type.trim() : undefined;
     const truncateMode =
@@ -539,6 +555,7 @@ async function checkEmbeddingConfig(
             endpoint,
             model,
             apiKey: apiKey,
+            ...(headers ? { headers } : {}),
             ...(inputType ? { inputType } : {}),
             ...(truncateMode ? { truncate: truncateMode } : {}),
             timeoutMs: 10_000,
@@ -1251,7 +1268,7 @@ export async function runDoctor(
     // 7b. Validate embedding configuration — runs a real probe against the
     // configured endpoint so users catch misconfigured URL / missing env var /
     // wrong provider issues before relying on semantic memory search.
-    const embeddingCheck = await checkEmbeddingConfig(paths.magicContextConfig);
+    const embeddingCheck = await checkEmbeddingConfig(paths.magicContextConfig, activeInstallation);
     issues += embeddingCheck.issues;
     if (embeddingCheck.issues > 0) failCount += embeddingCheck.issues;
     else if (embeddingCheck.unverified) warnCount++;

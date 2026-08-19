@@ -52,6 +52,9 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
                   model: config.model.trim(),
                   endpoint: normalizeEndpoint(config.endpoint),
                   apiKeyPresent: Boolean(config.api_key?.trim()),
+                  ...(Object.keys(config.headers ?? {}).length > 0
+                      ? { customHeadersPresent: true }
+                      : {}),
                   // input_type changes the embedding vector space (e.g. NIM
                   // 'query' vs 'passage'), so it participates in identity — a
                   // change must re-embed. truncate changes which text an over-long

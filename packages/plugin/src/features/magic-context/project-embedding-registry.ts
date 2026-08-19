@@ -31,7 +31,10 @@ import {
 } from "./git-commits/sweep-coordinator";
 import { invalidateProject } from "./memory/embedding-cache";
 import { getEmbeddingProviderIdentity } from "./memory/embedding-identity";
-import { LocalEmbeddingProvider } from "./memory/embedding-local";
+import {
+    getLocalEmbeddingUnavailableReason,
+    LocalEmbeddingProvider,
+} from "./memory/embedding-local";
 import { OpenAICompatibleEmbeddingProvider } from "./memory/embedding-openai";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import {
@@ -124,6 +127,7 @@ export interface ProjectEmbeddingRegistrationSnapshot {
     model: string;
     /** Configured provider kind (e.g. "openai-compatible", "local", "ollama"). */
     provider: string;
+    unavailableReason?: string;
 }
 
 interface ProjectEmbeddingRegistration {
@@ -138,6 +142,7 @@ interface ProjectEmbeddingRegistration {
     modelId: string;
     chunkModelId: string;
     observationMode: boolean;
+    unavailableReason: string | null;
 }
 
 interface UnembeddedMemoryRow {
@@ -237,6 +242,7 @@ export function markProjectLoadUntrusted(projectIdentity: string): void {
 }
 let projectSweepInProgress = false;
 let testProviderFactory: ((config: EmbeddingConfig) => EmbeddingProvider | null) | null = null;
+let localEmbeddingUnavailableReasonForRuntime = getLocalEmbeddingUnavailableReason;
 
 function synapseConfigFields(config: EmbeddingConfig): {
     model?: string;
@@ -394,6 +400,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
 
     if (config.provider === "openai-compatible") {
         const apiKey = config.api_key?.trim();
+        const headers = config.headers;
         const inputType = config.input_type?.trim();
         const queryInputType = config.query_input_type?.trim();
         const truncate = config.truncate?.trim();
@@ -402,6 +409,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
             model: config.model.trim(),
             endpoint: config.endpoint.trim(),
             ...(apiKey ? { api_key: apiKey } : {}),
+            ...(headers ? { headers } : {}),
             // Preserve provider-specific request fields (NVIDIA NIM input_type;
             // truncate). They must survive normalization so (a) they reach the
             // provider request body and (b) a change to either is part of the
@@ -480,6 +488,7 @@ function createProvider(
             endpoint: config.endpoint,
             model: config.model,
             apiKey: config.api_key,
+            headers: config.headers,
             inputType: config.input_type,
             queryInputType: config.query_input_type,
             truncate: config.truncate,
@@ -585,6 +594,7 @@ function snapshotFor(
         "model" in registration.config && typeof registration.config.model === "string"
             ? registration.config.model.trim()
             : "";
+    const unavailableReason = registration.unavailableReason;
     return {
         projectIdentity: registration.projectIdentity,
         sourceDirectory: registration.sourceDirectory,
@@ -598,15 +608,20 @@ function snapshotFor(
         chunkModelId:
             registration.observationMode || !providerIsOn ? "off" : registration.chunkModelId,
         model:
-            registration.observationMode || !providerIsOn
-                ? "off"
-                : configuredModel
-                  ? configuredModel
-                  : registration.modelId,
+            unavailableReason !== null
+                ? configuredModel
+                : registration.observationMode || !providerIsOn
+                  ? "off"
+                  : configuredModel
+                    ? configuredModel
+                    : registration.modelId,
         provider:
-            registration.observationMode || !providerIsOn
-                ? "off"
-                : (registration.config.provider ?? "local"),
+            unavailableReason !== null
+                ? registration.config.provider
+                : registration.observationMode || !providerIsOn
+                  ? "off"
+                  : (registration.config.provider ?? "local"),
+        ...(unavailableReason !== null ? { unavailableReason } : {}),
     };
 }
 
@@ -982,8 +997,14 @@ export function registerProjectEmbedding(
     sourceDirectory: string,
 ): ProjectEmbeddingRegistrationSnapshot {
     const resolvedConfig = resolveEmbeddingConfig(config);
-    const providerIdentity = getEmbeddingProviderIdentity(resolvedConfig);
-    const runtimeFingerprint = getRuntimeFingerprint(resolvedConfig);
+    const unavailableReason =
+        resolvedConfig.provider === "local" ? localEmbeddingUnavailableReasonForRuntime() : null;
+    const providerIdentity = unavailableReason
+        ? OFF_PROVIDER_IDENTITY
+        : getEmbeddingProviderIdentity(resolvedConfig);
+    const runtimeFingerprint = unavailableReason
+        ? `${OFF_PROVIDER_IDENTITY}:windows-bun-local`
+        : getRuntimeFingerprint(resolvedConfig);
     const chunkModelId = getChunkEmbeddingModelId(resolvedConfig, providerIdentity);
     const prior = projectRegistrations.get(projectIdentity);
     const canReuseProvider =
@@ -1018,6 +1039,7 @@ export function registerProjectEmbedding(
         modelId: providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : providerIdentity,
         chunkModelId: providerIdentity === OFF_PROVIDER_IDENTITY ? "off" : chunkModelId,
         observationMode: false,
+        unavailableReason,
     };
 
     projectRegistrations.set(projectIdentity, registration);
@@ -1069,6 +1091,7 @@ export function registerProjectShadowEmbedding(
                 modelId: prior.modelId,
                 chunkModelId: prior.chunkModelId,
                 observationMode: false,
+                unavailableReason: null,
             }),
             provider: "synapse",
         };
@@ -1699,6 +1722,7 @@ export function registerProjectInObservationMode(
         modelId: "off",
         chunkModelId: "off",
         observationMode: true,
+        unavailableReason: null,
     };
 
     projectRegistrations.set(projectIdentity, registration);
@@ -2593,6 +2617,7 @@ export interface EmbeddingCoverageStatus {
     model: string;
     /** Configured provider kind ("local" / "openai-compatible" / "ollama" / "off"). */
     provider: string;
+    unavailableReason?: string;
     /** This session's compartment-chunk coverage. */
     session: { embedded: number; total: number };
     /** Project-wide active-memory coverage. */
@@ -2617,6 +2642,9 @@ export function getEmbeddingCoverageStatus(
             enabled: false,
             model: snapshot?.model ?? "off",
             provider: snapshot?.provider ?? "off",
+            ...(snapshot?.unavailableReason
+                ? { unavailableReason: snapshot.unavailableReason }
+                : {}),
             session: { embedded: 0, total: 0 },
             memories: { embedded: 0, total: 0 },
             commits: { embedded: 0, total: 0, gitEnabled: false },
@@ -2728,6 +2756,12 @@ export function _setTestProviderFactoryForProject(
     testProviderFactory = factory;
 }
 
+export function _setTestLocalEmbeddingUnavailableReasonForProject(
+    resolver: (() => string | null) | null,
+): void {
+    localEmbeddingUnavailableReasonForRuntime = resolver ?? getLocalEmbeddingUnavailableReason;
+}
+
 export function _resetProjectEmbeddingRegistryForTests(): void {
     for (const registration of projectRegistrations.values()) {
         disposeProvider(registration.provider);
@@ -2745,4 +2779,5 @@ export function _resetProjectEmbeddingRegistryForTests(): void {
     globalRegistrationGeneration = 0;
     projectSweepInProgress = false;
     testProviderFactory = null;
+    localEmbeddingUnavailableReasonForRuntime = getLocalEmbeddingUnavailableReason;
 }
