@@ -57,6 +57,15 @@ export interface MessageUpdatedInfo {
     completedAt?: number;
 }
 
+export function isSuccessfulHostEvent(info: MessageUpdatedAssistantInfo): boolean {
+    if (info.error !== undefined && info.error !== null) return false;
+    if (info.finish === "error") return false;
+    return (
+        typeof info.completedAt === "number" ||
+        (typeof info.finish === "string" && info.finish.length > 0)
+    );
+}
+
 export interface SessionErrorInfo {
     sessionID: string;
     error: unknown;

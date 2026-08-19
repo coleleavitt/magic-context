@@ -17,7 +17,7 @@ import {
 
 /**
  * Model context limits resolve from OpenCode's SDK only (`config.providers()`),
- * bounded to a sane [20k, 3M] range, with a persisted last-known-good cache for
+ * bounded to exact positive integers above 20k, with a persisted last-known-good cache for
  * cold start. We no longer read OpenCode's `models.json` file ourselves (a torn
  * read produced impossible limits and a stale copy out-voted the live cap).
  */
@@ -196,6 +196,21 @@ describe("models-dev-cache (SDK-only)", () => {
         expect(getSdkContextLimit("unknown", "unknown")).toBeUndefined();
     });
 
+    test("accepts a legitimate 10M-token model window", async () => {
+        await refreshModelLimitsFromApi(
+            makeClient([
+                {
+                    id: "large-context-provider",
+                    models: { "large-context-model": { limit: { context: 10_000_000 } } },
+                },
+            ]),
+        );
+
+        expect(getSdkContextLimit("large-context-provider", "large-context-model")).toBe(
+            10_000_000,
+        );
+    });
+
     test("Codex-OAuth cap is honored: a 400k/272k gpt-5.5 resolves to 272k (not the stale 922k)", async () => {
         // The bug we're fixing: the SDK reports the auth-resolved cap; nothing may
         // out-vote it with a larger stale value.
@@ -276,7 +291,7 @@ describe("models-dev-cache (SDK-only)", () => {
         expect(getSdkContextLimit("ollama-cloud", "nonexistent:cloud")).toBeUndefined();
     });
 
-    describe("sanity bounds [20k, 3M]", () => {
+    describe("sanity bounds [20k, Number.MAX_SAFE_INTEGER]", () => {
         test("rejects an implausibly small limit (torn-read garbage like 6748)", async () => {
             await refreshModelLimitsFromApi(
                 makeClient([
@@ -298,9 +313,14 @@ describe("models-dev-cache (SDK-only)", () => {
             expect(getSdkContextLimit("p", "m")).toBeUndefined();
         });
 
-        test("rejects an impossibly large limit (> 3M)", async () => {
+        test("rejects a limit outside JavaScript's exact integer range", async () => {
             await refreshModelLimitsFromApi(
-                makeClient([{ id: "p", models: { m: { limit: { context: 5_000_000 } } } }]),
+                makeClient([
+                    {
+                        id: "p",
+                        models: { m: { limit: { context: Number.MAX_SAFE_INTEGER + 1 } } },
+                    },
+                ]),
             );
             expect(getSdkContextLimit("p", "m")).toBeUndefined();
         });
@@ -312,13 +332,13 @@ describe("models-dev-cache (SDK-only)", () => {
                         id: "p",
                         models: {
                             lo: { limit: { context: 20000 } },
-                            hi: { limit: { context: 3000000 } },
+                            hi: { limit: { context: Number.MAX_SAFE_INTEGER } },
                         },
                     },
                 ]),
             );
             expect(getSdkContextLimit("p", "lo")).toBe(20000);
-            expect(getSdkContextLimit("p", "hi")).toBe(3000000);
+            expect(getSdkContextLimit("p", "hi")).toBe(Number.MAX_SAFE_INTEGER);
         });
     });
 

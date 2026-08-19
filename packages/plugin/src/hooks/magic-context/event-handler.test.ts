@@ -14,6 +14,7 @@ import {
     getHistorianFailureState,
     getMaxCompressionDepth,
     getOrCreateSessionMeta,
+    getOverflowState,
     getStrippedPlaceholderIds,
     getTagsBySession,
     incrementCompressionDepth,
@@ -42,6 +43,7 @@ import type { ContextUsage } from "../../features/magic-context/types";
 import { getWindowReportsPath } from "../../features/magic-context/window-report-ledger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { createEventHandler } from "./event-handler";
+import { createEventHook } from "./hook-handlers";
 
 type ContextUsageCacheEntry = {
     usage: ContextUsage;
@@ -157,6 +159,29 @@ function providersClient(limit: number, prompt?: ReturnType<typeof mock>) {
         },
         session: prompt ? { prompt } : undefined,
     };
+}
+
+function createHostEventHook(
+    deps: ReturnType<typeof createDeps>,
+    contextUsageMap: Map<string, ContextUsageCacheEntry>,
+) {
+    return createEventHook({
+        eventHandler: createEventHandler(deps),
+        contextUsageMap,
+        db: deps.db,
+        liveModelBySession: new Map(),
+        variantBySession: new Map(),
+        agentBySession: new Map(),
+        sessionDirectoryBySession: new Map(),
+        historyRefreshSessions: new Set(),
+        deferredHistoryRefreshSessions: new Set(),
+        systemPromptRefreshSessions: new Set(),
+        pendingMaterializationSessions: new Set(),
+        deferredMaterializationSessions: new Set(),
+        lastHeuristicsTurnId: new Map(),
+        client: deps.client as never,
+        protectedTags: 5,
+    });
 }
 
 describe("createEventHandler", () => {
@@ -546,6 +571,209 @@ describe("createEventHandler", () => {
         expect(contextUsageMap.get("ses-regression-recovered")?.usage.percentage).toBe(90);
     });
 
+    it("uses an output-length completion after the real model-switch reset to correct a stale low limit", async () => {
+        // Given: a prior model established a small safe-token baseline while the
+        // catalog advertises only 128k for the next model.
+        useTempDataHome("context-event-model-switch-first-sample-");
+        await refreshModelLimitsFromApi(providersClient(128_000));
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        const deps = createDeps(contextUsageMap);
+        deps.client = providersClient(128_000);
+        const hook = createHostEventHook(deps, contextUsageMap);
+        await hook({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        role: "assistant",
+                        finish: "stop",
+                        sessionID: "ses-model-switch-first-sample",
+                        providerID: "test-provider",
+                        modelID: "old-model",
+                        tokens: { input: 1_000, cache: { read: 0, write: 0 } },
+                    },
+                },
+            },
+        });
+
+        // When: an error-free output-length response on the new model proves
+        // a 10M-token prompt, including cache reads and writes, succeeded.
+        await hook({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        role: "assistant",
+                        finish: "length",
+                        sessionID: "ses-model-switch-first-sample",
+                        providerID: "test-provider",
+                        modelID: "test-model",
+                        tokens: { input: 6_000_000, cache: { read: 3_000_000, write: 1_000_000 } },
+                    },
+                },
+            },
+        });
+
+        // Then: shared metadata and live pressure both use the proven lower bound.
+        const meta = getOrCreateSessionMeta(deps.db, "ses-model-switch-first-sample");
+        expect(contextUsageMap.get("ses-model-switch-first-sample")?.usage).toEqual({
+            inputTokens: 10_000_000,
+            percentage: 100,
+        });
+        expect(meta.lastUsageContextLimit).toBe(10_000_000);
+        expect(getOverflowState(deps.db, "ses-model-switch-first-sample")).toMatchObject({
+            detectedContextLimit: 10_000_000,
+            detectedContextLimitModelKey: "test-provider/test-model",
+            detectedContextLimitProvenance: "prompt_only",
+        });
+    });
+
+    for (const completion of [
+        {
+            name: "an error-bearing completed event",
+            finish: undefined,
+            completed: 1,
+            error: "boom",
+        },
+        { name: "finish:error", finish: "error", completed: undefined, error: undefined },
+        {
+            name: "a nonterminal numeric usage event",
+            finish: undefined,
+            completed: undefined,
+            error: undefined,
+        },
+    ]) {
+        it(`does not update ordinary usage from ${completion.name}`, async () => {
+            // Given: ordinary usage, a pending transform decision, and historian
+            // failure state established by the prior successful model.
+            useTempDataHome("context-event-model-switch-failed-sample-");
+            await refreshModelLimitsFromApi(providersClient(128_000));
+            const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+            const deps = createDeps(contextUsageMap);
+            deps.client = providersClient(128_000);
+            const hook = createHostEventHook(deps, contextUsageMap);
+            await hook({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            role: "assistant",
+                            finish: "stop",
+                            sessionID: "ses-model-switch-failed-sample",
+                            providerID: "test-provider",
+                            modelID: "old-model",
+                            tokens: { input: 100_000, cache: { read: 0, write: 0 } },
+                        },
+                    },
+                },
+            });
+            incrementHistorianFailure(deps.db, "ses-model-switch-failed-sample", "failed");
+            recordPendingTransformDecision("ses-model-switch-failed-sample", {
+                tsMs: 1,
+                decision: "execute",
+                materialized: true,
+                materializeReason: "pressure_refold",
+                emergency: false,
+                droppedTokens: 0,
+                droppedCount: 1,
+                inputTokens: 100_000,
+                bustedThisPass: true,
+            });
+            const baselineMeta = getOrCreateSessionMeta(deps.db, "ses-model-switch-failed-sample");
+            const baselineUsage = contextUsageMap.get("ses-model-switch-failed-sample");
+
+            // When: the new model reports usage on a failed completion shape.
+            await hook({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            id: "msg-model-switch-failed-sample",
+                            role: "assistant",
+                            finish: completion.finish,
+                            time:
+                                completion.completed === undefined
+                                    ? undefined
+                                    : { completed: completion.completed },
+                            error: completion.error,
+                            sessionID: "ses-model-switch-failed-sample",
+                            providerID: "test-provider",
+                            modelID: "test-model",
+                            tokens: { input: 258_901, cache: { read: 0, write: 0 } },
+                        },
+                    },
+                },
+            });
+            await waitForTimers();
+
+            // Then: live pressure, persisted pressure, historian recovery, and
+            // the pending transform decision remain exactly as they were.
+            expect(contextUsageMap.get("ses-model-switch-failed-sample")).toEqual(baselineUsage);
+            const meta = getOrCreateSessionMeta(deps.db, "ses-model-switch-failed-sample");
+            expect(meta.lastContextPercentage).toBe(baselineMeta.lastContextPercentage);
+            expect(meta.lastInputTokens).toBe(baselineMeta.lastInputTokens);
+            expect(meta.lastUsageContextLimit).toBe(baselineMeta.lastUsageContextLimit);
+            expect(meta.lastObservedModelKey).toBe(baselineMeta.lastObservedModelKey);
+            expect(meta.observedSafeInputTokens).toBe(baselineMeta.observedSafeInputTokens);
+            expect(
+                getHistorianFailureState(deps.db, "ses-model-switch-failed-sample").failureCount,
+            ).toBe(1);
+            const row = deps.db
+                .prepare("SELECT COUNT(*) AS count FROM transform_decisions WHERE session_id = ?")
+                .get("ses-model-switch-failed-sample") as { count: number };
+            expect(row.count).toBe(0);
+            expect(
+                transformDecisionLogTest.getPending("ses-model-switch-failed-sample"),
+            ).toBeDefined();
+        });
+    }
+
+    for (const malformed of [
+        { name: "fractional input", tokens: { input: 1.5, cache: { read: 0, write: 0 } } },
+        { name: "negative cache usage", tokens: { input: 1, cache: { read: -1, write: 0 } } },
+        {
+            name: "cache-inclusive integer overflow",
+            tokens: { input: Number.MAX_SAFE_INTEGER, cache: { read: 1, write: 0 } },
+        },
+    ]) {
+        it(`rejects ${malformed.name}`, async () => {
+            // Given: stale 128k catalog metadata and no prior usage.
+            useTempDataHome("context-event-model-switch-malformed-sample-");
+            await refreshModelLimitsFromApi(providersClient(128_000));
+            const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+            const deps = createDeps(contextUsageMap);
+            deps.client = providersClient(128_000);
+            const hook = createHostEventHook(deps, contextUsageMap);
+
+            // When: the host reports malformed cache-inclusive usage.
+            await hook({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            role: "assistant",
+                            finish: "stop",
+                            sessionID: "ses-model-switch-malformed-sample",
+                            providerID: "test-provider",
+                            modelID: "test-model",
+                            tokens: malformed.tokens,
+                        },
+                    },
+                },
+            });
+
+            // Then: malformed usage cannot overwrite metadata or live pressure.
+            expect(
+                getOverflowState(deps.db, "ses-model-switch-malformed-sample").detectedContextLimit,
+            ).toBe(0);
+            expect(contextUsageMap.get("ses-model-switch-malformed-sample")).toBeUndefined();
+            expect(
+                getOrCreateSessionMeta(deps.db, "ses-model-switch-malformed-sample")
+                    .observedSafeInputTokens,
+            ).toBe(0);
+        });
+    }
+
     it("alerts once when a cache-regressed context limit stays wrong after refresh", async () => {
         useTempDataHome("context-event-cache-regression-alert-");
         const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
@@ -596,7 +824,7 @@ describe("createEventHandler", () => {
 
         const meta = getOrCreateSessionMeta(openDatabase(), "ses-regression-alert");
         expect(meta.cacheAlertSent).toBe(true);
-        expect(meta.lastContextPercentage).toBe(400);
+        expect(meta.lastContextPercentage).toBe(100);
         expect(prompt).toHaveBeenCalledTimes(1);
         const call = prompt.mock.calls[0]?.[0] as { body?: { parts?: Array<{ text?: string }> } };
         expect(call.body?.parts?.[0]?.text).toContain("context limit of 30,000 tokens");
@@ -781,6 +1009,7 @@ describe("createEventHandler", () => {
                 properties: {
                     info: {
                         role: "assistant",
+                        finish: "stop",
                         sessionID: "ses-bg",
                         tokens: { input: 120_000, cache: { read: 12_000, write: 0 } },
                     },

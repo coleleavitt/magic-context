@@ -1051,7 +1051,7 @@ describe("magic-context hook", () => {
 
         const meta = getOrCreateSessionMeta(openDatabase(), "ses-model-change");
         expect(meta.clearedReasoningThroughTag).toBe(0);
-        expect(meta.observedSafeInputTokens).toBe(0);
+        expect(meta.observedSafeInputTokens).toBe(25_000);
         expect(meta.cacheAlertSent).toBe(false);
     });
 });

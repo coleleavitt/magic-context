@@ -47,6 +47,7 @@ import {
     getSessionCreatedInfo,
     getSessionErrorInfo,
     getSessionProperties,
+    isSuccessfulHostEvent,
 } from "./event-payloads";
 import {
     resolveCacheTtl,
@@ -424,8 +425,6 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 });
             }
 
-            let messageHadOverflowError = false;
-
             // Secondary overflow-detection path: OpenCode attaches overflow
             // errors to the assistant message itself in addition to emitting
             // session.error. Checking both ensures we catch the error no
@@ -435,7 +434,6 @@ export function createEventHandler(deps: EventHandlerDeps) {
             if (info.error !== undefined && info.error !== null) {
                 const detection = detectOverflow(info.error);
                 if (detection.isOverflow) {
-                    messageHadOverflowError = true;
                     try {
                         captureWindowReport({
                             db: deps.db,
@@ -518,15 +516,24 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 }
             }
 
+            if (!isSuccessfulHostEvent(info)) return;
+
             const now = Date.now();
             const usageTokens = [
                 info.tokens?.input,
                 info.tokens?.cache?.read,
                 info.tokens?.cache?.write,
             ];
-            const hasUsageTokens = usageTokens.some(
-                (value) => typeof value === "number" && value > 0,
+            const totalInputTokens = usageTokens.reduce<number>(
+                (total, value) => total + (value ?? 0),
+                0,
             );
+            const hasUsageTokens =
+                usageTokens.every(
+                    (value) => value === undefined || (Number.isSafeInteger(value) && value >= 0),
+                ) &&
+                usageTokens.some((value) => typeof value === "number" && value > 0) &&
+                Number.isSafeInteger(totalInputTokens);
             const terminalAssistantUpdate =
                 info.messageID !== undefined &&
                 hasUsageTokens &&
@@ -536,10 +543,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     db: deps.db,
                     sessionId: info.sessionID,
                     messageId: info.messageID,
-                    inputTokens:
-                        (info.tokens?.input ?? 0) +
-                        (info.tokens?.cache?.read ?? 0) +
-                        (info.tokens?.cache?.write ?? 0),
+                    inputTokens: totalInputTokens,
                 });
             }
 
@@ -570,10 +574,6 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 }
 
                 if (hasUsageTokens) {
-                    const totalInputTokens =
-                        (info.tokens?.input ?? 0) +
-                        (info.tokens?.cache?.read ?? 0) +
-                        (info.tokens?.cache?.write ?? 0);
                     // Auth is provably live now (a request returned usage), so
                     // re-warm the model-limit cache once per process to overwrite
                     // any stale pre-auth limit (e.g. gpt-5.5 cached at the raw
@@ -599,8 +599,9 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     const observedSafeInputTokens = sessionMeta.observedSafeInputTokens ?? 0;
                     if (
                         percentage > 100 &&
-                        observedSafeInputTokens > 0 &&
-                        totalInputTokens <= observedSafeInputTokens * 2
+                        modelKey !== undefined &&
+                        (observedSafeInputTokens === 0 ||
+                            totalInputTokens <= observedSafeInputTokens * 2)
                     ) {
                         const oldLimit = contextLimit;
                         if (deps.client) {
@@ -635,6 +636,22 @@ export function createEventHandler(deps: EventHandlerDeps) {
                                 updates.cacheAlertSent = true;
                             }
                         }
+
+                        if (contextLimit < totalInputTokens) {
+                            recordDetectedContextLimit(
+                                deps.db,
+                                info.sessionID,
+                                totalInputTokens,
+                                modelKey,
+                                "prompt_only",
+                            );
+                            contextLimit = resolveContextLimit(info.providerID, info.modelID, {
+                                db: deps.db,
+                                sessionID: info.sessionID,
+                            });
+                            percentage = (totalInputTokens / contextLimit) * 100;
+                            if (sessionMeta.cacheAlertSent) updates.cacheAlertSent = true;
+                        }
                     }
 
                     deps.contextUsageMap.set(info.sessionID, {
@@ -651,12 +668,10 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     updates.lastInputTokens = totalInputTokens;
                     updates.lastUsageContextLimit = contextLimit;
                     updates.lastObservedModelKey = modelKey ?? null;
-                    if (!messageHadOverflowError) {
-                        updates.observedSafeInputTokens = Math.max(
-                            observedSafeInputTokens,
-                            totalInputTokens,
-                        );
-                    }
+                    updates.observedSafeInputTokens = Math.max(
+                        observedSafeInputTokens,
+                        totalInputTokens,
+                    );
 
                     const historianFailureState = getHistorianFailureState(deps.db, info.sessionID);
                     if (historianFailureState.failureCount > 0 && percentage < 90) {

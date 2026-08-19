@@ -39,6 +39,7 @@ import {
     getMessageUpdatedAssistantInfo,
     getMessageUpdatedInfo,
     getSessionProperties,
+    isSuccessfulHostEvent,
 } from "./event-payloads";
 import { resolveSessionId as resolveEventSessionId } from "./event-resolvers";
 import { dropSlot } from "./lkg-slot";
@@ -282,28 +283,13 @@ export function createEventHook(args: {
     protectedTags: number;
 }) {
     return async (input: { event: { type: string; properties?: unknown } }) => {
-        await args.eventHandler(input);
-
         if (input.event.type === "message.updated") {
-            const messageInfo = getMessageUpdatedInfo(input.event.properties);
-            if (messageInfo?.messageID) {
-                const isTerminalUser = messageInfo.role === "user";
-                const isTerminalAssistant =
-                    messageInfo.role === "assistant" &&
-                    (typeof messageInfo.completedAt === "number" ||
-                        typeof messageInfo.finish === "string");
-                if (isTerminalUser || isTerminalAssistant) {
-                    scheduleIncrementalIndex(
-                        args.db,
-                        messageInfo.sessionID,
-                        messageInfo.messageID,
-                        readRawSessionMessageById,
-                    );
-                }
-            }
-
             const assistantInfo = getMessageUpdatedAssistantInfo(input.event.properties);
-            if (assistantInfo?.providerID && assistantInfo?.modelID) {
+            if (
+                assistantInfo?.providerID &&
+                assistantInfo.modelID &&
+                isSuccessfulHostEvent(assistantInfo)
+            ) {
                 const previous = args.liveModelBySession.get(assistantInfo.sessionID);
                 args.liveModelBySession.set(assistantInfo.sessionID, {
                     providerID: assistantInfo.providerID,
@@ -361,6 +347,27 @@ export function createEventHook(args: {
                         observedSafeInputTokens: 0,
                         cacheAlertSent: false,
                     });
+                }
+            }
+        }
+
+        await args.eventHandler(input);
+
+        if (input.event.type === "message.updated") {
+            const messageInfo = getMessageUpdatedInfo(input.event.properties);
+            if (messageInfo?.messageID) {
+                const isTerminalUser = messageInfo.role === "user";
+                const isTerminalAssistant =
+                    messageInfo.role === "assistant" &&
+                    (typeof messageInfo.completedAt === "number" ||
+                        typeof messageInfo.finish === "string");
+                if (isTerminalUser || isTerminalAssistant) {
+                    scheduleIncrementalIndex(
+                        args.db,
+                        messageInfo.sessionID,
+                        messageInfo.messageID,
+                        readRawSessionMessageById,
+                    );
                 }
             }
         }

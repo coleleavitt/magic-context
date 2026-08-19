@@ -16,7 +16,7 @@
  *      from a persisted last-known-good file on cold start so a restart uses the
  *      real limit immediately (no 128k-default budget-collapse window).
  *
- * All cached values are bounded to a sane [20k, 3M] range on insert, so torn /
+ * All cached values must be exact integers of at least 20k on insert, so torn /
  * unconfigured-default garbage can never be returned or persisted. The startup
  * warm retries a couple times when OpenCode's provider service isn't ready yet.
  *
@@ -46,21 +46,21 @@ interface OpencodeClientLike {
     };
 }
 
-// Plausible bounds for a real model's prompt limit. A value outside this range
-// is physically impossible for an agentic session and signals a transient/garbage
-// read — e.g. a torn read of OpenCode's `models.json` mid-write once produced
-// `contextLimit=6748` (smaller than a single system prompt) for a session that
-// had been running for hours past 200k+ (issue #117). Such values must be
-// REJECTED, not trusted as a "smaller real cap". A genuinely smaller real limit
-// still comes through the overflow-detection path (detectedContextLimit).
+// The lower bound rejects transient/garbage reads — e.g. a torn models.json read
+// produced contextLimit=6748 for a session already past 200k (issue #117). The
+// upper bound is JavaScript's exact-integer ceiling: model windows keep growing,
+// so arithmetic safety is the only future-proof maximum.
 export const MIN_SANE_LIMIT = 20_000;
-export const MAX_SANE_LIMIT = 3_000_000;
+export const MAX_SANE_LIMIT = Number.MAX_SAFE_INTEGER;
 
-/** True when `limit` is a plausible real prompt window — used to reject torn /
- *  unconfigured-default garbage in BOTH harnesses (OpenCode's SDK values and
- *  Pi's reported `contextWindow`). Exported so Pi applies the identical bound. */
+/** True when `limit` is an exact prompt window above the garbage-read floor. */
 export function isSaneLimit(limit: number | undefined): limit is number {
-    return typeof limit === "number" && limit >= MIN_SANE_LIMIT && limit <= MAX_SANE_LIMIT;
+    return (
+        typeof limit === "number" &&
+        Number.isSafeInteger(limit) &&
+        limit >= MIN_SANE_LIMIT &&
+        limit <= MAX_SANE_LIMIT
+    );
 }
 
 export type OutputReserveConfig = number | { default: number; [modelKey: string]: number };
