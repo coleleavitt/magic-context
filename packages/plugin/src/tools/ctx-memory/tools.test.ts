@@ -384,6 +384,17 @@ describe("createCtxMemoryTools", () => {
             expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(1);
             expect(syncSessions).toEqual(["ses-memory"]);
 
+            const duplicate = await rustTools.ctx_memory.execute(
+                {
+                    action: "write",
+                    category: "USER_DIRECTIVES",
+                    content: "Keep the context database authoritative.",
+                },
+                toolContext("ses-second"),
+            );
+            expect(duplicate).toContain("Memory already exists");
+            expect(syncSessions).toEqual(["ses-memory", "ses-second"]);
+
             const tsTools = createCtxMemoryTools({
                 db,
                 resolveProjectPath: () => "/repo/project",
@@ -398,7 +409,7 @@ describe("createCtxMemoryTools", () => {
                 },
                 toolContext(),
             );
-            expect(syncSessions).toEqual(["ses-memory"]);
+            expect(syncSessions).toEqual(["ses-memory", "ses-second"]);
         });
 
         it("routes all module-owned memory actions without writing the TS table", async () => {

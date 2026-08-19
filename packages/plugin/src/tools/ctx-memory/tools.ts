@@ -564,6 +564,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         toolContext.agent === DREAMER_AGENT ? "dreamer" : getSourceType(deps),
                 });
                 if (!insertResult.inserted) {
+                    requestRustMemorySync(deps, toolContext.sessionID);
                     return `Memory already exists [ID: ${insertResult.memory.id}] in ${category}.`;
                 }
 
