@@ -1,4 +1,5 @@
 import type { Database } from "../../../shared/sqlite";
+import { mergeMemoryEpisodeEvidence } from "./storage-memory";
 import type { MemoryStatus } from "./types";
 
 /**
@@ -83,20 +84,10 @@ export function rekeyMemoryRowWithCollisionMerge(
             )
             .get();
         if (hasEvidence) {
+            const mergedSeenCount = mergeMemoryEpisodeEvidence(db, collision.id, [rowId]);
             db.prepare(
-                `INSERT OR IGNORE INTO memory_evidence (
-                    memory_id, content_hash, source_session_id, source_message_id, source_type, observed_at
-                )
-                SELECT ?, content_hash, source_session_id, source_message_id, source_type, observed_at
-                  FROM memory_evidence WHERE memory_id = ?`,
-            ).run(collision.id, rowId);
-            db.prepare(
-                `UPDATE memories SET seen_count = MAX(
-                    COALESCE(seen_count, 1),
-                    ?,
-                    (SELECT COUNT(DISTINCT source_session_id) FROM memory_evidence WHERE memory_id = ?)
-                ) WHERE id = ?`,
-            ).run(row.seen_count ?? 1, collision.id, collision.id);
+                "UPDATE memories SET seen_count = MAX(COALESCE(seen_count, 1), ?) WHERE id = ?",
+            ).run(mergedSeenCount ?? row.seen_count ?? 1, collision.id);
         } else {
             db.prepare(
                 "UPDATE memories SET seen_count = MAX(COALESCE(seen_count, 1), ?) WHERE id = ?",

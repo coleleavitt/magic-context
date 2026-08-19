@@ -1699,7 +1699,7 @@ struct ModuleMemoryWire {
     #[serde(default)]
     mural_cue_rejection_count: i64,
     #[serde(default)]
-    evidence: Vec<ModuleMemoryEvidenceWire>,
+    evidence: Option<Vec<ModuleMemoryEvidenceWire>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1817,17 +1817,18 @@ impl ModuleMemoryWire {
             mural_cue_hash: self.mural_cue_hash,
             mural_cue_at: self.mural_cue_at,
             mural_cue_rejection_count: self.mural_cue_rejection_count,
-            evidence: self
-                .evidence
-                .into_iter()
-                .map(|row| ModuleMemoryEvidenceRow {
-                    content_hash: row.content_hash,
-                    source_session_id: row.source_session_id,
-                    source_message_id: row.source_message_id,
-                    source_type: row.source_type,
-                    observed_at: row.observed_at,
-                })
-                .collect(),
+            evidence: self.evidence.map(|evidence| {
+                evidence
+                    .into_iter()
+                    .map(|row| ModuleMemoryEvidenceRow {
+                        content_hash: row.content_hash,
+                        source_session_id: row.source_session_id,
+                        source_message_id: row.source_message_id,
+                        source_type: row.source_type,
+                        observed_at: row.observed_at,
+                    })
+                    .collect()
+            }),
         }
     }
 }

@@ -1114,6 +1114,44 @@ describe("createCtxMemoryTool", () => {
 });
 
 describe("Pi ctx_memory provenance", () => {
+	it("advances a migrated legacy baseline only for a distinct session", async () => {
+		const db = createTestDb();
+		try {
+			let sessionId = "pi-session-a";
+			const tool = createCtxMemoryTool({
+				db,
+				resolveProjectIdentity: () => "git:project",
+			});
+			const ctx = {
+				cwd: "/repo",
+				sessionManager: { getSessionId: () => sessionId },
+			} as never;
+			const write = () =>
+				tool.execute(
+					"call-write",
+					{ action: "write", category: "CONSTRAINTS", content: "Migrated Pi fact" },
+					new AbortController().signal,
+					() => undefined,
+					ctx,
+				);
+
+			await write();
+			const memory = db
+				.prepare<unknown[], { id: number }>("SELECT id FROM memories")
+				.get();
+			expect(memory).toBeDefined();
+			db.prepare("UPDATE memories SET seen_count = 10 WHERE id = ?").run(memory?.id);
+
+			await write();
+			expect(getMemoryById(db, memory?.id ?? -1)?.seenCount).toBe(10);
+			sessionId = "pi-session-b";
+			await write();
+			expect(getMemoryById(db, memory?.id ?? -1)?.seenCount).toBe(11);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("preserves content-bound evidence when memories merge", async () => {
 		const db = createTestDb();
 		try {

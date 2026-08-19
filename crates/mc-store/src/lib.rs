@@ -2483,7 +2483,12 @@ fn normalize_authority_route_tx(
         rows
     };
     for (source_id, canonical_id) in collisions {
-        merge_memory_evidence_tx(tx, canonical_id, &[source_id])?;
+        let legacy_seen_baseline = legacy_seen_baseline_tx(tx, &[canonical_id, source_id])?;
+        let evidence_count = merge_memory_evidence_tx(tx, canonical_id, &[source_id])?;
+        tx.execute(
+            "UPDATE mc_memories SET seen_count = ?1 WHERE id = ?2",
+            params![legacy_seen_baseline + evidence_count, canonical_id],
+        )?;
     }
     tx.execute(
         "DELETE FROM mc_memories
@@ -2502,15 +2507,6 @@ fn normalize_authority_route_tx(
                    AND canonical.normalized_hash = mc_memories.normalized_hash
             )",
         params![context_store_uuid, project, route_project_root],
-    )?;
-    tx.execute(
-        "UPDATE mc_memories
-            SET seen_count = MAX(
-                seen_count,
-                (SELECT COUNT(DISTINCT source_session_id) FROM mc_memory_evidence WHERE memory_id = mc_memories.id)
-            )
-          WHERE project_path = ?1",
-        [project],
     )?;
     tx.execute(
         "UPDATE mc_memories
@@ -4569,7 +4565,9 @@ pub struct ModuleMemoryRow {
     pub mural_cue_hash: Option<String>,
     pub mural_cue_at: Option<i64>,
     pub mural_cue_rejection_count: i64,
-    pub evidence: Vec<ModuleMemoryEvidenceRow>,
+    /// `None` means an older sparse snapshot omitted evidence; `Some([])` is an
+    /// authoritative clear.
+    pub evidence: Option<Vec<ModuleMemoryEvidenceRow>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -5405,10 +5403,17 @@ fn record_memory_evidence_tx(
     let Some(source_session_id) = input.source_session_id else {
         return Ok(false);
     };
-    let content_hash: String = tx.query_row(
-        "SELECT normalized_hash FROM mc_memories WHERE id = ?1",
+    let (content_hash, original_source_session_id, prior_evidence_count): (
+        String,
+        Option<String>,
+        i64,
+    ) = tx.query_row(
+        "SELECT normalized_hash, source_session_id,
+                (SELECT COUNT(DISTINCT source_session_id)
+                   FROM mc_memory_evidence WHERE memory_id = ?1)
+           FROM mc_memories WHERE id = ?1",
         [memory_id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let feed_seq_before = tx.query_row(
         "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed",
@@ -5429,16 +5434,21 @@ fn record_memory_evidence_tx(
         ],
     )? > 0;
     if inserted {
+        let evidenced_seen_count = if prior_evidence_count > 0 {
+            prior_evidence_count
+        } else if original_source_session_id.as_deref() == Some(source_session_id) {
+            1
+        } else {
+            0
+        };
         tx.execute(
             "UPDATE mc_memories
-                SET seen_count = MAX(
-                        COALESCE(seen_count, 1),
-                        (SELECT COUNT(DISTINCT source_session_id) FROM mc_memory_evidence WHERE memory_id = ?1)
-                    ),
-                    last_seen_at = ?2,
-                    updated_at = ?2
+                SET seen_count = MAX(COALESCE(seen_count, 1) - ?2, 0)
+                        + (SELECT COUNT(DISTINCT source_session_id) FROM mc_memory_evidence WHERE memory_id = ?1),
+                    last_seen_at = ?3,
+                    updated_at = ?3
               WHERE id = ?1",
-            params![memory_id, input.now_ms],
+            params![memory_id, evidenced_seen_count, input.now_ms],
         )?;
         if let Some(memory) = load_memory_full_tx(tx, memory_id)? {
             emit_verification_memory_snapshot_tx(tx, &memory, feed_seq_before)?;
@@ -5466,6 +5476,28 @@ fn merge_memory_evidence_tx(
         [target_id],
         |row| row.get(0),
     )
+}
+
+fn legacy_seen_baseline_tx(
+    tx: &rusqlite::Transaction<'_>,
+    memory_ids: &[i64],
+) -> rusqlite::Result<i64> {
+    let mut baseline = 0;
+    for memory_id in memory_ids {
+        baseline += tx.query_row(
+            "SELECT MAX(
+                    COALESCE(seen_count, 1) - (
+                        SELECT COUNT(DISTINCT source_session_id)
+                          FROM mc_memory_evidence WHERE memory_id = ?1
+                    ),
+                    0
+                )
+               FROM mc_memories WHERE id = ?1",
+            [memory_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+    }
+    Ok(baseline)
 }
 
 /// Transaction-scoped ports used by the module facade. Every method operates on the transaction
@@ -5741,6 +5773,9 @@ impl<'a> FacadeMutationTxn<'a> {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| error.to_string())?;
+        let affected_ids = affected.iter().map(|memory| memory.id).collect::<Vec<_>>();
+        let legacy_seen_baseline =
+            legacy_seen_baseline_tx(self.tx, &affected_ids).map_err(|error| error.to_string())?;
         let evidence_count = merge_memory_evidence_tx(
             self.tx,
             target_id,
@@ -5750,8 +5785,7 @@ impl<'a> FacadeMutationTxn<'a> {
                 .collect::<Vec<_>>(),
         )
         .map_err(|error| error.to_string())?;
-        let prior_seen_count: i64 = affected.iter().map(|memory| memory.seen_count.max(0)).sum();
-        let seen_count = prior_seen_count.max(evidence_count);
+        let seen_count = legacy_seen_baseline + evidence_count;
         let retrieval_count: i64 = affected
             .iter()
             .map(|memory| memory.retrieval_count.max(0))
@@ -11495,6 +11529,8 @@ impl McStore {
                 [],
                 |row| row.get::<_, i64>(0),
             )?;
+            let affected_ids = affected.iter().map(|memory| memory.id).collect::<Vec<_>>();
+            let legacy_seen_baseline = legacy_seen_baseline_tx(tx, &affected_ids)?;
             let evidence_count = merge_memory_evidence_tx(
                 tx,
                 target_id,
@@ -11503,9 +11539,7 @@ impl McStore {
                     .map(|memory| memory.id)
                     .collect::<Vec<_>>(),
             )?;
-            let prior_seen_count: i64 =
-                affected.iter().map(|memory| memory.seen_count.max(0)).sum();
-            let seen_count = prior_seen_count.max(evidence_count);
+            let seen_count = legacy_seen_baseline + evidence_count;
             let retrieval_count: i64 = affected
                 .iter()
                 .map(|memory| memory.retrieval_count.max(0))
@@ -15136,18 +15170,23 @@ impl McStore {
                             .expect("every natural-key survivor was seeded")
                     })
                     .collect::<Vec<_>>();
-                for module_row_id in module_row_ids.iter().copied().collect::<BTreeSet<_>>() {
+                let evidence_authoritative_ids = rows
+                    .iter()
+                    .zip(&module_row_ids)
+                    .filter_map(|(row, module_row_id)| {
+                        row.snapshot.get("evidence").map(|_| *module_row_id)
+                    })
+                    .collect::<BTreeSet<_>>();
+                for module_row_id in evidence_authoritative_ids {
                     tx.execute(
                         "DELETE FROM mc_memory_evidence WHERE memory_id = ?1",
                         [module_row_id],
                     )?;
                 }
                 for (row, module_row_id) in rows.iter().zip(&module_row_ids) {
-                    let evidence = row
-                        .snapshot
-                        .get("evidence")
-                        .cloned()
-                        .unwrap_or_else(|| Value::Array(Vec::new()));
+                    let Some(evidence) = row.snapshot.get("evidence").cloned() else {
+                        continue;
+                    };
                     let evidence: Vec<ModuleMemoryEvidenceRow> = serde_json::from_value(evidence)
                         .map_err(|error| {
                             rusqlite::Error::ToSqlConversionFailure(Box::new(error))
@@ -15653,7 +15692,9 @@ fn replace_authority_memories_tx(
                     memory.mural_cue_rejection_count,
                 ],
             )?;
-            replace_memory_evidence_tx(tx, existing_id, &memory.evidence)?;
+            if let Some(evidence) = &memory.evidence {
+                replace_memory_evidence_tx(tx, existing_id, evidence)?;
+            }
             continue;
         }
         tx.execute(
@@ -15757,7 +15798,9 @@ fn replace_authority_memories_tx(
             params![&memory.project_path, &memory.category, &memory.normalized_hash],
             |row| row.get::<_, i64>(0),
         )?;
-        replace_memory_evidence_tx(tx, stored_id, &memory.evidence)?;
+        if let Some(evidence) = &memory.evidence {
+            replace_memory_evidence_tx(tx, stored_id, evidence)?;
+        }
     }
     Ok(())
 }
@@ -20086,6 +20129,72 @@ mod tests {
     }
 
     #[test]
+    fn authority_seed_distinguishes_absent_evidence_from_an_explicit_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let snapshot = serde_json::json!({
+            "id": 100,
+            "project_path": "git:project",
+            "category": "CONSTRAINTS",
+            "content": "seeded fact",
+            "normalized_hash": "seeded-hash",
+            "updated_at": 100,
+            "status": "active",
+            "evidence": [{
+                "content_hash": "seeded-hash",
+                "source_session_id": "session-a",
+                "source_message_id": "assistant-a1",
+                "source_type": "agent",
+                "observed_at": 11
+            }]
+        });
+        let seed = |snapshot: Value| {
+            store
+                .seed_authority_rows(
+                    "current-store",
+                    "git:project",
+                    "memories",
+                    &[AuthoritySeedRow {
+                        source_row_id: 100,
+                        snapshot,
+                    }],
+                )
+                .unwrap()
+        };
+
+        let ids = seed(snapshot.clone());
+        let mut sparse = snapshot.clone();
+        sparse.as_object_mut().unwrap().remove("evidence");
+        seed(sparse);
+        let count = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_memory_evidence WHERE memory_id = ?1",
+                    [ids[0]],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let mut clear = snapshot;
+        clear["evidence"] = Value::Array(Vec::new());
+        seed(clear);
+        let count = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_memory_evidence WHERE memory_id = ?1",
+                    [ids[0]],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn project_mural_artifact_upsert_is_hash_gated() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -20576,6 +20685,59 @@ mod tests {
     }
 
     #[test]
+    fn memory_evidence_advances_a_migrated_legacy_baseline_for_a_new_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let save = |session_id: &str, now_ms: i64| {
+            store
+                .insert_memory(InsertMemoryInput {
+                    project_path: "git:project",
+                    route_project_root: None,
+                    category: "CONSTRAINTS",
+                    content: "Migrated fact",
+                    source_session_id: Some(session_id),
+                    source_message_id: None,
+                    source_type: Some("user"),
+                    importance: Some(50),
+                    expires_at: None,
+                    metadata_json: None,
+                    now_ms,
+                })
+                .unwrap()
+        };
+        let memory_id = save("session-a", 1);
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE mc_memories SET seen_count = 10 WHERE id = ?1",
+                    [memory_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        save("session-a", 2);
+        assert_eq!(
+            store
+                .get_memory_full(memory_id)
+                .unwrap()
+                .unwrap()
+                .seen_count,
+            10
+        );
+        save("session-b", 3);
+        assert_eq!(
+            store
+                .get_memory_full(memory_id)
+                .unwrap()
+                .unwrap()
+                .seen_count,
+            11
+        );
+    }
+
+    #[test]
     fn memory_evidence_keeps_the_content_version_observed_by_each_session() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -20692,7 +20854,7 @@ mod tests {
     }
 
     #[test]
-    fn authority_state_sync_replaces_the_complete_memory_evidence_set() {
+    fn authority_state_sync_distinguishes_absent_evidence_from_an_explicit_clear() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let row = ModuleMemoryRow {
@@ -20703,19 +20865,21 @@ mod tests {
             normalized_hash: "synced-hash".to_string(),
             status: "active".to_string(),
             verification_status: "unverified".to_string(),
-            evidence: vec![ModuleMemoryEvidenceRow {
+            evidence: Some(vec![ModuleMemoryEvidenceRow {
                 content_hash: "synced-hash".to_string(),
                 source_session_id: "session-a".to_string(),
                 source_message_id: Some("assistant-a1".to_string()),
                 source_type: "agent".to_string(),
                 observed_at: 11,
-            }],
+            }]),
             ..Default::default()
         };
 
         store
             .inner
-            .with_conn_fenced(|tx| replace_authority_memories_tx(tx, "/repo", &[row]))
+            .with_conn_fenced(|tx| {
+                replace_authority_memories_tx(tx, "/repo", std::slice::from_ref(&row))
+            })
             .unwrap();
 
         let evidence = store
@@ -20744,6 +20908,42 @@ mod tests {
                 "agent".to_string(),
             )
         );
+
+        let sparse = ModuleMemoryRow {
+            evidence: None,
+            ..row.clone()
+        };
+        store
+            .inner
+            .with_conn_fenced(|tx| replace_authority_memories_tx(tx, "/repo", &[sparse]))
+            .unwrap();
+        let evidence_count = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM mc_memory_evidence", [], |row| {
+                    row.get(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(evidence_count, 1);
+
+        let clear = ModuleMemoryRow {
+            evidence: Some(Vec::new()),
+            ..row
+        };
+        store
+            .inner
+            .with_conn_fenced(|tx| replace_authority_memories_tx(tx, "/repo", &[clear]))
+            .unwrap();
+        let evidence_count = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM mc_memory_evidence", [], |row| {
+                    row.get(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(evidence_count, 0);
     }
 
     #[test]
@@ -20843,7 +21043,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(merged.seen_count, 10);
+        assert_eq!(merged.seen_count, 11);
     }
 
     #[test]
@@ -23824,6 +24024,20 @@ mod shadow_tests {
         let canonical = insert(identity, "same fact", "session-a", 1);
         let duplicate = insert(route_project_root, "same fact", "session-b", 2);
         let singleton = insert(route_project_root, "path-only fact", "session-c", 3);
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE mc_memories SET seen_count = 10 WHERE id = ?1",
+                    [canonical],
+                )?;
+                conn.execute(
+                    "UPDATE mc_memories SET seen_count = 4 WHERE id = ?1",
+                    [duplicate],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         let evidence_before = store
             .inner
             .with_conn(|conn| {
@@ -23871,6 +24085,14 @@ mod shadow_tests {
             })
             .unwrap();
         assert_eq!(canonical_evidence, 2);
+        assert_eq!(
+            store
+                .get_memory_full(canonical)
+                .unwrap()
+                .unwrap()
+                .seen_count,
+            14
+        );
         assert_eq!(
             store
                 .get_memory_full(canonical)

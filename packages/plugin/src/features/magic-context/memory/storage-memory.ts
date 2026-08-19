@@ -277,8 +277,15 @@ function recordMemoryEvidenceInCurrentTransaction(
     input: MemoryInput,
 ): void {
     if (!input.sourceSessionId || !hasMemoryEvidenceTable(db)) return;
-    const memory = db.prepare("SELECT normalized_hash FROM memories WHERE id = ?").get(memoryId) as
-        | { normalized_hash?: string }
+    const memory = db
+        .prepare(
+            `SELECT normalized_hash, source_session_id,
+                    (SELECT COUNT(DISTINCT source_session_id)
+                       FROM memory_evidence WHERE memory_id = ?) AS evidence_count
+               FROM memories WHERE id = ?`,
+        )
+        .get(memoryId, memoryId) as
+        | { normalized_hash?: string; source_session_id?: string | null; evidence_count?: number }
         | undefined;
     if (!memory?.normalized_hash) return;
     const now = Date.now();
@@ -299,14 +306,22 @@ function recordMemoryEvidenceInCurrentTransaction(
     if ((result.changes ?? 0) === 0) return;
     db.prepare(
         `UPDATE memories
-            SET seen_count = MAX(
-                    COALESCE(seen_count, 1),
-                    (SELECT COUNT(DISTINCT source_session_id) FROM memory_evidence WHERE memory_id = ?)
-                ),
+            SET seen_count = MAX(COALESCE(seen_count, 1) - ?, 0)
+                    + (SELECT COUNT(DISTINCT source_session_id) FROM memory_evidence WHERE memory_id = ?),
                 last_seen_at = ?,
                 updated_at = ?
           WHERE id = ?`,
-    ).run(memoryId, now, now, memoryId);
+    ).run(
+        (memory.evidence_count ?? 0) > 0
+            ? memory.evidence_count
+            : memory.source_session_id === input.sourceSessionId
+              ? 1
+              : 0,
+        memoryId,
+        now,
+        now,
+        memoryId,
+    );
 }
 
 export function recordMemoryEvidence(db: Database, memoryId: number, input: MemoryInput): void {
@@ -556,7 +571,7 @@ function getMergeMemoryStatsStatement(db: Database): PreparedStatement {
     let stmt = mergeMemoryStatsStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "UPDATE memories SET seen_count = MAX(COALESCE(seen_count, 1), ?, ?), retrieval_count = ?, merged_from = ?, status = ?, updated_at = ? WHERE id = ?",
+            "UPDATE memories SET seen_count = MAX(COALESCE(seen_count, 1), ?), retrieval_count = ?, merged_from = ?, status = ?, updated_at = ? WHERE id = ?",
         );
         mergeMemoryStatsStatements.set(db, stmt);
     }
@@ -716,6 +731,7 @@ export function insertMemory(db: Database, input: MemoryInput): Memory {
  * surfacing a transient write failure.
  */
 export function insertMemoryIdempotent(db: Database, input: MemoryInput): InsertMemoryResult {
+    assertTsMemoryWriteAllowed(db, input.projectPath);
     const existing = getMemoryByHash(
         db,
         input.projectPath,
@@ -745,6 +761,46 @@ export function insertMemoryIdempotent(db: Database, input: MemoryInput): Insert
         }
         return { memory: getMemoryById(db, raced.id) ?? raced, inserted: false };
     }
+}
+
+export function mergeMemoryEpisodeEvidence(
+    db: Database,
+    targetId: number,
+    sourceIds: readonly number[],
+): number | null {
+    if (!hasMemoryEvidenceTable(db)) return null;
+    const ids = [targetId, ...sourceIds];
+    const placeholders = ids.map(() => "?").join(", ");
+    const rows = db
+        .prepare(
+            `SELECT memories.id, memories.seen_count,
+                    COUNT(DISTINCT memory_evidence.source_session_id) AS evidence_count
+               FROM memories
+               LEFT JOIN memory_evidence ON memory_evidence.memory_id = memories.id
+              WHERE memories.id IN (${placeholders})
+              GROUP BY memories.id, memories.seen_count`,
+        )
+        .all(...ids) as Array<{ seen_count?: number; evidence_count?: number }>;
+    const legacyBaseline = rows.reduce(
+        (sum, row) =>
+            sum + Math.max((row.seen_count ?? 1) - (row.evidence_count ?? 0), 0),
+        0,
+    );
+    for (const sourceId of sourceIds) {
+        db.prepare(
+            `INSERT OR IGNORE INTO memory_evidence (
+                memory_id, content_hash, source_session_id, source_message_id, source_type, observed_at
+            )
+            SELECT ?, content_hash, source_session_id, source_message_id, source_type, observed_at
+              FROM memory_evidence WHERE memory_id = ?`,
+        ).run(targetId, sourceId);
+    }
+    const union = db
+        .prepare(
+            "SELECT COUNT(DISTINCT source_session_id) AS count FROM memory_evidence WHERE memory_id = ?",
+        )
+        .get(targetId) as { count?: number } | undefined;
+    return legacyBaseline + (union?.count ?? 0);
 }
 
 export function getMemoryByHash(
@@ -1234,26 +1290,16 @@ export function mergeMemoryStats(
     status: MemoryStatus,
 ): void {
     assertTsMemoryIdWriteAllowed(db, id);
-    let evidenceCount: number | null = null;
-    if (hasMemoryEvidenceTable(db)) {
-        db.prepare(
-            `INSERT OR IGNORE INTO memory_evidence (
-                memory_id, content_hash, source_session_id, source_message_id, source_type, observed_at
-            )
-            SELECT ?, content_hash, source_session_id, source_message_id, source_type, observed_at
-              FROM memory_evidence
-             WHERE memory_id IN (SELECT value FROM json_each(?))`,
-        ).run(id, mergedFrom);
-        const row = db
-            .prepare(
-                "SELECT COUNT(DISTINCT source_session_id) AS count FROM memory_evidence WHERE memory_id = ?",
-            )
-            .get(id) as { count?: number } | undefined;
-        if (typeof row?.count === "number" && row.count > 0) evidenceCount = row.count;
-    }
+    const mergedIds = db
+        .prepare("SELECT value AS id FROM json_each(?) WHERE type = 'integer' AND value <> ?")
+        .all(mergedFrom, id) as Array<{ id: number }>;
+    const mergedEpisodeCount = mergeMemoryEpisodeEvidence(
+        db,
+        id,
+        mergedIds.map((row) => row.id),
+    );
     getMergeMemoryStatsStatement(db).run(
-        seenCount,
-        evidenceCount ?? 0,
+        mergedEpisodeCount ?? seenCount,
         retrievalCount,
         mergedFrom,
         status,

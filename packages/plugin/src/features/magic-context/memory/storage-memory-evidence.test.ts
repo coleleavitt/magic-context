@@ -13,6 +13,7 @@ import {
     getMemoryById,
     insertMemoryIdempotent,
     mergeMemoryStats,
+    ModuleMemoryAuthorityError,
     updateMemoryContent,
 } from "./storage-memory";
 
@@ -87,6 +88,32 @@ describe("memory evidence lifecycle", () => {
         ]);
     });
 
+    it("rejects MODULE-managed exact duplicates before recording evidence", () => {
+        db = makeDatabase();
+        const memory = save("Authority-owned fact", "session-a", "user-a1");
+        db.prepare(
+            "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, ?, ?)",
+        ).run("git:project", "store-uuid", Date.now());
+
+        expect(() => save("Authority-owned fact", "session-b", "user-b1")).toThrow(
+            ModuleMemoryAuthorityError,
+        );
+        expect(evidence(memory.id)).toHaveLength(1);
+        expect(getMemoryById(db, memory.id)?.seenCount).toBe(1);
+    });
+
+    it("advances a migrated legacy baseline for a new session without double counting", () => {
+        db = makeDatabase();
+        const memory = save("Migrated fact", "session-a", "user-a1");
+        db.prepare("UPDATE memories SET seen_count = 10 WHERE id = ?").run(memory.id);
+
+        save("Migrated fact", "session-a", "user-a2");
+        expect(getMemoryById(db, memory.id)?.seenCount).toBe(10);
+
+        save("Migrated fact", "session-b", "user-b1");
+        expect(getMemoryById(db, memory.id)?.seenCount).toBe(11);
+    });
+
     it("preserves evidence through update archive and delete lifecycle", () => {
         db = makeDatabase();
         const memory = save("Original fact", "session-a", "user-a1");
@@ -150,7 +177,7 @@ describe("memory evidence lifecycle", () => {
             "active",
         );
 
-        expect(getMemoryById(db, canonical.id)?.seenCount).toBe(10);
+        expect(getMemoryById(db, canonical.id)?.seenCount).toBe(11);
     });
 
     it("preserves evidence when identity relocation merges an exact collision", () => {
