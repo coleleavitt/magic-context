@@ -8,8 +8,9 @@ import {
     CURATE_CHILD_TITLE,
     HISTORIAN_CHILD_TITLE,
     historianOrphanStaleMs,
+    historianOrphanSweepTitleMatches,
     MAINTAIN_DOCS_CHILD_TITLE,
-    orphanSweepTitleMatches,
+    privacyOrphanSweepTitleMatches,
     REFRESH_PRIMERS_CHILD_TITLE,
     RETROSPECTIVE_CHILD_TITLE,
     retrospectiveOrphanStaleMs,
@@ -57,10 +58,14 @@ describe("retrospectiveOrphanStaleMs", () => {
     });
 });
 
-describe("orphanSweepTitleMatches", () => {
-    test("preserves historian children when keep_subagents is enabled", () => {
-        expect(orphanSweepTitleMatches(false).exact).toContain(HISTORIAN_CHILD_TITLE);
-        expect(orphanSweepTitleMatches(true).exact).not.toContain(HISTORIAN_CHILD_TITLE);
+describe("orphan sweep title groups", () => {
+    test("keeps historian and privacy titles in separate groups", () => {
+        const privacyTitles = privacyOrphanSweepTitleMatches();
+        const historianTitles = historianOrphanSweepTitleMatches();
+
+        expect(privacyTitles.exact).toContain(RETROSPECTIVE_CHILD_TITLE);
+        expect(privacyTitles.exact).not.toContain(HISTORIAN_CHILD_TITLE);
+        expect(historianTitles).toEqual({ exact: [HISTORIAN_CHILD_TITLE], prefixes: [] });
     });
 });
 

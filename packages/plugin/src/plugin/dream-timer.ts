@@ -6,8 +6,9 @@ import { acquireLease, releaseLease } from "../features/magic-context/dreamer/le
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
 import {
     historianOrphanStaleMs,
-    orphanSweepTitleMatches,
+    historianOrphanSweepTitleMatches,
     PRIVACY_SENSITIVE_CHILD_TASKS,
+    privacyOrphanSweepTitleMatches,
     retrospectiveOrphanStaleMs,
     sweepOrphanedRetrospectiveChildren,
 } from "../features/magic-context/dreamer/retrospective-orphan-sweep";
@@ -425,7 +426,15 @@ async function sweepProject(
         return;
     }
 
-    let privacySweepTimeouts: Array<number | undefined> = [];
+    // Resolve the privacy age budget before any awaited scheduler work. If
+    // scheduling rejects, the orphan sweep must still protect a legitimately
+    // long-running child with its configured timeout rather than the 60m floor.
+    const runtimeConfigs = buildDreamTaskRuntimeConfigs(dreamerConfig, reg.language);
+    const privacySweepTimeouts = runtimeConfigs
+        .filter((config) =>
+            (PRIVACY_SENSITIVE_CHILD_TASKS as readonly string[]).includes(config.task),
+        )
+        .map((config) => config.timeoutMinutes);
     try {
         await runCompiledSmartNoteSweep(reg, db);
 
@@ -434,7 +443,6 @@ async function sweepProject(
         // runs due tasks grouped by conflict-domain under keyed leases. The
         // executor runs in THIS registration's own checkout (not a sibling
         // worktree the shared git:<sha> identity might resolve to).
-        const runtimeConfigs = buildDreamTaskRuntimeConfigs(dreamerConfig, reg.language);
         const executor = createDreamTaskExecutor({
             client: reg.client,
             sessionDirectory: reg.directory,
@@ -470,14 +478,6 @@ async function sweepProject(
         if (ran > 0) {
             log(`[dreamer] timer tick (${origin}) ${reg.projectIdentity} — ran ${ran} task(s)`);
         }
-
-        // PRIVACY backstop: remove crash-orphaned children carrying raw user or
-        // project text only after the longest swept task's timeout has elapsed.
-        // OpenCode-only (Pi subprocess children die with their process); skip
-        // when no opencode.db.
-        privacySweepTimeouts = runtimeConfigs
-            .filter((c) => (PRIVACY_SENSITIVE_CHILD_TASKS as readonly string[]).includes(c.task))
-            .map((c) => c.timeoutMinutes);
     } catch (error) {
         log(`[dreamer] timer-triggered task scheduling failed for ${reg.projectIdentity}:`, error);
     }
@@ -491,22 +491,29 @@ async function sweepOrphanedChildSessions(
     const opencodeDb = openOpenCodeDb();
     if (!opencodeDb) return;
 
-    const titleMatches = orphanSweepTitleMatches(reg.keepSubagents === true);
-
     try {
+        // Dreamer privacy titles use task timeout ×3. Historian children have a
+        // separate retry/fallback budget; sharing the maximum made raw dreamer
+        // sessions linger for hours. keep_subagents exempts historian only.
         await sweepOrphanedRetrospectiveChildren({
             opencodeDb,
             client: reg.client,
             sessionDirectory: reg.directory,
-            staleMs: Math.max(
-                retrospectiveOrphanStaleMs(privacySweepTimeouts),
-                historianOrphanStaleMs(
+            staleMs: retrospectiveOrphanStaleMs(privacySweepTimeouts),
+            titleMatches: privacyOrphanSweepTitleMatches(),
+        });
+        if (reg.keepSubagents !== true) {
+            await sweepOrphanedRetrospectiveChildren({
+                opencodeDb,
+                client: reg.client,
+                sessionDirectory: reg.directory,
+                staleMs: historianOrphanStaleMs(
                     reg.historianTimeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
                     reg.historianFallbackCount ?? 0,
                 ),
-            ),
-            titleMatches,
-        });
+                titleMatches: historianOrphanSweepTitleMatches(),
+            });
+        }
     } catch (error) {
         log(`[dreamer] child-session orphan sweep failed for ${reg.projectIdentity}:`, error);
     } finally {

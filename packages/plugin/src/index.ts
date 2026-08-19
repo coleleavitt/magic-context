@@ -64,6 +64,7 @@ import { setKeepSubagents } from "./shared/keep-subagents";
 import { log } from "./shared/logger";
 import { refreshModelLimitsFromApi } from "./shared/models-dev-cache";
 import { createPromptSurfaceRuntime } from "./shared/prompt-surface-runtime";
+import { resolveFallbackChain } from "./shared/resolve-fallbacks";
 import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
@@ -368,7 +369,9 @@ const server: Plugin = async (ctx) => {
                 client: ctx.client,
                 dreamerConfig: dreamerRunnable ? pluginConfig.dreamer : undefined,
                 historianTimeoutMs: pluginConfig.historian_timeout_ms,
-                historianFallbackCount: pluginConfig.historian?.fallback_models?.length ?? 0,
+                historianFallbackCount: resolveFallbackChain(
+                    pluginConfig.historian?.fallback_models,
+                ).length,
                 keepSubagents: pluginConfig.keep_subagents,
                 language: pluginConfig.language,
                 transformMode: pluginConfig.transform_mode,

@@ -119,6 +119,33 @@ describe("dream-timer message-history maintenance (static)", () => {
     });
 });
 
+describe("dream-timer privacy orphan sweep ordering (static)", () => {
+    const source = readFileSync(join(import.meta.dir, "dream-timer.ts"), "utf8");
+    const sweep = source.slice(
+        source.indexOf("async function sweepProject("),
+        source.indexOf("async function runCompiledSmartNoteSweep("),
+    );
+
+    test("derives privacy timeouts before task scheduling can reject", () => {
+        const timeoutIndex = sweep.indexOf("const privacySweepTimeouts = runtimeConfigs");
+        const schedulerIndex = sweep.indexOf("await runDueTasksForProject(");
+
+        expect(timeoutIndex).toBeGreaterThan(0);
+        expect(timeoutIndex).toBeLessThan(schedulerIndex);
+    });
+
+    test("sweeps historian and privacy titles with separate stale windows", () => {
+        const orphanSweep = source.slice(
+            source.indexOf("async function sweepOrphanedChildSessions("),
+            source.indexOf("async function runCompiledSmartNoteSweep("),
+        );
+        const sweepCalls = orphanSweep.match(/sweepOrphanedRetrospectiveChildren\(\{/g) ?? [];
+
+        expect(sweepCalls).toHaveLength(2);
+        expect(orphanSweep).not.toContain("staleMs: Math.max(");
+    });
+});
+
 describe("dream-timer git commit backlog drain (static)", () => {
     const source = readFileSync(join(import.meta.dir, "dream-timer.ts"), "utf8");
 

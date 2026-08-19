@@ -7,7 +7,7 @@ import type { DreamTaskName } from "./task-registry";
 type OpencodeClient = PluginContext["client"];
 
 /**
- * Privacy backstop for dreamer children that carry raw user or project text.
+ * Privacy backstop for internal children that carry raw user or project text.
  *
  * These child sessions normally delete themselves in `finally`, but a hard
  * SIGKILL/OOM BETWEEN session-create and that delete would leave their prompts
@@ -16,6 +16,8 @@ type OpencodeClient = PluginContext["client"];
  * CONCURRENCY: `session.delete` has no cross-process "active session" lease (OC
  * peer confirmed), so the ONLY safe filter is AGE — a child older than any
  * legitimate run cannot belong to a live run on another OpenCode process.
+ * Callers sweep dreamer/privacy titles and historian titles separately because
+ * their maximum legitimate runtimes are calculated from different budgets.
  * OpenCode sets `title` + `time_created` immediately at create (not lazily), so
  * the age gate is airtight. 404 on delete = already-swept = success.
  */
@@ -55,14 +57,17 @@ export const PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES: PrivacySensitiveChildTitleMa
 };
 const PRIMARY_AND_SUGGESTED_CALLS_PER_CANDIDATE = 2;
 
-export function orphanSweepTitleMatches(keepSubagents: boolean): PrivacySensitiveChildTitleMatches {
-    if (!keepSubagents) return PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES;
+export function privacyOrphanSweepTitleMatches(): PrivacySensitiveChildTitleMatches {
     return {
         exact: PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES.exact.filter(
             (title) => title !== HISTORIAN_CHILD_TITLE,
         ),
         prefixes: PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES.prefixes,
     };
+}
+
+export function historianOrphanSweepTitleMatches(): PrivacySensitiveChildTitleMatches {
+    return { exact: [HISTORIAN_CHILD_TITLE], prefixes: [] };
 }
 
 /** Stale threshold from task timeout(s): max(60min, maxTimeout×3) — comfortably
