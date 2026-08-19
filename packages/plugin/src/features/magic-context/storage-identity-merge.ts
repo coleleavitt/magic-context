@@ -201,7 +201,23 @@ function mergeMemoryRow(
         .get(toIdentity, row.category, row.normalized_hash, sourceId) as SqliteRow | undefined;
     if (collision && typeof collision.id === "number") {
         const targetId = collision.id;
-        const mergedSeen = Math.max(Number(collision.seen_count ?? 1), Number(row.seen_count ?? 1));
+        db.prepare(
+            `INSERT OR IGNORE INTO memory_evidence (
+                memory_id, content_hash, source_session_id, source_message_id, source_type, observed_at
+            )
+            SELECT ?, content_hash, source_session_id, source_message_id, source_type, observed_at
+              FROM memory_evidence WHERE memory_id = ?`,
+        ).run(targetId, sourceId);
+        const evidenceRow = db
+            .prepare(
+                "SELECT COUNT(DISTINCT source_session_id) AS count FROM memory_evidence WHERE memory_id = ?",
+            )
+            .get(targetId) as { count?: number } | undefined;
+        const mergedSeen = Math.max(
+            Number(collision.seen_count ?? 1),
+            Number(row.seen_count ?? 1),
+            evidenceRow?.count ?? 0,
+        );
         const sourceClassifiedAt = Number(row.classified_at ?? 0);
         const targetClassifiedAt = Number(collision.classified_at ?? 0);
         if (sourceClassifiedAt > targetClassifiedAt) {

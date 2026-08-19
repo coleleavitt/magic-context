@@ -78,6 +78,56 @@ function protocol(seedCalls: { bytes: number[] }): AuthorityModuleClient {
 }
 
 describe("memory authority protocol", () => {
+    test("mirror sync installs the module's content-bound evidence set", () => {
+        const database = db();
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "memories",
+                        op: "insert",
+                        module_row_id: 9,
+                        full_row_snapshot: {
+                            project_path: "/repo",
+                            category: "CONSTRAINTS",
+                            content: "Mirrored fact",
+                            normalized_hash: "fact-hash",
+                            evidence: [
+                                {
+                                    content_hash: "fact-hash",
+                                    source_session_id: "session-a",
+                                    source_message_id: "assistant-a1",
+                                    source_type: "agent",
+                                    observed_at: 11,
+                                },
+                            ],
+                        },
+                        content_hash: "fact-hash",
+                    },
+                ],
+            },
+        });
+
+        expect(
+            database
+                .prepare(
+                    "SELECT content_hash, source_session_id, source_message_id, source_type FROM memory_evidence",
+                )
+                .get(),
+        ).toEqual({
+            content_hash: "fact-hash",
+            source_session_id: "session-a",
+            source_message_id: "assistant-a1",
+            source_type: "agent",
+        });
+    });
+
     test("historical sparse note feed rows preserve rich local columns", () => {
         const database = db();
         const localStoreUuid = ensureContextStoreUuid(database);
