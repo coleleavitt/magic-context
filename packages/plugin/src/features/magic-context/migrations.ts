@@ -2823,6 +2823,11 @@ export const MIGRATIONS: Migration[] = [
         description: "preserve content-bound per-session memory evidence provenance",
         up(db: Database): void {
             if (!tableExists(db, "memories")) return;
+            const memoryColumns = new Set(
+                (db.prepare("PRAGMA table_info(memories)").all() as Array<{ name: string }>).map(
+                    (row) => row.name,
+                ),
+            );
             db.exec(`
                 CREATE TABLE IF NOT EXISTS memory_evidence (
                     memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -2835,6 +2840,15 @@ export const MIGRATIONS: Migration[] = [
                 );
                 CREATE INDEX IF NOT EXISTS idx_memory_evidence_session
                     ON memory_evidence(source_session_id, memory_id);
+            `);
+            if (
+                ["id", "normalized_hash", "source_session_id", "source_type", "first_seen_at"].some(
+                    (column) => !memoryColumns.has(column),
+                )
+            ) {
+                return;
+            }
+            db.exec(`
                 INSERT OR IGNORE INTO memory_evidence (
                     memory_id, content_hash, source_session_id, source_message_id, source_type, observed_at
                 )
