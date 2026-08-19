@@ -2226,9 +2226,10 @@ describe("createTransform", () => {
         //#when — simulate message.updated setting real usage, then second pass loads it
         contextUsageMap.delete("ses-lazy");
         updateSessionMeta(db, "ses-lazy", {
-            lastResponseTime: 1_000,
+            lastResponseTime: Date.now(),
             lastContextPercentage: 50,
             lastInputTokens: 100_000,
+            lastUsageObservedAt: Date.now(),
         });
         await transform({}, { messages });
 
@@ -2619,6 +2620,8 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
             lastInputTokens: 300_000,
             lastObservedModelKey: OLD_KEY,
             lastUsageContextLimit: 512_000,
+            lastResponseTime: Date.now(),
+            lastUsageObservedAt: Date.now(),
         });
         await seedNewModelLimit(272_000);
 
@@ -2685,6 +2688,8 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
             lastInputTokens: 200_000,
             lastObservedModelKey: NEW_KEY,
             lastUsageContextLimit: 272_000,
+            lastResponseTime: Date.now(),
+            lastUsageObservedAt: Date.now(),
         });
         await seedNewModelLimit(272_000);
 
@@ -2727,6 +2732,8 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
             lastInputTokens: 300_000,
             lastObservedModelKey: NEW_KEY,
             lastUsageContextLimit: 400_000,
+            lastResponseTime: Date.now(),
+            lastUsageObservedAt: Date.now(),
         });
         await seedNewModelLimit(272_000);
 
@@ -2767,6 +2774,8 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
             lastInputTokens: 300_000,
             lastObservedModelKey: OLD_KEY,
             lastUsageContextLimit: 512_000,
+            lastResponseTime: Date.now(),
+            lastUsageObservedAt: Date.now(),
         });
         await seedNewModelLimit(272_000);
 
@@ -2791,6 +2800,8 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
             lastInputTokens: 300_000,
             lastObservedModelKey: OLD_KEY,
             lastUsageContextLimit: 512_000,
+            lastResponseTime: Date.now(),
+            lastUsageObservedAt: Date.now(),
         });
         await seedNewModelLimit(272_000);
 

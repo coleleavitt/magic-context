@@ -131,6 +131,8 @@ describe("event-resolvers", () => {
                     lastInputTokens: 100_000,
                     lastUsageContextLimit: 1_048_576,
                     lastObservedModelKey: modelKey,
+                    lastResponseTime: Date.now(),
+                    lastUsageObservedAt: Date.now(),
                 });
 
                 const trustedLimit = resolveTrustedContextLimit("custom-proxy", "gemini-agent", {
@@ -162,6 +164,8 @@ describe("event-resolvers", () => {
                     lastInputTokens: 100_000,
                     lastUsageContextLimit: 1_048_576,
                     lastObservedModelKey: "custom-proxy/previous-model",
+                    lastResponseTime: Date.now(),
+                    lastUsageObservedAt: Date.now(),
                 });
 
                 const trustedLimit = resolveTrustedContextLimit("custom-proxy", "gemini-agent", {
@@ -191,6 +195,8 @@ describe("event-resolvers", () => {
                     lastInputTokens: 100_000,
                     lastUsageContextLimit: 1_048_576,
                     lastObservedModelKey: "openai/gpt-alias-test",
+                    lastResponseTime: Date.now(),
+                    lastUsageObservedAt: Date.now(),
                 });
                 // Simulate a legacy session row whose model key uses the old provider prefix.
                 db.prepare(

@@ -305,10 +305,11 @@ export function loadPersistedUsage(db: Database, sessionId: string): PersistedUs
         )
         .get(sessionId);
 
+    if (!isPersistedUsageRow(result)) return null;
+    const observedAt = result.last_usage_observed_at || result.last_response_time;
     if (
-        !isPersistedUsageRow(result) ||
-        result.last_usage_observed_at <= 0 ||
-        Date.now() - result.last_usage_observed_at > CONTEXT_USAGE_TTL_MS ||
+        observedAt <= 0 ||
+        Date.now() - observedAt > CONTEXT_USAGE_TTL_MS ||
         (result.last_context_percentage === 0 && result.last_input_tokens === 0)
     ) {
         return null;
@@ -319,7 +320,7 @@ export function loadPersistedUsage(db: Database, sessionId: string): PersistedUs
             percentage: result.last_context_percentage,
             inputTokens: result.last_input_tokens,
         },
-        updatedAt: result.last_usage_observed_at,
+        updatedAt: observedAt,
         lastObservedModelKey: result.last_observed_model_key,
         lastUsageContextLimit:
             typeof result.last_usage_context_limit === "number"

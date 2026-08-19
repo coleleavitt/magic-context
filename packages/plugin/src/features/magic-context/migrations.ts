@@ -2831,6 +2831,13 @@ export const MIGRATIONS: Migration[] = [
                 "last_usage_observed_at",
                 "INTEGER NOT NULL DEFAULT 0",
             );
+            db.exec(`
+                UPDATE session_meta
+                   SET last_usage_observed_at = last_response_time
+                 WHERE last_usage_observed_at = 0
+                   AND last_input_tokens > 0
+                   AND last_response_time > 0;
+            `);
         },
     },
 ];

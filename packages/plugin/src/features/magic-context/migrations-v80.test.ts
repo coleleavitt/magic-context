@@ -43,7 +43,7 @@ describe("migration v80: tokenless usage observation timestamp", () => {
         }
     });
 
-    test("replaying from v79 adds the timestamp once with a fail-closed default", () => {
+    test("replaying from v79 preserves the observation time for legacy token usage", () => {
         const db = new Database(":memory:");
         try {
             seedAppliedVersion(db, 79);
@@ -66,7 +66,7 @@ describe("migration v80: tokenless usage observation timestamp", () => {
                 db
                     .prepare("SELECT last_usage_observed_at FROM session_meta WHERE session_id = ?")
                     .get("ses-legacy"),
-            ).toEqual({ last_usage_observed_at: 0 });
+            ).toEqual({ last_usage_observed_at: 123 });
             expect(
                 db
                     .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 80")
