@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, jest } from "bun:test";
 
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
 import { BOOT_QUIET_MS, setBootQuietPeriodForTests } from "../../plugin/boot-quiet";
@@ -114,6 +114,7 @@ describe("message-index-async", () => {
 
     afterEach(() => {
         setBootQuietPeriodForTests(null);
+        jest.useRealTimers();
         closeQuietly(db);
         __resetMessageIndexAsyncForTests();
     });
@@ -359,6 +360,8 @@ describe("message-index-async", () => {
     });
 
     it("rebuilds when removal overtakes a boot-quiet reconciliation", async () => {
+        jest.useFakeTimers();
+        jest.setSystemTime(0);
         const sessionId = "ses-boot-clear";
         const surviving = [message("m-survivor", 1, "surviving searchable bytes")];
         let reads = 0;
@@ -366,13 +369,15 @@ describe("message-index-async", () => {
             reads++;
             return surviving;
         };
-        setBootQuietPeriodForTests(Date.now() - BOOT_QUIET_MS + 20);
+        setBootQuietPeriodForTests(0);
 
-        scheduleReconciliation(db, sessionId, readSurviving);
-        scheduleClearAndReindex(db, sessionId, readSurviving);
+        const reconciliationFinished = scheduleReconciliation(db, sessionId, readSurviving);
+        const rebuildFinished = scheduleClearAndReindex(db, sessionId, readSurviving);
         expect(isSessionReconciled(sessionId)).toBe(false);
 
-        await wait(80);
+        jest.advanceTimersByTime(BOOT_QUIET_MS);
+        jest.runAllTimers();
+        await Promise.all([reconciliationFinished, rebuildFinished]);
 
         expect(reads).toBe(2);
         expect(countMessageRows(db, sessionId, "m-survivor")).toBe(1);

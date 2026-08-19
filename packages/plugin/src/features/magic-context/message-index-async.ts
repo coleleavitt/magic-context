@@ -73,7 +73,7 @@ const INCREMENTAL_DEBOUNCE_MS = 100;
 const RECONCILIATION_BATCH_SIZE = 100;
 
 const reconciledSessions = new Set<string>();
-const reconciliationScheduledSessions = new Set<string>();
+const reconciliationScheduledSessions = new Map<string, Promise<void>>();
 const sessionLocks = new Map<string, Promise<void>>();
 const incrementalTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const pendingIncrementalKeys = new Set<string>();
@@ -199,23 +199,29 @@ export function scheduleReconciliation(
     db: Database,
     sessionId: string,
     readMessages: ReadMessages,
-): void {
-    if (reconciledSessions.has(sessionId) || reconciliationScheduledSessions.has(sessionId)) {
-        return;
-    }
-    reconciliationScheduledSessions.add(sessionId);
+): Promise<void> {
+    if (reconciledSessions.has(sessionId)) return Promise.resolve();
+    const scheduled = reconciliationScheduledSessions.get(sessionId);
+    if (scheduled) return scheduled;
 
-    scheduleAfterBootQuiet(() => {
-        defer(() => {
-            void reconcileSessionIndex(db, sessionId, readMessages)
-                .catch((error) => {
-                    logIndexingError(sessionId, "reconciliation", error);
-                })
-                .finally(() => {
-                    reconciliationScheduledSessions.delete(sessionId);
-                });
+    const completion = new Promise<void>((resolve) => {
+        scheduleAfterBootQuiet(() => {
+            defer(() => {
+                void reconcileSessionIndex(db, sessionId, readMessages)
+                    .catch((error) => {
+                        logIndexingError(sessionId, "reconciliation", error);
+                    })
+                    .finally(() => {
+                        if (reconciliationScheduledSessions.get(sessionId) === completion) {
+                            reconciliationScheduledSessions.delete(sessionId);
+                        }
+                        resolve();
+                    });
+            });
         });
     });
+    reconciliationScheduledSessions.set(sessionId, completion);
+    return completion;
 }
 
 export function scheduleIncrementalIndex(
@@ -275,26 +281,29 @@ export function scheduleClearAndReindex(
     db: Database,
     sessionId: string,
     readMessages: ReadMessages,
-): void {
+): Promise<void> {
     reconciledSessions.delete(sessionId);
     reconciliationScheduledSessions.delete(sessionId);
     clearCompletedIncrementalKeys(sessionId);
 
-    scheduleAfterBootQuiet(() => {
-        defer(() => {
-            void runWithSessionLock(sessionId, () => {
-                // An older boot-quiet reconciliation can finish after this clear was
-                // scheduled, so invalidate process state under the same session lock
-                // that clears the durable index.
-                reconciledSessions.delete(sessionId);
-                clearCompletedIncrementalKeys(sessionId);
-                clearIndexedMessages(db, sessionId);
-            })
-                .then(() => reconcileSessionIndex(db, sessionId, readMessages))
-                .catch((error) => {
+    return new Promise<void>((resolve) => {
+        scheduleAfterBootQuiet(() => {
+            defer(() => {
+                void runWithSessionLock(sessionId, () => {
+                    // An older boot-quiet reconciliation can finish after this clear was
+                    // scheduled, so invalidate process state under the same session lock
+                    // that clears the durable index.
                     reconciledSessions.delete(sessionId);
-                    logIndexingError(sessionId, "clear and reindex", error);
-                });
+                    clearCompletedIncrementalKeys(sessionId);
+                    clearIndexedMessages(db, sessionId);
+                })
+                    .then(() => reconcileSessionIndex(db, sessionId, readMessages))
+                    .catch((error) => {
+                        reconciledSessions.delete(sessionId);
+                        logIndexingError(sessionId, "clear and reindex", error);
+                    })
+                    .finally(resolve);
+            });
         });
     });
 }
