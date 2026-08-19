@@ -898,6 +898,7 @@ describe("createEventHandler", () => {
         });
         deps.config.cache_ttl = { default: "5m", "openai/gpt-4o": "1m" };
         const handler = createEventHandler(deps);
+        const before = Date.now();
 
         await handler({
             event: {
@@ -914,6 +915,7 @@ describe("createEventHandler", () => {
 
         const meta = getOrCreateSessionMeta(openDatabase(), "ses-partial");
         expect(meta.cacheTtl).toBe("1m");
+        expect(meta.lastResponseTime).toBeGreaterThanOrEqual(before);
         expect(meta.lastContextPercentage).toBe(61);
         expect(meta.lastInputTokens).toBe(122_000);
         expect(contextUsageMap.get("ses-partial")).toEqual({

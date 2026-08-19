@@ -516,7 +516,10 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 }
             }
 
-            if (!isSuccessfulHostEvent(info)) return;
+            const successfulTerminalEvent = isSuccessfulHostEvent(info);
+            if ((info.error !== undefined && info.error !== null) || info.finish === "error") {
+                return;
+            }
 
             const now = Date.now();
             const usageTokens = [
@@ -534,10 +537,11 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 ) &&
                 usageTokens.some((value) => typeof value === "number" && value > 0) &&
                 Number.isSafeInteger(totalInputTokens);
+            if (!successfulTerminalEvent && usageTokens.some((value) => value !== undefined)) {
+                return;
+            }
             const terminalAssistantUpdate =
-                info.messageID !== undefined &&
-                hasUsageTokens &&
-                (typeof info.finish === "string" || typeof info.completedAt === "number");
+                info.messageID !== undefined && hasUsageTokens && successfulTerminalEvent;
             if (terminalAssistantUpdate && info.messageID) {
                 scheduleOpenCodeTransformDecisionWrite({
                     db: deps.db,
