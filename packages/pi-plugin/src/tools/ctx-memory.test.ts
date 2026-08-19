@@ -1129,7 +1129,11 @@ describe("Pi ctx_memory provenance", () => {
 			const write = () =>
 				tool.execute(
 					"call-write",
-					{ action: "write", category: "CONSTRAINTS", content: "Migrated Pi fact" },
+					{
+						action: "write",
+						category: "CONSTRAINTS",
+						content: "Migrated Pi fact",
+					},
 					new AbortController().signal,
 					() => undefined,
 					ctx,
@@ -1140,7 +1144,9 @@ describe("Pi ctx_memory provenance", () => {
 				.prepare<unknown[], { id: number }>("SELECT id FROM memories")
 				.get();
 			expect(memory).toBeDefined();
-			db.prepare("UPDATE memories SET seen_count = 10 WHERE id = ?").run(memory?.id);
+			db.prepare("UPDATE memories SET seen_count = 10 WHERE id = ?").run(
+				memory?.id,
+			);
 
 			await write();
 			expect(getMemoryById(db, memory?.id ?? -1)?.seenCount).toBe(10);
