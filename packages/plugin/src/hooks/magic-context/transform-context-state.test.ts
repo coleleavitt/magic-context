@@ -45,6 +45,7 @@ describe("loadContextUsage", () => {
         useTempDataHome("context-usage-load-");
         const db = openDatabase();
         updateSessionMeta(db, "ses-load", {
+            lastUsageObservedAt: Date.now(),
             lastResponseTime: 1_000,
             lastContextPercentage: 42.5,
             lastInputTokens: 85_000,
@@ -61,6 +62,7 @@ describe("loadContextUsage", () => {
         useTempDataHome("context-usage-refresh-");
         const db = openDatabase();
         updateSessionMeta(db, "ses-refresh", {
+            lastUsageObservedAt: Date.now(),
             lastResponseTime: 1_000,
             lastContextPercentage: 12.4,
             lastInputTokens: 12_400,
@@ -73,6 +75,7 @@ describe("loadContextUsage", () => {
         });
 
         updateSessionMeta(db, "ses-refresh", {
+            lastUsageObservedAt: Date.now(),
             lastResponseTime: 2_000,
             lastContextPercentage: 126.7,
             lastInputTokens: 126_700,
@@ -89,6 +92,7 @@ describe("loadContextUsage", () => {
         useTempDataHome("context-usage-cache-hit-");
         const db = openDatabase();
         updateSessionMeta(db, "ses-cache", {
+            lastUsageObservedAt: Date.now(),
             lastResponseTime: 1_000,
             lastContextPercentage: 50,
             lastInputTokens: 50_000,

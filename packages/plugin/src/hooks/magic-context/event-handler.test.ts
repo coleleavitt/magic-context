@@ -44,6 +44,7 @@ import { getWindowReportsPath } from "../../features/magic-context/window-report
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { createEventHandler } from "./event-handler";
 import { createEventHook } from "./hook-handlers";
+import { loadContextUsage } from "./transform-context-state";
 
 type ContextUsageCacheEntry = {
     usage: ContextUsage;
@@ -628,6 +629,77 @@ describe("createEventHandler", () => {
         });
     });
 
+    it("preserves new-model overflow recovery when overflow is the first event after a switch", async () => {
+        // Given: model A is the last observed live model.
+        useTempDataHome("context-event-model-switch-overflow-first-");
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        const deps = createDeps(contextUsageMap);
+        const hook = createHostEventHook(deps, contextUsageMap);
+        const sessionID = "ses-model-switch-overflow-first";
+        await hook({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "msg-model-a",
+                        role: "assistant",
+                        finish: "stop",
+                        sessionID,
+                        providerID: "test-provider",
+                        modelID: "model-a",
+                        tokens: { input: 1_000, cache: { read: 0, write: 0 } },
+                    },
+                },
+            },
+        });
+
+        // When: the first model-B event overflows, followed by a successful B response.
+        await hook({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "msg-model-b-overflow",
+                        role: "assistant",
+                        finish: "error",
+                        sessionID,
+                        providerID: "test-provider",
+                        modelID: "model-b",
+                        error: "This model's maximum context length is 120000 tokens.",
+                    },
+                },
+            },
+        });
+        expect(getOverflowState(deps.db, sessionID)).toMatchObject({
+            detectedContextLimit: 120_000,
+            detectedContextLimitModelKey: "test-provider/model-b",
+            needsEmergencyRecovery: true,
+        });
+        await hook({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "msg-model-b-success",
+                        role: "assistant",
+                        finish: "stop",
+                        sessionID,
+                        providerID: "test-provider",
+                        modelID: "model-b",
+                        tokens: { input: 1_000, cache: { read: 0, write: 0 } },
+                    },
+                },
+            },
+        });
+
+        // Then: model B's detected limit and recovery latch survive its success.
+        expect(getOverflowState(deps.db, sessionID)).toMatchObject({
+            detectedContextLimit: 120_000,
+            detectedContextLimitModelKey: "test-provider/model-b",
+            needsEmergencyRecovery: true,
+        });
+    });
+
     for (const completion of [
         {
             name: "an error-bearing completed event",
@@ -922,6 +994,52 @@ describe("createEventHandler", () => {
             usage: { percentage: 61, inputTokens: 122_000 },
             updatedAt: preservedUpdatedAt,
         });
+    });
+
+    it("expires tokenless-restored usage across a process restart", async () => {
+        // Given: usage was observed at T0, then a tokenless terminal update arrived later.
+        useTempDataHome("context-event-tokenless-restart-");
+        const realNow = Date.now;
+        const observedAt = realNow();
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        const deps = createDeps(contextUsageMap);
+        const handler = createEventHandler(deps);
+        const sessionID = "ses-tokenless-restart";
+        try {
+            Date.now = () => observedAt;
+            await handler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            role: "assistant",
+                            finish: "stop",
+                            sessionID,
+                            tokens: { input: 64_000, cache: { read: 0, write: 0 } },
+                        },
+                    },
+                },
+            });
+            Date.now = () => observedAt + 30 * 60 * 1_000;
+            await handler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: { role: "assistant", finish: "stop", sessionID },
+                    },
+                },
+            });
+
+            // When: the process restarts after the original usage observation expires.
+            closeDatabase();
+            Date.now = () => observedAt + 61 * 60 * 1_000;
+            const restoredUsage = loadContextUsage(new Map(), openDatabase(), sessionID);
+
+            // Then: the newer tokenless response cannot extend stale usage forever.
+            expect(restoredUsage).toEqual({ percentage: 0, inputTokens: 0 });
+        } finally {
+            Date.now = realNow;
+        }
     });
 
     it("ignores tokenless assistant updates when no prior usage exists", async () => {

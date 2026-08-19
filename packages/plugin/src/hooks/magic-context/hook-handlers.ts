@@ -3,6 +3,7 @@ import {
     scheduleIncrementalIndex,
     scheduleReconciliation,
 } from "../../features/magic-context/message-index-async";
+import { detectOverflow } from "../../features/magic-context/overflow-detection";
 import { clearPersistedReasoningWatermark } from "../../features/magic-context/storage";
 import {
     getOrCreateSessionMeta,
@@ -282,26 +283,29 @@ export function createEventHook(args: {
     client: PluginContext["client"];
     protectedTags: number;
 }) {
+    const pressureModelBySession = new Map<string, { providerID: string; modelID: string }>();
     return async (input: { event: { type: string; properties?: unknown } }) => {
         if (input.event.type === "message.updated") {
             const assistantInfo = getMessageUpdatedAssistantInfo(input.event.properties);
-            if (
-                assistantInfo?.providerID &&
-                assistantInfo.modelID &&
-                isSuccessfulHostEvent(assistantInfo)
-            ) {
+            if (assistantInfo?.providerID && assistantInfo.modelID) {
                 const previous = args.liveModelBySession.get(assistantInfo.sessionID);
+                const pressureModel =
+                    pressureModelBySession.get(assistantInfo.sessionID) ?? previous;
                 args.liveModelBySession.set(assistantInfo.sessionID, {
                     providerID: assistantInfo.providerID,
                     modelID: assistantInfo.modelID,
                 });
+                const acceptsPressureModel =
+                    isSuccessfulHostEvent(assistantInfo) ||
+                    detectOverflow(assistantInfo.error).isOverflow;
                 // When the model changes (e.g., switching from 128k to 1M context model),
                 // clear stale context percentage and historian failure state so the transform
                 // doesn't keep using the old model's usage metrics or emergency state.
                 if (
-                    previous &&
-                    (previous.providerID !== assistantInfo.providerID ||
-                        previous.modelID !== assistantInfo.modelID)
+                    acceptsPressureModel &&
+                    pressureModel &&
+                    (pressureModel.providerID !== assistantInfo.providerID ||
+                        pressureModel.modelID !== assistantInfo.modelID)
                 ) {
                     // The reasoning watermark is only valid for the model that
                     // produced it. On a switch TO an interleaved-reasoning
@@ -315,7 +319,7 @@ export function createEventHook(args: {
                     dropSlot(assistantInfo.sessionID, "model-change");
                     sessionLog(
                         assistantInfo.sessionID,
-                        `model changed (${previous.providerID}/${previous.modelID} -> ${assistantInfo.providerID}/${assistantInfo.modelID}), clearing historian failure state and reasoning watermark`,
+                        `model changed (${pressureModel.providerID}/${pressureModel.modelID} -> ${assistantInfo.providerID}/${assistantInfo.modelID}), clearing historian failure state and reasoning watermark`,
                     );
                     // Don't clear lastContextPercentage/lastInputTokens here — the event handler
                     // already computed the correct percentage using the NEW model's context limit
@@ -346,6 +350,12 @@ export function createEventHook(args: {
                         clearedReasoningThroughTag: 0,
                         observedSafeInputTokens: 0,
                         cacheAlertSent: false,
+                    });
+                }
+                if (acceptsPressureModel) {
+                    pressureModelBySession.set(assistantInfo.sessionID, {
+                        providerID: assistantInfo.providerID,
+                        modelID: assistantInfo.modelID,
                     });
                 }
             }
@@ -384,6 +394,7 @@ export function createEventHook(args: {
             // createEventHandler has already persisted pending_session_cleanup before
             // this process-local indexing latch is discarded.
             args.liveModelBySession.delete(sessionId);
+            pressureModelBySession.delete(sessionId);
             args.variantBySession.delete(sessionId);
             args.agentBySession.delete(sessionId);
             args.sessionDirectoryBySession.delete(sessionId);

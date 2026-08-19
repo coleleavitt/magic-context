@@ -28,14 +28,14 @@ function columnNames(db: Database, table: string): string[] {
     );
 }
 
-describe("migration v74: detected context-limit provenance", () => {
-    test("fresh databases include provenance and keep the schema fence aligned", () => {
+describe("migration v80: tokenless usage observation timestamp", () => {
+    test("fresh databases include the timestamp and align the schema fence", () => {
         const db = new Database(":memory:");
         try {
             initializeDatabase(db);
             runMigrations(db);
 
-            expect(columnNames(db, "session_meta")).toContain("detected_context_limit_provenance");
+            expect(columnNames(db, "session_meta")).toContain("last_usage_observed_at");
             expect(LATEST_SUPPORTED_VERSION).toBe(80);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
         } finally {
@@ -43,54 +43,35 @@ describe("migration v74: detected context-limit provenance", () => {
         }
     });
 
-    test("upgrades legacy rows conservatively and remains idempotent", () => {
+    test("replaying from v79 adds the timestamp once with a fail-closed default", () => {
         const db = new Database(":memory:");
         try {
+            seedAppliedVersion(db, 79);
             db.exec(`
                 CREATE TABLE session_meta (
                     session_id TEXT PRIMARY KEY,
-                    detected_context_limit INTEGER NOT NULL DEFAULT 0
+                    last_context_percentage REAL DEFAULT 0,
+                    last_input_tokens INTEGER DEFAULT 0,
+                    last_response_time INTEGER
                 );
-                INSERT INTO session_meta (session_id, detected_context_limit)
-                VALUES ('ses-legacy', 167000);
+                INSERT INTO session_meta (
+                    session_id, last_context_percentage, last_input_tokens, last_response_time
+                ) VALUES ('ses-legacy', 50, 50000, 123);
             `);
-            seedAppliedVersion(db, 73);
 
             runMigrations(db);
             runMigrations(db);
 
-            const row = db
-                .prepare(
-                    "SELECT detected_context_limit, detected_context_limit_provenance FROM session_meta WHERE session_id = ?",
-                )
-                .get("ses-legacy") as {
-                detected_context_limit: number;
-                detected_context_limit_provenance: string;
-            };
-            expect(row).toEqual({
-                detected_context_limit: 167_000,
-                detected_context_limit_provenance: "unknown",
-            });
             expect(
                 db
-                    .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 74")
-                    .get() as {
-                    count: number;
-                },
-            ).toEqual({ count: 1 });
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("tolerates a sparse pre-v74 database without session metadata", () => {
-        const db = new Database(":memory:");
-        try {
-            seedAppliedVersion(db, 73);
-            expect(() => runMigrations(db)).not.toThrow();
+                    .prepare("SELECT last_usage_observed_at FROM session_meta WHERE session_id = ?")
+                    .get("ses-legacy"),
+            ).toEqual({ last_usage_observed_at: 0 });
             expect(
-                db.prepare("SELECT version FROM schema_migrations WHERE version = 74").get(),
-            ).toEqual({ version: 74 });
+                db
+                    .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 80")
+                    .get(),
+            ).toEqual({ count: 1 });
         } finally {
             closeQuietly(db);
         }

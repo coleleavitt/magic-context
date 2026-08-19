@@ -24,6 +24,7 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import {
+    CONTEXT_USAGE_TTL_MS,
     getChannel2NudgeState,
     getPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
@@ -62,8 +63,6 @@ import { invalidateTrueRawTokenCache } from "./read-session-true-raw-tokens";
 import { type NotificationParams, sendIgnoredMessage } from "./send-session-notification";
 import { clearMessageTokensCache } from "./transform";
 import { resetDegradedCacheCount } from "./transform-postprocess-phase";
-
-const CONTEXT_USAGE_TTL_MS = 60 * 60 * 1000;
 
 type CacheTtlConfig = string | Record<string, string>;
 
@@ -663,6 +662,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     updates.lastContextPercentage = percentage;
                     updates.lastInputTokens = totalInputTokens;
                     updates.lastUsageContextLimit = usageContextLimit;
+                    updates.lastUsageObservedAt = now;
                     updates.lastObservedModelKey = modelKey ?? null;
                     updates.observedSafeInputTokens = Math.max(
                         observedSafeInputTokens,

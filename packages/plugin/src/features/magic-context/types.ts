@@ -108,6 +108,7 @@ export interface SessionMeta {
     cachedM0ProjectIdentity: string | null;
     lastObservedModelKey: string | null;
     lastUsageContextLimit: number;
+    lastUsageObservedAt: number;
     priorBoundaryOrdinal: number;
     protectedTailPolicyVersion: number;
     protectedTailDrainWindowStartedAt: number;

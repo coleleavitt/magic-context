@@ -49,6 +49,7 @@ export interface SessionMetaRow {
     cached_m0_project_identity: string | null;
     last_observed_model_key: string | null;
     last_usage_context_limit: number | null;
+    last_usage_observed_at: number | null;
     prior_boundary_ordinal: number | null;
     protected_tail_policy_version: number | null;
     protected_tail_drain_window_started_at: number | null;
@@ -107,6 +108,7 @@ export const SESSION_META_SELECT_COLUMNS = [
     "cached_m0_project_identity",
     "last_observed_model_key",
     "last_usage_context_limit",
+    "last_usage_observed_at",
     "prior_boundary_ordinal",
     "protected_tail_policy_version",
     "protected_tail_drain_window_started_at",
@@ -164,6 +166,7 @@ export const META_COLUMNS: Record<string, string> = {
     cachedM0ProjectIdentity: "cached_m0_project_identity",
     lastObservedModelKey: "last_observed_model_key",
     lastUsageContextLimit: "last_usage_context_limit",
+    lastUsageObservedAt: "last_usage_observed_at",
     priorBoundaryOrdinal: "prior_boundary_ordinal",
     protectedTailPolicyVersion: "protected_tail_policy_version",
     protectedTailDrainWindowStartedAt: "protected_tail_drain_window_started_at",
@@ -289,6 +292,7 @@ export function isSessionMetaRow(row: unknown): row is SessionMetaRow {
         isStringOrNull(r.cached_m0_project_identity) &&
         isStringOrNull(r.last_observed_model_key) &&
         isNumberOrNull(r.last_usage_context_limit) &&
+        isNumberOrNull(r.last_usage_observed_at) &&
         isNumberOrNull(r.prior_boundary_ordinal) &&
         isNumberOrNull(r.protected_tail_policy_version) &&
         isNumberOrNull(r.protected_tail_drain_window_started_at) &&
@@ -348,6 +352,7 @@ export function getDefaultSessionMeta(sessionId: string): SessionMeta {
         cachedM0ProjectIdentity: null,
         lastObservedModelKey: null,
         lastUsageContextLimit: 0,
+        lastUsageObservedAt: 0,
         priorBoundaryOrdinal: 1,
         protectedTailPolicyVersion: 0,
         protectedTailDrainWindowStartedAt: 0,
@@ -468,6 +473,7 @@ export function toSessionMeta(row: SessionMetaRow): SessionMeta {
         cachedM0ProjectIdentity: stringOrNull(row.cached_m0_project_identity),
         lastObservedModelKey: stringOrNull(row.last_observed_model_key),
         lastUsageContextLimit: numOrZero(row.last_usage_context_limit),
+        lastUsageObservedAt: numOrZero(row.last_usage_observed_at),
         priorBoundaryOrdinal: Math.max(1, numOrZero(row.prior_boundary_ordinal) || 1),
         protectedTailPolicyVersion: numOrZero(row.protected_tail_policy_version),
         protectedTailDrainWindowStartedAt: numOrZero(row.protected_tail_drain_window_started_at),

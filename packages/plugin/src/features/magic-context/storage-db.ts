@@ -93,7 +93,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 78;
+export const LATEST_SUPPORTED_VERSION = 80;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -1475,6 +1475,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       cached_m1_bytes BLOB,
       last_observed_model_key TEXT,
       last_usage_context_limit INTEGER NOT NULL DEFAULT 0,
+      last_usage_observed_at INTEGER NOT NULL DEFAULT 0,
       prior_boundary_ordinal INTEGER NOT NULL DEFAULT 1,
       protected_tail_policy_version INTEGER NOT NULL DEFAULT 0,
       protected_tail_drain_window_started_at INTEGER NOT NULL DEFAULT 0,
@@ -1880,6 +1881,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "cached_m1_bytes", "BLOB");
     ensureColumn(db, "session_meta", "last_observed_model_key", "TEXT");
     ensureColumn(db, "session_meta", "last_usage_context_limit", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, "session_meta", "last_usage_observed_at", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "prior_boundary_ordinal", "INTEGER NOT NULL DEFAULT 1");
     ensureColumn(db, "session_meta", "protected_tail_policy_version", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(

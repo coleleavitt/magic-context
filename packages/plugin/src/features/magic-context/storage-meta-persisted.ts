@@ -10,6 +10,8 @@ import { stableStringify } from "../../shared/stable-json";
 import { ensureSessionMetaRow } from "./storage-meta-shared";
 import type { ContextUsage } from "./types";
 
+export const CONTEXT_USAGE_TTL_MS = 60 * 60 * 1_000;
+
 const emergencyRecoveryArmedSessions = new Set<string>();
 const emergencyRecoveryArmedAtBySession = new Map<string, number>();
 const providerOverflowReconfirmedSessions = new Set<string>();
@@ -38,6 +40,7 @@ interface PersistedUsageRow {
     last_response_time: number;
     last_observed_model_key: string | null;
     last_usage_context_limit: number | null;
+    last_usage_observed_at: number;
 }
 
 interface PersistedReasoningWatermarkRow {
@@ -198,7 +201,8 @@ function isPersistedUsageRow(row: unknown): row is PersistedUsageRow {
         typeof r.last_input_tokens === "number" &&
         typeof r.last_response_time === "number" &&
         (typeof r.last_observed_model_key === "string" || r.last_observed_model_key === null) &&
-        (typeof r.last_usage_context_limit === "number" || r.last_usage_context_limit === null)
+        (typeof r.last_usage_context_limit === "number" || r.last_usage_context_limit === null) &&
+        typeof r.last_usage_observed_at === "number"
     );
 }
 
@@ -297,12 +301,14 @@ function getDefaultHistorianFailureState(): PersistedHistorianFailureState {
 export function loadPersistedUsage(db: Database, sessionId: string): PersistedUsageState | null {
     const result = db
         .prepare(
-            "SELECT last_context_percentage, last_input_tokens, last_response_time, last_observed_model_key, last_usage_context_limit FROM session_meta WHERE session_id = ?",
+            "SELECT last_context_percentage, last_input_tokens, last_response_time, last_observed_model_key, last_usage_context_limit, last_usage_observed_at FROM session_meta WHERE session_id = ?",
         )
         .get(sessionId);
 
     if (
         !isPersistedUsageRow(result) ||
+        result.last_usage_observed_at <= 0 ||
+        Date.now() - result.last_usage_observed_at > CONTEXT_USAGE_TTL_MS ||
         (result.last_context_percentage === 0 && result.last_input_tokens === 0)
     ) {
         return null;
@@ -313,7 +319,7 @@ export function loadPersistedUsage(db: Database, sessionId: string): PersistedUs
             percentage: result.last_context_percentage,
             inputTokens: result.last_input_tokens,
         },
-        updatedAt: result.last_response_time || Date.now(),
+        updatedAt: result.last_usage_observed_at,
         lastObservedModelKey: result.last_observed_model_key,
         lastUsageContextLimit:
             typeof result.last_usage_context_limit === "number"

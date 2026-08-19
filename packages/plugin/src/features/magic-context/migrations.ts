@@ -2818,6 +2818,21 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        // Temporary merge-order reservation: PR #340 owns v79, so this PR must
+        // remain v80 even while v79 is absent from this worktree.
+        version: 80,
+        description: "persist the original observation time for tokenless usage TTL",
+        up(db: Database): void {
+            if (!tableExists(db, "session_meta")) return;
+            ensureColumn(
+                db,
+                "session_meta",
+                "last_usage_observed_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            );
+        },
+    },
 ];
 
 /**
