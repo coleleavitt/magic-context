@@ -2831,13 +2831,20 @@ export const MIGRATIONS: Migration[] = [
                 "last_usage_observed_at",
                 "INTEGER NOT NULL DEFAULT 0",
             );
-            db.exec(`
-                UPDATE session_meta
-                   SET last_usage_observed_at = last_response_time
-                 WHERE last_usage_observed_at = 0
-                   AND last_input_tokens > 0
-                   AND last_response_time > 0;
-            `);
+            const columns = new Set(
+                (
+                    db.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name: string }>
+                ).map((row) => row.name),
+            );
+            if (columns.has("last_input_tokens") && columns.has("last_response_time")) {
+                db.exec(`
+                    UPDATE session_meta
+                       SET last_usage_observed_at = last_response_time
+                     WHERE last_usage_observed_at = 0
+                       AND last_input_tokens > 0
+                       AND last_response_time > 0;
+                `);
+            }
         },
     },
 ];
