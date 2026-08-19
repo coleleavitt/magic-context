@@ -592,6 +592,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         db: deps.db,
                         sessionID: info.sessionID,
                     });
+                    let usageContextLimit = contextLimit;
                     let percentage = contextLimit > 0 ? (totalInputTokens / contextLimit) * 100 : 0;
 
                     sessionLog(
@@ -617,6 +618,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                                 sessionID: info.sessionID,
                             });
                             if (contextLimit >= totalInputTokens) {
+                                usageContextLimit = contextLimit;
                                 percentage = (totalInputTokens / contextLimit) * 100;
                                 sessionLog(
                                     info.sessionID,
@@ -642,18 +644,8 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         }
 
                         if (contextLimit < totalInputTokens) {
-                            recordDetectedContextLimit(
-                                deps.db,
-                                info.sessionID,
-                                totalInputTokens,
-                                modelKey,
-                                "prompt_only",
-                            );
-                            contextLimit = resolveContextLimit(info.providerID, info.modelID, {
-                                db: deps.db,
-                                sessionID: info.sessionID,
-                            });
-                            percentage = (totalInputTokens / contextLimit) * 100;
+                            usageContextLimit = totalInputTokens;
+                            percentage = 100;
                             if (sessionMeta.cacheAlertSent) updates.cacheAlertSent = true;
                         }
                     }
@@ -670,7 +662,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
 
                     updates.lastContextPercentage = percentage;
                     updates.lastInputTokens = totalInputTokens;
-                    updates.lastUsageContextLimit = contextLimit;
+                    updates.lastUsageContextLimit = usageContextLimit;
                     updates.lastObservedModelKey = modelKey ?? null;
                     updates.observedSafeInputTokens = Math.max(
                         observedSafeInputTokens,

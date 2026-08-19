@@ -622,9 +622,9 @@ describe("createEventHandler", () => {
         });
         expect(meta.lastUsageContextLimit).toBe(10_000_000);
         expect(getOverflowState(deps.db, "ses-model-switch-first-sample")).toMatchObject({
-            detectedContextLimit: 10_000_000,
-            detectedContextLimitModelKey: "test-provider/test-model",
-            detectedContextLimitProvenance: "prompt_only",
+            detectedContextLimit: 0,
+            detectedContextLimitModelKey: null,
+            detectedContextLimitProvenance: "unknown",
         });
     });
 
