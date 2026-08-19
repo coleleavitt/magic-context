@@ -1,3 +1,4 @@
+import { MAX_HISTORIAN_PROMPT_ATTEMPTS } from "../../../config/schema/magic-context";
 import type { PluginContext } from "../../../plugin/types";
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
@@ -19,6 +20,7 @@ type OpencodeClient = PluginContext["client"];
  * the age gate is airtight. 404 on delete = already-swept = success.
  */
 export const RETROSPECTIVE_CHILD_TITLE = "magic-context-dream-retrospective";
+export const HISTORIAN_CHILD_TITLE = "magic-context-compartment";
 export const USER_MEMORIES_CHILD_TITLE = "magic-context-dream-user-memories";
 export const CURATE_CHILD_TITLE = "magic-context-dream-curate";
 export const MAINTAIN_DOCS_CHILD_TITLE = "magic-context-dream-maintain-docs";
@@ -43,6 +45,7 @@ export interface PrivacySensitiveChildTitleMatches {
 export const PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES: PrivacySensitiveChildTitleMatches = {
     exact: [
         RETROSPECTIVE_CHILD_TITLE,
+        HISTORIAN_CHILD_TITLE,
         USER_MEMORIES_CHILD_TITLE,
         CURATE_CHILD_TITLE,
         MAINTAIN_DOCS_CHILD_TITLE,
@@ -50,6 +53,17 @@ export const PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES: PrivacySensitiveChildTitleMa
     ],
     prefixes: [SMART_NOTE_COMPILE_CHILD_TITLE_PREFIX, SMART_NOTE_CONFIRM_CHILD_TITLE_PREFIX],
 };
+const PRIMARY_AND_SUGGESTED_CALLS_PER_CANDIDATE = 2;
+
+export function orphanSweepTitleMatches(keepSubagents: boolean): PrivacySensitiveChildTitleMatches {
+    if (!keepSubagents) return PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES;
+    return {
+        exact: PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES.exact.filter(
+            (title) => title !== HISTORIAN_CHILD_TITLE,
+        ),
+        prefixes: PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES.prefixes,
+    };
+}
 
 /** Stale threshold from task timeout(s): max(60min, maxTimeout×3) — comfortably
  *  past every swept child type so a live child is never swept. */
@@ -65,6 +79,17 @@ export function retrospectiveOrphanStaleMs(
     );
     const timeoutMs = maxTimeoutMinutes * 60_000;
     return Math.max(60 * 60_000, timeoutMs * 3);
+}
+
+export function historianOrphanStaleMs(timeoutMs: number, fallbackCount: number): number {
+    const candidateCount = Math.max(0, fallbackCount) + 1;
+    const attemptBudgetMinutes =
+        (timeoutMs *
+            MAX_HISTORIAN_PROMPT_ATTEMPTS *
+            PRIMARY_AND_SUGGESTED_CALLS_PER_CANDIDATE *
+            candidateCount) /
+        60_000;
+    return retrospectiveOrphanStaleMs(attemptBudgetMinutes);
 }
 
 interface OrphanRow {

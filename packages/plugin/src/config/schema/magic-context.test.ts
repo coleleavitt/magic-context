@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import {
-    DEFAULT_HISTORIAN_TIMEOUT_MS,
     DEFAULT_HISTORY_BUDGET_PERCENTAGE,
     DEFAULT_LOCAL_EMBEDDING_MODEL,
     type MagicContextConfig,
@@ -25,7 +24,7 @@ describe("MagicContextConfigSchema", () => {
                 protected_tags: 20,
                 clear_reasoning_age: 50,
                 history_budget_percentage: DEFAULT_HISTORY_BUDGET_PERCENTAGE,
-                historian_timeout_ms: DEFAULT_HISTORIAN_TIMEOUT_MS,
+                historian_timeout_ms: 600_000,
                 embedding: {
                     provider: "local",
                     model: DEFAULT_LOCAL_EMBEDDING_MODEL,

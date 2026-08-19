@@ -6,6 +6,9 @@ import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import {
     CURATE_CHILD_TITLE,
+    HISTORIAN_CHILD_TITLE,
+    historianOrphanStaleMs,
+    orphanSweepTitleMatches,
     MAINTAIN_DOCS_CHILD_TITLE,
     REFRESH_PRIMERS_CHILD_TITLE,
     RETROSPECTIVE_CHILD_TITLE,
@@ -48,6 +51,17 @@ describe("retrospectiveOrphanStaleMs", () => {
         expect(retrospectiveOrphanStaleMs([10, 45, undefined])).toBe(135 * 60_000);
         expect(retrospectiveOrphanStaleMs(undefined)).toBe(60 * 60_000);
     });
+
+    test("covers every outer retry, fallback, and model-suggestion call", () => {
+        expect(historianOrphanStaleMs(600_000, 3)).toBe(12 * 60 * 60_000);
+    });
+});
+
+describe("orphanSweepTitleMatches", () => {
+    test("preserves historian children when keep_subagents is enabled", () => {
+        expect(orphanSweepTitleMatches(false).exact).toContain(HISTORIAN_CHILD_TITLE);
+        expect(orphanSweepTitleMatches(true).exact).not.toContain(HISTORIAN_CHILD_TITLE);
+    });
 });
 
 describe("sweepOrphanedRetrospectiveChildren", () => {
@@ -75,7 +89,8 @@ describe("sweepOrphanedRetrospectiveChildren", () => {
         insert(db, "old", RETROSPECTIVE_CHILD_TITLE, DIR, now - staleMs - 6);
         insert(db, "old-curate", CURATE_CHILD_TITLE, DIR, now - staleMs - 5);
         insert(db, "old-docs", MAINTAIN_DOCS_CHILD_TITLE, DIR, now - staleMs - 4);
-        insert(db, "old-refresh", REFRESH_PRIMERS_CHILD_TITLE, DIR, now - staleMs - 3);
+        insert(db, "old-refresh", REFRESH_PRIMERS_CHILD_TITLE, DIR, now - staleMs - 4);
+        insert(db, "old-historian", HISTORIAN_CHILD_TITLE, DIR, now - staleMs - 3);
         insert(
             db,
             "old-compile",
@@ -92,6 +107,7 @@ describe("sweepOrphanedRetrospectiveChildren", () => {
         );
         // recent child (live run) → NOT swept
         insert(db, "fresh", RETROSPECTIVE_CHILD_TITLE, DIR, now - 1000);
+        insert(db, "fresh-historian", HISTORIAN_CHILD_TITLE, DIR, now - 1000);
         // old but a different title → NOT swept
         insert(db, "other-title", "magic-context-dream-verify", DIR, now - staleMs - 1);
         // old retrospective but ANOTHER directory → NOT swept
@@ -112,10 +128,11 @@ describe("sweepOrphanedRetrospectiveChildren", () => {
             "old-curate",
             "old-docs",
             "old-refresh",
+            "old-historian",
             "old-compile",
             "old-confirm",
         ]);
-        expect(count).toBe(7);
+        expect(count).toBe(8);
     });
 
     test("treats a delete error (404 / already removed) as success", async () => {

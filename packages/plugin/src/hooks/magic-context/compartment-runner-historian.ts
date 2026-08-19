@@ -1,7 +1,10 @@
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HISTORIAN_AGENT, HISTORIAN_EDITOR_AGENT } from "../../agents/historian";
-import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
+import {
+    DEFAULT_HISTORIAN_TIMEOUT_MS,
+    MAX_HISTORIAN_PROMPT_ATTEMPTS,
+} from "../../config/schema/magic-context";
 import { openDatabase } from "../../features/magic-context/storage";
 import type { SubagentKind } from "../../features/magic-context/storage-subagent-invocations";
 import {
@@ -19,7 +22,6 @@ import {
     getProjectMagicContextHistorianDir,
 } from "../../shared/data-path";
 import { describeError, getErrorMessage } from "../../shared/error-message";
-import { shouldKeepSubagents } from "../../shared/keep-subagents";
 import { isRecord } from "../../shared/record-type-guard";
 import type { Database } from "../../shared/sqlite";
 import { createChildSessionWithFence } from "./child-session-spawn";
@@ -46,7 +48,7 @@ import {
 function historianResponseDumpDir(directory: string): string {
     return getProjectMagicContextHistorianDir(directory);
 }
-const MAX_HISTORIAN_RETRIES = 2;
+const MAX_HISTORIAN_RETRIES = MAX_HISTORIAN_PROMPT_ATTEMPTS - 1;
 
 interface HistorianModelOverride {
     providerID: string;
@@ -325,9 +327,6 @@ async function runHistorianPrompt(args: {
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     let invocationRecorded = false;
-    // Keep FAILED historian child sessions for debugging (the model output, the
-    // exact prompt, and the error are all inspectable in the child session). Only
-    // delete on SUCCESS, where the result is already persisted as a compartment.
     let outcomeOk = false;
 
     const recordInvocation = (params: {
@@ -489,23 +488,15 @@ async function runHistorianPrompt(args: {
             error: `Historian failed while processing this session: ${desc.brief}`,
         };
     } finally {
-        // Delete the child session ONLY on success. On failure, keep it so the
-        // failed model output / prompt / error can be inspected for debugging
-        // (the run is already recorded as failed in subagent_invocations +
-        // historian_runs; the live child session is the missing piece). A periodic
-        // sweep can GC old failed child sessions later if needed.
-        if (agentSessionId && outcomeOk && !shouldKeepSubagents()) {
-            await client.session.delete({ path: { id: agentSessionId } }).catch((e: unknown) => {
-                shared.sessionLog(
-                    parentSessionId,
-                    "compartment agent: session cleanup failed",
-                    getErrorMessage(e),
-                );
-            });
-        } else if (agentSessionId && (!outcomeOk || shouldKeepSubagents())) {
+        // OpenCode can persist detached summary/step parts after prompt completion
+        // and even after the session reports idle. Immediate deletion races those
+        // writes and produces foreign-key failures in opencode.db. Keep the child
+        // here; the age-gated orphan sweep removes it after every legitimate writer
+        // has had ample time to finish.
+        if (agentSessionId) {
             shared.sessionLog(
                 parentSessionId,
-                `historian: KEEPING child session ${agentSessionId} (${outcomeOk ? "keep_subagents" : "failed"}) — not deleted`,
+                `historian: KEEPING child session ${agentSessionId} (${outcomeOk ? "deferred cleanup" : "failed"}) — not deleted`,
             );
         }
     }

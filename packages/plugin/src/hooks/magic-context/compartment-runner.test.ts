@@ -1296,6 +1296,7 @@ describe("runCompartmentAgent", () => {
                 },
             ],
         }));
+        const statusSession = mock(async () => ({ data: { "ses-agent": { type: "idle" } } }));
         const deleteSession = mock(async () => ({}));
 
         const client = {
@@ -1304,6 +1305,7 @@ describe("runCompartmentAgent", () => {
                 create: createSession,
                 prompt: promptSession,
                 messages,
+                status: statusSession,
                 delete: deleteSession,
             },
         } as unknown as PluginContext["client"];
@@ -1327,6 +1329,8 @@ describe("runCompartmentAgent", () => {
             query: { directory: "/tmp/parent" },
         });
         expect(promptSession.mock.calls[0]?.[0]?.body.agent).toBe("historian");
+        expect(statusSession).not.toHaveBeenCalled();
+        expect(deleteSession).not.toHaveBeenCalled();
     });
 
     it("keeps a committed publish succeeded and signaled when post-commit project registration throws", async () => {

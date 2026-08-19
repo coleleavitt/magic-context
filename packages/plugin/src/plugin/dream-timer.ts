@@ -1,12 +1,13 @@
 import { statSync } from "node:fs";
 
-import type { DreamerConfig } from "../config/schema/magic-context";
+import { DEFAULT_HISTORIAN_TIMEOUT_MS, type DreamerConfig } from "../config/schema/magic-context";
 import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
 import {
     PRIVACY_SENSITIVE_CHILD_TASKS,
-    PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES,
+    historianOrphanStaleMs,
+    orphanSweepTitleMatches,
     retrospectiveOrphanStaleMs,
     sweepOrphanedRetrospectiveChildren,
 } from "../features/magic-context/dreamer/retrospective-orphan-sweep";
@@ -77,6 +78,9 @@ interface ProjectRegistration {
     projectIdentity: string;
     client: PluginContext["client"];
     dreamerConfig?: DreamerConfig;
+    historianTimeoutMs?: number;
+    historianFallbackCount?: number;
+    keepSubagents?: boolean;
     language?: string;
     gitCommitIndexing?: {
         enabled: boolean;
@@ -333,7 +337,8 @@ async function runProjectMaintenance(
     const projectMaintenanceEnabled =
         Boolean(reg.dreamerConfig && reg.dreamerConfig.disable !== true) ||
         reg.memoryEnabled === true ||
-        reg.gitCommitIndexing?.enabled === true;
+        reg.gitCommitIndexing?.enabled === true ||
+        reg.historianTimeoutMs !== undefined;
     if (!projectMaintenanceEnabled) return;
 
     await reg.ensureRegistered(reg.directory, db);
@@ -416,9 +421,11 @@ async function sweepProject(
     }
 
     if (!dreamingEnabled || !dreamerConfig) {
+        await sweepOrphanedChildSessions(reg, []);
         return;
     }
 
+    let privacySweepTimeouts: Array<number | undefined> = [];
     try {
         await runCompiledSmartNoteSweep(reg, db);
 
@@ -468,30 +475,42 @@ async function sweepProject(
         // project text only after the longest swept task's timeout has elapsed.
         // OpenCode-only (Pi subprocess children die with their process); skip
         // when no opencode.db.
-        const privacySweepTimeouts = runtimeConfigs
+        privacySweepTimeouts = runtimeConfigs
             .filter((c) => (PRIVACY_SENSITIVE_CHILD_TASKS as readonly string[]).includes(c.task))
             .map((c) => c.timeoutMinutes);
-        const ocDb = openOpenCodeDb();
-        if (ocDb) {
-            try {
-                await sweepOrphanedRetrospectiveChildren({
-                    opencodeDb: ocDb,
-                    client: reg.client,
-                    sessionDirectory: reg.directory,
-                    staleMs: retrospectiveOrphanStaleMs(privacySweepTimeouts),
-                    titleMatches: PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES,
-                });
-            } catch (sweepError) {
-                log(
-                    `[dreamer] retrospective orphan sweep failed for ${reg.projectIdentity}:`,
-                    sweepError,
-                );
-            } finally {
-                closeQuietly(ocDb);
-            }
-        }
     } catch (error) {
         log(`[dreamer] timer-triggered task scheduling failed for ${reg.projectIdentity}:`, error);
+    }
+    await sweepOrphanedChildSessions(reg, privacySweepTimeouts);
+}
+
+async function sweepOrphanedChildSessions(
+    reg: ProjectRegistration,
+    privacySweepTimeouts: readonly (number | undefined)[],
+): Promise<void> {
+    const opencodeDb = openOpenCodeDb();
+    if (!opencodeDb) return;
+
+    const titleMatches = orphanSweepTitleMatches(reg.keepSubagents === true);
+
+    try {
+        await sweepOrphanedRetrospectiveChildren({
+            opencodeDb,
+            client: reg.client,
+            sessionDirectory: reg.directory,
+            staleMs: Math.max(
+                retrospectiveOrphanStaleMs(privacySweepTimeouts),
+                historianOrphanStaleMs(
+                    reg.historianTimeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
+                    reg.historianFallbackCount ?? 0,
+                ),
+            ),
+            titleMatches,
+        });
+    } catch (error) {
+        log(`[dreamer] child-session orphan sweep failed for ${reg.projectIdentity}:`, error);
+    } finally {
+        closeQuietly(opencodeDb);
     }
 }
 

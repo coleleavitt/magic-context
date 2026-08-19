@@ -18,6 +18,7 @@ import {
     createEventHook,
     createToolExecuteAfterHook,
 } from "./hook-handlers";
+import { EMPTY_TASK_OUTPUT_SENTINEL } from "./empty-task-output";
 
 function createTestDb(): Database {
     const db = new Database(":memory:");
@@ -34,6 +35,21 @@ function createTestHook(db: Database): ReturnType<typeof createToolExecuteAfterH
 }
 
 describe("createToolExecuteAfterHook todo snapshots", () => {
+    test("native task hook surfaces an empty completed child result", async () => {
+        const db = createTestDb();
+        try {
+            const output = {
+                output: '<task id="ses-child" state="completed">\n<task_result>\n\n</task_result>\n</task>',
+            };
+
+            await createTestHook(db)({ tool: "task", sessionID: "ses-parent" }, output);
+
+            expect(output.output).toContain(EMPTY_TASK_OUTPUT_SENTINEL);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("rust mode forwards todo state to the module without changing TS capture", async () => {
         const db = createTestDb();
         try {
