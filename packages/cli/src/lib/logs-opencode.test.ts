@@ -398,8 +398,8 @@ describe("bundleIssueReport secret redaction", () => {
             const body = readFileSync(bundled.path, "utf-8");
 
             expect(body).toContain('"api_key": "<REDACTED:api_key>"');
-            expect(body).toContain('"Authorization": "<REDACTED:authorization>"');
-            expect(body).toContain('"X-Api-Key": "<REDACTED:x-api-key>"');
+            expect(body).toContain('"Authorization": "<REDACTED:header>"');
+            expect(body).toContain('"X-Api-Key": "<REDACTED:header>"');
             expect(body).not.toContain("emb-secret-value");
             expect(body).not.toContain("historian-secret-value");
             expect(body).not.toContain("header-secret-value");
