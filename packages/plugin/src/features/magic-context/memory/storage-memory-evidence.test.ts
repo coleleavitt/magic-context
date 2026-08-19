@@ -12,8 +12,8 @@ import {
     deleteMemory,
     getMemoryById,
     insertMemoryIdempotent,
-    mergeMemoryStats,
     ModuleMemoryAuthorityError,
+    mergeMemoryStats,
     updateMemoryContent,
 } from "./storage-memory";
 

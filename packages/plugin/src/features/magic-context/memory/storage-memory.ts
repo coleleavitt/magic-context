@@ -782,8 +782,7 @@ export function mergeMemoryEpisodeEvidence(
         )
         .all(...ids) as Array<{ seen_count?: number; evidence_count?: number }>;
     const legacyBaseline = rows.reduce(
-        (sum, row) =>
-            sum + Math.max((row.seen_count ?? 1) - (row.evidence_count ?? 0), 0),
+        (sum, row) => sum + Math.max((row.seen_count ?? 1) - (row.evidence_count ?? 0), 0),
         0,
     );
     for (const sourceId of sourceIds) {
