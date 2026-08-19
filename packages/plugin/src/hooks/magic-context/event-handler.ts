@@ -14,6 +14,7 @@ import {
     getPendingCompactionMarkerState,
     getPersistedNoteNudge,
     getPersistedReasoningWatermark,
+    loadPersistedUsage,
     markSessionCleanupPending,
     recordDetectedContextLimit,
     recordOverflowDetected,
@@ -555,7 +556,25 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 `event message.updated: provider=${info.providerID} model=${info.modelID} hasUsageTokens=${hasUsageTokens} tokens.input=${info.tokens?.input} cache.read=${info.tokens?.cache?.read} cache.write=${info.tokens?.cache?.write}`,
             );
 
-            const hasKnownUsage = hasUsageTokens || deps.contextUsageMap.has(info.sessionID);
+            let hasKnownUsage = hasUsageTokens || deps.contextUsageMap.has(info.sessionID);
+            if (!hasKnownUsage) {
+                try {
+                    const persisted = loadPersistedUsage(deps.db, info.sessionID);
+                    if (persisted) {
+                        deps.contextUsageMap.set(info.sessionID, {
+                            ...persisted,
+                            hasUsageTokens: false,
+                        });
+                        hasKnownUsage = true;
+                    }
+                } catch (error) {
+                    sessionLog(
+                        info.sessionID,
+                        "event message.updated usage restore failed:",
+                        error,
+                    );
+                }
+            }
             if (!hasKnownUsage) {
                 sessionLog(
                     info.sessionID,

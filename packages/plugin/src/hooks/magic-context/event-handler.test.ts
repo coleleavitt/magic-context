@@ -1042,6 +1042,50 @@ describe("createEventHandler", () => {
         }
     });
 
+    it("refreshes response timing from fresh persisted usage after restart", async () => {
+        useTempDataHome("context-event-tokenless-restart-refresh-");
+        const realNow = Date.now;
+        const observedAt = realNow();
+        const sessionID = "ses-tokenless-restart-refresh";
+        try {
+            Date.now = () => observedAt;
+            const firstHandler = createEventHandler(createDeps(new Map()));
+            await firstHandler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            role: "assistant",
+                            finish: "stop",
+                            sessionID,
+                            tokens: { input: 64_000, cache: { read: 0, write: 0 } },
+                        },
+                    },
+                },
+            });
+
+            closeDatabase();
+            Date.now = () => observedAt + 30 * 60 * 1_000;
+            const restartedUsage = new Map<string, ContextUsageCacheEntry>();
+            const restartedHandler = createEventHandler(createDeps(restartedUsage));
+            await restartedHandler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: { role: "assistant", finish: "stop", sessionID },
+                    },
+                },
+            });
+
+            const meta = getOrCreateSessionMeta(openDatabase(), sessionID);
+            expect(meta.lastResponseTime).toBe(observedAt + 30 * 60 * 1_000);
+            expect(meta.lastUsageObservedAt).toBe(observedAt);
+            expect(restartedUsage.get(sessionID)?.usage.inputTokens).toBe(64_000);
+        } finally {
+            Date.now = realNow;
+        }
+    });
+
     it("ignores tokenless assistant updates when no prior usage exists", async () => {
         useTempDataHome("context-event-no-finish-");
         const handler = createEventHandler(createDeps(new Map()));
