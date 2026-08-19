@@ -110,5 +110,33 @@ describe("embedding module", () => {
             expect(first.modelId).not.toBe(anonymous.modelId);
             expect(first.modelId).not.toContain("secret");
         });
+
+        it("openai-compatible identity is stable for equivalent headers and rotates on any header change", () => {
+            const common = {
+                endpoint: "http://localhost:1234/v1",
+                model: "text-embedding-3-small",
+            };
+            const first = new OpenAICompatibleEmbeddingProvider({
+                ...common,
+                headers: { "X-Workspace": "credential-one", "X-Region": "us-east-1" },
+            });
+            const equivalent = new OpenAICompatibleEmbeddingProvider({
+                ...common,
+                headers: { "x-region": "us-east-1", "x-workspace": "credential-one" },
+            });
+            const rotatedValue = new OpenAICompatibleEmbeddingProvider({
+                ...common,
+                headers: { "X-Workspace": "credential-two", "X-Region": "us-east-1" },
+            });
+            const rotatedName = new OpenAICompatibleEmbeddingProvider({
+                ...common,
+                headers: { "X-Account": "credential-one", "X-Region": "us-east-1" },
+            });
+
+            expect(first.modelId).toBe(equivalent.modelId);
+            expect(first.modelId).not.toBe(rotatedValue.modelId);
+            expect(first.modelId).not.toBe(rotatedName.modelId);
+            expect(first.modelId).not.toContain("credential-one");
+        });
     });
 });

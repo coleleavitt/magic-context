@@ -119,6 +119,23 @@ describe("sanitizeConfigValue — preserves benign config keys", () => {
         expect(sanitized.embedding?.model).toBe("text-embedding-3-small");
     });
 
+    it("redacts every embedding header value regardless of header name", () => {
+        const sanitized = sanitizeConfigValue({
+            embedding: {
+                headers: {
+                    "X-Workspace": "workspace-credential",
+                    "X-Region": "us-east-1",
+                },
+            },
+        }) as Record<string, Record<string, Record<string, unknown>>>;
+
+        expect(sanitized.embedding?.headers).toEqual({
+            "X-Workspace": "<REDACTED:header>",
+            "X-Region": "<REDACTED:header>",
+        });
+        expect(JSON.stringify(sanitized)).not.toContain("workspace-credential");
+    });
+
     it("does not redact memory.injection_budget_tokens", () => {
         const config = {
             memory: {

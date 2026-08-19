@@ -12,6 +12,7 @@ import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magi
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
     type EmbeddingProbeOutcome,
+    InvalidEmbeddingHeadersError,
     parseEmbeddingHeaders,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
@@ -697,7 +698,15 @@ async function runHealthChecks(options: {
         const model = typeof mergedEmbedding.model === "string" ? mergedEmbedding.model.trim() : "";
         const apiKey =
             typeof mergedEmbedding.api_key === "string" ? mergedEmbedding.api_key : undefined;
-        const headers = parseEmbeddingHeaders(mergedEmbedding.headers);
+        let headers: Readonly<Record<string, string>> | undefined;
+        let headersValid = true;
+        try {
+            headers = parseEmbeddingHeaders(mergedEmbedding.headers);
+        } catch (error) {
+            if (!(error instanceof InvalidEmbeddingHeadersError)) throw error;
+            headersValid = false;
+            add(results, "fail", error.message);
+        }
         const inputType =
             typeof mergedEmbedding.input_type === "string"
                 ? mergedEmbedding.input_type.trim()
@@ -706,13 +715,13 @@ async function runHealthChecks(options: {
             typeof mergedEmbedding.truncate === "string"
                 ? mergedEmbedding.truncate.trim()
                 : undefined;
-        if (!endpoint || !model) {
+        if (headersValid && (!endpoint || !model)) {
             add(
                 results,
                 "fail",
                 "Embedding provider is openai-compatible but endpoint/model is missing",
             );
-        } else {
+        } else if (headersValid) {
             try {
                 const outcome = await options.deps.probeEmbeddingEndpoint({
                     endpoint,

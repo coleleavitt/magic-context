@@ -18,6 +18,7 @@ import {
 } from "./git-commits/storage-git-commit-embeddings";
 import { upsertCommits } from "./git-commits/storage-git-commits";
 import { acquireGitSweepLease, releaseGitSweepLease } from "./git-commits/sweep-coordinator";
+import { getEmbeddingProviderIdentity } from "./memory/embedding-identity";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import { insertMemory } from "./memory/storage-memory";
 import {
@@ -339,6 +340,51 @@ describe("project embedding registry", () => {
         expect(noDtype.providerIdentity).toBe(
             "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357",
         );
+    });
+
+    it("reuses equivalent custom headers and recreates the provider when a header rotates", async () => {
+        const providers: FakeEmbeddingProvider[] = [];
+        _setTestProviderFactoryForProject((config) => {
+            const created = new FakeEmbeddingProvider(getEmbeddingProviderIdentity(config));
+            providers.push(created);
+            return created;
+        });
+        const db = useTempDb();
+        const features = { memoryEnabled: true, gitCommitEnabled: false };
+        const common = {
+            provider: "openai-compatible" as const,
+            endpoint: "https://api.example.com/v1",
+            model: "embedding-model",
+        };
+
+        registerProjectEmbedding(
+            db,
+            "git:header-rotation",
+            { ...common, headers: { "X-Workspace": "credential-one", "X-Region": "east" } },
+            features,
+            "/repo",
+        );
+        await embedTextForProject("git:header-rotation", "first");
+        registerProjectEmbedding(
+            db,
+            "git:header-rotation",
+            { ...common, headers: { "X-Workspace": "credential-one", "X-Region": "east" } },
+            features,
+            "/repo",
+        );
+        await embedTextForProject("git:header-rotation", "equivalent");
+        registerProjectEmbedding(
+            db,
+            "git:header-rotation",
+            { ...common, headers: { "X-Workspace": "credential-two", "X-Region": "east" } },
+            features,
+            "/repo",
+        );
+        await embedTextForProject("git:header-rotation", "rotated");
+
+        expect(providers).toHaveLength(2);
+        expect(providers[0]?.disposed).toBe(true);
+        expect(providers[1]?.disposed).toBe(false);
     });
 
     it("a non-default local_dtype folds into the identity and differs from the default (#259)", () => {

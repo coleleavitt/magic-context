@@ -769,6 +769,55 @@ describe("Pi doctor", () => {
         expect(probeOptions?.apiKey).toBe("fallback-key");
     });
 
+    it("fails closed on invalid embedding headers without probing or echoing values", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        const secret = "benign-name-secret-value";
+        writeFileSync(
+            join(root, ".config", "cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                embedding: {
+                    provider: "openai-compatible",
+                    endpoint: "https://example.com/v1",
+                    model: "text-embedding-3-small",
+                    headers: { "Invalid Header": secret },
+                },
+            }),
+        );
+        const prompts = new MockPrompts();
+        const options = baseOptions(root, cwd, prompts);
+        let probeCalls = 0;
+        const errors: string[] = [];
+        const originalError = console.error;
+        console.error = (message?: unknown) => {
+            errors.push(String(message));
+        };
+
+        try {
+            const code = await runDoctor({
+                ...options,
+                deps: {
+                    ...options.deps,
+                    probeEmbeddingEndpoint: async () => {
+                        probeCalls++;
+                        return { kind: "ok", status: 200, dimensions: 3 };
+                    },
+                },
+            });
+
+            expect(code).toBe(1);
+        } finally {
+            console.error = originalError;
+        }
+
+        const output = errors.join("\n");
+        expect(output).toContain("Invalid embedding.headers");
+        expect(output).not.toContain(secret);
+        expect(probeCalls).toBe(0);
+    });
+
     it("sanitizes thrown embedding probe errors before printing them", async () => {
         const root = makeTempRoot();
         const cwd = makeTempRoot("mc-pi-doctor-cwd-");

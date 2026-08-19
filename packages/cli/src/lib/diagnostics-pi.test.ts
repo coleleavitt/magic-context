@@ -49,6 +49,27 @@ describe("sanitizeValue Pi diagnostics redaction", () => {
             api_key: "<REDACTED>",
         });
     });
+
+    it("redacts every embedding header value regardless of header name", () => {
+        const sanitized = sanitizeValue({
+            embedding: {
+                headers: {
+                    "X-Workspace": "workspace-credential",
+                    "X-Region": "us-east-1",
+                },
+            },
+        });
+
+        expect(sanitized).toEqual({
+            embedding: {
+                headers: {
+                    "X-Workspace": "<REDACTED>",
+                    "X-Region": "<REDACTED>",
+                },
+            },
+        });
+        expect(JSON.stringify(sanitized)).not.toContain("workspace-credential");
+    });
 });
 
 describe("collectDiagnostics Pi path resolution", () => {

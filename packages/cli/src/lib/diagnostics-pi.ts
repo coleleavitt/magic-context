@@ -205,16 +205,22 @@ function shouldRedactKey(key: string): boolean {
     return /api[_-]?key|token|secret|password|authorization|cookie/i.test(key);
 }
 
-export function sanitizeValue(value: unknown, key = ""): unknown {
+export function sanitizeValue(value: unknown, keyPath: readonly string[] = []): unknown {
     if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+    const key = keyPath.at(-1) ?? "";
+    if (keyPath.length >= 3 && keyPath.at(-3) === "embedding" && keyPath.at(-2) === "headers") {
+        return "<REDACTED>";
+    }
     if (shouldRedactKey(key)) return "<REDACTED>";
     if (typeof value === "string") return sanitizeString(value);
-    if (Array.isArray(value)) return value.map((entry) => sanitizeValue(entry));
+    if (Array.isArray(value)) {
+        return value.map((entry, index) => sanitizeValue(entry, [...keyPath, String(index)]));
+    }
     if (value && typeof value === "object") {
         return Object.fromEntries(
             Object.entries(value).map(([entryKey, entry]) => [
                 entryKey,
-                sanitizeValue(entry, entryKey),
+                sanitizeValue(entry, [...keyPath, entryKey]),
             ]),
         );
     }

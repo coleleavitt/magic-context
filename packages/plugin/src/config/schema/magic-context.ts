@@ -7,6 +7,7 @@ import type {
     AGENTIC_DREAM_TASKS,
     DreamTaskName,
 } from "../../features/magic-context/dreamer/task-registry";
+import { normalizeEmbeddingHeaders } from "../../shared/embedding-headers";
 import { isValidPromptSurfaceModelKey } from "../../shared/prompt-surface";
 import { AgentOverrideConfigSchema } from "./agent-overrides";
 
@@ -288,6 +289,19 @@ export type HistorianConfig = NonNullable<z.infer<typeof HistorianConfigSchema>>
 
 const EmbeddingFallbackProviderSchema = z.enum(["local", "openai-compatible", "off"]);
 
+const EmbeddingHeadersSchema = z
+    .record(z.string().trim().min(1), z.string().min(1))
+    .superRefine((headers, ctx) => {
+        try {
+            normalizeEmbeddingHeaders(headers);
+        } catch {
+            ctx.addIssue({
+                code: "custom",
+                message: "embedding.headers contains invalid HTTP header names or values",
+            });
+        }
+    });
+
 function expandConfigPath(value: string): string {
     const trimmed = value.trim();
     if (trimmed === "~") return homedir();
@@ -315,12 +329,9 @@ const BaseEmbeddingConfigSchema = z
             .optional()
             .describe("API endpoint URL. Required when provider is openai-compatible."),
         api_key: z.string().optional().describe("API key for remote embedding provider (optional)"),
-        headers: z
-            .record(z.string().trim().min(1), z.string().min(1))
-            .optional()
-            .describe(
-                "USER-LEVEL ONLY custom HTTP headers for openai-compatible embedding requests. Use config variable substitution for secrets (for example Authorization: {env:EMBEDDING_AUTHORIZATION}). Custom Authorization takes precedence over api_key. Project config cannot set headers, and status/doctor diagnostics never print header values.",
-            ),
+        headers: EmbeddingHeadersSchema.optional().describe(
+            "USER-LEVEL ONLY custom HTTP headers for openai-compatible embedding requests. Use config variable substitution for secrets (for example Authorization: {env:EMBEDDING_AUTHORIZATION}). Custom Authorization takes precedence over api_key. Project config cannot set headers, and status/doctor diagnostics never print header values.",
+        ),
         input_type: z
             .string()
             .optional()

@@ -8,6 +8,24 @@ import {
 } from "./magic-context";
 
 describe("MagicContextConfigSchema", () => {
+    it("rejects invalid embedding header names and values without echoing their contents", () => {
+        const secret = "credential-with-newline\nsecond-line";
+        const parsed = MagicContextConfigSchema.safeParse({
+            embedding: {
+                provider: "openai-compatible",
+                endpoint: "https://api.example.com/v1",
+                model: "embedding-model",
+                headers: { "Invalid Header": secret },
+            },
+        });
+
+        expect(parsed.success).toBe(false);
+        if (!parsed.success) {
+            const message = parsed.error.message;
+            expect(message).toContain("embedding.headers");
+            expect(message).not.toContain(secret);
+        }
+    });
     describe("defaults", () => {
         it("applies defaults for an empty config", () => {
             const result = MagicContextConfigSchema.parse({});

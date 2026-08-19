@@ -8,6 +8,7 @@ import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
     type EmbeddingProbeOutcome,
+    InvalidEmbeddingHeadersError,
     parseEmbeddingHeaders,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
@@ -497,7 +498,14 @@ async function checkEmbeddingConfig(
     const endpoint = typeof embedding?.endpoint === "string" ? embedding.endpoint.trim() : "";
     const model = typeof embedding?.model === "string" ? embedding.model.trim() : "";
     const apiKey = typeof embedding?.api_key === "string" ? embedding.api_key : undefined;
-    const headers = parseEmbeddingHeaders(embedding?.headers);
+    let headers: Readonly<Record<string, string>> | undefined;
+    try {
+        headers = parseEmbeddingHeaders(embedding?.headers);
+    } catch (error) {
+        if (!(error instanceof InvalidEmbeddingHeadersError)) throw error;
+        log.error(error.message);
+        return { issues: 1 };
+    }
     const inputType =
         typeof embedding?.input_type === "string" ? embedding.input_type.trim() : undefined;
     const truncateMode =

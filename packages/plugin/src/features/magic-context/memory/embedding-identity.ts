@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import type { EmbeddingConfig } from "../../../config/schema/magic-context";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../../config/schema/magic-context";
+import { normalizeEmbeddingHeaders } from "../../../shared/embedding-headers";
 import { getSynapseLaneIdentity } from "./embedding-synapse";
 import { computeNormalizedHash } from "./normalize-hash";
 
@@ -34,6 +36,12 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
     }
 
     const truncate = config.provider === "openai-compatible" ? config.truncate?.trim() : undefined;
+    const customHeadersFingerprint =
+        config.provider === "openai-compatible" && Object.keys(config.headers ?? {}).length > 0
+            ? createHash("sha256")
+                  .update(JSON.stringify(normalizeEmbeddingHeaders(config.headers ?? {})))
+                  .digest("hex")
+            : undefined;
     // local_dtype changes the produced vectors (a quantized ONNX model emits
     // different embeddings than fp32), so a non-default dtype MUST fold into the
     // model identity — switching dtype re-embeds rather than mixing vector
@@ -52,9 +60,7 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
                   model: config.model.trim(),
                   endpoint: normalizeEndpoint(config.endpoint),
                   apiKeyPresent: Boolean(config.api_key?.trim()),
-                  ...(Object.keys(config.headers ?? {}).length > 0
-                      ? { customHeadersPresent: true }
-                      : {}),
+                  ...(customHeadersFingerprint ? { customHeadersFingerprint } : {}),
                   // input_type changes the embedding vector space (e.g. NIM
                   // 'query' vs 'passage'), so it participates in identity — a
                   // change must re-embed. truncate changes which text an over-long

@@ -1,3 +1,10 @@
+import {
+    InvalidEmbeddingHeadersError,
+    normalizeEmbeddingHeaders,
+} from "../../../shared/embedding-headers";
+
+export { InvalidEmbeddingHeadersError } from "../../../shared/embedding-headers";
+
 /**
  * Live verification of an OpenAI-compatible embeddings endpoint.
  *
@@ -50,7 +57,7 @@ export function buildEmbeddingRequestHeaders(
     customHeaders?: Readonly<Record<string, string>>,
     apiKey?: string,
 ): Headers {
-    const headers = new Headers(customHeaders);
+    const headers = new Headers(normalizeEmbeddingHeaders(customHeaders ?? {}));
     headers.set("content-type", "application/json");
     const normalizedApiKey = apiKey?.trim();
     if (normalizedApiKey && !headers.has("authorization")) {
@@ -62,11 +69,15 @@ export function buildEmbeddingRequestHeaders(
 export function parseEmbeddingHeaders(
     value: unknown,
 ): Readonly<Record<string, string>> | undefined {
-    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    if (value === undefined) return undefined;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new InvalidEmbeddingHeadersError();
+    }
     const entries = Object.entries(value);
     if (!entries.every((entry): entry is [string, string] => typeof entry[1] === "string")) {
-        return undefined;
+        throw new InvalidEmbeddingHeadersError();
     }
+    normalizeEmbeddingHeaders(Object.fromEntries(entries));
     return Object.fromEntries(entries);
 }
 
@@ -98,8 +109,6 @@ export async function probeEmbeddingEndpoint(
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const url = `${endpoint}/embeddings`;
 
-    const headers = buildEmbeddingRequestHeaders(options.headers, options.apiKey);
-
     // Use a short fixed probe string. Providers bill by tokens, so minimal
     // input keeps the check cheap even on metered accounts.
     const inputType = options.inputType?.trim();
@@ -113,6 +122,7 @@ export async function probeEmbeddingEndpoint(
 
     let response: Response;
     try {
+        const headers = buildEmbeddingRequestHeaders(options.headers, options.apiKey);
         response = await fetchImpl(url, {
             method: "POST",
             headers,

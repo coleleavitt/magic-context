@@ -313,6 +313,52 @@ describe("probeEmbeddingEndpoint", () => {
         expect(headers.get("authorization")).toBe("Token custom-authorization");
     });
 
+    it("fails closed on invalid header names without echoing header values", async () => {
+        let fetchCalls = 0;
+        const secret = "benign-name-secret-value";
+
+        const result = await probeEmbeddingEndpoint({
+            endpoint: "https://api.example.com/v1",
+            model: "m",
+            headers: { "Invalid Header": secret },
+            fetch: async () => {
+                fetchCalls++;
+                return new Response();
+            },
+        });
+
+        expect(result).toEqual({
+            kind: "network_error",
+            message:
+                "Invalid embedding.headers: header names and values must be valid HTTP headers",
+        });
+        expect(JSON.stringify(result)).not.toContain(secret);
+        expect(fetchCalls).toBe(0);
+    });
+
+    it("fails closed on invalid header values without echoing the value", async () => {
+        let fetchCalls = 0;
+        const secret = "credential-with-newline\nsecond-line";
+
+        const result = await probeEmbeddingEndpoint({
+            endpoint: "https://api.example.com/v1",
+            model: "m",
+            headers: { "X-Workspace": secret },
+            fetch: async () => {
+                fetchCalls++;
+                return new Response();
+            },
+        });
+
+        expect(result).toEqual({
+            kind: "network_error",
+            message:
+                "Invalid embedding.headers: header names and values must be valid HTTP headers",
+        });
+        expect(JSON.stringify(result)).not.toContain(secret);
+        expect(fetchCalls).toBe(0);
+    });
+
     it("omits authorization header when no apiKey", async () => {
         const capture: FetchCapture = {};
         const fetch = mockFetch(
