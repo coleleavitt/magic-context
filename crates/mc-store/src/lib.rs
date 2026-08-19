@@ -16611,17 +16611,16 @@ fn memory_feed_snapshot(
                FROM mc_memory_evidence WHERE memory_id = ?1
                ORDER BY content_hash, source_session_id",
         )?;
-        statement
-            .query_map([memory.id], |row| {
-                Ok(ModuleMemoryEvidenceRow {
-                    content_hash: row.get(0)?,
-                    source_session_id: row.get(1)?,
-                    source_message_id: row.get(2)?,
-                    source_type: row.get(3)?,
-                    observed_at: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
+        let rows = statement.query_map([memory.id], |row| {
+            Ok(ModuleMemoryEvidenceRow {
+                content_hash: row.get(0)?,
+                source_session_id: row.get(1)?,
+                source_message_id: row.get(2)?,
+                source_type: row.get(3)?,
+                observed_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
     };
     Ok(serde_json::json!({
         "id": memory.id,
@@ -20775,9 +20774,9 @@ mod tests {
                 let mut statement = conn.prepare(
                     "SELECT content_hash FROM mc_memory_evidence WHERE memory_id = ?1 ORDER BY observed_at",
                 )?;
-                statement
-                    .query_map([memory_id], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()
+                let rows =
+                    statement.query_map([memory_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()
             })
             .unwrap();
         assert_eq!(
@@ -20917,7 +20916,7 @@ mod tests {
             .inner
             .with_conn_fenced(|tx| replace_authority_memories_tx(tx, "/repo", &[sparse]))
             .unwrap();
-        let evidence_count = store
+        let evidence_count: i64 = store
             .inner
             .with_conn(|conn| {
                 conn.query_row("SELECT COUNT(*) FROM mc_memory_evidence", [], |row| {
@@ -20935,7 +20934,7 @@ mod tests {
             .inner
             .with_conn_fenced(|tx| replace_authority_memories_tx(tx, "/repo", &[clear]))
             .unwrap();
-        let evidence_count = store
+        let evidence_count: i64 = store
             .inner
             .with_conn(|conn| {
                 conn.query_row("SELECT COUNT(*) FROM mc_memory_evidence", [], |row| {
