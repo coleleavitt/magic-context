@@ -13,12 +13,12 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { EMPTY_TASK_OUTPUT_SENTINEL } from "./empty-task-output";
 import {
     createChatMessageHook,
     createEventHook,
     createToolExecuteAfterHook,
 } from "./hook-handlers";
-import { EMPTY_TASK_OUTPUT_SENTINEL } from "./empty-task-output";
 
 function createTestDb(): Database {
     const db = new Database(":memory:");
