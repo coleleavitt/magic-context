@@ -17,12 +17,15 @@ import type { ContextDatabase } from "@magic-context/core/features/magic-context
 import { startDreamScheduleTimer as defaultStartDreamScheduleTimer } from "@magic-context/core/plugin/dream-timer";
 import type { ModelHarness } from "@magic-context/core/shared/model-resolution";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
+import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { PiSubagentRunner } from "../subagent-runner";
 import { createPiPrimerRawProviderFactory } from "./primer-raw-provider-pi";
 import { PiRetrospectiveRawProvider } from "./retrospective-raw-provider-pi";
 
 export interface PiDreamerOptions {
 	db: ContextDatabase;
+	/** Injected child execution seam shared with historian, sidekick, and commands. */
+	runner?: SubagentRunner;
 	projectDir: string;
 	projectIdentity: string;
 	/** One stable token per full Pi extension instance. */
@@ -147,8 +150,9 @@ const inFlightDreams = (() => {
 	return dreams;
 })();
 let sessionCounter = 0;
-let piSubagentRunnerFactory: PiSubagentRunnerFactory = () =>
+const defaultPiSubagentRunnerFactory: PiSubagentRunnerFactory = () =>
 	new PiSubagentRunner();
+let piSubagentRunnerFactory = defaultPiSubagentRunnerFactory;
 let startDreamScheduleTimerFn: typeof defaultStartDreamScheduleTimer =
 	defaultStartDreamScheduleTimer;
 
@@ -402,7 +406,11 @@ function createPiDreamerClient(
 	onAdjunctsRefreshNeeded = opts.onAdjunctsRefreshNeeded,
 	isRegistrationOwnerActive: () => boolean = () => true,
 ): DreamTimerClient {
-	const runner = piSubagentRunnerFactory();
+	// An explicit test factory remains authoritative; production uses the injected deep runner.
+	const runner =
+		piSubagentRunnerFactory === defaultPiSubagentRunnerFactory
+			? (opts.runner ?? piSubagentRunnerFactory())
+			: piSubagentRunnerFactory();
 	const assertRegistrationOwnerActive = (): void => {
 		if (!isRegistrationOwnerActive()) {
 			throw new Error(
@@ -650,7 +658,7 @@ export const __test = {
 		sessionsById.clear();
 		inFlightDreams.clear();
 		sessionCounter = 0;
-		piSubagentRunnerFactory = () => new PiSubagentRunner();
+		piSubagentRunnerFactory = defaultPiSubagentRunnerFactory;
 		startDreamScheduleTimerFn = defaultStartDreamScheduleTimer;
 	},
 };

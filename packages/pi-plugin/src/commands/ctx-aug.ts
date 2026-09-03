@@ -48,6 +48,7 @@ import {
 } from "@magic-context/core/features/magic-context/sidekick/core";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 
+import type { HostBoundChildRunner } from "../prime-child-runner";
 import { PiSubagentRunner } from "../subagent-runner";
 
 /**
@@ -89,12 +90,14 @@ type ResolveSidekickConfig = (ctx: {
 export function registerCtxAugCommand(
 	pi: ExtensionAPI,
 	config: PiSidekickConfig | undefined | ResolveSidekickConfig,
+	runner?: HostBoundChildRunner,
 ): void {
-	const runner = new PiSubagentRunner();
+	const childRunner = runner ?? new PiSubagentRunner();
 
 	pi.registerCommand("ctx-aug", {
 		description: "Augment your prompt with relevant project context (sidekick)",
 		handler: async (args, ctx) => {
+			if ("bindHost" in childRunner) childRunner.bindHost(ctx);
 			const prompt = args.trim();
 
 			// Use Pi's session entry IDs for log correlation. The session
@@ -154,7 +157,7 @@ export function registerCtxAugCommand(
 			}
 			sessionLog(sessionLabel, "/ctx-aug: project identity", projectIdentity);
 
-			const result = await runner.run({
+			const result = await childRunner.run({
 				agent: "sidekick",
 				systemPrompt: withContentLanguageDirective(
 					currentConfig.systemPrompt ?? SIDEKICK_SYSTEM_PROMPT,

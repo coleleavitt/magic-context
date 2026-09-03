@@ -412,6 +412,12 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
             "Ignoring pi.subagent_extensions from project config (security: only user-level config may choose extensions loaded by Pi subagent children).",
         );
     }
+    if (isPlainObject(pi) && "run_agent_mutation_tools" in pi) {
+        delete pi.run_agent_mutation_tools;
+        warnings.push(
+            "Ignoring pi.run_agent_mutation_tools from project config (security: only user-level config may grant Prime mutation-dreamer capabilities).",
+        );
+    }
 
     for (const field of ["subc", "shadow_embedding"] as const) {
         if (field in projectRaw) {

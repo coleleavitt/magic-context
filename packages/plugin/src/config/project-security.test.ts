@@ -140,9 +140,12 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warnings.some((w) => w.includes("storage.enforce_private_permissions"))).toBe(true);
     });
 
-    it("strips Pi subagent extension allowlists from project config", () => {
+    it("strips Pi child capability allowlists from project config", () => {
         const raw: Record<string, unknown> = {
-            pi: { subagent_extensions: ["./repo-controlled-extension.ts"] },
+            pi: {
+                subagent_extensions: ["./repo-controlled-extension.ts"],
+                run_agent_mutation_tools: ["ipython"],
+            },
             dreamer: { model: "x" },
         };
 
@@ -151,6 +154,7 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(raw.pi).toEqual({});
         expect(raw.dreamer).toEqual({ model: "x" });
         expect(warnings.some((w) => w.includes("pi.subagent_extensions"))).toBe(true);
+        expect(warnings.some((w) => w.includes("pi.run_agent_mutation_tools"))).toBe(true);
     });
 
     it("strips embedding destination fields from project config but keeps tuning fields", () => {

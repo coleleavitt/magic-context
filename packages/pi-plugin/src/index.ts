@@ -105,6 +105,7 @@ import {
 } from "@magic-context/core/shared/prompt-surface-runtime";
 import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
+import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { reloadWindowOverlay } from "@magic-context/core/shared/window-geometry";
 
 import { handlePiCloneSessionStart } from "./clone-inheritance";
@@ -173,6 +174,7 @@ import { handlePiProviderFailure } from "./provider-error-recovery-pi";
 import { readPiSessionMessages } from "./read-session-pi";
 import { registerStatusLine, updateStatusLine } from "./status-line";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
+import { PrimePreferredChildRunner } from "./prime-child-runner";
 import {
 	configurePiSubagentExtensions,
 	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
@@ -711,6 +713,7 @@ export function resolveSidekickFromConfig(
 export function resolveHistorianFromConfig(
 	config: MagicContextConfig,
 	harness: PiHarnessKind = PI_HARNESS_KIND,
+	runner: SubagentRunner = new PiSubagentRunner(),
 ): PiHistorianOptions | undefined {
 	// Defensive: schema declares `historian` required with default {}, but the
 	// runtime config can come from a malformed JSONC merge that drops the
@@ -733,7 +736,7 @@ export function resolveHistorianFromConfig(
 	const fallbackModels = resolved.fallbacks;
 
 	return {
-		runner: new PiSubagentRunner(),
+		runner,
 		model,
 		fallbackModels,
 		historianChunkTokens,
@@ -1074,6 +1077,8 @@ async function startPiMagicContextRuntime(
 	// The allowlist is user-tier only, so configure all child runners once at
 	// boot. Project config is stripped before this merged config is returned.
 	configurePiSubagentExtensions(config.pi?.subagent_extensions);
+	const childRunner = new PrimePreferredChildRunner(new PiSubagentRunner());
+	childRunner.configure({ mutationTools: config.pi?.run_agent_mutation_tools });
 	logPiConfigLoad({
 		dir: projectDir,
 		loadedFromPaths,
@@ -1197,7 +1202,7 @@ async function startPiMagicContextRuntime(
 			hasDeprecatedProtectedTags?: boolean;
 		},
 	): ResolvedPiProjectDeps {
-		const hist = resolveHistorianFromConfig(cfg);
+		const hist = resolveHistorianFromConfig(cfg, PI_HARNESS_KIND, childRunner);
 		if (hist) {
 			hist.onStatusChange = (ctx) => {
 				updateStatusLine(ctx, {
@@ -1260,6 +1265,7 @@ async function startPiMagicContextRuntime(
 	function resolveCurrentProjectDeps(ctx: {
 		cwd: string;
 	}): ResolvedPiProjectDeps {
+		childRunner.bindHost(ctx);
 		return resolveProjectDepsForDir(ctx.cwd);
 	}
 
@@ -1295,6 +1301,7 @@ async function startPiMagicContextRuntime(
 		}
 		registerPiDreamerProject({
 			db,
+			runner: childRunner,
 			projectDir: current.projectDir,
 			projectIdentity: current.projectIdentity,
 			registrationOwner: dreamerRegistrationOwner,
@@ -1442,6 +1449,7 @@ async function startPiMagicContextRuntime(
 	registerCtxAugCommand(
 		pi,
 		(ctx) => resolveCurrentProjectDeps(ctx).sidekickConfig,
+		childRunner,
 	);
 	info(
 		bootProjectDeps.sidekickConfig
@@ -1461,9 +1469,9 @@ async function startPiMagicContextRuntime(
 	// Step 5c: register the diagnostic/admin slash commands so Pi reaches
 	// command-surface parity with the OpenCode plugin. Their user-facing output
 	// uses model-invisible custom entries when the runtime can render them.
-	const recompRunner = new PiSubagentRunner();
-	const wrapupRunner = new PiSubagentRunner();
-	const upgradeRunner = new PiSubagentRunner();
+	const recompRunner = childRunner;
+	const wrapupRunner = childRunner;
+	const upgradeRunner = childRunner;
 	registerCtxStatusCommand(pi, {
 		db,
 		projectIdentity,

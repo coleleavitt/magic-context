@@ -52,6 +52,12 @@ export const PiConfigSchema = z
             .describe(
                 "User-only allowlist of Pi extensions for Magic Context subagent children. When set, children use --no-extensions and load only these entries (plus Magic Context's scoped child extension where applicable). Relative paths resolve from ~/.pi/agent, matching Pi's settings.json package location. Unset preserves normal Pi extension discovery.",
             ),
+        run_agent_mutation_tools: z
+            .array(z.string().trim().min(1))
+            .optional()
+            .describe(
+                "User-only exact Prime ctx.runAgent tool allowlist for mutation dreamers. Unset keeps those tasks on the portable subprocess runner. Legacy read/bash/edit names are never broadened to ipython.",
+            ),
     })
     .optional();
 export type PiConfig = NonNullable<z.infer<typeof PiConfigSchema>>;
