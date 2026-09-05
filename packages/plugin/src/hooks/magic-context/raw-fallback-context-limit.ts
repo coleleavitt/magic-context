@@ -1,7 +1,7 @@
 import { ENGINE_RECONNECTING_USER_MESSAGE } from "./emergency-fail-closed";
 
 export class RawFallbackContextLimitError extends Error {
-    readonly code = "RAW_FALLBACK_CONTEXT_LIMIT";
+    readonly code = "EXTENSION_CONTEXT_BLOCKED";
     readonly recoverable = true;
 
     constructor(

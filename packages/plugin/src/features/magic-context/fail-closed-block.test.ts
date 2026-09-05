@@ -250,7 +250,7 @@ describe("createFailClosedBlockingError", () => {
     it("sets a stable name and code for wrapper instanceof checks", () => {
         const error = createFailClosedBlockingError(fenceReason);
         expect(error.name).toBe("FailClosedBlockingError");
-        expect(error.code).toBe("FAIL_CLOSED_BLOCKING");
+        expect(error.code).toBe("EXTENSION_CONTEXT_BLOCKED");
         expect(isFailClosedBlockingError(error)).toBe(true);
     });
 });

@@ -32,11 +32,16 @@ export interface PrimeRunAgentResult {
 }
 
 interface PrimeRunAgentContext {
-	runAgent(request: PrimeRunAgentRequest, options?: PrimeRunAgentOptions): Promise<PrimeRunAgentResult>;
+	runAgent(
+		request: PrimeRunAgentRequest,
+		options?: PrimeRunAgentOptions,
+	): Promise<PrimeRunAgentResult>;
 }
 
 /** Published Pi 0.83 does not declare Prime's extension. Keep the feature test local and structural. */
-export function hasPrimeRunAgent(context: unknown): context is PrimeRunAgentContext {
+export function hasPrimeRunAgent(
+	context: unknown,
+): context is PrimeRunAgentContext {
 	if (typeof context !== "object" || context === null) return false;
 	return typeof (context as { runAgent?: unknown }).runAgent === "function";
 }
@@ -56,8 +61,25 @@ const NO_TOOL_AGENTS = new Set([
 
 const REPO_INVESTIGATOR_TOOLS: Readonly<Record<string, readonly string[]>> = {
 	sidekick: ["read", "grep", "find", "ls", "ctx_search", "aft_search"],
-	"dreamer-primer-investigator": ["read", "grep", "find", "ls", "ctx_search", "aft_outline", "aft_zoom", "aft_search"],
-	"dreamer-memory-mapper": ["read", "grep", "find", "ls", "aft_outline", "aft_zoom", "aft_search"],
+	"dreamer-primer-investigator": [
+		"read",
+		"grep",
+		"find",
+		"ls",
+		"ctx_search",
+		"aft_outline",
+		"aft_zoom",
+		"aft_search",
+	],
+	"dreamer-memory-mapper": [
+		"read",
+		"grep",
+		"find",
+		"ls",
+		"aft_outline",
+		"aft_zoom",
+		"aft_search",
+	],
 };
 
 const MUTATION_AGENTS = new Set([
@@ -88,11 +110,34 @@ function failure(
 	status: PrimeRunAgentResult["status"],
 	error: string | undefined,
 	durationMs: number,
-): SubagentRunResult {
-	if (status === "aborted") return { ok: false, reason: "abort", error: error ?? "Prime child agent aborted", durationMs };
-	if (status === "turn_limit") return { ok: false, reason: "truncated", error: error ?? "Prime child agent reached its turn limit", durationMs };
-	if (status === "budget_exceeded") return { ok: false, reason: "truncated", error: error ?? "Prime child agent exceeded its token budget", durationMs };
-	return { ok: false, reason: "model_failed", error: error ?? "Prime child agent failed", durationMs };
+): Extract<SubagentRunResult, { ok: false }> {
+	if (status === "aborted")
+		return {
+			ok: false,
+			reason: "abort",
+			error: error ?? "Prime child agent aborted",
+			durationMs,
+		};
+	if (status === "turn_limit")
+		return {
+			ok: false,
+			reason: "truncated",
+			error: error ?? "Prime child agent reached its turn limit",
+			durationMs,
+		};
+	if (status === "budget_exceeded")
+		return {
+			ok: false,
+			reason: "truncated",
+			error: error ?? "Prime child agent exceeded its token budget",
+			durationMs,
+		};
+	return {
+		ok: false,
+		reason: "model_failed",
+		error: error ?? "Prime child agent failed",
+		durationMs,
+	};
 }
 
 /** One deep execution seam. Prime is preferred when safely scoped; portable Pi CLI remains the fallback. */
@@ -117,43 +162,138 @@ export class PrimePreferredChildRunner implements HostBoundChildRunner {
 		if (!host || tools === undefined) return this.fallback.run(options);
 		const startedAt = Date.now();
 		if (options.signal?.aborted) {
-			return { ok: false, reason: "abort", error: "Prime child agent aborted by caller", durationMs: 0 };
+			return {
+				ok: false,
+				reason: "abort",
+				error: "Prime child agent aborted by caller",
+				durationMs: 0,
+			};
 		}
 		const timeoutController = new AbortController();
 		const abort = () => timeoutController.abort(options.signal?.reason);
 		options.signal?.addEventListener("abort", abort, { once: true });
-		const timer = options.timeoutMs === undefined
-			? undefined
-			: setTimeout(() => timeoutController.abort(new Error("timeout")), options.timeoutMs);
+		const timer =
+			options.timeoutMs === undefined
+				? undefined
+				: setTimeout(
+						() => timeoutController.abort(new Error("timeout")),
+						options.timeoutMs,
+					);
+		const attempts: string[] = [];
+		const seen = new Set<string>();
+		for (const candidate of [
+			options.model,
+			...(options.fallbackModels ?? []).map((entry) =>
+				typeof entry === "string" ? entry : entry.model,
+			),
+		]) {
+			if (!candidate || seen.has(candidate)) continue;
+			seen.add(candidate);
+			attempts.push(candidate);
+		}
+		if (attempts.length === 0) attempts.push("");
+		const nativeFailures: string[] = [];
 		try {
-			const result = await host.runAgent(
-				{ prompt: promptFor(options), ...(options.model ? { model: options.model } : {}) },
-				{
-					tools,
-					signal: timeoutController.signal,
-					maxTurns: tools === "none" ? 1 : MUTATION_AGENTS.has(options.agent) ? 12 : 8,
-					...(options.maxOutputTokens === undefined ? {} : { tokenBudget: options.maxOutputTokens }),
-				},
-			);
-			const durationMs = Date.now() - startedAt;
-			if (result.status !== "completed") {
-				if (timeoutController.signal.aborted && !options.signal?.aborted) {
-					return { ok: false, reason: "timeout", error: `Prime child agent timed out after ${options.timeoutMs}ms`, durationMs };
+			for (const model of attempts) {
+				let failed: Extract<SubagentRunResult, { ok: false }>;
+				try {
+					const result = await host.runAgent(
+						{ prompt: promptFor(options), ...(model ? { model } : {}) },
+						{
+							tools,
+							signal: timeoutController.signal,
+							maxTurns:
+								tools === "none"
+									? 1
+									: MUTATION_AGENTS.has(options.agent)
+										? 12
+										: 8,
+							...(options.maxOutputTokens === undefined
+								? {}
+								: { tokenBudget: options.maxOutputTokens }),
+						},
+					);
+					const durationMs = Date.now() - startedAt;
+					if (result.status === "completed") {
+						const assistantText = result.output.trim();
+						if (assistantText.length > 0) {
+							return {
+								ok: true,
+								assistantText,
+								durationMs,
+								toolCallCount: result.toolCalls,
+								meta: {
+									status: result.status,
+									model: result.model,
+									turns: result.turns,
+									usage: result.usage,
+								},
+							};
+						}
+						failed = {
+							ok: false,
+							reason: "no_assistant",
+							error: "Prime child agent completed without assistant output",
+							durationMs,
+						};
+					} else if (timeoutController.signal.aborted) {
+						return options.signal?.aborted
+							? {
+									ok: false,
+									reason: "abort",
+									error: "Prime child agent aborted by caller",
+									durationMs,
+								}
+							: {
+									ok: false,
+									reason: "timeout",
+									error: `Prime child agent timed out after ${options.timeoutMs}ms`,
+									durationMs,
+								};
+					} else {
+						failed = failure(result.status, result.error, durationMs);
+					}
+				} catch (error) {
+					const durationMs = Date.now() - startedAt;
+					if (timeoutController.signal.aborted) {
+						return options.signal?.aborted
+							? {
+									ok: false,
+									reason: "abort",
+									error: "Prime child agent aborted by caller",
+									durationMs,
+								}
+							: {
+									ok: false,
+									reason: "timeout",
+									error: `Prime child agent timed out after ${options.timeoutMs}ms`,
+									durationMs,
+								};
+					}
+					failed = {
+						ok: false,
+						reason: "model_failed",
+						error: error instanceof Error ? error.message : String(error),
+						durationMs,
+					};
 				}
-				return failure(result.status, result.error, durationMs);
+				nativeFailures.push(`${model || "host default"}: ${failed.error}`);
+				if (
+					failed.reason !== "model_failed" &&
+					failed.reason !== "no_assistant"
+				)
+					return failed;
 			}
-			const assistantText = result.output.trim();
-			return assistantText.length === 0
-				? { ok: false, reason: "no_assistant", error: "Prime child agent completed without assistant output", durationMs }
-				: { ok: true, assistantText, durationMs, toolCallCount: result.toolCalls, meta: { status: result.status, model: result.model, turns: result.turns, usage: result.usage } };
-		} catch (error) {
-			const durationMs = Date.now() - startedAt;
-			if (timeoutController.signal.aborted) {
-				return options.signal?.aborted
-					? { ok: false, reason: "abort", error: "Prime child agent aborted by caller", durationMs }
-					: { ok: false, reason: "timeout", error: `Prime child agent timed out after ${options.timeoutMs}ms`, durationMs };
-			}
-			return { ok: false, reason: "model_failed", error: error instanceof Error ? error.message : String(error), durationMs };
+
+			// Native model resolution/authentication can differ from portable Pi CLI
+			// resolution. Preserve that escape hatch only for safe, pre-answer failures.
+			const portable = await this.fallback.run(options);
+			if (portable.ok) return portable;
+			return {
+				...portable,
+				error: `Prime attempts failed (${nativeFailures.join("; ")}); portable fallback failed: ${portable.error}`,
+				durationMs: Date.now() - startedAt,
+			};
 		} finally {
 			if (timer !== undefined) clearTimeout(timer);
 			options.signal?.removeEventListener("abort", abort);
@@ -165,8 +305,11 @@ export class PrimePreferredChildRunner implements HostBoundChildRunner {
 		const investigator = REPO_INVESTIGATOR_TOOLS[agent];
 		if (investigator) return { allow: [...investigator] };
 		if (!MUTATION_AGENTS.has(agent)) return "none";
-		if (!this.mutationTools || this.mutationTools.length === 0) return undefined;
+		if (!this.mutationTools || this.mutationTools.length === 0)
+			return undefined;
 		// Exact configured names only. Never broaden legacy read/bash/edit into Prime's ipython.
-		return { allow: [...this.mutationTools.filter((tool) => tool !== "ipython")] };
+		return {
+			allow: [...this.mutationTools.filter((tool) => tool !== "ipython")],
+		};
 	}
 }

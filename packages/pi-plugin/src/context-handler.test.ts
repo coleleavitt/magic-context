@@ -5032,3 +5032,46 @@ describe("emergency-scaled boundary retry derives its band from the execute thre
 		expect(escalationBands(80).forceMaterializationPercentage).toBe(85);
 	});
 });
+
+describe("Pi emergency historian ordering and fail-closed parity", () => {
+	it("preserves synthetic recovery pressure in the historian snapshot", () => {
+		const src = readFileSync(
+			join(import.meta.dir, "context-handler.ts"),
+			"utf8",
+		);
+		const mainBump = src.indexOf(
+			"usagePercentage = Math.max(usagePercentage, 95)",
+		);
+		const schedule = src.indexOf("maybeFireHistorian({", mainBump);
+		expect(mainBump).toBeGreaterThan(0);
+		expect(schedule).toBeGreaterThan(mainBump);
+		expect(src.slice(schedule, schedule + 500)).toContain("pressureSnapshot");
+	});
+
+	it("force-starts an eligible historian before the >=95% wait", () => {
+		const src = readFileSync(
+			join(import.meta.dir, "context-handler.ts"),
+			"utf8",
+		);
+		const emergency = src.indexOf("if (isEmergency)");
+		const wait = src.indexOf("await withTimeout(histPromise", emergency);
+		expect(src.slice(emergency, wait)).toContain("maybeFireHistorian");
+	});
+
+	it("uses the shared raw-fallback context-limit signal instead of raw pass-through", () => {
+		const src = readFileSync(
+			join(import.meta.dir, "context-handler.ts"),
+			"utf8",
+		);
+		expect(src).toContain("new RawFallbackContextLimitError");
+	});
+
+	it("exposes the host-neutral structural blocking code", () => {
+		const blocked =
+			new (require("@magic-context/core/hooks/magic-context/raw-fallback-context-limit").RawFallbackContextLimitError)(
+				101,
+				100,
+			);
+		expect(blocked.code).toBe("EXTENSION_CONTEXT_BLOCKED");
+	});
+});

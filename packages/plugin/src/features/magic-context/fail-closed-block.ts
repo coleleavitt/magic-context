@@ -69,7 +69,7 @@ export type FailClosedReason =
       };
 
 export class FailClosedBlockingError extends Error {
-    readonly code = "FAIL_CLOSED_BLOCKING";
+    readonly code = "EXTENSION_CONTEXT_BLOCKED";
     readonly reason: FailClosedReason;
 
     constructor(message: string, reason: FailClosedReason, options?: { cause?: unknown }) {
@@ -257,7 +257,7 @@ export function isFailClosedBlockingError(error: unknown): error is FailClosedBl
         (typeof error === "object" &&
             error !== null &&
             (error as { name?: string }).name === "FailClosedBlockingError" &&
-            (error as { code?: string }).code === "FAIL_CLOSED_BLOCKING")
+            (error as { code?: string }).code === "EXTENSION_CONTEXT_BLOCKED")
     );
 }
 

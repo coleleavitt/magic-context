@@ -155,6 +155,7 @@ import {
 	resolveBoundaryContext,
 	resolveProtectedTailBoundary,
 } from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
+import { RawFallbackContextLimitError } from "@magic-context/core/hooks/magic-context/raw-fallback-context-limit";
 import {
 	readRawSessionMessages,
 	setRawMessageProvider,
@@ -2173,6 +2174,9 @@ export function registerPiContextHandler(
 		let lkgPassSnapshot: PiLkgPassSnapshot | undefined;
 		let lkgCompactionOff = baseOptions.compactionOff === true;
 		let lkgEmergencyRecoveryArmed = false;
+		let finalUsagePercentage = 0;
+		let finalInputTokens = 0;
+		let finalContextLimit: number | undefined;
 		try {
 			const tFindSession = performance.now();
 			const sessionId = resolveSessionId(ctx);
@@ -2656,6 +2660,9 @@ export function registerPiContextHandler(
 					usableContextLimit: usageContextLimit,
 				}));
 			const realUsagePercentageBeforeEmergencyBump = usagePercentage;
+			finalUsagePercentage = usagePercentage;
+			finalInputTokens = usageInputTokens;
+			finalContextLimit = windowGeometry?.usableHard ?? usageContextLimit;
 			// Emergency bump LAST so it floors recovery pressure without capping
 			// a higher live forward-pressure reading.
 			if (needsEmergencyBump) {
@@ -2867,9 +2874,26 @@ export function registerPiContextHandler(
 					);
 				}
 
-				// Wait for in-flight historian (if any) so its drops can
-				// be applied on this pass. Bounded so a hung historian
-				// doesn't stall the user's turn.
+				// At >=95%, start an eligible historian before looking up the wait
+				// promise. Scheduling later in the pass leaves a detached-trigger race:
+				// the emergency branch observes no run, skips the wait, and sends raw.
+				if (options.historian) {
+					maybeFireHistorian({
+						pi,
+						ctx,
+						sessionId,
+						db: options.db,
+						historian: options.historian,
+						isFirstContextPassForSession,
+						rawMessageProvider,
+						taggerFloor,
+						pressureSnapshot: {
+							percentage: usagePercentage,
+							inputTokens: usageInputTokens,
+						},
+					});
+				}
+
 				const histPromise = inFlightHistorian.get(sessionId);
 				if (histPromise) {
 					try {
@@ -3109,6 +3133,10 @@ export function registerPiContextHandler(
 					activeTags: result.activeTags,
 					rawMessageProvider,
 					taggerFloor,
+					pressureSnapshot: {
+						percentage: usagePercentage,
+						inputTokens: usageInputTokens,
+					},
 				});
 			}
 			logTransformTiming(
@@ -3544,8 +3572,22 @@ export function registerPiContextHandler(
 					summarizeTransformError(err),
 				);
 			}
-			// Fall through with no mutation — Pi proceeds with original
-			// messages, equivalent to a no-op transform pass.
+			// Raw pass-through is unsafe once the host already reports a full
+			// context. Use the shared recoverable signal so Pi/OMP can retry instead
+			// of sending the known-over-limit unmodified history.
+			if (
+				!lkgCompactionOff &&
+				sessionIdForError &&
+				finalUsagePercentage >= EMERGENCY_BLOCK_PERCENTAGE &&
+				finalContextLimit !== undefined &&
+				finalInputTokens > finalContextLimit
+			) {
+				throw new RawFallbackContextLimitError(
+					finalInputTokens,
+					finalContextLimit,
+					{ cause: err },
+				);
+			}
 			return;
 		}
 	});
@@ -4005,6 +4047,8 @@ function maybeFireHistorian(args: {
 		readMessages: () => ReturnType<typeof readPiSessionMessages>;
 	};
 	taggerFloor?: number;
+	/** Authoritative pressure already resolved by the owning transform pass. */
+	pressureSnapshot?: { percentage: number; inputTokens: number };
 }): void {
 	const { ctx, sessionId, db, historian, isFirstContextPassForSession } = args;
 
@@ -4116,6 +4160,18 @@ function maybeFireHistorian(args: {
 			liveInputTokens: piUsage?.tokens,
 			usableContextLimit: usageContextLimit,
 		});
+		if (args.pressureSnapshot) {
+			usage = {
+				percentage: Math.max(
+					usage.percentage,
+					args.pressureSnapshot.percentage,
+				),
+				inputTokens: Math.max(
+					usage.inputTokens,
+					args.pressureSnapshot.inputTokens,
+				),
+			};
+		}
 		sessionLog(
 			sessionId,
 			`historian trigger eval: usage=${usage.percentage.toFixed(1)}% (${usage.inputTokens} tokens) [${usageSource}], checking trigger...`,

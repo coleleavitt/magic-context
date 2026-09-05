@@ -8,7 +8,7 @@ export const ENGINE_RECONNECTING_USER_MESSAGE =
     "Magic Context's engine is reconnecting. Send your message again in a few seconds.";
 
 export class EmergencyFailClosedError extends Error {
-    readonly code = "EMERGENCY_FAIL_CLOSED";
+    readonly code = "EXTENSION_CONTEXT_BLOCKED";
 
     constructor(message: string, options?: { cause?: unknown }) {
         super(message, options);

@@ -5430,7 +5430,7 @@ describe("raw fallback refusal copy and early abort", () => {
         expect(error.message).not.toMatch(/\d/);
         expect(error.estimatedTokens).toBe(5_493_229);
         expect(error.contextLimitTokens).toBe(1_000_000);
-        expect(error.code).toBe("RAW_FALLBACK_CONTEXT_LIMIT");
+        expect(error.code).toBe("EXTENSION_CONTEXT_BLOCKED");
         expect(error.recoverable).toBe(true);
     });
 
@@ -5531,7 +5531,7 @@ describe("raw fallback refusal copy and early abort", () => {
         const error = (await failure) as EmergencyFailClosedError;
         expect(error.message).toBe(ENGINE_RECONNECTING_USER_MESSAGE);
         expect(error.message).not.toMatch(/\d/);
-        expect(error.code).toBe("EMERGENCY_FAIL_CLOSED");
+        expect(error.code).toBe("EXTENSION_CONTEXT_BLOCKED");
     });
 
     it("notifies parked sessions with the calm reconnect line", async () => {
