@@ -970,9 +970,18 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			) {
 				for (let i = 0; i < fallbackChain.length; i += 1) {
 					const candidate = fallbackChain[i];
+					// Name the failure that forces the escalation: without it a chain of
+					// 1-2 minute fallbacks (e.g. every candidate reported turn_limit) is
+					// indistinguishable from real model failures in the log.
+					const why =
+						validatedPass.kind === "validation-failed"
+							? `validation failed: ${validatedPass.error}`
+							: validatedPass.kind === "spawn-failed"
+								? `subagent run failed (${validatedPass.reason}): ${validatedPass.error}`
+								: "historian returned no usable text";
 					sessionLog(
 						sessionId,
-						`historian: escalating to ${candidate.kind === "session" ? "session-model last resort" : "configured fallback model"} ${candidate.entry.model}`,
+						`historian: escalating to ${candidate.kind === "session" ? "session-model last resort" : "configured fallback model"} ${candidate.entry.model} after ${why}`,
 					);
 					const fbResult = await runHistorianSubagentWithTransientRetries({
 						runner,
