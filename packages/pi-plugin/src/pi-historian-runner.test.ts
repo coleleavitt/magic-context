@@ -1,4 +1,4 @@
-import { describe, expect, it, mock, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { acquireCompartmentLease } from "@magic-context/core/features/magic-context/compartment-lease";
 import {
 	appendCompartments,
@@ -30,6 +30,7 @@ import {
 	clearPiHistorianAlertState,
 	runPiHistorian,
 } from "./pi-historian-runner";
+import { configureTraceApiForTests } from "./pi-trace";
 import { createTestDb } from "./test-utils.test";
 
 describe("buildPiCompactionSummary", () => {
@@ -1071,5 +1072,191 @@ describe("runPiHistorian", () => {
 				closeQuietly(db);
 			}
 		});
+	});
+});
+
+describe("historian trace spans", () => {
+	afterEach(() => configureTraceApiForTests(undefined));
+
+	interface RecordedSpan {
+		name: string;
+		attrs: Record<string, unknown>;
+		parent: string | null;
+		errors: unknown[];
+	}
+
+	/** Fake host trace api: records every span with its attrs and parent name. */
+	function recordTraceSpans(): RecordedSpan[] {
+		const spans: RecordedSpan[] = [];
+		const stack: RecordedSpan[] = [];
+		const handleFor = (span: RecordedSpan) => ({
+			setAttributes: (more: Record<string, unknown>) => {
+				Object.assign(span.attrs, more);
+			},
+			recordError: (error: unknown) => {
+				span.errors.push(error);
+			},
+		});
+		configureTraceApiForTests({
+			withSpan: (name, attrs, fn) => {
+				const span: RecordedSpan = {
+					name,
+					attrs: { ...attrs },
+					parent: stack[stack.length - 1]?.name ?? null,
+					errors: [],
+				};
+				spans.push(span);
+				stack.push(span);
+				const out = fn(handleFor(span));
+				return Promise.resolve(out).finally(() => {
+					stack.splice(stack.indexOf(span), 1);
+				}) as ReturnType<typeof fn>;
+			},
+			currentSpan: () => {
+				const top = stack[stack.length - 1];
+				return top ? handleFor(top) : undefined;
+			},
+		});
+		return spans;
+	}
+
+	it("traces run, subagent, validate and publish phases for a successful run", async () => {
+		const spans = recordTraceSpans();
+		const { db, runner } = await runHistorianWith({
+			outputs: [successXml()],
+		});
+		try {
+			expect(runner.run).toHaveBeenCalledTimes(1);
+			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
+			expect(spans.map((s) => [s.name, s.parent])).toEqual([
+				["historian.run", null],
+				["historian.subagent", "historian.run"],
+				["historian.validate", "historian.subagent"],
+				["historian.publish", "historian.run"],
+			]);
+			const [run, subagent, validate, publish] = spans;
+			expect(run?.attrs).toEqual({
+				"historian.session_id": "ses-historian",
+				"historian.model": "test/model",
+				"historian.chunk_start": 1,
+				"historian.chunk_end": 2,
+				"historian.messages": 2,
+				"historian.status": "success",
+				"historian.compartments": 1,
+				"historian.facts": 1,
+			});
+			expect(subagent?.attrs).toEqual({
+				"historian.pass": "first",
+				"historian.model": "test/model",
+				"historian.outcome": "ok",
+			});
+			expect(validate?.attrs).toEqual({
+				"historian.text_chars": successXml().length,
+				"historian.valid": true,
+				"historian.compartments": 1,
+				"historian.facts": 1,
+			});
+			expect(publish?.attrs).toEqual({
+				"historian.compartments": 1,
+				"historian.facts": 1,
+				"historian.events": 0,
+				"historian.published": true,
+				"historian.promoted_facts": 1,
+			});
+			expect(spans.every((s) => s.errors.length === 0)).toBe(true);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("traces a failed validation through the repair pass without a publish span", async () => {
+		const spans = recordTraceSpans();
+		const { db, runner } = await runHistorianWith({
+			outputs: ["not xml", "still not xml"],
+		});
+		try {
+			expect(runner.run).toHaveBeenCalledTimes(2);
+			expect(getCompartments(db, "ses-historian")).toEqual([]);
+			expect(spans.map((s) => [s.name, s.parent])).toEqual([
+				["historian.run", null],
+				["historian.subagent", "historian.run"],
+				["historian.validate", "historian.subagent"],
+				["historian.subagent", "historian.run"],
+				["historian.validate", "historian.subagent"],
+			]);
+			const [run, first, firstValidate, repair, repairValidate] = spans;
+			expect(first?.attrs["historian.pass"]).toBe("first");
+			expect(first?.attrs["historian.outcome"]).toBe("validation-failed");
+			expect(typeof first?.attrs["historian.error"]).toBe("string");
+			expect(firstValidate?.attrs["historian.valid"]).toBe(false);
+			expect(firstValidate?.attrs["historian.error"]).toBe(
+				first?.attrs["historian.error"],
+			);
+			expect(repair?.attrs["historian.pass"]).toBe("repair");
+			expect(repair?.attrs["historian.model"]).toBe("test/model");
+			expect(repair?.attrs["historian.outcome"]).toBe("validation-failed");
+			expect(repairValidate?.attrs["historian.valid"]).toBe(false);
+			expect(run?.attrs["historian.status"]).toBe("failed");
+			expect(run?.attrs["historian.compartments"]).toBe(0);
+			expect(run?.attrs["historian.failure_reason"]).toBe(
+				repair?.attrs["historian.error"],
+			);
+			expect(run?.attrs).not.toHaveProperty("historian.facts");
+			// Failed phases are marked as span errors so the trace flags them.
+			expect(first?.errors).toEqual([first?.attrs["historian.error"]]);
+			expect(firstValidate?.errors).toEqual([
+				firstValidate?.attrs["historian.error"],
+			]);
+			expect(repair?.errors).toEqual([repair?.attrs["historian.error"]]);
+			expect(run?.errors).toEqual([run?.attrs["historian.failure_reason"]]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("labels fallback candidates and marks spawn failures", async () => {
+		const spans = recordTraceSpans();
+		const { db, runner } = await runHistorianWith({
+			runner: runnerWithSteps([
+				{
+					ok: false,
+					reason: "model_failed",
+					error: "bad request: unsupported model",
+					durationMs: 1,
+				},
+				"",
+				successXml("Session model recovered Pi history."),
+			]),
+			fallbackModels: ["fallback/model"],
+			fallbackModelId: "session/model",
+		});
+		try {
+			expect(runner.run).toHaveBeenCalledTimes(3);
+			const passes = spans
+				.filter((s) => s.name === "historian.subagent")
+				.map((s) => [
+					s.attrs["historian.pass"],
+					s.attrs["historian.model"],
+					s.attrs["historian.outcome"],
+				]);
+			expect(passes).toEqual([
+				["first", "test/model", "spawn-failed"],
+				["fallback", "fallback/model", "no-output"],
+				["fallback-session", "session/model", "ok"],
+			]);
+			// Spawn failures and empty output never reach validation.
+			expect(spans.filter((s) => s.name === "historian.validate")).toHaveLength(
+				1,
+			);
+			expect(spans[0]?.attrs["historian.status"]).toBe("success");
+			expect(spans[0]?.errors).toEqual([]);
+			expect(
+				spans
+					.filter((s) => s.name === "historian.subagent")
+					.map((s) => s.errors.length),
+			).toEqual([1, 1, 0]);
+		} finally {
+			closeQuietly(db);
+		}
 	});
 });

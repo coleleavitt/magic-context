@@ -129,6 +129,7 @@ import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child
 
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
+import { type TraceSpan, tracedSpan } from "./pi-trace";
 import {
 	convertEntriesToRawMessages,
 	SYNTH_USER_ID_PREFIX,
@@ -137,6 +138,52 @@ import {
 const HISTORIAN_AGENT_NAME = "magic-context-historian";
 const DEFAULT_HISTORIAN_TIMEOUT_MS = 600_000;
 const MAX_HISTORIAN_RETRIES = 2;
+
+/** Keep trace attribute strings short: spans are rendered inline by `prime-agent trace`. */
+const TRACE_ERROR_MAX_CHARS = 200;
+
+function shortTraceError(message: string): string {
+	const flat = message.replace(/\s+/g, " ").trim();
+	return flat.length > TRACE_ERROR_MAX_CHARS
+		? `${flat.slice(0, TRACE_ERROR_MAX_CHARS)}…`
+		: flat;
+}
+
+type HistorianTracePass =
+	| "first"
+	| "repair"
+	| "fallback"
+	| "fallback-session"
+	| "editor";
+
+/** Trace outcome for one `historian.subagent` span (run + validation). */
+function historianPassTraceOutcome(outcome: ValidationOutcome): {
+	"historian.outcome": string;
+	"historian.error"?: string;
+} {
+	switch (outcome.kind) {
+		case "ok":
+			return { "historian.outcome": "ok" };
+		case "validation-failed":
+			return {
+				"historian.outcome": "validation-failed",
+				"historian.error": shortTraceError(outcome.error),
+			};
+		case "spawn-failed":
+			return {
+				"historian.outcome":
+					outcome.reason === "abort" ? "abort" : "spawn-failed",
+				"historian.error": shortTraceError(
+					`${outcome.reason}: ${outcome.error}`,
+				),
+			};
+		case "no-output":
+			return {
+				"historian.outcome": "no-output",
+				"historian.error": "historian returned no usable text",
+			};
+	}
+}
 
 /** Keep historian alert noise to once per minute per session. */
 const HISTORIAN_ALERT_COOLDOWN_MS = 60 * 1000;
@@ -435,7 +482,28 @@ export interface PiHistorianDeps {
 	forceKeepLastCompartment?: boolean;
 }
 
+/**
+ * Run one incremental historian pass. The whole run is wrapped in a host
+ * `historian.run` span (see `pi-trace.ts`) so its phases — subagent passes,
+ * validation, publish — show up in `prime-agent trace <id>` next to the child
+ * agent's own `rlm.run_agent` / `llm.request` spans. Tracing never alters
+ * control flow: without a tracing host the span helpers are plain calls.
+ */
 export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
+	await tracedSpan(
+		"historian.run",
+		{
+			"historian.session_id": deps.sessionId,
+			"historian.model": deps.historianModel,
+		},
+		(runSpan) => runPiHistorianTraced(deps, runSpan),
+	);
+}
+
+async function runPiHistorianTraced(
+	deps: PiHistorianDeps,
+	runSpan: TraceSpan,
+): Promise<void> {
 	const {
 		db,
 		sessionId,
@@ -655,6 +723,11 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				offset,
 				eligibleEndOrdinal,
 			);
+			runSpan.setAttributes({
+				"historian.chunk_start": chunk.startIndex,
+				"historian.chunk_end": chunk.endIndex,
+				"historian.messages": chunk.messageCount,
+			});
 			const forceKeepLastCompartmentForChunk =
 				forceKeepLastCompartment === true && !chunk.hasMore;
 			if (!chunk.text || chunk.messageCount === 0) {
@@ -849,6 +922,41 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				};
 			};
 
+			// One `historian.subagent` span per child invocation: the run (with its
+			// transient retries) plus the validation of its output, so the span's
+			// outcome names why a pass did not stick. The child's own spans nest
+			// under it through the host's ambient trace context.
+			const runTracedPass = (
+				pass: HistorianTracePass,
+				options: SubagentRunOptions,
+			): Promise<{ result: SubagentRunResult; outcome: ValidationOutcome }> =>
+				tracedSpan(
+					"historian.subagent",
+					{ "historian.pass": pass, "historian.model": options.model },
+					async (passSpan) => {
+						const result = await runHistorianSubagentWithTransientRetries({
+							runner,
+							sessionId,
+							passLabel: pass,
+							retryBackoffMs,
+							options,
+						});
+						const outcome = await validateHistorianResult(
+							result,
+							sessionId,
+							chunk,
+							priorCompartments,
+							sequenceOffset,
+						);
+						const traceOutcome = historianPassTraceOutcome(outcome);
+						passSpan.setAttributes(traceOutcome);
+						if (traceOutcome["historian.error"] !== undefined) {
+							passSpan.recordError(traceOutcome["historian.error"]);
+						}
+						return { result, outcome };
+					},
+				);
+
 			retainDrainReservationForRetryThrottle = true;
 			const historianSystemPrompt = withContentLanguageDirective(
 				COMPARTMENT_AGENT_SYSTEM_PROMPT,
@@ -862,12 +970,9 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			);
 
 			// First pass.
-			const firstResult = await runHistorianSubagentWithTransientRetries({
-				runner,
-				sessionId,
-				passLabel: "first",
-				retryBackoffMs,
-				options: {
+			const { result: firstResult, outcome: firstPass } = await runTracedPass(
+				"first",
+				{
 					agent: HISTORIAN_AGENT_NAME,
 					systemPrompt: historianSystemPrompt,
 					userMessage: prompt,
@@ -882,15 +987,9 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					accountingSessionId: sessionId,
 					accountingSubagent: "historian",
 				},
-			});
-
-			let validatedPass = await validateHistorianResult(
-				firstResult,
-				sessionId,
-				chunk,
-				priorCompartments,
-				sequenceOffset,
 			);
+
+			let validatedPass: ValidationOutcome = firstPass;
 			// Track which subagent run actually produced the validated
 			// draft. This matters for the optional two-pass editor refinement
 			// below: when first-pass validation fails but repair succeeds,
@@ -915,12 +1014,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					validatedPass.error,
 					deps.language,
 				);
-				const repairResult = await runHistorianSubagentWithTransientRetries({
-					runner,
-					sessionId,
-					passLabel: "repair",
-					retryBackoffMs,
-					options: {
+				const { result: repairResult, outcome: repairPass } =
+					await runTracedPass("repair", {
 						agent: HISTORIAN_AGENT_NAME,
 						systemPrompt: historianSystemPrompt,
 						userMessage: repairPrompt,
@@ -934,15 +1029,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						onProgress: buildProgressLogger("repair"),
 						accountingSessionId: sessionId,
 						accountingSubagent: "historian",
-					},
-				});
-				validatedPass = await validateHistorianResult(
-					repairResult,
-					sessionId,
-					chunk,
-					priorCompartments,
-					sequenceOffset,
-				);
+					});
+				validatedPass = repairPass;
 				// If repair produced a valid result, that's the draft we
 				// want the editor to refine. (If repair also failed,
 				// validatedDraftText doesn't matter — we'll bail before
@@ -985,13 +1073,9 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						sessionId,
 						`historian: escalating to ${candidate.kind === "session" ? "session-model last resort" : "configured fallback model"} ${candidate.entry.model} after ${why}`,
 					);
-					const fbResult = await runHistorianSubagentWithTransientRetries({
-						runner,
-						sessionId,
-						passLabel:
-							candidate.kind === "session" ? "fallback-session" : "fallback",
-						retryBackoffMs,
-						options: {
+					const { result: fbResult, outcome: fbPass } = await runTracedPass(
+						candidate.kind === "session" ? "fallback-session" : "fallback",
+						{
 							agent: HISTORIAN_AGENT_NAME,
 							systemPrompt: historianSystemPrompt,
 							userMessage: prompt,
@@ -1006,13 +1090,6 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 							accountingSessionId: sessionId,
 							accountingSubagent: "historian",
 						},
-					});
-					const fbPass = await validateHistorianResult(
-						fbResult,
-						sessionId,
-						chunk,
-						priorCompartments,
-						sequenceOffset,
 					);
 					if (fbPass.kind === "ok") {
 						validatedPass = fbPass;
@@ -1061,34 +1138,21 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				const draftAssistantText = validatedDraftText ?? "";
 				if (draftAssistantText.trim().length > 0) {
 					sessionLog(sessionId, "historian two-pass: running editor on draft");
-					const editorResult = await runHistorianSubagentWithTransientRetries({
-						runner,
-						sessionId,
-						passLabel: "editor",
-						retryBackoffMs,
-						options: {
-							agent: HISTORIAN_AGENT_NAME,
-							systemPrompt: historianEditorSystemPrompt,
-							userMessage: buildHistorianEditorPrompt(draftAssistantText),
-							model: historianModel,
-							timeoutMs: historianTimeoutMs,
-							cwd: directory,
-							signal,
-							thinkingLevel,
-							temperature,
-							maxOutputTokens,
-							onProgress: buildProgressLogger("editor"),
-							accountingSessionId: sessionId,
-							accountingSubagent: "historian_editor",
-						},
+					const { outcome: editorPass } = await runTracedPass("editor", {
+						agent: HISTORIAN_AGENT_NAME,
+						systemPrompt: historianEditorSystemPrompt,
+						userMessage: buildHistorianEditorPrompt(draftAssistantText),
+						model: historianModel,
+						timeoutMs: historianTimeoutMs,
+						cwd: directory,
+						signal,
+						thinkingLevel,
+						temperature,
+						maxOutputTokens,
+						onProgress: buildProgressLogger("editor"),
+						accountingSessionId: sessionId,
+						accountingSubagent: "historian_editor",
 					});
-					const editorPass = await validateHistorianResult(
-						editorResult,
-						sessionId,
-						chunk,
-						priorCompartments,
-						sequenceOffset,
-					);
 					if (editorPass.kind === "ok") {
 						sessionLog(
 							sessionId,
@@ -1232,92 +1296,119 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				return;
 			}
 			let published = false;
-			db.exec("BEGIN IMMEDIATE");
-			try {
-				if (!isCompartmentLeaseHeld(db, sessionId, compartmentLeaseHolderId)) {
-					db.exec("ROLLBACK");
-					sessionLog(
-						sessionId,
-						"historian publish skipped: compartment lease no longer held",
-					);
-					rollbackDrainReservation();
-					return;
-				}
-				appendCompartments(db, sessionId, newCompartments);
-				// Resolve durable ids for the just-appended compartments (last N rows by
-				// sequence — appendCompartments inserts at the tail). Used for events
-				// anchoring + post-commit embeddings.
-				persistedIds = getCompartments(db, sessionId)
-					.slice(-newCompartments.length)
-					.map((c) => c.id);
-				// v2 faithful fact lifecycle (E6 parity): facts are no longer a
-				// REPLACE-the-whole-list store. The historian emits only THIS
-				// chunk's facts (deduped against <project-memory> in the prompt);
-				// they flow to project memory via in-transaction durable promotion.
-				// No replaceSessionFacts — promoted facts reach the agent through the
-				// renderer's m[1] new-memories watermark. Promotion is in the SAME
-				// transaction as the boundary floor below, so both commit or both roll back.
-				if (promotionActive && !skipUnanchoredPromotion) {
-					promotedFactRefs = promoteSessionFactsDurable(
-						db,
-						sessionId,
-						projectPath,
-						validatedPass.facts ?? [],
-					);
-				}
-
-				if (publishableEvents.length > 0) {
+			const publishOutcome = await tracedSpan(
+				"historian.publish",
+				{
+					"historian.compartments": newCompartments.length,
+					"historian.facts": validatedPass.facts?.length ?? 0,
+					"historian.events": publishableEvents.length,
+				},
+				async (publishSpan): Promise<"published" | "lease-lost"> => {
+					db.exec("BEGIN IMMEDIATE");
 					try {
-						insertCompartmentEvents(
-							db,
-							sessionId,
-							publishableEvents,
-							persistedIds,
-						);
-						sessionLog(
-							sessionId,
-							`stored ${publishableEvents.length} compartment event(s)`,
-						);
-					} catch (error) {
-						sessionLog(sessionId, "failed to store compartment events:", error);
-					}
-				}
+						if (
+							!isCompartmentLeaseHeld(db, sessionId, compartmentLeaseHolderId)
+						) {
+							db.exec("ROLLBACK");
+							sessionLog(
+								sessionId,
+								"historian publish skipped: compartment lease no longer held",
+							);
+							rollbackDrainReservation();
+							publishSpan.setAttributes({
+								"historian.published": false,
+								"historian.error": "compartment lease no longer held",
+							});
+							publishSpan.recordError("compartment lease no longer held");
+							return "lease-lost";
+						}
+						appendCompartments(db, sessionId, newCompartments);
+						// Resolve durable ids for the just-appended compartments (last N rows by
+						// sequence — appendCompartments inserts at the tail). Used for events
+						// anchoring + post-commit embeddings.
+						persistedIds = getCompartments(db, sessionId)
+							.slice(-newCompartments.length)
+							.map((c) => c.id);
+						// v2 faithful fact lifecycle (E6 parity): facts are no longer a
+						// REPLACE-the-whole-list store. The historian emits only THIS
+						// chunk's facts (deduped against <project-memory> in the prompt);
+						// they flow to project memory via in-transaction durable promotion.
+						// No replaceSessionFacts — promoted facts reach the agent through the
+						// renderer's m[1] new-memories watermark. Promotion is in the SAME
+						// transaction as the boundary floor below, so both commit or both roll back.
+						if (promotionActive && !skipUnanchoredPromotion) {
+							promotedFactRefs = promoteSessionFactsDurable(
+								db,
+								sessionId,
+								projectPath,
+								validatedPass.facts ?? [],
+							);
+						}
 
-				queueDropsForCompartmentalizedMessages(db, sessionId, lastNewEnd);
+						if (publishableEvents.length > 0) {
+							try {
+								insertCompartmentEvents(
+									db,
+									sessionId,
+									publishableEvents,
+									persistedIds,
+								);
+								sessionLog(
+									sessionId,
+									`stored ${publishableEvents.length} compartment event(s)`,
+								);
+							} catch (error) {
+								sessionLog(
+									sessionId,
+									"failed to store compartment events:",
+									error,
+								);
+							}
+						}
 
-				clearHistorianFailureState(db, sessionId);
-				// Healthy historian progress clears the drain-failure backoff. Normal
-				// runs also clear overflow recovery; wrapup keeps it armed until the loop
-				// reaches the keep watermark.
-				clearHistorianDrainFailure(db, sessionId);
-				recordProtectedTailPublicationFloor(db, sessionId, lastNewEnd + 1);
-				if (!isWrapupInProgress(db, sessionId))
-					clearEmergencyRecovery(db, sessionId);
-				// userObservations are inserted POST-COMMIT
-				// (best-effort, below), not inside this publish transaction. An
-				// auxiliary user_memory_candidates failure must never roll back
-				// compartment publication. Mirrors OpenCode.
-				if (lastNewEndMessageId) {
-					setPendingPiCompactionMarkerState(db, sessionId, {
-						firstKeptEntryId,
-						endMessageId: lastNewEndMessageId,
-						ordinal: lastNewEnd,
-						tokensBefore: chunk.tokenEstimate,
-						summary: markerSummary,
-						publishedAt: Date.now(),
-					});
-				}
-				db.exec("COMMIT");
-				published = true;
-			} finally {
-				if (!published) {
-					try {
-						db.exec("ROLLBACK");
-					} catch {
-						// Transaction may already be closed by an early rollback.
+						queueDropsForCompartmentalizedMessages(db, sessionId, lastNewEnd);
+
+						clearHistorianFailureState(db, sessionId);
+						// Healthy historian progress clears the drain-failure backoff. Normal
+						// runs also clear overflow recovery; wrapup keeps it armed until the loop
+						// reaches the keep watermark.
+						clearHistorianDrainFailure(db, sessionId);
+						recordProtectedTailPublicationFloor(db, sessionId, lastNewEnd + 1);
+						if (!isWrapupInProgress(db, sessionId))
+							clearEmergencyRecovery(db, sessionId);
+						// userObservations are inserted POST-COMMIT
+						// (best-effort, below), not inside this publish transaction. An
+						// auxiliary user_memory_candidates failure must never roll back
+						// compartment publication. Mirrors OpenCode.
+						if (lastNewEndMessageId) {
+							setPendingPiCompactionMarkerState(db, sessionId, {
+								firstKeptEntryId,
+								endMessageId: lastNewEndMessageId,
+								ordinal: lastNewEnd,
+								tokensBefore: chunk.tokenEstimate,
+								summary: markerSummary,
+								publishedAt: Date.now(),
+							});
+						}
+						db.exec("COMMIT");
+						published = true;
+						publishSpan.setAttributes({
+							"historian.published": true,
+							"historian.promoted_facts": promotedFactRefs.length,
+						});
+						return "published";
+					} finally {
+						if (!published) {
+							try {
+								db.exec("ROLLBACK");
+							} catch {
+								// Transaction may already be closed by an early rollback.
+							}
+						}
 					}
-				}
-			}
+				},
+			);
+			if (publishOutcome !== "published") return;
 
 			// Signal deferred materialization/history-refresh immediately after COMMIT.
 			// All publish-visible durable state (compartments, boundary floor, promoted
@@ -1541,6 +1632,27 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			}
 		}
 		updateSessionMeta(db, sessionId, { compartmentInProgress: false });
+		// Stamp the run outcome on the `historian.run` span (mirrors historian_runs).
+		// A failed run also marks the span as errored so `prime-agent trace` flags it.
+		{
+			const status = telemetry.status ?? "failed";
+			const failureReason = telemetry.failureReason
+				? shortTraceError(telemetry.failureReason)
+				: undefined;
+			runSpan.setAttributes({
+				"historian.status": status,
+				"historian.compartments": telemetry.compartmentsProduced ?? 0,
+				...(status === "success"
+					? { "historian.facts": telemetry.factsEmitted ?? 0 }
+					: {}),
+				...(failureReason !== undefined
+					? { "historian.failure_reason": failureReason }
+					: {}),
+			});
+			if (status === "failed") {
+				runSpan.recordError(failureReason ?? "historian run failed");
+			}
+		}
 		// Record one historian_runs row for this attempt (every exit path).
 		try {
 			const latest = getLatestHistorianInvocationId(db, sessionId);
@@ -1626,28 +1738,45 @@ async function validateHistorianResult(
 		return { kind: "no-output" };
 	}
 
-	const validation = validateHistorianOutput(
-		result.assistantText,
-		sessionId,
-		chunk,
-		priorCompartments,
-		sequenceOffset,
+	return tracedSpan(
+		"historian.validate",
+		{ "historian.text_chars": result.assistantText.length },
+		async (validateSpan) => {
+			const validation = validateHistorianOutput(
+				result.assistantText,
+				sessionId,
+				chunk,
+				priorCompartments,
+				sequenceOffset,
+			);
+			if (validation.ok) {
+				validateSpan.setAttributes({
+					"historian.valid": true,
+					"historian.compartments": validation.compartments.length,
+					"historian.facts": validation.facts.length,
+				});
+				return {
+					kind: "ok",
+					compartments: validation.compartments,
+					facts: validation.facts,
+					userObservations: validation.userObservations,
+					primerCandidates: validation.primerCandidates,
+					events: validation.events,
+				};
+			}
+			const error = shortTraceError(validation.error);
+			validateSpan.setAttributes({
+				"historian.valid": false,
+				"historian.error": error,
+			});
+			validateSpan.recordError(error);
+			return {
+				kind: "validation-failed",
+				error: validation.error,
+				rawText: result.assistantText,
+			};
+		},
 	);
-	if (validation.ok) {
-		return {
-			kind: "ok",
-			compartments: validation.compartments,
-			facts: validation.facts,
-			userObservations: validation.userObservations,
-			primerCandidates: validation.primerCandidates,
-			events: validation.events,
-		};
-	}
-	return {
-		kind: "validation-failed",
-		error: validation.error,
-		rawText: result.assistantText,
-	};
 }
 
 export function buildPiCompactionSummary(
