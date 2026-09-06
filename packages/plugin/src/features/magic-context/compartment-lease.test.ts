@@ -9,7 +9,10 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     acquireCompartmentLease,
+    createCompartmentLeaseHolderId,
+    holderPid,
     isCompartmentLeaseHeld,
+    reclaimDeadHolderLease,
     releaseCompartmentLease,
     renewCompartmentLease,
 } from "./compartment-lease";
@@ -155,5 +158,40 @@ describe("compartment state lease", () => {
                 // Ignore EBUSY on Windows
             }
         }
+    });
+});
+
+describe("dead-holder reclaim", () => {
+    it("encodes and parses the owning pid", () => {
+        const id = createCompartmentLeaseHolderId("abc");
+        expect(holderPid(id)).toBe(process.pid);
+        expect(holderPid("legacy-uuid")).toBeUndefined();
+        expect(holderPid("x#pid=notanumber")).toBeUndefined();
+    });
+
+    it("lets a new process take over a live lease whose holder pid no longer exists", () => {
+        const db = makeDb();
+        // A pid that cannot exist on this host: above the Linux pid_max ceiling.
+        const dead = "old-run#pid=4194304999";
+        expect(acquireCompartmentLease(db, "ses", dead)).not.toBeNull();
+        const mine = createCompartmentLeaseHolderId("new-run");
+        expect(acquireCompartmentLease(db, "ses", mine)).not.toBeNull();
+        expect(isCompartmentLeaseHeld(db, "ses", mine)).toBe(true);
+        expect(isCompartmentLeaseHeld(db, "ses", dead)).toBe(false);
+        closeQuietly(db);
+    });
+
+    it("keeps a live lease when the holder process is alive or unknown", () => {
+        const db = makeDb();
+        const alive = createCompartmentLeaseHolderId("this-process");
+        expect(acquireCompartmentLease(db, "ses", alive)).not.toBeNull();
+        expect(reclaimDeadHolderLease(db, "ses")).toBe(false);
+        expect(acquireCompartmentLease(db, "ses", "other#pid=4194304999")).toBeNull();
+        const legacy = makeDb();
+        expect(acquireCompartmentLease(legacy, "ses", "legacy-holder-without-pid")).not.toBeNull();
+        expect(reclaimDeadHolderLease(legacy, "ses")).toBe(false);
+        expect(acquireCompartmentLease(legacy, "ses", createCompartmentLeaseHolderId("x"))).toBeNull();
+        closeQuietly(db);
+        closeQuietly(legacy);
     });
 });

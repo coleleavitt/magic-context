@@ -11,12 +11,66 @@ export interface LeaseAcquired {
     expiresAt: number;
 }
 
+const HOLDER_PID_SUFFIX = "#pid=";
+
+/**
+ * A holder id that carries the owning pid so a lease left behind by a process
+ * that died (a forced daemon shutdown, a crash) can be reclaimed at once
+ * instead of stalling the historian for the full TTL. The database is host
+ * local, so a pid check is meaningful; ids without the suffix (older
+ * processes, remote holders) keep TTL-only semantics.
+ */
+export function createCompartmentLeaseHolderId(random: string): string {
+    return `${random}${HOLDER_PID_SUFFIX}${process.pid}`;
+}
+
+export function holderPid(holderId: string): number | undefined {
+    const index = holderId.lastIndexOf(HOLDER_PID_SUFFIX);
+    if (index < 0) return undefined;
+    const pid = Number(holderId.slice(index + HOLDER_PID_SUFFIX.length));
+    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+function processAlive(pid: number): boolean {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (err) {
+        // EPERM: the process exists but belongs to another user -> alive.
+        return (err as NodeJS.ErrnoException).code === "EPERM";
+    }
+}
+
+/**
+ * Drop a live-looking lease whose holder process is gone. Returns true when a
+ * row was removed. Never throws; a failed check just falls back to the TTL.
+ */
+export function reclaimDeadHolderLease(db: Database, sessionId: string, now = Date.now()): boolean {
+    try {
+        const row = db
+            .prepare(
+                "SELECT holder_id AS holderId FROM compartment_state_lease WHERE session_id = ? AND expires_at > ?",
+            )
+            .get(sessionId, now) as { holderId: string } | undefined;
+        if (!row) return false;
+        const pid = holderPid(row.holderId);
+        if (pid === undefined || pid === process.pid || processAlive(pid)) return false;
+        const result = db
+            .prepare("DELETE FROM compartment_state_lease WHERE session_id = ? AND holder_id = ?")
+            .run(sessionId, row.holderId);
+        return result.changes === 1;
+    } catch {
+        return false;
+    }
+}
+
 export function acquireCompartmentLease(
     db: Database,
     sessionId: string,
     holderId: string,
 ): LeaseAcquired | null {
     const acquiredAt = Date.now();
+    reclaimDeadHolderLease(db, sessionId, acquiredAt);
     const expiresAt = acquiredAt + COMPARTMENT_LEASE_TTL_MS;
     const result = db
         .prepare(

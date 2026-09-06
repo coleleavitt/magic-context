@@ -521,6 +521,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					sessionId,
 					`historian failure: source=existing-validation reason="${existingValidationError}"`,
 				);
+				telemetry.failureReason = `existing-validation: ${existingValidationError}`;
 				{
 					const failCount = incrementHistorianFailure(
 						db,
@@ -681,6 +682,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					sessionId,
 					`historian failure: source=chunk-coverage reason="${chunkCoverageError}" chunkRange=${chunk.startIndex}-${chunk.endIndex}`,
 				);
+				telemetry.failureReason = `chunk-coverage: ${chunkCoverageError}`;
 				{
 					const failCount = incrementHistorianFailure(
 						db,
@@ -1032,6 +1034,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 							? `subagent run failed (${validatedPass.reason}): ${validatedPass.error}`
 							: "historian returned no usable text";
 				sessionLog(sessionId, `historian failure: ${errorMsg}`);
+				telemetry.failureReason = errorMsg;
 				{
 					const failCount = incrementHistorianFailure(db, sessionId, errorMsg);
 					await notify(buildHistorianFailureNotice(failCount, errorMsg));
@@ -1146,6 +1149,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					sessionId,
 					`historian failure: source=no-progress newCompartmentCount=${newCompartments.length} lastNewEnd=${lastNewEnd} priorEnd=${offset - 1}`,
 				);
+				telemetry.failureReason = errorMsg;
 				{
 					const failCount = incrementHistorianFailure(db, sessionId, errorMsg);
 					await notify(buildHistorianFailureNotice(failCount, errorMsg));

@@ -6,6 +6,7 @@ import type {
 import {
 	acquireCompartmentLease,
 	COMPARTMENT_LEASE_RENEWAL_MS,
+	createCompartmentLeaseHolderId,
 	releaseCompartmentLeaseBestEffort,
 	renewCompartmentLease,
 } from "@magic-context/core/features/magic-context/compartment-lease";
@@ -242,7 +243,7 @@ export async function runPiWrapup(
 			return `## Magic Wrapup — Partial\n\nNo runnable wrapup boundary is available yet; wrapped up 0 messages into 0 compartments. Run /ctx-wrapup again to continue.`;
 		}
 
-		holderId = crypto.randomUUID();
+		holderId = createCompartmentLeaseHolderId(crypto.randomUUID());
 		const acquired = acquireWrapupInProgress(deps.db, sessionId, {
 			holderId,
 			messagesToKeep,
@@ -538,7 +539,7 @@ async function acquireCompartmentLeaseEventually(
 		Math.max(0, waitStartedAt + maxWaitMs - Date.now());
 	for (;;) {
 		if (remainingMs() <= 0) return { ok: false, reason: "timeout" };
-		const holderId = crypto.randomUUID();
+		const holderId = createCompartmentLeaseHolderId(crypto.randomUUID());
 		const lease = acquireCompartmentLease(db, sessionId, holderId);
 		if (lease) return { ok: true, holderId };
 		if (!renewWrapupMarker({})) return { ok: false, reason: "ownership_lost" };

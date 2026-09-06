@@ -39,6 +39,7 @@ import type {
 import {
 	acquireCompartmentLease,
 	COMPARTMENT_LEASE_RENEWAL_MS,
+	createCompartmentLeaseHolderId,
 	releaseCompartmentLeaseBestEffort,
 	renewCompartmentLease,
 } from "@magic-context/core/features/magic-context/compartment-lease";
@@ -3888,7 +3889,7 @@ function spawnPiHistorianRun(args: {
 		currentContextLimit,
 		fallbackModelId,
 	} = args;
-	const holderId = crypto.randomUUID();
+	const holderId = createCompartmentLeaseHolderId(crypto.randomUUID());
 	const runPromise = (async () => {
 		const lease = acquireCompartmentLease(db, sessionId, holderId);
 		if (!lease) {
