@@ -33,6 +33,9 @@ export function configureTraceApiForTests(
 async function resolve(): Promise<TraceApi | null> {
 	if (api !== undefined) return api;
 	try {
+		// Must stay a bare specifier and be marked --external in the bun build:
+		// if pi-ai is inlined into dist, this resolves to a private copy whose
+		// span sink is never installed, and every span here goes nowhere.
 		const mod = (await import("@earendil-works/pi-ai")) as Partial<TraceApi>;
 		api = typeof mod.withSpan === "function" ? (mod as TraceApi) : null;
 	} catch {
