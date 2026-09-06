@@ -19,6 +19,11 @@ interface TraceApi {
 
 let api: TraceApi | null | undefined;
 
+/** Test seam: force the bridge to use `next` (null = no tracing, undefined = re-resolve). */
+export function configureTraceApiForTests(next: TraceApi | null | undefined): void {
+	api = next;
+}
+
 async function resolve(): Promise<TraceApi | null> {
 	if (api !== undefined) return api;
 	try {
