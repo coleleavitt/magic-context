@@ -43,6 +43,7 @@ import {
 	renewCompartmentLease,
 } from "@magic-context/core/features/magic-context/compartment-lease";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
+import { setContextSpanAttributes, tracedContextPass } from "./pi-trace.js";
 import { isFailClosedBlockingError } from "@magic-context/core/features/magic-context/fail-closed-block";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
@@ -2167,7 +2168,7 @@ export function registerPiContextHandler(
 		sessionLog(sessionId, message);
 	});
 
-	pi.on("context", async (event, ctx) => {
+	const handleContextEvent = async (event: ContextEvent, ctx: ExtensionContext) => {
 		const transformStartTime = performance.now();
 		let rawMessageCount = 0;
 		let sessionIdForError: string | undefined;
@@ -3467,6 +3468,15 @@ export function registerPiContextHandler(
 				sessionId,
 				`transform completed in ${transformElapsedMs.toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
 			);
+			setContextSpanAttributes({
+				"context.session_id": sessionId,
+				"context.messages_out": outputMessages.length,
+				"context.targets": result.targetCount,
+				"context.watermark": result.reasoningWatermark,
+				"context.usage_percent": finalUsagePercentage,
+				"context.input_tokens": finalInputTokens,
+				"context.context_limit": finalContextLimit,
+			});
 			if (
 				assertTailHygieneLastWriter &&
 				process.env.NODE_ENV !== "production"
@@ -3590,6 +3600,19 @@ export function registerPiContextHandler(
 			}
 			return;
 		}
+	};
+	pi.on("context", (event, ctx) => {
+		// The handler owns error handling for the event payload (a hostile
+		// `messages` getter must reach its catch), so read nothing here.
+		let messagesIn: number | undefined;
+		try {
+			messagesIn = event.messages.length;
+		} catch {
+			messagesIn = undefined;
+		}
+		return tracedContextPass("context.transform", { "context.messages_in": messagesIn }, () =>
+			handleContextEvent(event, ctx),
+		);
 	});
 	log(
 		"[magic-context][pi] registered context handler (tagging + drops + nudges)",
