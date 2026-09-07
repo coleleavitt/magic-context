@@ -44,7 +44,6 @@ import {
 	renewCompartmentLease,
 } from "@magic-context/core/features/magic-context/compartment-lease";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
-import { setContextSpanAttributes, tracedContextPass } from "./pi-trace.js";
 import { isFailClosedBlockingError } from "@magic-context/core/features/magic-context/fail-closed-block";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
@@ -187,7 +186,6 @@ import {
 	TEXT_TAG_IDENTITY_MARKER,
 	tagTranscript,
 } from "@magic-context/core/shared/tag-transcript";
-
 import {
 	clearAutoSearchForPiSession,
 	runAutoSearchHintForPi,
@@ -244,6 +242,7 @@ import {
 	resolvePiPressureSnapshot,
 } from "./pi-pressure";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
+import { setContextSpanAttributes, tracedContextPass } from "./pi-trace.js";
 import { applyPiThinkingBindingRecovery } from "./provider-error-recovery-pi";
 import {
 	convertEntriesToRawMessages,
@@ -331,6 +330,15 @@ export const __test = {
 	},
 	recordSuccessfulTaggedMessageIds,
 	buildPiTextIdentityPlan,
+	isHistorianDrainBudgetBlocked,
+	captureContextHandlerActivationGeneration,
+	applyHistorianDrainBudgetBlock,
+	setHistorianDrainBudgetBlockedUntilForTests(
+		sessionId: string,
+		blockedUntil: number,
+	): void {
+		historianDrainBudgetBlockedUntil.set(sessionId, blockedUntil);
+	},
 	setInFlightHistorianForTests(
 		sessionId: string,
 		promise: Promise<unknown>,
@@ -493,6 +501,7 @@ const sessionsByProject = new Map<string, Set<string>>();
 const lastSeenProjectIdentityBySession = new Map<string, string>();
 const rawMessageProviderUnregistersBySession = new Map<string, () => void>();
 const activeContextHandlerSessions = new Set<string>();
+const contextHandlerActivationGeneration = new Map<string, number>();
 const lastHeuristicsTurnIdBySession = new Map<string, string>();
 const routinePressureAppliedBySession = new Map<string, boolean>();
 const firstContextPassSeenBySession = new Set<string>();
@@ -798,8 +807,14 @@ export function trackSessionForProject(
 ): void {
 	// Move-to-end so iteration order is least-recently-tracked → most-recent
 	// (Set preserves insertion order; re-inserting refreshes recency).
-	activeContextHandlerSessions.delete(sessionId);
+	const wasActive = activeContextHandlerSessions.delete(sessionId);
 	activeContextHandlerSessions.add(sessionId);
+	if (!wasActive) {
+		contextHandlerActivationGeneration.set(
+			sessionId,
+			(contextHandlerActivationGeneration.get(sessionId) ?? 0) + 1,
+		);
+	}
 	let sessions = sessionsByProject.get(projectIdentity);
 	if (!sessions) {
 		sessions = new Set();
@@ -819,6 +834,27 @@ export function trackSessionForProject(
 
 function isContextHandlerSessionActive(sessionId: string): boolean {
 	return activeContextHandlerSessions.has(sessionId);
+}
+
+function captureContextHandlerActivationGeneration(
+	sessionId: string,
+): number | undefined {
+	return contextHandlerActivationGeneration.get(sessionId);
+}
+
+function applyHistorianDrainBudgetBlock(
+	sessionId: string,
+	activationGeneration: number | undefined,
+	blockedUntil: number,
+): boolean {
+	if (
+		!isContextHandlerSessionActive(sessionId) ||
+		contextHandlerActivationGeneration.get(sessionId) !== activationGeneration
+	) {
+		return false;
+	}
+	historianDrainBudgetBlockedUntil.set(sessionId, blockedUntil);
+	return true;
 }
 
 function updateSessionProjectTracking(
@@ -2169,7 +2205,10 @@ export function registerPiContextHandler(
 		sessionLog(sessionId, message);
 	});
 
-	const handleContextEvent = async (event: ContextEvent, ctx: ExtensionContext) => {
+	const handleContextEvent = async (
+		event: ContextEvent,
+		ctx: ExtensionContext,
+	) => {
 		const transformStartTime = performance.now();
 		let rawMessageCount = 0;
 		let sessionIdForError: string | undefined;
@@ -3611,8 +3650,10 @@ export function registerPiContextHandler(
 		} catch {
 			messagesIn = undefined;
 		}
-		return tracedContextPass("context.transform", { "context.messages_in": messagesIn }, () =>
-			handleContextEvent(event, ctx),
+		return tracedContextPass(
+			"context.transform",
+			{ "context.messages_in": messagesIn },
+			() => handleContextEvent(event, ctx),
 		);
 	});
 	log(
@@ -3635,6 +3676,22 @@ export function registerPiContextHandler(
  * subprocess mid-run.
  */
 const inFlightHistorian = new Map<string, Promise<unknown>>();
+
+/** Automatic trigger suppression until the current protected-tail drain window resets. */
+const historianDrainBudgetBlockedUntil = new Map<string, number>();
+
+function isHistorianDrainBudgetBlocked(
+	sessionId: string,
+	now = Date.now(),
+): boolean {
+	const blockedUntil = historianDrainBudgetBlockedUntil.get(sessionId);
+	if (blockedUntil === undefined) return false;
+	if (blockedUntil <= now) {
+		historianDrainBudgetBlockedUntil.delete(sessionId);
+		return false;
+	}
+	return true;
+}
 
 /**
  * Wait for one session's in-flight historian run to complete. Called from the
@@ -3890,6 +3947,8 @@ function spawnPiHistorianRun(args: {
 		fallbackModelId,
 	} = args;
 	const holderId = createCompartmentLeaseHolderId(crypto.randomUUID());
+	const activationGeneration =
+		captureContextHandlerActivationGeneration(sessionId);
 	const runPromise = (async () => {
 		const lease = acquireCompartmentLease(db, sessionId, holderId);
 		if (!lease) {
@@ -3935,6 +3994,13 @@ function spawnPiHistorianRun(args: {
 				userMemoriesEnabled: historian.userMemoriesEnabled,
 				language: historian.language,
 				compartmentLeaseHolderId: holderId,
+				onDrainBudgetSpent: (blockedUntil) => {
+					applyHistorianDrainBudgetBlock(
+						sessionId,
+						activationGeneration,
+						blockedUntil,
+					);
+				},
 				notifyIssue: (text) => {
 					if (!isContextHandlerSessionActive(sessionId)) {
 						sessionLog(
@@ -4078,6 +4144,14 @@ function maybeFireHistorian(args: {
 
 	if (inFlightHistorian.has(sessionId)) {
 		sessionLog(sessionId, "historian trigger eval: in-flight, skipping");
+		return;
+	}
+
+	if (isHistorianDrainBudgetBlocked(sessionId)) {
+		sessionLog(
+			sessionId,
+			"historian trigger eval: drain budget spent, skipping until window reset",
+		);
 		return;
 	}
 
@@ -6564,6 +6638,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	activeContextHandlerSessions.delete(sessionId);
 	clearAutoSearchForPiSession(sessionId);
 	lastEmergencyNotificationAtMs.delete(sessionId);
+	historianDrainBudgetBlockedUntil.delete(sessionId);
 	historyRefreshSessions.delete(sessionId);
 	pendingMaterializationSessions.delete(sessionId);
 	systemPromptRefreshSessions.delete(sessionId);

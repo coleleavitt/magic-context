@@ -480,6 +480,8 @@ export interface PiHistorianDeps {
 	forceDrainQuota?: boolean;
 	/** Persist the final weak-lookahead compartment for coverage while skipping promotion. */
 	forceKeepLastCompartment?: boolean;
+	/** Notify the trigger owner that no automatic run can reserve drain budget before this time. */
+	onDrainBudgetSpent?: (blockedUntil: number) => void;
 }
 
 /**
@@ -536,6 +538,7 @@ async function runPiHistorianTraced(
 		ensureProjectRegistered = ensureProjectRegisteredFromPiDirectory,
 		forceDrainQuota,
 		forceKeepLastCompartment,
+		onDrainBudgetSpent,
 	} = deps;
 
 	let issueNotified = false;
@@ -711,6 +714,10 @@ async function runPiHistorianTraced(
 					});
 			if (!reserve.ok) {
 				sessionLog(sessionId, describeProtectedTailDrainBudgetSkip(reserve));
+				const blockedUntil = reserve.budgetState?.retryAt;
+				if (blockedUntil !== undefined && blockedUntil > Date.now()) {
+					onDrainBudgetSpent?.(blockedUntil);
+				}
 				telemetry.status = "noop";
 				telemetry.failureReason = "internal protected-tail drain budget spent";
 				return;

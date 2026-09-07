@@ -179,6 +179,8 @@ describe("emergency drain catch-up latch", () => {
         // Within the backoff window: latch is armed but bypass is suppressed → skip.
         const blocked = reserve(db, SID, 96, t + 20);
         expect(blocked.ok).toBe(false);
+        expect(blocked.budgetState?.retryAt).toBe(t + 10 + EMERGENCY_DRAIN_FAILURE_BACKOFF_MS);
+        expect(blocked.budgetState?.retryAt).toBeLessThan(blocked.budgetState!.resetsAt);
         // After the backoff window: bypass resumes.
         const allowed = reserve(db, SID, 96, t + EMERGENCY_DRAIN_FAILURE_BACKOFF_MS + 20);
         expect(allowed.ok).toBe(true);

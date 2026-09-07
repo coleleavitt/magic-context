@@ -471,6 +471,54 @@ describe("persisted Pi text identity vectors", () => {
 	});
 });
 
+describe("historian drain-budget trigger suppression", () => {
+	it("suppresses repeated automatic runs until the drain window resets", () => {
+		const sessionId = "ses-drain-budget-block";
+		try {
+			contextHandlerInternals.setHistorianDrainBudgetBlockedUntilForTests(
+				sessionId,
+				10_000,
+			);
+			expect(
+				contextHandlerInternals.isHistorianDrainBudgetBlocked(sessionId, 9_999),
+			).toBe(true);
+			expect(
+				contextHandlerInternals.isHistorianDrainBudgetBlocked(
+					sessionId,
+					10_000,
+				),
+			).toBe(false);
+			expect(
+				contextHandlerInternals.isHistorianDrainBudgetBlocked(sessionId, 9_999),
+			).toBe(false);
+		} finally {
+			clearContextHandlerSession(sessionId);
+		}
+	});
+
+	it("rejects a late callback from an earlier session activation", () => {
+		const sessionId = "ses-drain-budget-generation";
+		trackSessionForProject("project-a", sessionId);
+		const staleGeneration =
+			contextHandlerInternals.captureContextHandlerActivationGeneration(
+				sessionId,
+			);
+		clearContextHandlerSession(sessionId);
+		trackSessionForProject("project-a", sessionId);
+		expect(
+			contextHandlerInternals.applyHistorianDrainBudgetBlock(
+				sessionId,
+				staleGeneration,
+				10_000,
+			),
+		).toBe(false);
+		expect(
+			contextHandlerInternals.isHistorianDrainBudgetBlocked(sessionId, 9_999),
+		).toBe(false);
+		clearContextHandlerSession(sessionId);
+	});
+});
+
 describe("Pi fallback tag adoption", () => {
 	type RawTagRow = {
 		tagNumber: number;

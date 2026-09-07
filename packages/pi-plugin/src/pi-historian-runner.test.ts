@@ -226,6 +226,9 @@ async function runHistorianWith(args: {
 	retryBackoffMs?: (retryIndex: number) => number;
 	notifyIssue?: Parameters<typeof runPiHistorian>[0]["notifyIssue"];
 	onPublished?: () => void;
+	onDrainBudgetSpent?: Parameters<
+		typeof runPiHistorian
+	>[0]["onDrainBudgetSpent"];
 	appendCompaction?: Parameters<typeof runPiHistorian>[0]["appendCompaction"];
 	readBranchEntries?: () => unknown[];
 	boundarySnapshot?: ProtectedTailBoundarySnapshot;
@@ -265,6 +268,7 @@ async function runHistorianWith(args: {
 		autoPromote: args.autoPromote,
 		userMemoriesEnabled: args.userMemoriesEnabled,
 		onPublished: args.onPublished,
+		onDrainBudgetSpent: args.onDrainBudgetSpent,
 		appendCompaction: args.appendCompaction,
 		readBranchEntries: args.readBranchEntries,
 		notifyIssue: args.notifyIssue,
@@ -396,9 +400,11 @@ describe("runPiHistorian", () => {
 		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
 			() => {},
 		);
+		const onDrainBudgetSpent = mock((_blockedUntil: number) => {});
 		const { db, runner } = await runHistorianWith({
 			outputs: [successXml()],
 			boundarySnapshot: boundary,
+			onDrainBudgetSpent,
 			beforeRun: (db) => {
 				for (let i = 0; i < 3; i++) {
 					const reservation = reserveProtectedTailDrainTokens({
@@ -424,6 +430,8 @@ describe("runPiHistorian", () => {
 				"ses-historian",
 				"historian skip: internal drain budget spent (9000/9000 tokens; resets in 10m)",
 			);
+			expect(onDrainBudgetSpent).toHaveBeenCalledTimes(1);
+			expect(onDrainBudgetSpent.mock.calls[0]?.[0]).toBeGreaterThan(Date.now());
 		} finally {
 			logSpy.mockRestore();
 			closeQuietly(db);

@@ -72,6 +72,7 @@ describe("protected-tail drain budget window", () => {
         expect(firstSkip.budgetState).toEqual({
             windowStartedAt: startedAt,
             resetsAt: startedAt + DRAIN_WINDOW_MS,
+            retryAt: startedAt + DRAIN_WINDOW_MS,
             resetInMs: DRAIN_WINDOW_MS - 1,
             spentTokens: PER_RUN_CAP,
             limitTokens: PER_RUN_CAP,

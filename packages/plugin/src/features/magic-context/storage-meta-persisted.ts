@@ -171,6 +171,8 @@ export interface ProtectedTailDrainReservation {
 export interface ProtectedTailDrainBudgetState {
     windowStartedAt: number;
     resetsAt: number;
+    /** Earliest time a skipped reservation can become eligible (may precede the window reset during emergency backoff). */
+    retryAt: number;
     resetInMs: number;
     spentTokens: number;
     limitTokens: number;
@@ -874,10 +876,15 @@ export function reserveProtectedTailDrainTokens(args: {
         }
 
         const activeWindowStartedAt = meta.protectedTailDrainWindowStartedAt;
+        const resetsAt = activeWindowStartedAt + DRAIN_WINDOW_MS;
+        const retryAt = inFailureBackoff
+            ? Math.min(resetsAt, meta.historianDrainFailureAt + EMERGENCY_DRAIN_FAILURE_BACKOFF_MS)
+            : resetsAt;
         const budgetState = (spentTokens: number): ProtectedTailDrainBudgetState => ({
             windowStartedAt: activeWindowStartedAt,
-            resetsAt: activeWindowStartedAt + DRAIN_WINDOW_MS,
-            resetInMs: Math.max(0, activeWindowStartedAt + DRAIN_WINDOW_MS - now),
+            resetsAt,
+            retryAt,
+            resetInMs: Math.max(0, resetsAt - now),
             spentTokens,
             limitTokens: budget,
         });
