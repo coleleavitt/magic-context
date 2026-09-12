@@ -1,0 +1,709 @@
+# Instincts generated from https://github.com/coleleavitt/magic-context
+# Generated: 2026-07-17T17:45:48.044Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: magic-context-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Commit Length
+
+## Action
+
+Write moderate-length commit messages (~61 characters)
+
+## Evidence
+
+- Average commit message length: 61 chars
+- Based on 100 commits
+
+---
+id: magic-context-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: magic-context-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: magic-context-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: magic-context-arch-type-based
+trigger: "when adding new code"
+confidence: 0.8
+domain: architecture
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Arch Type Based
+
+## Action
+
+Place code in the appropriate type folder (components/, services/, utils/, etc.)
+
+## Evidence
+
+- Type-based module organization detected
+- Folders: 
+
+---
+id: magic-context-test-framework
+trigger: "when writing tests"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Test Framework
+
+## Action
+
+Use jest as the test framework
+
+## Evidence
+
+- Test framework detected: jest
+- File pattern: *.test.ts
+
+---
+id: magic-context-test-naming
+trigger: "when creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Test Naming
+
+## Action
+
+Name test files using the pattern: *.test.ts
+
+## Evidence
+
+- File pattern: *.test.ts
+- Consistent across test files
+
+---
+id: magic-context-test-types
+trigger: "when planning tests for a feature"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Test Types
+
+## Action
+
+Write unit, integration, e2e tests to match project standards
+
+## Evidence
+
+- Test types detected: unit, integration, e2e
+- Coverage config: yes
+
+---
+id: magic-context-workflow-feature-development
+trigger: "when implementing a new feature"
+confidence: 0.75
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Workflow Feature Development
+
+## Action
+
+Follow the feature-development workflow:
+1. Add feature implementation
+2. Add tests for feature
+3. Update documentation
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~5x per month
+- Files: packages/dashboard/src/*, packages/dashboard/src/components/configeditor/*, packages/dashboard/src/components/dreamerpanel/*
+
+---
+id: magic-context-workflow-release-version-bump-and-announcement
+trigger: "when doing release version bump and announcement"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Workflow Release Version Bump And Announcement
+
+## Action
+
+Follow the release-version-bump-and-announcement workflow:
+1. Update package.json version(s) for CLI, plugin, and/or dashboard
+2. Add or update release notes in .alfonso/release-notes/
+3. Update in-app announcement/version file (e.g., src/shared/announcement.ts)
+4. Optionally fix or update related tests or configuration files
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: packages/cli/package.json, packages/pi-plugin/package.json, packages/plugin/package.json
+
+---
+id: magic-context-workflow-dashboard-feature-or-integration-implementation
+trigger: "when doing dashboard feature or integration implementation"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Workflow Dashboard Feature Or Integration Implementation
+
+## Action
+
+Follow the dashboard-feature-or-integration-implementation workflow:
+1. Update or add Rust files under packages/dashboard/src-tauri/src/ (e.g., commands.rs, serve/mod.rs, main.rs)
+2. Update or add TypeScript/React files under packages/dashboard/src/ (e.g., App.tsx, components/*, lib/api.ts, lib/types.ts)
+3. Optionally update Cargo.toml and/or build.rs for dependencies or build steps
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: packages/dashboard/src-tauri/src/commands.rs, packages/dashboard/src-tauri/src/serve/mod.rs, packages/dashboard/src-tauri/src/main.rs
+
+---
+id: magic-context-workflow-documentation-update-or-release-notes
+trigger: "when doing documentation update or release notes"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Workflow Documentation Update Or Release Notes
+
+## Action
+
+Follow the documentation-update-or-release-notes workflow:
+1. Update or add markdown files in documentation or release notes directories
+2. If relevant, update cross-references or troubleshooting sections
+3. Optionally update .gitignore for doc-related changes
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: ARCHITECTURE.md, STRUCTURE.md, packages/docs/src/content/docs/**/*.md
+
+---
+id: magic-context-workflow-cli-opencode-detection-or-cache-fix
+trigger: "when doing cli opencode detection or cache fix"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Workflow Cli Opencode Detection Or Cache Fix
+
+## Action
+
+Follow the cli-opencode-detection-or-cache-fix workflow:
+1. Update CLI adapter files (e.g., adapters/opencode.ts)
+2. Update or add CLI command files (e.g., commands/doctor-opencode.ts, setup-opencode.ts)
+3. Update or add CLI lib files (e.g., lib/diagnostics-opencode.ts, opencode-detect.ts, opencode-plugin-cache.ts)
+4. Add or update related tests
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: packages/cli/src/adapters/opencode.ts, packages/cli/src/commands/doctor-opencode.ts, packages/cli/src/commands/setup-opencode.ts
+
+---
+id: magic-context-workflow-test-or-ci-workflow-addition-or-update
+trigger: "when doing test or ci workflow addition or update"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Workflow Test Or Ci Workflow Addition Or Update
+
+## Action
+
+Follow the test-or-ci-workflow-addition-or-update workflow:
+1. Add or update .github/workflows/*.yml for CI or probe workflows
+2. Add or update test files in relevant package directories
+3. Optionally update code to support new test cases
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: .github/workflows/*.yml, packages/dashboard/src-tauri/src/commands.rs, packages/plugin/src/tui/badge-contrast.test.ts
+
+---
+id: magic-context-workflow-mc-module-and-mc-store-feature-slice
+trigger: "when doing mc module and mc store feature slice"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/coleleavitt/magic-context
+---
+
+# Magic Context Workflow Mc Module And Mc Store Feature Slice
+
+## Action
+
+Follow the mc-module-and-mc-store-feature-slice workflow:
+1. Add or update Rust source files in crates/mc-core, crates/mc-module, crates/mc-store
+2. Add or update migration logic and data structures
+3. Add or update corresponding tests in tests/ or testdata/
+4. Update Cargo.toml and/or workspace files as needed
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: crates/mc-core/src/*.rs, crates/mc-core/testdata/*.json, crates/mc-core/testdata/gen-golden.ts
+
+---
+id: magic-context-instinct-file-naming
+trigger: "When creating a new file in the codebase"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct File Naming
+
+## Action
+
+Name the file using camelCase (e.g., myFeature.ts)
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.files
+- Consistent in packages/cli/src/*, packages/dashboard/src/*
+
+---
+id: magic-context-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Function Naming
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.functions
+
+---
+id: magic-context-instinct-class-naming
+trigger: "When defining a new class"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Class Naming
+
+## Action
+
+Use PascalCase for class names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.classes
+
+---
+id: magic-context-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constant names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.constants
+
+---
+id: magic-context-instinct-import-style
+trigger: "When importing modules in TypeScript files"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Import Style
+
+## Action
+
+Use relative import paths
+
+## Evidence
+
+- Pattern in codeStyle.importStyle
+
+---
+id: magic-context-instinct-export-style
+trigger: "When exporting from a module"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in codeStyle.exportStyle
+
+---
+id: magic-context-instinct-test-file-pattern
+trigger: "When creating a test file"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Test File Pattern
+
+## Action
+
+Name the file with a .test.ts suffix
+
+## Evidence
+
+- Pattern in testing.filePattern
+- Seen in packages/cli/src/commands/doctor-opencode.test.ts
+
+---
+id: magic-context-instinct-test-framework
+trigger: "When writing tests for TypeScript code"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Test Framework
+
+## Action
+
+Use Jest as the testing framework
+
+## Evidence
+
+- Pattern in testing.framework
+- Seen in packages/e2e-tests/tests/*.test.ts
+
+---
+id: magic-context-instinct-test-types
+trigger: "When planning tests for a feature"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Test Types
+
+## Action
+
+Include unit, integration, and e2e tests as appropriate
+
+## Evidence
+
+- Pattern in testing.testTypes
+
+---
+id: magic-context-instinct-test-coverage-config
+trigger: "When configuring tests"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Test Coverage Config
+
+## Action
+
+Enable and maintain code coverage configuration
+
+## Evidence
+
+- Pattern in testing.coverageConfig
+
+---
+id: magic-context-instinct-error-handling
+trigger: "When handling errors in code"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Error Handling
+
+## Action
+
+Use try-catch blocks for error handling
+
+## Evidence
+
+- Pattern in errorHandling.style
+
+---
+id: magic-context-instinct-commit-prefix
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Commit Prefix
+
+## Action
+
+Prefix the commit with a type (fix, mason, test, release, docs, chore)
+
+## Evidence
+
+- Pattern in commits.prefixes
+- Seen in commit 'fix(cli): clear each plugin-cache root independently in doctor'
+
+---
+id: magic-context-instinct-commit-format
+trigger: "When writing a commit message"
+confidence: 0.8
+domain: git
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Commit Format
+
+## Action
+
+Use the format: <type>(<scope>): <description>
+
+## Evidence
+
+- Pattern in commits.examples
+- Seen in commit 'fix(cli): clear each plugin-cache root independently in doctor'
+
+---
+id: magic-context-instinct-release-workflow
+trigger: "When releasing a new version of the CLI, plugin, or dashboard"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Release Workflow
+
+## Action
+
+Update package.json versions, add release notes in .alfonso/release-notes/, update in-app announcement/version file, and optionally fix related tests/config
+
+## Evidence
+
+- release-version-bump-and-announcement workflow
+- Seen in commits with 'release:' prefix and files like package.json, .alfonso/release-notes/*.md
+
+---
+id: magic-context-instinct-dashboard-feature-workflow
+trigger: "When adding a new feature or integration to the dashboard (backend/frontend)"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Dashboard Feature Workflow
+
+## Action
+
+Update/add Rust files in packages/dashboard/src-tauri/src/, update/add TypeScript/React files in packages/dashboard/src/, optionally update Cargo.toml/build.rs
+
+## Evidence
+
+- dashboard-feature-or-integration-implementation workflow
+- Seen in commits with 'mason:' prefix and files in packages/dashboard/src-tauri/src/ and packages/dashboard/src/
+
+---
+id: magic-context-instinct-docs-update-workflow
+trigger: "When documenting new features, changes, or preparing release notes"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Docs Update Workflow
+
+## Action
+
+Update/add markdown files in documentation/release notes directories, update cross-references/troubleshooting, optionally update .gitignore
+
+## Evidence
+
+- documentation-update-or-release-notes workflow
+- Seen in commits with 'docs:' prefix and files like ARCHITECTURE.md, .alfonso/release-notes/*.md
+
+---
+id: magic-context-instinct-cli-opencode-fix-workflow
+trigger: "When fixing or enhancing OpenCode CLI/desktop detection or plugin cache logic"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Cli Opencode Fix Workflow
+
+## Action
+
+Update CLI adapter, command, and lib files; add/update related tests
+
+## Evidence
+
+- cli-opencode-detection-or-cache-fix workflow
+- Seen in commits with 'fix' prefix and files in packages/cli/src/adapters/opencode.ts, packages/cli/src/lib/opencode-plugin-cache.ts
+
+---
+id: magic-context-instinct-test-or-ci-workflow
+trigger: "When adding new tests, regression probes, or updating CI workflows"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Test Or Ci Workflow
+
+## Action
+
+Add/update .github/workflows/*.yml, add/update test files in relevant package directories, optionally update code to support new tests
+
+## Evidence
+
+- test-or-ci-workflow-addition-or-update workflow
+- Seen in commits with 'test' prefix and files like .github/workflows/*.yml, *.test.ts
+
+---
+id: magic-context-instinct-mc-slice-workflow
+trigger: "When developing a new slice of the Magic Context Rust module"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: coleleavitt/magic-context
+---
+
+# Magic Context Instinct Mc Slice Workflow
+
+## Action
+
+Add/update Rust source files in crates/mc-core, crates/mc-module, crates/mc-store; add/update migration logic, data structures, and corresponding tests; update Cargo.toml/workspace files as needed
+
+## Evidence
+
+- mc-module-and-mc-store-feature-slice workflow
+- Seen in commits with files in crates/mc-core/src/*.rs, crates/mc-module/src/*.rs, crates/mc-store/src/*.rs
+
