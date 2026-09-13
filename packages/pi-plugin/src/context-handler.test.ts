@@ -6061,5 +6061,4 @@ describe("Pi emergency historian ordering and fail-closed parity", () => {
 		const wait = src.indexOf("await withTimeout(histPromise", emergency);
 		expect(src.slice(emergency, wait)).toContain("maybeFireHistorian");
 	});
-
 });

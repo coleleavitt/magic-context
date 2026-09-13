@@ -16,16 +16,18 @@ import {
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { startDreamScheduleTimer as defaultStartDreamScheduleTimer } from "@magic-context/core/plugin/dream-timer";
 import type { ModelHarness } from "@magic-context/core/shared/model-resolution";
-import type { CompletedSubagentToolCall } from "@magic-context/core/shared/subagent-runner";
+import type {
+	CompletedSubagentToolCall,
+	SubagentRunner,
+} from "@magic-context/core/shared/subagent-runner";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
-import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { PiSubagentRunner } from "../subagent-runner";
 import { createPiPrimerRawProviderFactory } from "./primer-raw-provider-pi";
 import { PiRetrospectiveRawProvider } from "./retrospective-raw-provider-pi";
 
 export interface PiDreamerOptions {
 	db: ContextDatabase;
-	/** Injected child execution seam shared with historian, sidekick, and commands. */
+	/** Injected child execution seam shared with historian, Dreamer, and commands. */
 	runner?: SubagentRunner;
 	projectDir: string;
 	projectIdentity: string;

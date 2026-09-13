@@ -60,7 +60,6 @@ const NO_TOOL_AGENTS = new Set([
 ]);
 
 const REPO_INVESTIGATOR_TOOLS: Readonly<Record<string, readonly string[]>> = {
-	sidekick: ["read", "grep", "find", "ls", "ctx_search", "aft_search"],
 	"dreamer-primer-investigator": [
 		"read",
 		"grep",

@@ -714,7 +714,7 @@ mod tests {
         extract_cache_events, parse_log_line, parse_log_record, read_log_tail, read_log_tails,
         resolve_log_path_for, resolve_log_path_from_temp_dir, resolve_log_paths, Harness,
     };
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
     // The env var is process-global; serialize the tests that mutate it.

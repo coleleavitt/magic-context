@@ -78,7 +78,6 @@ import {
 	onNoteTrigger,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
 import { preloadTokenizer } from "@magic-context/core/hooks/magic-context/read-session-formatting";
-import { guardPiProviderContextEdits } from "@magic-context/core/shared/provider-context-edit-guard";
 import { normalizeTodoStateJson } from "@magic-context/core/hooks/magic-context/todo-view";
 import { maybeSendUpgradeReminder } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
 import {
@@ -107,6 +106,7 @@ import {
 	createPromptSurfaceGuidanceEpochCache,
 	createPromptSurfaceRuntime,
 } from "@magic-context/core/shared/prompt-surface-runtime";
+import { guardPiProviderContextEdits } from "@magic-context/core/shared/provider-context-edit-guard";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import {
@@ -176,11 +176,11 @@ import {
 } from "./pi-harness-kind";
 import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
 import { abortInFlightRecomps, awaitInFlightRecomps } from "./pi-recomp-runner";
+import { PrimePreferredChildRunner } from "./prime-child-runner";
 import { handlePiProviderFailure } from "./provider-error-recovery-pi";
 import { readPiSessionMessages } from "./read-session-pi";
 import { registerStatusLine, updateStatusLine } from "./status-line";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
-import { PrimePreferredChildRunner } from "./prime-child-runner";
 import {
 	configurePiSubagentExtensions,
 	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
@@ -1225,7 +1225,9 @@ async function startPiMagicContextRuntime(
 	// dispatch. Handlers run in extension load order, so a later extension can
 	// still inject edits after this guard; there is no post-all-handlers seam.
 	pi.on("before_provider_request", (event, ctx) =>
-		guardPiProviderContextEdits(event.payload, compactionOff, () => ctx.abort()),
+		guardPiProviderContextEdits(event.payload, compactionOff, () =>
+			ctx.abort(),
+		),
 	);
 
 	await ensureProjectRegisteredFromPiDirectory(projectDir, db);

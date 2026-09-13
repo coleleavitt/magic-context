@@ -190,7 +190,9 @@ describe("dead-holder reclaim", () => {
         const legacy = makeDb();
         expect(acquireCompartmentLease(legacy, "ses", "legacy-holder-without-pid")).not.toBeNull();
         expect(reclaimDeadHolderLease(legacy, "ses")).toBe(false);
-        expect(acquireCompartmentLease(legacy, "ses", createCompartmentLeaseHolderId("x"))).toBeNull();
+        expect(
+            acquireCompartmentLease(legacy, "ses", createCompartmentLeaseHolderId("x")),
+        ).toBeNull();
         closeQuietly(db);
         closeQuietly(legacy);
     });

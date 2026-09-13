@@ -58,6 +58,8 @@ async function createRepository(): Promise<{ repo: string; firstSha: string }> {
     await git(repo, "init", "--initial-branch=main");
     await git(repo, "config", "user.name", "Retina Test");
     await git(repo, "config", "user.email", "retina@example.invalid");
+    await git(repo, "config", "commit.gpgSign", "false");
+    await git(repo, "config", "tag.gpgSign", "false");
     await writeFile(join(repo, "state.txt"), "one\n");
     await git(repo, "add", "state.txt");
     await git(repo, "commit", "-m", "first");

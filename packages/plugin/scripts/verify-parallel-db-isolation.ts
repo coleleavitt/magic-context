@@ -48,16 +48,16 @@ function main(): void {
         const sharedDir = join(root, "shared-data-home");
         const shared = runProbe(join(root, "shared"), sharedDir);
         const sharedOutput = outputOf(shared);
-        if (shared.status === 0) {
-            throw new Error("shared-data-home probe unexpectedly passed; it did not exercise SQLite contention");
-        }
-        if (!/SQLITE_BUSY|database is locked/i.test(sharedOutput)) {
-            throw new Error(`shared-data-home probe failed without a SQLite lock error:\n${sharedOutput}`);
-        }
-        if (shared.durationMs < 4_500) {
+        if (shared.status !== 0) {
             throw new Error(
-                `shared-data-home lock surfaced too quickly (${shared.durationMs}ms); busy_timeout was not observed`,
+                `shared-data-home current-schema probe failed; read/open paths must not require a writer lock:
+${sharedOutput}`,
             );
+        }
+        const sharedA = readRecord(join(root, "shared"), "worker-a.json");
+        const sharedB = readRecord(join(root, "shared"), "worker-b.json");
+        if (sharedA.dbPath !== sharedB.dbPath) {
+            throw new Error("shared-data-home probe did not exercise one shared database");
         }
 
         const isolated = runProbe(join(root, "isolated"));
@@ -79,7 +79,7 @@ function main(): void {
         }
 
         console.log(
-            `shared data-home: SQLITE_BUSY after ${shared.durationMs}ms (busy_timeout observed); ` +
+            `shared data-home: current-schema open remained non-writing across one locked database (${shared.durationMs}ms); ` +
                 `isolated workers: pid ${workerA.pid} -> ${workerA.dataHome}, pid ${workerB.pid} -> ${workerB.dataHome}`,
         );
     } finally {

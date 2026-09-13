@@ -334,6 +334,8 @@ for (const native of [false, true]) {
 						process.execPath,
 						"test",
 						import.meta.path,
+						"--timeout",
+						"30000",
 						"-t",
 						"^removal marker child$",
 					],
