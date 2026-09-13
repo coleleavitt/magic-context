@@ -18,7 +18,7 @@ import {
     writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { prepareContextDatabase } from "../prepare-context-db";
 import { assertMockEndpoint, assertMockProviders, pinMockAgents } from "../mock-routing";
 import {
@@ -238,6 +238,10 @@ export function sweepOrphanedServes(): number {
  * the plugin's Rust module client reads), and it reuses the same env across a
  * serve restart so opencode.db + context.db survive the restart.
  */
+export function resolveIsolatedHome(env: IsolatedEnv): string {
+    return dirname(env.configDir);
+}
+
 export function createIsolatedEnv(): IsolatedEnv {
     const unique = `opencode-e2e-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const base = join(tmpdir(), unique);
@@ -641,6 +645,10 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         if (key === "SUBC_LAUNCH_NONCE") continue;
         childEnv[key] = value;
     }
+    // Keep host-global ~/.claude, ~/.agents, and ~/.opencode content out of
+    // hermetic prompts. Those files can add hundreds of thousands of system
+    // characters and invalidate fixed-window failure-mode tests.
+    childEnv.HOME = resolveIsolatedHome(env);
     childEnv.OPENCODE_CONFIG_DIR = env.configDir;
     childEnv.XDG_CONFIG_HOME = env.configDir;
     childEnv.XDG_DATA_HOME = env.dataDir;

@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { waitForReady } from "./spawn";
+import { createIsolatedEnv, resolveIsolatedHome, waitForReady } from "./spawn";
 
 let server: ReturnType<typeof Bun.serve> | undefined;
 const tempDirs: string[] = [];
@@ -32,6 +32,16 @@ afterEach(() => {
     for (const directory of tempDirs.splice(0)) {
         rmSync(directory, { recursive: true, force: true });
     }
+});
+
+
+describe("OpenCode process isolation", () => {
+    it("pins HOME to the isolated fixture root", () => {
+        const env = createIsolatedEnv();
+        tempDirs.push(resolveIsolatedHome(env));
+        expect(resolveIsolatedHome(env)).not.toBe(process.env.HOME);
+        expect(env.configDir.startsWith(resolveIsolatedHome(env))).toBe(true);
+    });
 });
 
 describe("opencode readiness", () => {
