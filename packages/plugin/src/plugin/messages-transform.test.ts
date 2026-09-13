@@ -12,6 +12,7 @@ import {
     resetEmergencyRecoveryRegistryForTest,
 } from "../features/magic-context/storage-meta-persisted";
 import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-closed";
+import { InheritedMagicContextMarkerError } from "../hooks/magic-context/inherited-compaction-marker-guard";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import { finalizeMessageRepresentation } from "../hooks/magic-context/transform-postprocess-phase";
 import { Database } from "../shared/sqlite";
@@ -111,6 +112,24 @@ describe("createMessagesTransformHandler — error boundary (issue #23)", () => 
         await expect(handler({}, makeOutput())).rejects.toBeInstanceOf(
             RawFallbackContextLimitError,
         );
+    });
+
+    it("surfaces inherited-marker and inspection refusals instead of falling back", async () => {
+        for (const error of [
+            new InheritedMagicContextMarkerError("ses_test"),
+            new InheritedMagicContextMarkerError("ses_test", {
+                inspectionFailure: new Error("schema drift"),
+            }),
+        ]) {
+            const handler = createMessagesTransformHandler({
+                magicContext: {
+                    "experimental.chat.messages.transform": async () => {
+                        throw error;
+                    },
+                },
+            });
+            await expect(handler({}, makeOutput())).rejects.toBe(error);
+        }
     });
 
     it("passes through non-error transforms normally", async () => {

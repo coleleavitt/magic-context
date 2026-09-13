@@ -67,6 +67,7 @@ import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { replayCavemanCompression } from "./caveman-cleanup";
 import { commitCompactionModeRecord, reconcileCompactionMode } from "./compaction-off-transition";
 import { getActiveCompartmentRun, startCompartmentAgent } from "./compartment-runner";
+import { assertNoInheritedMagicContextMarker } from "./inherited-compaction-marker-guard";
 import { buildTriggerInMemoryTail, checkCompartmentTrigger } from "./compartment-trigger";
 import {
     type CtxReduceAvailabilityVerdict,
@@ -879,6 +880,19 @@ export function createTransform(deps: TransformDeps) {
             sessionLog(sessionId, "compaction mode transition failed (retrying next pass):", error);
         }
 
+        const isFirstTransformPassForSession = !loadedSessions.has(sessionId);
+        assertNoInheritedMagicContextMarker({
+            db,
+            sessionId,
+            firstTransform: isFirstTransformPassForSession,
+            isSubagent: sessionMeta.isSubagent,
+            compactionOff,
+            inspectionEnabled: deps.client !== undefined,
+        });
+        // Mark the pass observed only after the safety probe succeeds. A refused
+        // retry must remain guarded rather than becoming an uninspected later pass.
+        loadedSessions.add(sessionId);
+
         // Rust mode is an authority adapter, not a second implementation of the
         // TypeScript renderer. Compaction-off still dispatches so the module can
         // provide the shared additive-only memory/docs contract.
@@ -1103,9 +1117,6 @@ export function createTransform(deps: TransformDeps) {
         logTransformTiming(sessionId, "modelChangeDetection", tModelDetect);
         logTransformTiming(sessionId, "schedulerAndUsage", tModelDetect);
         const tFirstPass = performance.now();
-        const isFirstTransformPassForSession = !loadedSessions.has(sessionId);
-        loadedSessions.add(sessionId);
-
         // First-pass reset MUST run BEFORE loadContextUsage so threshold checks
         // (95% blocking, 80% emergency nudge) don't fire on stale data from a
         // different model, reverted message, or previous session state.

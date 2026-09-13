@@ -12,6 +12,7 @@ import {
 } from "../features/magic-context/storage-meta-persisted";
 import { updateSessionMeta } from "../features/magic-context/storage-meta-session";
 import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-closed";
+import { InheritedMagicContextMarkerError } from "../hooks/magic-context/inherited-compaction-marker-guard";
 import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-replay";
 import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
@@ -186,8 +187,8 @@ function preserveUserTerminatedTail(
  *
  * Ordinary transform failures are not rethrown because OpenCode's Effect pipeline
  * turns thrown errors into user-visible prompt failures. FailClosedBlockingError,
- * EmergencyFailClosedError, RawFallbackContextLimitError, and AssistantTerminalRetryError
- * are intentional exceptions.
+ * EmergencyFailClosedError, RawFallbackContextLimitError, AssistantTerminalRetryError,
+ * and InheritedMagicContextMarkerError are intentional exceptions.
  * We accept degraded behavior (no injection / no drops this turn) rather than
  * blocking the user for ordinary bugs — but deterministic inoperability and an unsafe
  * assistant-terminal retry must block loudly.
@@ -287,7 +288,8 @@ export function createMessagesTransformHandler(args: {
         } catch (error) {
             if (
                 error instanceof RawFallbackContextLimitError ||
-                error instanceof AssistantTerminalRetryError
+                error instanceof AssistantTerminalRetryError ||
+                error instanceof InheritedMagicContextMarkerError
             ) {
                 throw error;
             }
