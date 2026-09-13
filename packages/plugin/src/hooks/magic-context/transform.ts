@@ -807,6 +807,22 @@ export function createTransform(deps: TransformDeps) {
         // reconciled even when Rust owns normal transform rendering.
         const compactionOff = deps.compactionOff === true;
 
+        // Inspect before compaction-off reconciliation can delete an inherited
+        // marker. OpenCode already filtered the incoming array before this hook,
+        // so cleanup in this pass cannot restore hidden prefix messages safely.
+        const isFirstTransformPassForSession = !loadedSessions.has(sessionId);
+        assertNoInheritedMagicContextMarker({
+            db,
+            sessionId,
+            firstTransform: isFirstTransformPassForSession,
+            isSubagent: sessionMeta.isSubagent,
+            compactionOff,
+            inspectionEnabled: deps.inspectOpenCodeMarkerOwnership === true,
+        });
+        // Mark the pass observed only after the safety probe succeeds. A refused
+        // retry must remain guarded rather than becoming an uninspected later pass.
+        loadedSessions.add(sessionId);
+
         // Mode-transition reconciliation runs on every pass and is a no-op
         // once the session's durable record matches the boot-resolved mode —
         // so the transition work (marker cleanup, latch/intent/pending-op
@@ -881,19 +897,6 @@ export function createTransform(deps: TransformDeps) {
             passOutcome.record("compaction-mode-transition-failure");
             sessionLog(sessionId, "compaction mode transition failed (retrying next pass):", error);
         }
-
-        const isFirstTransformPassForSession = !loadedSessions.has(sessionId);
-        assertNoInheritedMagicContextMarker({
-            db,
-            sessionId,
-            firstTransform: isFirstTransformPassForSession,
-            isSubagent: sessionMeta.isSubagent,
-            compactionOff,
-            inspectionEnabled: deps.inspectOpenCodeMarkerOwnership === true,
-        });
-        // Mark the pass observed only after the safety probe succeeds. A refused
-        // retry must remain guarded rather than becoming an uninspected later pass.
-        loadedSessions.add(sessionId);
 
         // Rust mode is an authority adapter, not a second implementation of the
         // TypeScript renderer. Compaction-off still dispatches so the module can
