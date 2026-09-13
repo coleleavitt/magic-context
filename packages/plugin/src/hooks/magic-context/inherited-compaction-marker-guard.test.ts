@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 
 setDefaultTimeout(30_000);
+
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,14 +20,22 @@ import {
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
-function setup(): { sessionId: string; contextDb: ReturnType<typeof openDatabase>; openCodeDb: Database } {
+function setup(): {
+    sessionId: string;
+    contextDb: ReturnType<typeof openDatabase>;
+    openCodeDb: Database;
+} {
     const dir = mkdtempSync(join(tmpdir(), "mc-inherited-marker-"));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
     mkdirSync(join(dir, "opencode"), { recursive: true });
     const openCodeDb = new Database(join(dir, "opencode", "opencode.db"));
-    openCodeDb.exec("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)");
-    openCodeDb.exec("CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)");
+    openCodeDb.exec(
+        "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+    );
+    openCodeDb.exec(
+        "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+    );
     return { sessionId: "ses-fork", contextDb: openDatabase(), openCodeDb };
 }
 
@@ -113,7 +122,7 @@ describe("inherited Magic Context marker guard", () => {
             { marker: false, firstTransform: true, isSubagent: false, compactionOff: false },
             { marker: true, firstTransform: false, isSubagent: false, compactionOff: false },
         ];
-        for (const [index, item] of cases.entries()) {
+        for (const item of cases) {
             closeDatabase();
             const state = setup();
             if (item.marker) addMarker(state.openCodeDb, state.sessionId);
@@ -222,7 +231,6 @@ describe("inherited Magic Context marker guard", () => {
         }
     });
 
-
     it("rejects an exact marker blob when the covered compartment is missing", () => {
         const { sessionId, contextDb, openCodeDb } = setup();
         addMarker(openCodeDb, sessionId);
@@ -245,7 +253,6 @@ describe("inherited Magic Context marker guard", () => {
             }),
         ).toThrow(InheritedMagicContextMarkerError);
     });
-
 
     it("requires ownership of the newest effective marker when an older marker also exists", () => {
         const { sessionId, contextDb, openCodeDb } = setup();
@@ -302,5 +309,4 @@ describe("inherited Magic Context marker guard", () => {
             );
         }
     });
-
 });

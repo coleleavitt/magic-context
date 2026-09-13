@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
-    ProviderContextEditsConflictError,
     assertNoOpenCodeProviderContextEdits,
+    ProviderContextEditsConflictError,
 } from "./provider-context-edit-guard";
 
 const anthropicModel = {
@@ -21,11 +21,11 @@ describe("OpenCode provider context edit ownership guard", () => {
     for (const [label, options] of [
         ["camel case", { contextManagement: { edits: [{ type: "compact_20260112" }] } }],
         ["snake case", { context_management: { edits: [{ type: "clear_tool_uses_20250919" }] } }],
+        ["Anthropic namespace + camel case", { anthropic: { contextManagement: { edits: [{}] } } }],
         [
-            "Anthropic namespace + camel case",
-            { anthropic: { contextManagement: { edits: [{}] } } },
+            "Anthropic namespace + snake case",
+            { anthropic: { context_management: { edits: [{}] } } },
         ],
-        ["Anthropic namespace + snake case", { anthropic: { context_management: { edits: [{}] } } }],
     ] as const) {
         test(`rejects ${label} edits on an Anthropic wire model`, () => {
             expect(() =>
@@ -33,7 +33,6 @@ describe("OpenCode provider context edit ownership guard", () => {
             ).toThrow(ProviderContextEditsConflictError);
         });
     }
-
 
     test("allows a provably empty edits list by identity", () => {
         const options = { anthropic: { contextManagement: { edits: [] } } };
@@ -81,9 +80,9 @@ describe("OpenCode provider context edit ownership guard", () => {
     test("rejects edits injected by a hook that ran before Magic Context", () => {
         const options: Record<string, unknown> = { effort: "high" };
         options.contextManagement = { edits: [{ type: "compact_20260112" }] };
-        expect(() =>
-            assertNoOpenCodeProviderContextEdits(anthropicModel, options, false),
-        ).toThrow(ProviderContextEditsConflictError);
+        expect(() => assertNoOpenCodeProviderContextEdits(anthropicModel, options, false)).toThrow(
+            ProviderContextEditsConflictError,
+        );
     });
 
     test("entry registers the guard at chat.params", () => {
@@ -102,5 +101,4 @@ describe("OpenCode provider context edit ownership guard", () => {
         options.contextManagement = { edits: [{}] };
         expect(options.contextManagement).toEqual({ edits: [{}] });
     });
-
 });

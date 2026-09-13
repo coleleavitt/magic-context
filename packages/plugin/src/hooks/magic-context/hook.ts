@@ -1116,6 +1116,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         commitSeenLastPass,
         internalChildSessions,
         client: deps.client,
+        inspectOpenCodeMarkerOwnership: true,
         directory: deps.directory,
         allowHomeProject: deps.config.allow_home_project,
         injectDocs: deps.config.dreamer?.inject_docs !== false,

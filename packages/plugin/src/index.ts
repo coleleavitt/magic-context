@@ -68,7 +68,6 @@ import {
 } from "./shared/conflict-detector";
 import { getMagicContextStorageDir } from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
-import { assertNoOpenCodeProviderContextEdits } from "./shared/provider-context-edit-guard";
 import { setKeepSubagents } from "./shared/keep-subagents";
 import { flushLogger, log } from "./shared/logger";
 import {
@@ -84,6 +83,7 @@ import {
     resolveOpenCodeDbPath,
 } from "./shared/opencode-db-path";
 import { createPromptSurfaceRuntime } from "./shared/prompt-surface-runtime";
+import { assertNoOpenCodeProviderContextEdits } from "./shared/provider-context-edit-guard";
 import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";

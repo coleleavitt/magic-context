@@ -67,7 +67,6 @@ import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { replayCavemanCompression } from "./caveman-cleanup";
 import { commitCompactionModeRecord, reconcileCompactionMode } from "./compaction-off-transition";
 import { getActiveCompartmentRun, startCompartmentAgent } from "./compartment-runner";
-import { assertNoInheritedMagicContextMarker } from "./inherited-compaction-marker-guard";
 import { buildTriggerInMemoryTail, checkCompartmentTrigger } from "./compartment-trigger";
 import {
     type CtxReduceAvailabilityVerdict,
@@ -96,6 +95,7 @@ import {
     estimateMessageTokens,
 } from "./final-wire-token-estimate";
 import type { LiveModelBySession } from "./hook-handlers";
+import { assertNoInheritedMagicContextMarker } from "./inherited-compaction-marker-guard";
 import {
     mustMaterialize,
     type PreparedCompartmentInjection,
@@ -582,6 +582,8 @@ export interface TransformDeps {
     lastHeuristicsTurnId: Map<string, string>;
     commitSeenLastPass?: Map<string, boolean>;
     client?: PluginContext["client"];
+    /** Production OpenCode enables raw marker ownership inspection; unit harnesses opt in explicitly. */
+    inspectOpenCodeMarkerOwnership?: boolean;
     directory?: string;
     /** Whether user-level configuration lets this session use the canonical home directory as its project. */
     allowHomeProject?: boolean;
@@ -887,7 +889,7 @@ export function createTransform(deps: TransformDeps) {
             firstTransform: isFirstTransformPassForSession,
             isSubagent: sessionMeta.isSubagent,
             compactionOff,
-            inspectionEnabled: deps.client !== undefined,
+            inspectionEnabled: deps.inspectOpenCodeMarkerOwnership === true,
         });
         // Mark the pass observed only after the safety probe succeeds. A refused
         // retry must remain guarded rather than becoming an uninspected later pass.

@@ -1,5 +1,5 @@
-import { getCompartments } from "../../features/magic-context/compartment-storage";
 import { listSessionCompactionMarkers } from "../../features/magic-context/compaction-marker";
+import { getCompartments } from "../../features/magic-context/compartment-storage";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getPersistedCompactionMarkerState } from "../../features/magic-context/storage-meta-persisted";
 

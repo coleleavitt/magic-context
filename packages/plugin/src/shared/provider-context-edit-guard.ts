@@ -44,8 +44,7 @@ export function assertNoOpenCodeProviderContextEdits<T>(
 ): T {
     if (compactionOff) return options;
     const conflict =
-        hasContextEdits(options) ||
-        (isRecord(options) && hasContextEdits(options.anthropic));
+        hasContextEdits(options) || (isRecord(options) && hasContextEdits(options.anthropic));
     if (conflict) throw new ProviderContextEditsConflictError();
     return options;
 }
