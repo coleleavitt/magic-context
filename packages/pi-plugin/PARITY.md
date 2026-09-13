@@ -1017,3 +1017,20 @@ Both harness twins now pre-execute a due fold off-wire and feed the shared `fold
 | `last_observed_model_key` | Write paths canonicalize it and OpenCode readers canonicalize both sides. Pi's pressure writer does not populate this OpenCode usage-attribution field, so an empty value on the incident session is expected; Pi HARD-fold identity comes from `liveModelBySession`, not this column. |
 
 Workspace fingerprints preserve the distinction between SQL `NULL` (not workspaced) and a non-empty hash. The compare normalizes only nullish values to `null`; it does not coerce `NULL` to `""`. A legacy zero-length fingerprint would therefore trigger one self-healing fold whose write stores the current `null`, not a per-pass loop.
+
+## Provider context-edit ownership guard and host hook ordering
+
+When Magic Context compaction is enabled, both harnesses fail closed instead of
+silently stripping Anthropic server-side context edits. OpenCode inspects the
+effective `contextManagement.edits` / `context_management.edits` provider
+options in `chat.params`. Pi inspects raw `context_management.edits` in
+`before_provider_request` and calls `ctx.abort()` because Pi catches extension
+handler exceptions.
+
+These are the final request seams each host exposes to an individual plugin,
+not global "after every plugin" barriers. OpenCode dispatches `chat.params`
+handlers in plugin order, and Pi dispatches `before_provider_request` handlers
+in extension load order. A later plugin/extension can therefore inject edits
+after Magic Context's guard. Load Magic Context last when other integrations
+rewrite provider requests. Focused tests preserve this limitation explicitly;
+it cannot be closed without a host-owned final-request policy hook.

@@ -68,6 +68,7 @@ import {
 } from "./shared/conflict-detector";
 import { getMagicContextStorageDir } from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
+import { assertNoOpenCodeProviderContextEdits } from "./shared/provider-context-edit-guard";
 import { setKeepSubagents } from "./shared/keep-subagents";
 import { flushLogger, log } from "./shared/logger";
 import {
@@ -824,6 +825,18 @@ const server: Plugin = async (ctx) => {
             await magicContextRuntime.magicContext?.["experimental.chat.system.transform"]?.(
                 input,
                 output,
+            );
+        },
+        // OpenCode has no post-all-plugins request hook. `chat.params` is the
+        // final effective provider-option seam this plugin can inspect. A plugin
+        // loaded after Magic Context can still inject edits after this handler.
+        "chat.params": async (input, output) => {
+            assertNoOpenCodeProviderContextEdits(
+                input.model,
+                output.options,
+                !pluginConfig.enabled ||
+                    !isCompactionEnabled(pluginConfig) ||
+                    magicContextRuntime.magicContext === undefined,
             );
         },
         "command.execute.before": async (input, output) => {

@@ -78,6 +78,7 @@ import {
 	onNoteTrigger,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
 import { preloadTokenizer } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import { guardPiProviderContextEdits } from "@magic-context/core/shared/provider-context-edit-guard";
 import { normalizeTodoStateJson } from "@magic-context/core/hooks/magic-context/todo-view";
 import { maybeSendUpgradeReminder } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
 import {
@@ -1219,6 +1220,13 @@ async function startPiMagicContextRuntime(
 		info("plugin DISABLED via config (enabled: false) — skipping registration");
 		return;
 	}
+
+	// Pi exposes the raw Anthropic payload here, after serialization and before
+	// dispatch. Handlers run in extension load order, so a later extension can
+	// still inject edits after this guard; there is no post-all-handlers seam.
+	pi.on("before_provider_request", (event, ctx) =>
+		guardPiProviderContextEdits(event.payload, compactionOff, () => ctx.abort()),
+	);
 
 	await ensureProjectRegisteredFromPiDirectory(projectDir, db);
 	info(
