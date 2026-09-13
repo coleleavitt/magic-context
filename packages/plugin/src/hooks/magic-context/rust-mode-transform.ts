@@ -12,13 +12,16 @@ import {
     pullMemoryMirrorOnce,
     reconcileAuthorityProject,
 } from "../../features/magic-context/context-authority";
-import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import {
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
 } from "../../features/magic-context/memory/project-identity";
 import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
-import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
+import {
+    modelKeyAcceptsImages,
+    resolveMuralWire,
+} from "../../features/magic-context/mural/render-trigger";
+import type { MuralWireOptions } from "../../features/magic-context/mural/resolve-mural";
 import { isFable51ThinkingBindingModel } from "../../features/magic-context/overflow-detection";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
@@ -36,14 +39,21 @@ import {
     isProviderOverflowFailClosedProven,
     isProviderOverflowReconfirmed,
     loadProtectedTailMeta,
+    resolveEpochFloorForPass,
     setPersistedTodoPermissionDenied,
     setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
+import { getPendingOps } from "../../features/magic-context/storage-ops";
+import {
+    GLOBAL_USER_PROFILE_PROJECT_PATH,
+    getProjectState,
+} from "../../features/magic-context/storage-project-state";
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { canonicalModelIdentity } from "../../shared/harness-provider-map";
 import { sessionLog } from "../../shared/logger";
 import { promptSurfaceConfigIdentity, resolvePromptSurface } from "../../shared/prompt-surface";
+import { createPromptSurfaceGuidanceEpochCache } from "../../shared/prompt-surface-runtime";
 import type { WindowGeometryResult } from "../../shared/window-geometry";
 import {
     cachedToolPermissionDenied,
@@ -70,6 +80,7 @@ import { replayLkg, resolveLkgModelKeys } from "./lkg-replay";
 import {
     captureSlot,
     dropSlot,
+    exactReusablePrefix,
     getSlot,
     incrementalLkgContentDigests,
     LKG_SNAPSHOT_ARRAY,
@@ -80,9 +91,15 @@ import {
     LKG_SNAPSHOT_OBJECT,
     LKG_SNAPSHOT_STRING,
     LKG_SNAPSHOT_UNDEFINED,
-    type LkgContentField,
     type LkgEntryNote,
+    type LkgInputSnapshot,
+    type LkgSlot,
+    type MessageContentSnapshot,
+    messageContentFields,
+    messageContentSnapshot,
     noteEntry,
+    signatureForFields,
+    visitMessageContentFields,
 } from "./lkg-slot";
 import {
     clearCompartmentMirrorCursor,
@@ -100,12 +117,13 @@ import {
 } from "./module-transport";
 import {
     buildPagedModuleTransformPayloads,
+    cloneModuleNativeOutput,
     encodeOpenCodeMessagesToCk,
     resolveOrdinalsForModule,
 } from "./module-wire";
 import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
-import { findLastAssistantModelFromOpenCodeDb, isMidTurn } from "./read-session-db";
+import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
 import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
@@ -163,21 +181,31 @@ async function resolveCombinedTodowriteVerdict(
     sessionId: string,
     messages: readonly MessageLike[],
     availability: ToolAvailabilityVerdict,
+    timings: RustPassTimings,
+    probeFresh = true,
 ): Promise<boolean> {
     if (!availability.frozen || !availability.callable || deps.compactionOff === true) return false;
 
+    const persistedDenied = getPersistedTodoPermissionDenied(deps.db, sessionId);
+    if (!probeFresh && persistedDenied !== null) return !persistedDenied;
     let permissionDenied =
-        cachedToolPermissionDenied(sessionId, "todowrite") ??
-        getPersistedTodoPermissionDenied(deps.db, sessionId) ??
-        false;
+        cachedToolPermissionDenied(sessionId, "todowrite") ?? persistedDenied ?? false;
     if (deps.client) {
         try {
+            const probeStartedAt = performance.now();
             permissionDenied = await todowritePermissionDenied(
                 deps.client,
                 sessionId,
                 activeAgentFromMessages(messages),
             );
-            setPersistedTodoPermissionDenied(deps.db, sessionId, permissionDenied);
+            timings.todoProbe += performance.now() - probeStartedAt;
+            const persistStartedAt = performance.now();
+            // Permission is still revalidated with the host each pass. Avoid a redundant
+            // SQLite write only when the durable verdict already matches that fresh read.
+            if (persistedDenied !== permissionDenied) {
+                setPersistedTodoPermissionDenied(deps.db, sessionId, permissionDenied);
+            }
+            timings.todoPersist += performance.now() - persistStartedAt;
         } catch (error) {
             // A failed SDK read cannot turn a prior denial into an allow. Keep the last
             // in-memory or durable verdict until a later pass obtains authoritative data.
@@ -220,6 +248,11 @@ function rawFallbackSerializedBytes(
 }
 
 export interface RustModeModuleClient extends ModuleStateSyncClient {
+    call(
+        args: Parameters<ModuleStateSyncClient["call"]>[0] & {
+            onTimings?: (timings: import("./module-transport").ModuleCallTimings) => void;
+        },
+    ): Promise<unknown>;
     authorityStatus?(args: {
         context_store_uuid: string;
         project: string;
@@ -247,15 +280,10 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
     ): Promise<ModuleCompartmentMirrorResponse>;
 }
 
-interface MessageContentSnapshot {
-    signature: string;
-    fields: LkgContentField[];
-}
-
 interface RustLkgCapturePlan {
     sessionId: string;
     inputIds: string[];
-    inputSnapshots: readonly MessageContentSnapshot[];
+    inputSnapshots: readonly Pick<MessageContentSnapshot, "fields">[];
     jsonPrefix: string;
     modelKey: string | null;
     providerKey: string | null;
@@ -272,7 +300,7 @@ interface RustWireCache {
     rawLastVisible: boolean;
     /** Content-sensitive per-message snapshots for the whole raw array. Delta passes
      * re-verify every reused message so in-place edits cannot ride a stale prefix. */
-    rawContentSnapshots: MessageContentSnapshot[];
+    rawContentSnapshots: Pick<MessageContentSnapshot, "fields">[];
     ckFingerprint: string;
     ckPrefixFingerprintBeforeLast: string;
     nativeFingerprint: string;
@@ -283,8 +311,58 @@ interface RustWireCache {
     nativeOutput?: unknown[];
 }
 
+class MagicContextRustHeapHolder {
+    readonly wireCaches = new Map<string, RustWireCache>();
+}
+
+export interface RustWireCacheHeapStats {
+    snapshots: number;
+    rawContentSnapshots: number;
+    estimatedBytes: number;
+    sessions: Array<{
+        sessionId: string;
+        rawMessages: number;
+        wireMessages: number;
+        rawContentSnapshots: number;
+        estimatedBytes: number;
+    }>;
+}
+
+function rustWireCacheEstimatedBytes(cache: RustWireCache): number {
+    let bytes = 0;
+    for (const value of [
+        cache.rawLastId,
+        cache.rawLastSignature,
+        cache.ckFingerprint,
+        cache.ckPrefixFingerprintBeforeLast,
+        cache.nativeFingerprint,
+        cache.nativePrefixFingerprintBeforeLast,
+        cache.fingerprint,
+    ]) {
+        if (value) bytes += value.length * 2;
+    }
+    for (const snapshot of cache.rawContentSnapshots) {
+        for (const field of snapshot.fields) {
+            if (typeof field === "string") bytes += field.length * 2;
+            else if (typeof field === "number" || typeof field === "boolean") bytes += 8;
+            else bytes += String(field).length * 2;
+        }
+    }
+    if (cache.nativeOutput) {
+        try {
+            bytes += Buffer.byteLength(JSON.stringify(cache.nativeOutput));
+        } catch {
+            // Cyclic host extensions are excluded from the serialized estimate.
+        }
+    }
+    return bytes;
+}
+
 interface RustSessionState extends ModuleStateSyncState {
     initialized: boolean;
+    todoProbeIdentity?: string;
+    todoProbeNextPass?: boolean;
+    lastAppliedAtMs?: number;
     consecutiveFailures: number;
     passCount: number;
     parked: boolean;
@@ -309,10 +387,25 @@ interface RustSessionState extends ModuleStateSyncState {
     memoryAuthorityRoot: string | null;
     memoryAuthorityReady: boolean;
     recordedSessionProjectIdentity: string | null;
+    recordedSessionDirectory: string | null;
+    resolvedMemoryProjectDirectory: string | null;
+    resolvedMemoryProjectPath: string | null;
+    stateSyncInputSignature: string | null;
+    memoryMirrorProjectionKey: string | null;
+    compartmentMirrorProjectionKey: string | null;
+    mirrorProjectionInFlight: boolean;
+    muralCuePoolVersion: number;
+    muralGeneration: number;
+    muralCache: { key: string; value: MuralWireOptions } | null;
     authorityMemorySyncSkipLogged?: boolean;
     lkgCaptureSequence: number;
     lkgLastCapturedRowVersion: number;
     lkgSyncCaptureRequired: boolean;
+    lkgAcceptedCapture?: {
+        inputs: readonly LkgInputSnapshot[];
+        captureSequence: number;
+        rowVersion: number;
+    };
     /** A fallback replay is provider-visible output. Keep that exact representation through
      * deferred recovery; healthy-pass and raw-tail limits prevent indefinite stale replay. */
     lkgRepresentationFrozen: boolean;
@@ -343,6 +436,16 @@ export interface RustModeTransformOptions {
     installNativeMessagesForTests?: (output: { messages: unknown[] }, messages: unknown[]) => void;
     /** Override only to exercise raw-fallback estimator failures in tests. */
     rawFallbackEstimatorForTests?: typeof estimateFinalWireInputTokens;
+    /** Override only to observe mural generation caching in tests. */
+    muralResolverForTests?: typeof resolveMuralWire;
+    /** Override only to observe session-identity caching in tests. */
+    sessionProjectIdentityResolverForTests?: typeof resolveProjectIdentityForSession;
+    /** Override only to observe memory-project identity caching in tests. */
+    memoryProjectIdentityResolverForTests?: typeof resolveProjectIdentity;
+    /** Disable hot-path I/O caches to establish an uncached differential-timing baseline. */
+    disableHotPathIoCachesForTests?: boolean;
+    /** Test-only callback after a capture is accepted, reporting the reused digest prefix length. */
+    onLkgCaptureForTests?: (reusedPrefix: number) => void;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -393,117 +496,45 @@ function messageIdOf(message: MessageLike): string | null {
     return typeof id === "string" && id.length > 0 ? id : null;
 }
 
-const FNV1A_32_OFFSET = 0x811c9dc5;
-const FNV1A_32_PRIME = 0x01000193;
-
-function updateFnv1a32(hash: number, value: string): number {
-    let next = hash;
-    for (let index = 0; index < value.length; index += 1) {
-        next ^= value.charCodeAt(index);
-        next = Math.imul(next, FNV1A_32_PRIME) >>> 0;
-    }
-    return next;
+function contentSnapshotsFor(
+    messages: readonly MessageLike[],
+): Pick<MessageContentSnapshot, "fields">[] {
+    // Copy primitive field tokens before the RPC so later host mutations cannot alter
+    // this snapshot. Wire-prefix validation compares the fields directly, without a hash.
+    return messages.map((message) => ({ fields: messageContentFields(message) }));
 }
 
-interface MessageContentFieldVisitor {
-    field(value: LkgContentField): boolean;
-    beginObject(): number | undefined;
-    endObject(token: number, entryCount: number): boolean;
-}
-
-function isSnapshotObjectChild(value: unknown): boolean {
-    return value !== undefined && typeof value !== "function" && typeof value !== "symbol";
-}
-
-function visitMessageContentFields(value: unknown, visitor: MessageContentFieldVisitor): boolean {
-    if (value === null) return visitor.field(LKG_SNAPSHOT_NULL);
-    if (typeof value === "string") {
-        return visitor.field(LKG_SNAPSHOT_STRING) && visitor.field(value);
-    }
-    if (typeof value === "number") {
-        return visitor.field(LKG_SNAPSHOT_NUMBER) && visitor.field(value);
-    }
-    if (typeof value === "boolean") {
-        return visitor.field(LKG_SNAPSHOT_BOOLEAN) && visitor.field(value);
-    }
-    if (value === undefined || typeof value === "function" || typeof value === "symbol") {
-        return visitor.field(LKG_SNAPSHOT_UNDEFINED);
-    }
-    if (Array.isArray(value)) {
-        if (!visitor.field(LKG_SNAPSHOT_ARRAY) || !visitor.field(value.length)) return false;
-        for (const item of value) {
-            if (!visitMessageContentFields(item, visitor)) return false;
-        }
-        return true;
-    }
-    if (typeof value === "object") {
-        if (!visitor.field(LKG_SNAPSHOT_OBJECT)) return false;
-        const objectToken = visitor.beginObject();
-        if (objectToken === undefined) return false;
-        let entryCount = 0;
-        for (const key in value) {
-            if (!Object.hasOwn(value, key)) continue;
-            const child = (value as Record<string, unknown>)[key];
-            if (!isSnapshotObjectChild(child)) continue;
-            entryCount += 1;
-            if (
-                !visitor.field(LKG_SNAPSHOT_KEY) ||
-                !visitor.field(key) ||
-                !visitMessageContentFields(child, visitor)
-            ) {
-                return false;
-            }
-        }
-        return visitor.endObject(objectToken, entryCount);
-    }
-    return visitor.field(LKG_SNAPSHOT_UNDEFINED);
-}
-
-function messageContentFields(message: MessageLike): LkgContentField[] {
-    const fields: LkgContentField[] = [];
-    const complete = visitMessageContentFields(message, {
-        field(value) {
-            fields.push(value);
-            return true;
-        },
-        beginObject() {
-            const countIndex = fields.length;
-            fields.push(0);
-            return countIndex;
-        },
-        endObject(countIndex, entryCount) {
-            fields[countIndex] = entryCount;
-            return true;
-        },
-    });
-    if (!complete) throw new Error("message content snapshot traversal stopped unexpectedly");
-    return fields;
-}
-
-function signatureForFields(fields: readonly LkgContentField[]): string {
-    let hash = FNV1A_32_OFFSET;
-    for (const field of fields) {
-        const value = typeof field === "symbol" ? (field.description ?? "") : String(field);
-        hash = updateFnv1a32(hash, `${typeof field}:${value.length}:`);
-        hash = updateFnv1a32(hash, value);
-        hash = updateFnv1a32(hash, "\0");
-    }
-    return hash.toString(16).padStart(8, "0");
-}
-
-/** Capture an exact field snapshot plus its compact content-sensitive rolling hash. */
-function messageContentSnapshot(message: MessageLike): MessageContentSnapshot {
-    const fields = messageContentFields(message);
-    return { signature: signatureForFields(fields), fields };
-}
-
-function contentSnapshotsFor(messages: readonly MessageLike[]): MessageContentSnapshot[] {
-    return messages.map(messageContentSnapshot);
+function rustCaptureDigests(
+    inputs: readonly LkgInputSnapshot[],
+    prior: LkgSlot | undefined,
+    acceptedInputs: readonly LkgInputSnapshot[] | null,
+) {
+    const reusablePrefix = prior?.inputContentSignatures
+        ? exactReusablePrefix(inputs, acceptedInputs)
+        : 0;
+    const inputContentSignatures = [
+        ...(prior?.inputContentSignatures?.slice(0, reusablePrefix) ?? []),
+        ...inputs.slice(reusablePrefix).map((input) => signatureForFields(input.fields)),
+    ];
+    const incremental = incrementalLkgContentDigests(
+        inputs.map((input, index) => ({
+            ...input,
+            signature: inputContentSignatures[index] ?? "",
+        })),
+        prior?.inputContentSignatures
+            ? {
+                  ids: prior.inputIdSeq.slice(0, reusablePrefix),
+                  signatures: prior.inputContentSignatures.slice(0, reusablePrefix),
+                  digests: prior.inputContentDigests.slice(0, reusablePrefix),
+              }
+            : undefined,
+    );
+    return { ...incremental, inputContentSignatures };
 }
 
 function messageMatchesContentSnapshot(
     message: MessageLike,
-    snapshot: MessageContentSnapshot,
+    snapshot: Pick<MessageContentSnapshot, "fields">,
 ): boolean {
     let fieldIndex = 0;
     const matched = visitMessageContentFields(message, {
@@ -575,6 +606,9 @@ function newestUserMessage(messages: MessageLike[]): MessageLike | undefined {
 }
 
 interface RustPassTimings {
+    identityResolve: number;
+    promptSurface: number;
+    muralResolve: number;
     prefixGuard: number;
     ordinalResolve: number;
     stateSync: number;
@@ -582,6 +616,19 @@ interface RustPassTimings {
     wireBuild: number;
     wireMessages: number;
     transport: number;
+    transportDetail: import("./module-transport").ModuleCallTimings;
+    preflight: number;
+    todoVerdict: number;
+    todoProbe: number;
+    todoPersist: number;
+    todoProbeRequired: number;
+    todoProbeReason: string;
+    todoUnprobedBust: number;
+    sessionDirectory: number;
+    paging: number;
+    outputClone: number;
+    delivery: number;
+    bookkeeping: number;
     transportPages: number;
     transportBytes: number;
     apply: number;
@@ -592,6 +639,9 @@ interface RustPassTimings {
 
 function emptyRustPassTimings(): RustPassTimings {
     return {
+        identityResolve: 0,
+        promptSurface: 0,
+        muralResolve: 0,
         prefixGuard: 0,
         ordinalResolve: 0,
         stateSync: 0,
@@ -599,6 +649,19 @@ function emptyRustPassTimings(): RustPassTimings {
         wireBuild: 0,
         wireMessages: 0,
         transport: 0,
+        transportDetail: { lane: 0, route: 0, encode: 0, issue: 0, responseWait: 0, settle: 0 },
+        preflight: 0,
+        todoVerdict: 0,
+        todoProbe: 0,
+        todoPersist: 0,
+        todoProbeRequired: 0,
+        todoProbeReason: "none",
+        todoUnprobedBust: 0,
+        sessionDirectory: 0,
+        paging: 0,
+        outputClone: 0,
+        delivery: 0,
+        bookkeeping: 0,
         transportPages: 0,
         transportBytes: 0,
         apply: 0,
@@ -667,6 +730,9 @@ function formatRustPassLog(args: {
 }): string {
     const timings = args.timings ?? emptyRustPassTimings();
     const measured =
+        timings.identityResolve +
+        timings.promptSurface +
+        timings.muralResolve +
         timings.prefixGuard +
         timings.ordinalResolve +
         timings.stateSync +
@@ -674,7 +740,13 @@ function formatRustPassLog(args: {
         timings.wireBuild +
         timings.transport +
         timings.apply +
-        timings.lkgSnapshot;
+        timings.lkgSnapshot +
+        timings.preflight +
+        timings.todoVerdict +
+        timings.sessionDirectory +
+        timings.paging +
+        timings.delivery +
+        timings.bookkeeping;
     // Mirror stages run after appliedAt and are excluded from elapsed, so they
     // must not be subtracted into `other` or they would hide leftover serve work.
     const unattributed = Math.max(0, args.elapsedMs - measured);
@@ -685,7 +757,7 @@ function formatRustPassLog(args: {
     const historianFields = args.historianCanonicalCause
         ? ` historian_no_fire=${args.historianNoFire ?? "unknown"} canonical_cause=${args.historianCanonicalCause}`
         : "";
-    return `rust pass: decision=${args.decision} reason=${args.reason}${schedulerFields}${historianFields} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)}`;
+    return `rust pass: decision=${args.decision} reason=${args.reason}${schedulerFields}${historianFields} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=identity_resolve:${timings.identityResolve.toFixed(1)} prompt_surface:${timings.promptSurface.toFixed(1)} mural_resolve:${timings.muralResolve.toFixed(1)} prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)} transport_lane:${timings.transportDetail.lane.toFixed(1)} transport_route:${timings.transportDetail.route.toFixed(1)} transport_encode:${timings.transportDetail.encode.toFixed(1)} transport_issue:${timings.transportDetail.issue.toFixed(1)} transport_response_wait_decode:${timings.transportDetail.responseWait.toFixed(1)} transport_settle:${timings.transportDetail.settle.toFixed(1)} transport_wrapper:${Math.max(0, timings.transport - Object.values(timings.transportDetail).reduce((sum, ms) => sum + ms, 0)).toFixed(1)} preflight:${timings.preflight.toFixed(1)} todo_verdict:${timings.todoVerdict.toFixed(1)} todo_probe:${timings.todoProbe.toFixed(1)} todo_persist:${timings.todoPersist.toFixed(1)} todo_probe_required:${timings.todoProbeRequired} todo_probe_reason:${timings.todoProbeReason} todo_unprobed_bust:${timings.todoUnprobedBust} session_directory:${timings.sessionDirectory.toFixed(1)} paging:${timings.paging.toFixed(1)} output_clone:${timings.outputClone.toFixed(1)} delivery:${timings.delivery.toFixed(1)} bookkeeping:${timings.bookkeeping.toFixed(1)}`;
 }
 
 function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
@@ -746,6 +818,45 @@ function responseValue(response: unknown): Record<string, unknown> {
     if (isRecord(response) && isRecord(response.result)) return response.result;
     if (isRecord(response)) return response;
     throw new Error("module transform returned a non-object response");
+}
+
+function mirrorProjectionKey(response: Record<string, unknown>): string | null {
+    const rowVersion = response.row_version;
+    if (typeof rowVersion !== "number" || !Number.isSafeInteger(rowVersion) || rowVersion < 0) {
+        return null;
+    }
+    const renderedMemoryIds = Array.isArray(response.rendered_memory_ids)
+        ? response.rendered_memory_ids
+        : [];
+    return JSON.stringify([
+        rowVersion,
+        response.boundary_id ?? null,
+        response.coverage_ordinal ?? null,
+        renderedMemoryIds,
+    ]);
+}
+
+function stateSyncInputSignature(args: {
+    projectPath: string | undefined;
+    sessionMeta: ReturnType<typeof getOrCreateSessionMeta>;
+    todoAvailability: ToolAvailabilityVerdict;
+    historyRefresh: boolean;
+    deferredHistoryRefresh: boolean;
+    pendingMaterialization: boolean;
+    deferredMaterialization: boolean;
+}): string {
+    return JSON.stringify([
+        args.projectPath ?? null,
+        args.sessionMeta.lastTodoState ?? "",
+        args.sessionMeta.clearedReasoningThroughTag ?? 0,
+        args.sessionMeta.toolReclaimWatermark ?? 0,
+        args.todoAvailability.frozen,
+        args.todoAvailability.callable,
+        args.historyRefresh,
+        args.deferredHistoryRefresh,
+        args.pendingMaterialization,
+        args.deferredMaterialization,
+    ]);
 }
 
 function isTransformPageAttemptMismatch(error: unknown): boolean {
@@ -854,6 +965,16 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             memoryAuthorityRoot: null,
             memoryAuthorityReady: false,
             recordedSessionProjectIdentity: null,
+            recordedSessionDirectory: null,
+            resolvedMemoryProjectDirectory: null,
+            resolvedMemoryProjectPath: null,
+            stateSyncInputSignature: null,
+            memoryMirrorProjectionKey: null,
+            compartmentMirrorProjectionKey: null,
+            mirrorProjectionInFlight: false,
+            muralCuePoolVersion: 0,
+            muralGeneration: 0,
+            muralCache: null,
             authorityMemorySyncSkipLogged: false,
             lkgCaptureSequence: 0,
             lkgLastCapturedRowVersion: 0,
@@ -915,6 +1036,7 @@ function passUsage(usage: ContextUsage, limit: number): Record<string, number> {
 interface TransformGeometryWire {
     usable_soft: number;
     usable_hard: number;
+    absolute_wall: number;
     derivation: string;
 }
 
@@ -936,6 +1058,7 @@ function transformGeometryForWire(
     return {
         usable_soft: geometry.usableSoft,
         usable_hard: geometry.usableHard,
+        absolute_wall: geometry.derivation.absoluteWall,
         derivation,
     };
 }
@@ -1404,7 +1527,6 @@ function buildTransformBody(args: {
     variant?: string;
     systemPromptHash: string;
     upgradeState: string;
-    midTurn: boolean;
     prevResponseCompletedAtMs?: number;
     requestObservedAtMs?: number;
     channel2NudgeState: string;
@@ -1438,7 +1560,6 @@ function buildTransformBody(args: {
         system_prompt_hash: args.systemPromptHash,
         upgrade_state: args.upgradeState,
         is_subagent: args.passInputs.is_subagent === true,
-        protected_tags: args.passInputs.protected_tags ?? DEFAULT_PROTECTED_TAGS,
         messages: args.input,
         native_messages: args.nativeMessages,
         tool_input_key_orders: args.toolInputKeyOrders ?? toolInputKeyOrders(args.input),
@@ -1455,7 +1576,6 @@ function buildTransformBody(args: {
         usage: args.usage,
         ...(args.geometry ? { geometry: args.geometry } : {}),
         provider_error: args.passInputs.provider_error,
-        mid_turn: args.midTurn,
         prev_response_completed_at_ms: args.prevResponseCompletedAtMs,
         request_observed_at_ms: args.requestObservedAtMs,
         channel2_nudge_state: args.channel2NudgeState,
@@ -1470,6 +1590,9 @@ function buildTransformBody(args: {
         ...(typeof args.passInputs.todo_tool_present === "boolean"
             ? { todo_tool_present: args.passInputs.todo_tool_present }
             : {}),
+        ...(typeof args.passInputs.todo_verdict_probed === "boolean"
+            ? { todo_verdict_probed: args.passInputs.todo_verdict_probed, verdict_stale_ok: false }
+            : {}),
         prompt_surface_preset: args.passInputs.prompt_surface_preset ?? "full",
         prompt_surface_model_key: args.passInputs.prompt_surface_model_key,
         prompt_surface_config_identity: args.passInputs.prompt_surface_config_identity,
@@ -1477,6 +1600,9 @@ function buildTransformBody(args: {
         prompt_surface_guidance_override: args.passInputs.prompt_surface_guidance_override,
         mural: args.passInputs.mural,
         effective_execute_threshold: args.passInputs.effective_execute_threshold,
+        ...(typeof args.passInputs.protected_tokens_effective === "number"
+            ? { protected_tokens_effective: args.passInputs.protected_tokens_effective }
+            : {}),
         auto_search_enabled: args.passInputs.auto_search_enabled === true,
         auto_search_score_threshold: args.passInputs.auto_search_score_threshold,
         auto_search_min_prompt_chars: args.passInputs.auto_search_min_prompt_chars,
@@ -1513,9 +1639,13 @@ export function createRustModeTransform(
     clearSession: (sessionId: string) => Promise<void>;
     invalidateWireState: (sessionId: string) => void;
     getState: (sessionId: string) => Readonly<RustSessionState>;
+    getHeapStats: () => RustWireCacheHeapStats;
 } {
     const states = new Map<string, RustSessionState>();
-    const wireCaches = new Map<string, RustWireCache>();
+    const heapHolder = new MagicContextRustHeapHolder();
+    const promptSurfaceGuidanceEpochs = deps.promptSurfaceRuntime
+        ? createPromptSurfaceGuidanceEpochCache(deps.promptSurfaceRuntime)
+        : undefined;
     const scheduleLkgCapture =
         options.scheduleLkgCapture ?? ((capture: () => void) => setImmediate(capture));
     const installNativeMessages = options.installNativeMessagesForTests ?? replaceMessagesInPlace;
@@ -1523,9 +1653,41 @@ export function createRustModeTransform(
         options.rawFallbackEstimatorForTests ?? estimateFinalWireInputTokens;
     const timeoutMs = Math.max(1, options.moduleTimeoutMs ?? RUST_SEND_TIMEOUT_MS);
 
+    const resolveMuralForPass = (
+        state: RustSessionState,
+        projectIdentity: string | undefined,
+        modelKey: string | undefined,
+        budgetTokens: number | undefined,
+    ): MuralWireOptions => {
+        // SDK refreshes can correct image support without changing the model key.
+        // Cache the candidate mural for the next permitted HARD (prefix rebuild);
+        // the Rust module keeps already-served m0 prefix bytes frozen on passes
+        // without cache-bust permission.
+        const key = JSON.stringify([
+            state.muralGeneration,
+            state.muralCuePoolVersion,
+            projectIdentity ?? null,
+            modelKey ?? null,
+            budgetTokens ?? null,
+            modelKeyAcceptsImages(modelKey),
+        ]);
+        if (options.disableHotPathIoCachesForTests !== true && state.muralCache?.key === key) {
+            return state.muralCache.value;
+        }
+        const value = (options.muralResolverForTests ?? resolveMuralWire)(
+            deps.db,
+            projectIdentity,
+            modelKey,
+            true,
+            budgetTokens,
+        );
+        state.muralCache = { key, value };
+        return value;
+    };
+
     const logStage = (
         sessionId: string,
-        stage: keyof RustPassTimings,
+        stage: Exclude<keyof RustPassTimings, "transportDetail" | "todoProbeReason">,
         startedAt: number,
         timings: RustPassTimings,
         extra?: string,
@@ -1542,19 +1704,35 @@ export function createRustModeTransform(
 
     const callModule = async (
         args: Parameters<RustModeModuleClient["call"]>[0],
-        attemptTimeoutMs = timeoutMs,
+        attemptTimeoutMs = args.timeoutMs ?? timeoutMs,
     ): Promise<unknown> => {
         const controller = new AbortController();
-        const timer = setTimeout(
-            () => controller.abort(new Error("rust module request timed out")),
-            attemptTimeoutMs,
-        );
+        const body = isRecord(args.body) ? args.body : {};
+        const timeoutError =
+            args.method === "state_sync"
+                ? Object.assign(
+                      new Error(
+                          `state_sync timeout stage=module_ack page=${body.seed_batch_index ?? 0}/${body.seed_batch_total ?? 1} series=${body.seed_id ?? "delta"} budget_ms=${attemptTimeoutMs}`,
+                      ),
+                      {
+                          code: "state_sync_timeout",
+                          stage: "module_ack",
+                          page: body.seed_batch_index ?? 0,
+                          pages: body.seed_batch_total ?? 1,
+                          series: body.seed_id ?? null,
+                      },
+                  )
+                : new Error("rust module request timed out");
+        const timer = setTimeout(() => controller.abort(timeoutError), attemptTimeoutMs);
         try {
             return await options.moduleClient.call({
                 ...args,
                 signal: controller.signal,
                 timeoutMs: attemptTimeoutMs,
             });
+        } catch (error) {
+            if (controller.signal.aborted) throw timeoutError;
+            throw error;
         } finally {
             clearTimeout(timer);
         }
@@ -1587,10 +1765,11 @@ export function createRustModeTransform(
     };
 
     const invalidateWireState = (sessionId: string): void => {
-        wireCaches.delete(sessionId);
+        heapHolder.wireCaches.delete(sessionId);
         const state = states.get(sessionId);
         if (!state) return;
         resetOrdinalMemo(state);
+        state.stateSyncInputSignature = null;
         state.forceFullWire = true;
     };
 
@@ -1602,6 +1781,8 @@ export function createRustModeTransform(
     ): boolean => {
         const slot = getSlot(sessionId);
         if (!slot) {
+            const state = states.get(sessionId);
+            if (state) state.lkgAcceptedCapture = undefined;
             sessionLog(sessionId, "lkg_miss");
             return false;
         }
@@ -1626,6 +1807,8 @@ export function createRustModeTransform(
         }
         if (!entry) {
             dropSlot(sessionId, "lkg_invalidated_reshape");
+            const state = states.get(sessionId);
+            if (state) state.lkgAcceptedCapture = undefined;
             sessionLog(sessionId, "lkg_invalidated_reshape");
             return false;
         }
@@ -1638,6 +1821,8 @@ export function createRustModeTransform(
             entry,
         });
         if (!replay.ok) {
+            const state = states.get(sessionId);
+            if (state) state.lkgAcceptedCapture = undefined;
             sessionLog(sessionId, replay.reason);
             return false;
         }
@@ -1698,7 +1883,7 @@ export function createRustModeTransform(
         sessionId: string,
         inputIds: readonly unknown[],
         inputKeys: ReturnType<typeof resolveLkgModelKeys>,
-        inputSnapshots: readonly MessageContentSnapshot[],
+        inputSnapshots: readonly Pick<MessageContentSnapshot, "fields">[],
         nativeMessages: readonly unknown[],
         responseRowVersion: number,
     ): RustLkgCapturePlan | null => {
@@ -1738,25 +1923,31 @@ export function createRustModeTransform(
         ) {
             return "superseded";
         }
-        // Steady passes append one message onto an unchanged prefix. Reuse the
-        // previous slot's digests for every id+content-signature match and hash
-        // only from the first changed entry so the deferred commit stays off the
-        // event-loop budget.
+        // Reuse requires the exact inputs from a previously accepted capture in this
+        // process; a restarted adapter has no such proof. Compute FNV signatures at
+        // commit, not before the RPC, retaining Pi's input_content_signatures format.
+        // Cache-busting/recovery captures still commit synchronously for durability.
         const prior = getSlot(plan.sessionId);
-        const inputContentSignatures = plan.inputSnapshots.map((snapshot) => snapshot.signature);
-        const { digests: inputContentDigests } = incrementalLkgContentDigests(
-            plan.inputIds.map((id, index) => ({
-                id,
-                signature: inputContentSignatures[index] ?? "",
-                fields: plan.inputSnapshots[index]?.fields ?? [],
-            })),
-            prior?.inputContentSignatures
-                ? {
-                      ids: prior.inputIdSeq,
-                      signatures: prior.inputContentSignatures,
-                      digests: prior.inputContentDigests,
-                  }
+        const inputs = plan.inputIds.map((id, index) => ({
+            id,
+            fields: plan.inputSnapshots[index]?.fields ?? [],
+        }));
+        // A failed durable refresh followed by eviction can hydrate an older slot.
+        // Its digests must not borrow the newer in-memory capture's equality proof.
+        const accepted = state.lkgAcceptedCapture;
+        const {
+            digests: inputContentDigests,
+            inputContentSignatures,
+            reusedPrefix,
+        } = rustCaptureDigests(
+            inputs,
+            prior?.modelKey === plan.modelKey &&
+                prior?.providerKey === plan.providerKey &&
+                prior?.captureSequence === accepted?.captureSequence &&
+                prior?.rowVersion === accepted?.rowVersion
+                ? prior
                 : undefined,
+            accepted?.inputs ?? null,
         );
         const slot = {
             jsonPrefix: plan.jsonPrefix,
@@ -1772,6 +1963,12 @@ export function createRustModeTransform(
         };
         const captured = captureSlot(plan.sessionId, slot);
         if (!captured) throw new Error("LKG slot rejected the prepared snapshot");
+        state.lkgAcceptedCapture = {
+            inputs,
+            captureSequence: plan.captureSequence,
+            rowVersion: plan.rowVersion,
+        };
+        options.onLkgCaptureForTests?.(reusedPrefix);
         // Durability across restarts: store the exact accepted snapshot (the
         // jsonPrefix string is reused as-is, never re-serialized). Best-effort —
         // a write failure leaves the in-memory slot serving this process.
@@ -2104,6 +2301,8 @@ export function createRustModeTransform(
                 return;
             }
         }
+        timings.preflight = performance.now() - passStartedAt;
+
         const reduceAvailability = resolveCtxReduceAvailability(sessionId);
         // Freeze the native todo-tool map verdict before state sync reads it, then combine it
         // with OpenCode's live permission decision. The module receives one authoritative bool;
@@ -2111,36 +2310,53 @@ export function createRustModeTransform(
         resolveTodowriteAvailabilityFromMessages(sessionId, messages);
         const todoAvailability = resolveTodowriteAvailability(sessionId);
         const toolPresent = reduceAvailability.frozen && reduceAvailability.callable;
-        let todoToolPresent = false;
-        try {
-            todoToolPresent = await resolveCombinedTodowriteVerdict(
-                deps,
-                sessionId,
-                messages,
-                todoAvailability,
-            );
-        } catch (error) {
-            preflightError ??= error;
-        }
+        let todoProbeIdentity = "";
+        let todoProbeRequired = true;
         try {
             if (preflightError) throw preflightError;
             if (!overflowState) throw new Error("rust overflow state unavailable");
+            const directoryStartedAt = performance.now();
             const { directory, resolvedFromHost } = await getSessionDirectory(deps, sessionId);
-            if (resolvedFromHost) {
-                const sessionProjectIdentity = resolveProjectIdentityForSession(
-                    directory,
-                    deps.allowHomeProject,
-                );
-                if (
-                    sessionProjectIdentity &&
-                    state.recordedSessionProjectIdentity !== sessionProjectIdentity
-                ) {
-                    // Missing chunk embeddings are restored through the session's
-                    // host-owned project binding, not through Rust module state.
-                    recordSessionProjectIdentity(deps.db, sessionId, sessionProjectIdentity);
+            timings.sessionDirectory += performance.now() - directoryStartedAt;
+            const identityResolveStartedAt = performance.now();
+            if (
+                resolvedFromHost &&
+                (options.disableHotPathIoCachesForTests === true ||
+                    state.recordedSessionDirectory !== directory)
+            ) {
+                const sessionProjectIdentity = (
+                    options.sessionProjectIdentityResolverForTests ??
+                    resolveProjectIdentityForSession
+                )(directory, deps.allowHomeProject);
+                if (sessionProjectIdentity) {
+                    if (state.recordedSessionProjectIdentity !== sessionProjectIdentity) {
+                        // Missing chunk embeddings are restored through the session's
+                        // host-owned project binding, not through Rust module state.
+                        recordSessionProjectIdentity(deps.db, sessionId, sessionProjectIdentity);
+                    }
                     state.recordedSessionProjectIdentity = sessionProjectIdentity;
+                    state.recordedSessionDirectory = directory;
                 }
             }
+            let memoryProjectPath = deps.projectPath;
+            if (deps.memoryConfig?.enabled && directory.length > 0) {
+                if (
+                    options.disableHotPathIoCachesForTests !== true &&
+                    state.resolvedMemoryProjectDirectory === directory
+                ) {
+                    memoryProjectPath = state.resolvedMemoryProjectPath ?? undefined;
+                } else {
+                    const resolvedProject = (
+                        options.memoryProjectIdentityResolverForTests ?? resolveProjectIdentity
+                    )(directory);
+                    if (resolvedProject) {
+                        state.resolvedMemoryProjectDirectory = directory;
+                        state.resolvedMemoryProjectPath = resolvedProject;
+                    }
+                    memoryProjectPath = resolvedProject;
+                }
+            }
+            logStage(sessionId, "identityResolve", identityResolveStartedAt, timings);
             if (model) deps.liveModelBySession?.set(sessionId, model);
             const usage = passUsageSnapshot;
             requestInputTokens = Math.max(0, Math.floor(usage.inputTokens));
@@ -2164,30 +2380,64 @@ export function createRustModeTransform(
                 deps.executeThresholdTokens,
                 resolvedContextLimit,
             );
-            const midTurn = isMidTurn(deps, sessionId);
             const requestObservedAtMs = Date.now();
             const recoveryNoHeadEscape =
                 overflowState.needsEmergencyRecovery &&
                 loadProtectedTailMeta(deps.db, sessionId).recoveryNoEligibleHeadCount >=
                     RECOVERY_NO_HEAD_LIMIT;
-            const promptSurfaceGuidance = deps.promptSurfaceRuntime?.resolveGuidance(
-                deps.promptSurface,
-                modelKey ?? undefined,
-            );
+            const promptSurfaceStartedAt = performance.now();
+            const promptSurfaceGuidance =
+                options.disableHotPathIoCachesForTests === true
+                    ? deps.promptSurfaceRuntime?.resolveGuidance(
+                          deps.promptSurface,
+                          modelKey ?? undefined,
+                      )
+                    : promptSurfaceGuidanceEpochs?.resolve(
+                          sessionId,
+                          deps.promptSurface,
+                          modelKey ?? undefined,
+                      );
             const promptSurface =
                 promptSurfaceGuidance ??
                 resolvePromptSurface(deps.promptSurface, modelKey ?? undefined);
+            logStage(sessionId, "promptSurface", promptSurfaceStartedAt, timings);
+            const muralResolveStartedAt = performance.now();
             const resolvedMural =
                 !sessionMeta.isSubagent && deps.muralEnabled === true
-                    ? resolveMuralWire(
-                          deps.db,
+                    ? resolveMuralForPass(
+                          state,
                           deps.projectPath,
                           modelKey ?? undefined,
-                          true,
                           deps.memoryConfig?.injectionBudgetTokens,
                       )
                     : undefined;
             const mural = muralInputForWire(resolvedMural);
+            logStage(sessionId, "muralResolve", muralResolveStartedAt, timings);
+            const protectionFloorCacheBustingPass =
+                schedulerDecision === "execute" ||
+                deps.historyRefreshSessions.has(sessionId) ||
+                deps.pendingMaterializationSessions.has(sessionId) ||
+                deps.deferredHistoryRefreshSessions?.has(sessionId) === true ||
+                deps.deferredMaterializationSessions?.has(sessionId) === true;
+            const protectionFloorResolution = resolveEpochFloorForPass(deps.db, sessionId, {
+                configuredOverride: deps.protectedTokens,
+                tierOverrides: deps.protectedTokenTierOverrides,
+                usableSoft: transformGeometry?.usable_soft ?? 128_000,
+                isCacheBustingPass: protectionFloorCacheBustingPass,
+                onRejectedProjectOverride: (warning) => sessionLog(sessionId, warning),
+            });
+            if (protectionFloorResolution.snapshotChanged) {
+                sessionLog(
+                    sessionId,
+                    `protected token floor snapshot: floor=${protectionFloorResolution.floor} provenance=${protectionFloorResolution.provenance === "override" ? "absolute" : "derived"} usableSoft=${transformGeometry?.usable_soft ?? 128_000}`,
+                );
+            } else if (protectionFloorResolution.preSnapshotInputChanged) {
+                sessionLog(
+                    sessionId,
+                    `protected token floor remains frozen until next priced pass: floor=${protectionFloorResolution.floor} reason=${protectionFloorResolution.preSnapshotBustReason}`,
+                );
+            }
+            const effectiveFloor = protectionFloorResolution.floor;
             const passInputs: Record<string, unknown> = {
                 now_ms: requestObservedAtMs,
                 model_key: modelKey,
@@ -2205,19 +2455,18 @@ export function createRustModeTransform(
                     !sessionMeta.isSubagent && deps.cavemanTextCompression?.enabled === true,
                 caveman_min_chars: deps.cavemanTextCompression?.minChars ?? 500,
                 cache_ttl: sessionMeta.cacheTtl,
-                mid_turn: midTurn,
                 is_subagent: sessionMeta.isSubagent,
                 system_prompt_hash: sessionMeta.systemPromptHash ?? "",
                 upgrade_state: readUpgradeState(deps.db, sessionId),
                 tool_present: toolPresent,
-                todo_tool_present: todoToolPresent,
+                todo_tool_present: false,
                 prompt_surface_preset: promptSurface.preset,
                 prompt_surface_model_key: modelKey,
                 prompt_surface_config_identity: promptSurfaceConfigIdentity(deps.promptSurface),
                 prompt_surface_tool_descriptions: deps.promptSurface?.tool_descriptions ?? {},
                 prompt_surface_guidance_override: promptSurfaceGuidance?.primaryOverride,
                 mural,
-                protected_tags: deps.protectedTags ?? DEFAULT_PROTECTED_TAGS,
+                protected_tokens_effective: effectiveFloor,
                 temporal_awareness: deps.experimentalTemporalAwareness === true,
                 channel2_nudge_state: getChannel2NudgeState(deps.db, sessionId),
                 emergency_recovery_armed:
@@ -2226,7 +2475,7 @@ export function createRustModeTransform(
                 detected_context_limit: overflowState.detectedContextLimit,
                 detected_context_limit_model_key: overflowState.detectedContextLimitModelKey,
             };
-            const previousWireCache = wireCaches.get(sessionId);
+            const previousWireCache = heapHolder.wireCaches.get(sessionId);
             let wireDelta:
                 | {
                       rawStart: number;
@@ -2327,6 +2576,7 @@ export function createRustModeTransform(
                 memoStoredCount: state.ordinalMemoStoredCount,
                 memoCanonicalCount: state.ordinalMemoCanonicalCount,
                 provisionalBase,
+                forceProbeForTests: options.disableHotPathIoCachesForTests,
             });
             logStage(sessionId, "ordinalResolve", ordinalStartedAt, timings);
             if (!resolved.ok) {
@@ -2345,6 +2595,7 @@ export function createRustModeTransform(
                     memoStoredCount: state.ordinalMemoStoredCount,
                     memoCanonicalCount: state.ordinalMemoCanonicalCount,
                     provisionalBase: state.ordinalContinuationBase ?? undefined,
+                    forceProbeForTests: options.disableHotPathIoCachesForTests,
                 });
                 logStage(
                     sessionId,
@@ -2368,20 +2619,90 @@ export function createRustModeTransform(
             const syncPass = {
                 db: deps.db,
                 sessionId,
-                projectPath:
-                    deps.memoryConfig?.enabled && directory.length > 0
-                        ? resolveProjectIdentity(directory)
-                        : deps.projectPath,
+                projectPath: memoryProjectPath,
                 nowMs: Date.now(),
             };
             const projectRoot = options.projectRoot ?? directory;
-            const memoryProjectPath =
-                deps.memoryConfig?.enabled && directory.length > 0
-                    ? resolveProjectIdentity(directory)
-                    : deps.projectPath;
-            const stateSyncStartedAt = performance.now();
             const authoritySeqAdoption = { used: false };
+            const memorySyncRequested =
+                options.memorySyncRequestedSessions?.delete(sessionId) === true;
+            // The acknowledged watermark snapshot is invalidated only by inputs already observed
+            // on this pass: memory-tool mutation requests; compartment/m0 publication signals;
+            // project/config refresh signals; or the already-loaded session_meta todo/reasoning
+            // epoch. A new transform instance is the config-reload/workspace epoch boundary.
+            const currentStateSyncInputSignature = stateSyncInputSignature({
+                projectPath: syncPass.projectPath,
+                sessionMeta,
+                todoAvailability,
+                historyRefresh: deps.historyRefreshSessions.has(sessionId),
+                deferredHistoryRefresh:
+                    deps.deferredHistoryRefreshSessions?.has(sessionId) === true,
+                pendingMaterialization: deps.pendingMaterializationSessions.has(sessionId),
+                deferredMaterialization:
+                    deps.deferredMaterializationSessions?.has(sessionId) === true,
+            });
+            const todoVerdictStartedAt = performance.now();
+            todoProbeIdentity = JSON.stringify([
+                modelKey,
+                sessionMeta.systemPromptHash,
+                activeAgentFromMessages(messages),
+                currentStateSyncInputSignature,
+                markerAt,
+                getProjectState(deps.db, memoryProjectPath ?? projectRoot),
+                getProjectState(deps.db, GLOBAL_USER_PROFILE_PROJECT_PATH),
+                passInputs.upgrade_state,
+                promptSurfaceConfigIdentity(deps.promptSurface),
+                state.muralCuePoolVersion,
+                state.muralGeneration,
+                mural,
+                effectiveFloor,
+                deps.clearReasoningAge,
+                deps.cavemanTextCompression,
+            ]);
+            const idleBudgetMs = sessionMeta.cacheTtl === "1h" ? 3_600_000 : 300_000;
+            // Synthetic todo bytes are re-decided only on a bust. Observe every
+            // adapter-visible bust signal rather than polling host permissions on
+            // an unchanged defer pass; unexpected module busts remain observable.
+            const todoProbeSignals = {
+                cold: !state.initialized,
+                missing_verdict: getPersistedTodoPermissionDenied(deps.db, sessionId) === null,
+                full_wire: state.forceFullWire || !wireDelta,
+                identity: state.todoProbeIdentity !== todoProbeIdentity,
+                module_hint: state.todoProbeNextPass === true,
+                pressure: usage.percentage >= threshold,
+                memory_sync: memorySyncRequested,
+                refresh: protectionFloorCacheBustingPass,
+                emergency: overflowState.needsEmergencyRecovery,
+                frozen: state.lkgRepresentationFrozen,
+                agent_drop: getPendingOps(deps.db, sessionId).length > 0,
+                ttl:
+                    state.lastAppliedAtMs !== undefined &&
+                    requestObservedAtMs - state.lastAppliedAtMs >= idleBudgetMs,
+            };
+            const probeReasons = Object.entries(todoProbeSignals)
+                .filter(([, due]) => due)
+                .map(([reason]) => reason);
+            todoProbeRequired = probeReasons.length > 0;
+            timings.todoProbeReason = probeReasons.join(",") || "none";
+            timings.todoProbeRequired = Number(todoProbeRequired);
+            passInputs.todo_tool_present = await resolveCombinedTodowriteVerdict(
+                deps,
+                sessionId,
+                messages,
+                todoAvailability,
+                timings,
+                todoProbeRequired,
+            );
+            passInputs.todo_verdict_probed = timings.todoProbe > 0;
+            passInputs.verdict_stale_ok = false;
+            timings.todoVerdict += performance.now() - todoVerdictStartedAt;
+            const knownWatermarksUnchanged =
+                options.disableHotPathIoCachesForTests !== true &&
+                !memorySyncRequested &&
+                !state.lkgRepresentationFrozen &&
+                state.stateSyncInputSignature === currentStateSyncInputSignature;
             let stateSyncRetryBusy = false;
+            const stateSyncStartedAt = performance.now();
             try {
                 await prepareRustMemoryAuthority({
                     db: deps.db,
@@ -2392,7 +2713,7 @@ export function createRustModeTransform(
                     allowProtocolBypassForTests: options.allowAuthorityProtocolBypassForTests,
                     onProjectPrepared: options.onProjectPrepared,
                 });
-                if (options.memorySyncRequestedSessions?.delete(sessionId)) {
+                if (memorySyncRequested) {
                     // A memory tool call can complete after the prior authority pass has
                     // acknowledged its watermarks. Rewind only memory watermarks so the
                     // next pass ships the mutation delta without reseeding compartments.
@@ -2427,9 +2748,13 @@ export function createRustModeTransform(
                         authority: true,
                         authorityState: state.memoryAuthorityReady ? "MODULE" : undefined,
                         authoritySeqAdoption,
+                        knownWatermarksUnchanged,
                     },
                 });
                 stateSyncRetryBusy = stateSyncResult.status === "retry_busy";
+                if (!stateSyncRetryBusy) {
+                    state.stateSyncInputSignature = currentStateSyncInputSignature;
+                }
             } finally {
                 logStage(sessionId, "stateSync", stateSyncStartedAt, timings);
             }
@@ -2538,7 +2863,6 @@ export function createRustModeTransform(
                 variant: deps.variantBySession?.get(sessionId),
                 systemPromptHash: sessionMeta.systemPromptHash ?? "",
                 upgradeState: String(passInputs.upgrade_state ?? ""),
-                midTurn,
                 prevResponseCompletedAtMs:
                     sessionMeta.lastResponseTime > 0 ? sessionMeta.lastResponseTime : undefined,
                 requestObservedAtMs,
@@ -2564,10 +2888,12 @@ export function createRustModeTransform(
                 payload: Record<string, unknown>,
                 detail = "",
             ): Promise<TransformSeriesResult> => {
+                const pagingStartedAt = performance.now();
                 const pages = buildPagedModuleTransformPayloads(
                     payload,
                     options.modulePageMaxBytes,
                 );
+                timings.paging += performance.now() - pagingStartedAt;
                 const seedMessageCount = Array.isArray(payload.input)
                     ? payload.input.length
                     : Array.isArray(payload.messages)
@@ -2599,6 +2925,12 @@ export function createRustModeTransform(
                                 projectRoot,
                                 method: "transform",
                                 body: page,
+                                onTimings: (detail) => {
+                                    for (const key of Object.keys(
+                                        detail,
+                                    ) as (keyof typeof detail)[])
+                                        timings.transportDetail[key] += detail[key];
+                                },
                                 // A reconnect discards a collecting page series. Page zero can be
                                 // retried safely, but later pages must make the caller restart it.
                                 generationSensitive: paged && index > 0,
@@ -2680,6 +3012,13 @@ export function createRustModeTransform(
             const nativeContentOmitted = !hasNativeResponseContent(response);
             if (needFullSync || nativeContentOmitted) {
                 if (needFullSync) {
+                    resetOrdinalMemo(state);
+                    state.stateSyncInputSignature = null;
+                    state.memoryMirrorProjectionKey = null;
+                    state.compartmentMirrorProjectionKey = null;
+                    state.muralGeneration += 1;
+                    state.muralCache = null;
+                    clearCompartmentMirrorCursor(sessionId);
                     // The module restarted and rejected the generation used by the state sync
                     // above. Synchronize the new process before requesting the full response;
                     // otherwise this pass may use incomplete restored state while the next pass
@@ -2745,6 +3084,25 @@ export function createRustModeTransform(
                 // malformed native response does not prove that the module restarted; retry it
                 // without reseeding state.
                 state.forceFullWire = true;
+                if (!todoProbeRequired) {
+                    const todoRetryStartedAt = performance.now();
+                    todoProbeRequired = true;
+                    timings.todoProbeRequired = 1;
+                    timings.todoProbeReason = "full_retry";
+                    passInputs.todo_tool_present = await resolveCombinedTodowriteVerdict(
+                        deps,
+                        sessionId,
+                        messages,
+                        todoAvailability,
+                        timings,
+                    );
+                    passInputs.todo_verdict_probed = timings.todoProbe > 0;
+                    timings.todoVerdict += performance.now() - todoRetryStartedAt;
+                    Object.assign(body, {
+                        todo_tool_present: passInputs.todo_tool_present,
+                        todo_verdict_probed: passInputs.todo_verdict_probed,
+                    });
+                }
                 if (wireDelta) {
                     const retryOrdinalStartedAt = performance.now();
                     let retryResolved = await resolveOrdinalsForModule({
@@ -2757,6 +3115,7 @@ export function createRustModeTransform(
                         memoStoredCount: state.ordinalMemoStoredCount,
                         memoCanonicalCount: state.ordinalMemoCanonicalCount,
                         provisionalBase: state.ordinalContinuationBase ?? undefined,
+                        forceProbeForTests: options.disableHotPathIoCachesForTests,
                     });
                     logStage(
                         sessionId,
@@ -2776,6 +3135,7 @@ export function createRustModeTransform(
                             memoAnchor: state.ordinalMemoAnchor,
                             memoStoredCount: state.ordinalMemoStoredCount,
                             memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                            forceProbeForTests: options.disableHotPathIoCachesForTests,
                         });
                     }
                     if (!retryResolved.ok) {
@@ -2829,7 +3189,6 @@ export function createRustModeTransform(
                         providerId: model?.providerID ?? null,
                         systemPromptHash: sessionMeta.systemPromptHash ?? "",
                         upgradeState: String(passInputs.upgrade_state ?? ""),
-                        midTurn,
                         prevResponseCompletedAtMs:
                             sessionMeta.lastResponseTime > 0
                                 ? sessionMeta.lastResponseTime
@@ -2846,9 +3205,7 @@ export function createRustModeTransform(
                         "retry=full",
                     );
                 }
-                const retryWireBuildStartedAt = performance.now();
                 response = await sendTransformSeriesWithSingleRestart(body, " retry=full");
-                logStage(sessionId, "wireBuild", retryWireBuildStartedAt, timings, "retry=full");
                 captureResponseTelemetry(response);
                 if (isNeedFullSync(response)) {
                     // The retry was a genuine full send; a second need_full_sync means
@@ -2900,6 +3257,13 @@ export function createRustModeTransform(
                 // SOFT re-renders m1 (delta folds, coverage folds): the served bytes changed,
                 // so the previous last-known-good (LKG) snapshot is already stale.
                 decisionUpper === "SOFT";
+            if (!todoProbeRequired && cacheBustingPass) {
+                timings.todoUnprobedBust += 1;
+                sessionLog(
+                    sessionId,
+                    `todo_permission_probe_miss decision=${decisionUpper} reason=${response.materialize_reason ?? "unknown"} verdict_stale_ok=false`,
+                );
+            }
             const deferredFirstDivergence = isRecord(response.first_divergence)
                 ? response.first_divergence
                 : undefined;
@@ -2974,7 +3338,9 @@ export function createRustModeTransform(
                     }
                 }
                 if (!replayedFrozenRepresentation) {
-                    appliedMessages = structuredClone(moduleMessages);
+                    const outputCloneStartedAt = performance.now();
+                    appliedMessages = cloneModuleNativeOutput(moduleMessages);
+                    timings.outputClone += performance.now() - outputCloneStartedAt;
                 }
                 // Delta offsets count the module's array, before host marker insertion or
                 // reasoning recovery. Keep that basis unmodified, including nested parts;
@@ -3055,6 +3421,7 @@ export function createRustModeTransform(
                 // and its replay still applies durable binding-mismatch strips.
                 if (cacheBustingPass) {
                     dropSlot(sessionId, "lkg_cache_bust_pending_capture");
+                    state.lkgAcceptedCapture = undefined;
                 }
                 // Build the capture from the installed array. A priced replacement commits its
                 // snapshot before this transform can return, so a process death cannot leave the
@@ -3077,6 +3444,7 @@ export function createRustModeTransform(
                         return;
                     }
                     dropSlot(sessionId, `lkg_${mode}_capture_failed`);
+                    state.lkgAcceptedCapture = undefined;
                     state.lkgSyncCaptureRequired = true;
                     sessionLog(
                         sessionId,
@@ -3134,6 +3502,7 @@ export function createRustModeTransform(
                 }
                 throw error;
             }
+            const bookkeepingStartedAt = performance.now();
             if (cacheBustingPass) {
                 if (frozenReleaseReason) {
                     sessionLog(
@@ -3152,6 +3521,7 @@ export function createRustModeTransform(
             } catch (error) {
                 sessionLog(sessionId, "rust rendered-memory mirror write failed (ignored):", error);
             }
+            const deliveryStartedAt = performance.now();
             if (deliveryPassIds.length > 0) {
                 try {
                     await sendNoteDeliveryDisposition("transform.ack");
@@ -3161,6 +3531,7 @@ export function createRustModeTransform(
                     sessionLog(sessionId, "rust note delivery ack failed (will retry):", ackError);
                 }
             }
+            timings.delivery += performance.now() - deliveryStartedAt;
             const ordinalContinuationBase = response.ordinal_continuation_base;
             if (
                 typeof ordinalContinuationBase === "number" &&
@@ -3240,21 +3611,52 @@ export function createRustModeTransform(
                     // Best-effort: a later pass with current recovery evidence retries the clear.
                 }
             }
-            wireCaches.set(sessionId, pendingWireCache);
+            if (timings.todoProbe > 0) state.todoProbeIdentity = todoProbeIdentity;
+            state.todoProbeNextPass =
+                response.reconcile_pending === true ||
+                (isRecord(response.historian) && response.historian.fired === true);
+            state.lastAppliedAtMs = requestObservedAtMs;
+            heapHolder.wireCaches.set(sessionId, pendingWireCache);
+            timings.bookkeeping += performance.now() - bookkeepingStartedAt - timings.delivery;
             appliedAt = performance.now();
-            // Mirrors feed later RPC reads and tolerate seconds of staleness. Run the two pulls in
-            // their established order, but do not keep the transform hook pending while a backlog
-            // page or SQLite apply is slow. pullMemoryMirrorOnce still coalesces overlapping passes.
+            // Stable transform projections cannot have new module-owned mirror rows. A changed
+            // row/boundary/manifest marker schedules one ordered background pull; old modules that
+            // omit row_version keep the compatibility behavior of polling after every pass.
+            const projectionKey =
+                options.disableHotPathIoCachesForTests === true
+                    ? null
+                    : mirrorProjectionKey(response);
             const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
-            if (options.moduleClient.mirrorPull || getCompartmentsAfter) {
+            const memoryMirrorDue =
+                options.moduleClient.mirrorPull !== undefined &&
+                (memorySyncRequested ||
+                    projectionKey === null ||
+                    state.memoryMirrorProjectionKey !== projectionKey);
+            const compartmentMirrorDue =
+                getCompartmentsAfter !== undefined &&
+                (projectionKey === null || state.compartmentMirrorProjectionKey !== projectionKey);
+            if ((memoryMirrorDue || compartmentMirrorDue) && !state.mirrorProjectionInFlight) {
+                state.mirrorProjectionInFlight = true;
                 void (async () => {
-                    if (options.moduleClient.mirrorPull) {
+                    if (memoryMirrorDue) {
                         const mirrorPullStartedAt = performance.now();
                         try {
-                            await pullMemoryMirrorOnce({
+                            const mirrorDrain = await pullMemoryMirrorOnce({
                                 db: deps.db,
-                                module: options.moduleClient as AuthorityModuleClient,
+                                module: options.moduleClient,
                             });
+                            if (mirrorDrain.cuePoolVersion !== state.muralCuePoolVersion) {
+                                state.muralCuePoolVersion = mirrorDrain.cuePoolVersion;
+                                state.muralCache = null;
+                            }
+                            if (mirrorDrain.complete) {
+                                state.memoryMirrorProjectionKey = projectionKey;
+                            } else if (mirrorDrain.budgetExhausted) {
+                                sessionLog(
+                                    sessionId,
+                                    `rust memory mirror backlog deferred: rows_applied=${mirrorDrain.rowsApplied} backlog_remaining=true pages=${mirrorDrain.pagesPulled}`,
+                                );
+                            }
                         } catch (error) {
                             sessionLog(
                                 sessionId,
@@ -3265,7 +3667,7 @@ export function createRustModeTransform(
                             logStage(sessionId, "mirrorPull", mirrorPullStartedAt, timings);
                         }
                     }
-                    if (getCompartmentsAfter) {
+                    if (compartmentMirrorDue && getCompartmentsAfter) {
                         const compartmentMirrorStartedAt = performance.now();
                         try {
                             await mirrorModuleCompartments({
@@ -3280,6 +3682,7 @@ export function createRustModeTransform(
                                         ),
                                 } satisfies ModuleCompartmentReader,
                             });
+                            state.compartmentMirrorProjectionKey = projectionKey;
                         } catch (error) {
                             sessionLog(
                                 sessionId,
@@ -3295,7 +3698,9 @@ export function createRustModeTransform(
                             );
                         }
                     }
-                })();
+                })().finally(() => {
+                    state.mirrorProjectionInFlight = false;
+                });
             }
             finishPass(true);
         } catch (error) {
@@ -3364,7 +3769,8 @@ export function createRustModeTransform(
             const clearLocalState = () => {
                 dropSlot(sessionId, "session-deleted");
                 states.delete(sessionId);
-                wireCaches.delete(sessionId);
+                heapHolder.wireCaches.delete(sessionId);
+                promptSurfaceGuidanceEpochs?.clear(sessionId);
                 clearCompartmentMirrorCursor(sessionId);
             };
             clearLocalState();
@@ -3390,6 +3796,24 @@ export function createRustModeTransform(
                 idOrdinalMemo: new Map(ensureState(states, sessionId).idOrdinalMemo),
             };
         },
+        getHeapStats(): RustWireCacheHeapStats {
+            const sessions = [...heapHolder.wireCaches].map(([sessionId, cache]) => ({
+                sessionId,
+                rawMessages: cache.rawCount,
+                wireMessages: cache.wireCount,
+                rawContentSnapshots: cache.rawContentSnapshots.length,
+                estimatedBytes: rustWireCacheEstimatedBytes(cache),
+            }));
+            return {
+                snapshots: heapHolder.wireCaches.size,
+                rawContentSnapshots: sessions.reduce(
+                    (sum, session) => sum + session.rawContentSnapshots,
+                    0,
+                ),
+                estimatedBytes: sessions.reduce((sum, session) => sum + session.estimatedBytes, 0),
+                sessions,
+            };
+        },
     };
 }
 
@@ -3407,6 +3831,7 @@ export const __rustModeTransformTest = {
     applyNativeMessagesVerbatim,
     authoritySeedRows,
     contentSnapshotsFor,
+    rustCaptureDigests,
     snapshotTags: {
         array: LKG_SNAPSHOT_ARRAY,
         object: LKG_SNAPSHOT_OBJECT,

@@ -52,10 +52,11 @@ import {
     type Channel1State,
     type Channel2PredicateBaseline,
     evaluateChannel2,
+    formatChannel2Evaluation,
     reclaimableToolOutputCount,
     type ToolReclaimHint,
 } from "./ctx-reduce-nudge";
-import { isMidTurn } from "./read-session-db";
+import { assistantAwaitingTools } from "./read-session-db";
 
 export interface Channel2DeliveryDeps {
     db: Database;
@@ -86,7 +87,7 @@ function subagentRunIsActive(deps: Channel2DeliveryDeps, sessionId: string): boo
     try {
         const meta = getOrCreateSessionMeta(deps.db, sessionId);
         if (!meta.isSubagent) return true;
-        return isMidTurn(deps, sessionId);
+        return assistantAwaitingTools(deps, sessionId);
     } catch (error) {
         sessionLog(
             sessionId,
@@ -162,6 +163,10 @@ export async function maybeDeliverChannel2(
     // An unavailable or generation-invalidated baseline holds `pending`; a known
     // false predicate cancels it to the re-armable empty state.
     const evaluation = evaluateChannel2(deps.baseline);
+    sessionLog(
+        sessionId,
+        formatChannel2Evaluation(evaluation, { leaseBefore: "pending", leaseAfter: "pending" }),
+    );
     if (deps.directiveText === undefined && !evaluation.evaluable) {
         return false;
     }

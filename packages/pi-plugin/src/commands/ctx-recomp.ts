@@ -170,7 +170,7 @@ export function registerCtxRecompCommand(
 				text:
 					parsed.kind === "partial"
 						? `## Magic Recomp\n\nPartial recomp started for range ${parsed.range.start}-${parsed.range.end}.`
-						: "## Magic Recomp\n\nHistorian recomp started. Rebuilding compartments and facts from raw Pi session history now.",
+						: "## Magic Recomp\n\nRecomp started. Rebuilding the compressed history from raw session history now; saved memories are kept as they are.",
 				level: "info",
 			});
 
@@ -255,16 +255,11 @@ export function registerCtxRecompCommand(
 								`/ctx-recomp: clearEmergencyRecovery failed (continuing): ${describeError(recoveryError).brief}`,
 							);
 						}
-						// DEFERRED staging (background-safe): stage the native marker
-						// as a pending blob + signal a DEFERRED history refresh so the
-						// next transform pass (at a turn boundary) drains and applies
-						// it. The detached run must NOT apply the marker eagerly
-						// (appendCompaction mutates getBranch immediately, which from a
-						// background task could land mid-turn) nor use the eager
-						// history/materialization signals — those would force a
-						// materialization on whatever pass is running, possibly
-						// mid-turn, busting the cache. Mirrors the background
-						// historian's onPublished (signalPiDeferred*).
+						// Deferred staging lets the native marker and history refresh ride
+						// the next genuine bust. The detached run must not mutate getBranch
+						// or force materialization eagerly because either could alter an
+						// otherwise cache-stable pass. This mirrors the historian's
+						// deferred publish signals.
 						try {
 							stagePiRecompMarker({
 								db: currentDeps.db,
@@ -374,7 +369,7 @@ function buildConfirmationWarning(
 			"## ⚠️ Recomp Confirmation Required",
 			"",
 			`You currently have **${compartments.length}** compartments.`,
-			"Running /ctx-recomp will **regenerate all compartments and facts** from raw session history.",
+			"Running /ctx-recomp will **rebuild the compressed history** from raw session history. Saved memories are not changed.",
 			"",
 			"This operation may take a long time and will consume historian-model tokens.",
 			"",

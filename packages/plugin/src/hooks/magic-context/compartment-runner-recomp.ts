@@ -26,6 +26,7 @@ import { getErrorMessage } from "../../shared/error-message";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
+import { renderUserFacingFailure, userFacingFailureCode } from "../../shared/user-facing-codes";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
@@ -43,9 +44,13 @@ import {
     createDefaultBoundarySnapshotForTests,
     resolveOpenCodeProtectedTailBoundary,
 } from "./protected-tail-boundary";
-import { getRawSessionMessageCount, readSessionChunk } from "./read-session-chunk";
+import {
+    getRawSessionMessageCount,
+    getRawSessionTagKeysThrough,
+    readSessionChunk,
+} from "./read-session-chunk";
 import { buildReferenceBlocks } from "./reference-retrieval";
-import { sendIgnoredMessage } from "./send-session-notification";
+import { sendStatusNotification } from "./send-session-notification";
 
 function insertRecompCompartmentRows(
     db: Database,
@@ -209,7 +214,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         const resumed = existingStaging !== null;
 
         if (resumed) {
-            await sendIgnoredMessage(
+            await sendStatusNotification(
                 client,
                 sessionId,
                 `## Magic Recomp — Resumed\n\nFound ${existingStaging.compartments.length} staged compartment(s) from ${existingStaging.passCount} previous pass(es), covering messages 1-${existingStaging.lastEndMessage}. Resuming from message ${offset}.`,
@@ -254,6 +259,12 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
 
             // Ensure latest candidates are saved to staging before promoting
             saveRecompStagingPass(db, sessionId, passCount, candidateCompartments, candidateFacts);
+            const lastCompartmentEnd =
+                candidateCompartments[candidateCompartments.length - 1]?.endMessage ?? 0;
+            const compartmentTagKeys =
+                lastCompartmentEnd > 0
+                    ? await getRawSessionTagKeysThrough(sessionId, lastCompartmentEnd, { db })
+                    : null;
 
             const promoted = promoteRecompStagingWithM0Mutation(db, sessionId, leaseHolderId);
             if (!promoted) return null;
@@ -294,10 +305,13 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 void embedAndStoreCompartmentChunks(db, sessionId, projectIdentity, chunksToEmbed);
             }
 
-            const lastCompartmentEnd =
-                promoted.compartments[promoted.compartments.length - 1]?.endMessage ?? 0;
-            if (lastCompartmentEnd > 0) {
-                queueDropsForCompartmentalizedMessages(db, sessionId, lastCompartmentEnd);
+            if (lastCompartmentEnd > 0 && compartmentTagKeys) {
+                queueDropsForCompartmentalizedMessages(
+                    db,
+                    sessionId,
+                    lastCompartmentEnd,
+                    compartmentTagKeys,
+                );
             }
 
             // Signal LAST relative to the drop queue — after queueDrops so a
@@ -334,10 +348,13 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 }
             }
 
+            sessionLog(
+                sessionId,
+                `recomp partial code=${userFacingFailureCode("recomp_unavailable")} reason="${reason}"`,
+            );
             return [
-                `Persisted ${promoted.compartments.length} compartment${promoted.compartments.length === 1 ? "" : "s"} from ${passCount} successful pass${passCount === 1 ? "" : "es"}.`,
-                `Covered raw history 1-${lastCompartmentEnd} out of ${rawMessageCount} total messages.`,
-                `Remaining messages ${lastCompartmentEnd + 1}-${protectedTailStart - 1} were not rebuilt (${reason}).`,
+                `Rebuilt ${promoted.compartments.length} history block${promoted.compartments.length === 1 ? "" : "s"} across ${passCount} successful pass${passCount === 1 ? "" : "es"}.`,
+                renderUserFacingFailure("recomp_unavailable"),
             ].join("\n");
         }
 
@@ -368,7 +385,11 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 if (partial) {
                     return `## Magic Recomp — Partial\n\n${partial}`;
                 }
-                return `## Magic Recomp — Failed\n\nRecomp stopped because the raw chunk could not be represented safely: ${chunkCoverageError}\n\nNothing was written.`;
+                sessionLog(
+                    sessionId,
+                    `recomp failed code=${userFacingFailureCode("recomp_unavailable")} reason="${chunkCoverageError}"`,
+                );
+                return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("recomp_unavailable")}`;
             }
 
             // v2 bounded reference model: 4 rotating seeds + last-6 recency
@@ -395,7 +416,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 extractionFree: true,
             });
 
-            await sendIgnoredMessage(
+            await sendStatusNotification(
                 client,
                 sessionId,
                 `## Magic Recomp\n\nHistorian pass ${passCount + 1}, attempt ${passAttempt} started for messages ${chunk.startIndex}-${chunk.endIndex}.`,
@@ -426,10 +447,14 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 callbacks: {
                     onRepairRetry: async (error) => {
                         emitProgress(`Repair retry (pass ${passCount + 1})…`);
-                        await sendIgnoredMessage(
+                        sessionLog(
+                            sessionId,
+                            `recomp retry code=${userFacingFailureCode("recomp_unavailable")} reason="${error}"`,
+                        );
+                        await sendStatusNotification(
                             client,
                             sessionId,
-                            `## Magic Recomp\n\nHistorian pass ${passCount + 1}, attempt ${passAttempt} is continuing with a repair retry for messages ${chunk.startIndex}-${chunk.endIndex}.\n\nThe previous output did not validate: ${error}`,
+                            `## Magic Recomp\n\nHistory compression is retrying this pass. ${renderUserFacingFailure("recomp_unavailable")}`,
                             notifParams(),
                         );
                     },
@@ -450,10 +475,10 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                         protectedTailStart,
                     );
                     if (smallerChunk.messageCount > 0 && smallerChunk.endIndex < chunk.endIndex) {
-                        await sendIgnoredMessage(
+                        await sendStatusNotification(
                             client,
                             sessionId,
-                            `## Magic Recomp\n\nHistorian pass ${passCount + 1}, attempt ${passAttempt} is continuing with a smaller chunk ending at ${smallerChunk.endIndex} because messages ${chunk.startIndex}-${chunk.endIndex} could not be validated.\n\nValidator result: ${validatedPass.error}`,
+                            `## Magic Recomp\n\nHistory compression is retrying with a smaller set of messages. ${renderUserFacingFailure("recomp_unavailable")}`,
                             notifParams(),
                         );
                         currentTokenBudget = reducedBudget;
@@ -482,13 +507,17 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                     compartmentsProduced: 0,
                 });
 
+                sessionLog(
+                    sessionId,
+                    `recomp failed code=${userFacingFailureCode("recomp_unavailable")} reason="${validatedPass.error}" messageRange=${chunk.startIndex}-${chunk.endIndex}`,
+                );
                 const partial = await promoteAndFinalize(
-                    `historian failed to validate messages ${chunk.startIndex}-${chunk.endIndex}: ${validatedPass.error}`,
+                    `history model response did not validate for messages ${chunk.startIndex}-${chunk.endIndex}`,
                 );
                 if (partial) {
                     return `## Magic Recomp — Partial\n\n${partial}`;
                 }
-                return `## Magic Recomp — Failed\n\nRecomp failed while rebuilding messages ${chunk.startIndex}-${chunk.endIndex}: ${validatedPass.error}\n\nNothing was written.`;
+                return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("recomp_unavailable")}`;
             }
 
             // historian_runs telemetry: one row per SUCCESSFUL recomp pass. Failure
@@ -556,11 +585,21 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         if (mergedValidationError) {
             // Clean up staging on final validation failure
             clearRecompStaging(db, sessionId);
-            return `## Magic Recomp — Failed\n\nRecomp completed ${passCount} pass${passCount === 1 ? "" : "es"} but produced an invalid final compartment set: ${mergedValidationError}\n\nNothing was written.`;
+            sessionLog(
+                sessionId,
+                `recomp failed code=${userFacingFailureCode("recomp_unavailable")} reason="${mergedValidationError}"`,
+            );
+            return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("recomp_unavailable")}`;
         }
 
         // Final success: promote staging → real tables
         saveRecompStagingPass(db, sessionId, passCount, candidateCompartments, candidateFacts);
+        const lastCompartmentEnd =
+            candidateCompartments[candidateCompartments.length - 1]?.endMessage ?? 0;
+        const compartmentTagKeys =
+            lastCompartmentEnd > 0
+                ? await getRawSessionTagKeysThrough(sessionId, lastCompartmentEnd, { db })
+                : null;
         const promoted = promoteRecompStagingWithM0Mutation(db, sessionId, leaseHolderId);
         if (!promoted) {
             sessionLog(sessionId, "recomp publish skipped: compartment lease no longer held");
@@ -584,9 +623,13 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         // a <facts> block, but recomp discards it for promotion purposes.)
         void finalFacts;
 
-        const lastCompartmentEnd = finalCompartments[finalCompartments.length - 1]?.endMessage ?? 0;
-        if (lastCompartmentEnd > 0) {
-            queueDropsForCompartmentalizedMessages(db, sessionId, lastCompartmentEnd);
+        if (lastCompartmentEnd > 0 && compartmentTagKeys) {
+            queueDropsForCompartmentalizedMessages(
+                db,
+                sessionId,
+                lastCompartmentEnd,
+                compartmentTagKeys,
+            );
         }
 
         // Signal LAST relative to the drop queue (mirrors the incremental +
@@ -647,7 +690,11 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         // Recomp replaces durable state atomically, so unexpected failures must leave state untouched.
         // Staging is preserved so a retry can resume from where we left off.
         const message = getErrorMessage(error);
-        return `## Magic Recomp — Failed\n\nRecomp failed unexpectedly: ${message}\n\nStaging data preserved for resume on next attempt.`;
+        sessionLog(
+            sessionId,
+            `recomp failed code=${userFacingFailureCode("recomp_unavailable")} reason="${message}"`,
+        );
+        return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("recomp_unavailable")}`;
     } finally {
         updateSessionMeta(db, sessionId, { compartmentInProgress: false });
         cleanupHistorianStateFile(currentStateFilePath);

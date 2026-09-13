@@ -7,7 +7,11 @@ import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import { LocalEmbeddingProvider } from "./embedding-local";
 import { OpenAICompatibleEmbeddingProvider } from "./embedding-openai";
 import type { EmbeddingProvider } from "./embedding-provider";
-import { SynapseEmbeddingProvider } from "./embedding-synapse";
+import {
+    isSynapseEmbeddingTruncated,
+    SynapseEmbeddingProvider,
+    type SynapseLaneDescriptor,
+} from "./embedding-synapse";
 
 export type {
     EmbeddingFeatures,
@@ -17,6 +21,7 @@ export {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
     contentSha256,
+    describeShadowBackfillWriteRefusal,
     embedBatchForProject,
     embedItemsForProject,
     embedShadowTextForProject,
@@ -30,6 +35,7 @@ export {
     getShadowBackfillRemaining,
     getShadowBackfillStopReason,
     getShadowEmbeddingMeasurementCohort,
+    listShadowBackfillStalls,
     markProjectLoadUntrusted,
     registerProjectEmbedding,
     registerProjectInObservationMode,
@@ -79,6 +85,12 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
             ...(apiKey ? { api_key: apiKey } : {}),
             ...(inputType ? { input_type: inputType } : {}),
             ...(queryInputType ? { query_input_type: queryInputType } : {}),
+            ...(config.query_instruction !== undefined
+                ? { query_instruction: config.query_instruction }
+                : {}),
+            ...(config.document_prefix !== undefined
+                ? { document_prefix: config.document_prefix }
+                : {}),
             ...(truncate ? { truncate } : {}),
             ...(config.max_input_tokens
                 ? {
@@ -95,7 +107,18 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
     }
 
     if (config.provider === "synapse") {
-        return { ...config, max_input_tokens: 8192 };
+        const raw = config as EmbeddingConfig & {
+            synapse_descriptor?: SynapseLaneDescriptor;
+        };
+        const maxInputTokens = raw.synapse_descriptor?.max_tokens ?? config.max_input_tokens;
+        return {
+            ...config,
+            ...(maxInputTokens
+                ? {
+                      max_input_tokens: normalizeCompartmentChunkMaxInputTokens(maxInputTokens),
+                  }
+                : {}),
+        };
     }
 
     throw new Error("Unknown embedding provider");
@@ -117,6 +140,8 @@ function createProvider(config: EmbeddingConfig): EmbeddingProvider | null {
             apiKey: config.api_key,
             inputType: config.input_type,
             queryInputType: config.query_input_type,
+            queryInstruction: config.query_instruction,
+            documentPrefix: config.document_prefix,
             truncate: config.truncate,
             maxInputTokens: config.max_input_tokens,
         });
@@ -139,6 +164,8 @@ function createProvider(config: EmbeddingConfig): EmbeddingProvider | null {
             synapse_table_epoch?: number;
             synapse_dims?: number;
             synapse_recommended_batch?: number;
+            synapse_recommended_token_budget?: number;
+            synapse_descriptor?: SynapseLaneDescriptor;
             synapse_provenance?: unknown;
         };
         return new SynapseEmbeddingProvider({
@@ -150,6 +177,8 @@ function createProvider(config: EmbeddingConfig): EmbeddingProvider | null {
             tableEpoch: synapse.synapse_table_epoch,
             dims: synapse.synapse_dims,
             recommendedBatch: synapse.synapse_recommended_batch,
+            recommendedTokenBudget: synapse.synapse_recommended_token_budget,
+            descriptor: synapse.synapse_descriptor,
             provenance: synapse.synapse_provenance,
         });
     }
@@ -173,7 +202,12 @@ export function initializeEmbedding(config: EmbeddingConfig): void {
     const previousProviderIdentity =
         previousProvider?.modelId ?? resolveProviderIdentity(embeddingConfig);
 
-    if (previousProviderIdentity === nextProviderIdentity) {
+    const queryRecipeUnchanged =
+        embeddingConfig.provider !== "openai-compatible" ||
+        nextConfig.provider !== "openai-compatible" ||
+        (embeddingConfig.query_instruction === nextConfig.query_instruction &&
+            embeddingConfig.query_input_type === nextConfig.query_input_type);
+    if (previousProviderIdentity === nextProviderIdentity && queryRecipeUnchanged) {
         embeddingConfig = nextConfig;
         return;
     }
@@ -211,7 +245,8 @@ export async function embedText(text: string, signal?: AbortSignal): Promise<Flo
         return null;
     }
 
-    return currentProvider.embed(text, signal);
+    const vector = await currentProvider.embed(text, signal);
+    return vector && !isSynapseEmbeddingTruncated(vector) ? vector : null;
 }
 
 export function getEmbeddingModelId(): string {

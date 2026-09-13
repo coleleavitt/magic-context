@@ -5,10 +5,14 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import {
+    CLASSIFY_CHILD_TITLE,
+    COMPRESS_CUES_CHILD_TITLE,
     CURATE_CHILD_TITLE,
     HISTORIAN_CHILD_TITLE,
     historianOrphanStaleMs,
     MAINTAIN_DOCS_CHILD_TITLE,
+    MAP_MEMORIES_CHILD_TITLE,
+    MEMORY_MIGRATION_CHILD_TITLE,
     REFRESH_PRIMERS_CHILD_TITLE,
     RETROSPECTIVE_CHILD_TITLE,
     retrospectiveOrphanStaleMs,
@@ -16,6 +20,7 @@ import {
     SMART_NOTE_CONFIRM_CHILD_TITLE_PREFIX,
     sweepOrphanedRetrospectiveChildren,
     USER_MEMORIES_CHILD_TITLE,
+    VERIFY_CHILD_TITLE,
 } from "./retrospective-orphan-sweep";
 
 let db: Database | null = null;
@@ -44,11 +49,11 @@ function insert(database: Database, id: string, title: string, dir: string, crea
 }
 
 describe("retrospectiveOrphanStaleMs", () => {
-    test("is at least 60min and scales with timeout×3", () => {
-        expect(retrospectiveOrphanStaleMs(20)).toBe(60 * 60_000); // 60min floor wins
-        expect(retrospectiveOrphanStaleMs(30)).toBe(90 * 60_000); // 30×3 wins
-        expect(retrospectiveOrphanStaleMs([10, 45, undefined])).toBe(135 * 60_000);
-        expect(retrospectiveOrphanStaleMs(undefined)).toBe(60 * 60_000);
+    test("is at least 60min and adds detached-writer grace after timeout×3", () => {
+        expect(retrospectiveOrphanStaleMs(20)).toBe(75 * 60_000);
+        expect(retrospectiveOrphanStaleMs(30)).toBe(105 * 60_000);
+        expect(retrospectiveOrphanStaleMs([10, 45, undefined])).toBe(150 * 60_000);
+        expect(retrospectiveOrphanStaleMs(undefined)).toBe(75 * 60_000);
     });
 });
 
@@ -108,8 +113,13 @@ describe("sweepOrphanedRetrospectiveChildren", () => {
         // recent children (live or still draining detached writes) → NOT swept
         insert(db, "fresh", RETROSPECTIVE_CHILD_TITLE, DIR, now - 1000);
         insert(db, "fresh-historian", HISTORIAN_CHILD_TITLE, DIR, now - 1000);
+        insert(db, "old-migration", MEMORY_MIGRATION_CHILD_TITLE, DIR, now - staleMs - 14);
+        insert(db, "old-map", MAP_MEMORIES_CHILD_TITLE, DIR, now - staleMs - 12);
+        insert(db, "old-verify", VERIFY_CHILD_TITLE, DIR, now - staleMs - 11);
+        insert(db, "old-classify", CLASSIFY_CHILD_TITLE, DIR, now - staleMs - 10);
+        insert(db, "old-cues", COMPRESS_CUES_CHILD_TITLE, DIR, now - staleMs - 9);
         // old but a different title → NOT swept
-        insert(db, "other-title", "magic-context-dream-verify", DIR, now - staleMs - 1);
+        insert(db, "other-title", "magic-context-dream-not-covered", DIR, now - staleMs - 1);
         // old retrospective but ANOTHER directory → NOT swept
         insert(db, "other-dir", RETROSPECTIVE_CHILD_TITLE, "/repo/elsewhere", now - staleMs - 1);
 
@@ -123,6 +133,11 @@ describe("sweepOrphanedRetrospectiveChildren", () => {
         });
 
         expect(deleted).toEqual([
+            "old-migration",
+            "old-map",
+            "old-verify",
+            "old-classify",
+            "old-cues",
             "old-historian",
             "old-user-memories",
             "old",
@@ -132,7 +147,34 @@ describe("sweepOrphanedRetrospectiveChildren", () => {
             "old-compile",
             "old-confirm",
         ]);
-        expect(count).toBe(8);
+        expect(count).toBe(13);
+    });
+
+    test("sweeps all four memory-snapshot task titles and rejects an unknown title", async () => {
+        db = makeOpencodeDb();
+        const coveredTitles = [
+            MAP_MEMORIES_CHILD_TITLE,
+            VERIFY_CHILD_TITLE,
+            CLASSIFY_CHILD_TITLE,
+            COMPRESS_CUES_CHILD_TITLE,
+        ];
+        for (const [index, title] of coveredTitles.entries()) {
+            insert(db, `covered-${index}`, title, DIR, now - staleMs - index - 1);
+        }
+        insert(db, "not-covered", "magic-context-dream-unrelated", DIR, now - staleMs - 10);
+        const { client, deleted } = deleteClient();
+
+        const count = await sweepOrphanedRetrospectiveChildren({
+            opencodeDb: db,
+            client,
+            sessionDirectory: DIR,
+            staleMs,
+            now,
+        });
+
+        expect(count).toBe(4);
+        expect(deleted).toEqual(["covered-3", "covered-2", "covered-1", "covered-0"]);
+        expect(deleted).not.toContain("not-covered");
     });
 
     test("keeps a recent historian child and sweeps it after the full attempt budget", async () => {
@@ -167,22 +209,26 @@ describe("sweepOrphanedRetrospectiveChildren", () => {
         expect(deleted).toEqual(["historian-budget-expired"]);
     });
 
-    test("preserves stale children when keep_subagents is enabled", async () => {
+    test("keep_subagents preserves ordinary children but still sweeps the privacy class", async () => {
         db = makeOpencodeDb();
         insert(db, "kept-historian", HISTORIAN_CHILD_TITLE, DIR, now - staleMs - 1);
+        insert(db, "kept-migration", MEMORY_MIGRATION_CHILD_TITLE, DIR, now - staleMs - 2);
+        insert(db, "private-retrospective", RETROSPECTIVE_CHILD_TITLE, DIR, now - staleMs - 4);
+        insert(db, "private-curate", CURATE_CHILD_TITLE, DIR, now - staleMs - 5);
+        insert(db, "private-docs", MAINTAIN_DOCS_CHILD_TITLE, DIR, now - staleMs - 6);
         const { client, deleted } = deleteClient();
 
         const count = await sweepOrphanedRetrospectiveChildren({
             opencodeDb: db,
             client,
             sessionDirectory: DIR,
-            staleMs,
+            staleMs: { privacy: staleMs, historian: staleMs },
             now,
             keepSubagents: true,
         });
 
-        expect(count).toBe(0);
-        expect(deleted).toEqual([]);
+        expect(count).toBe(3);
+        expect(deleted).toEqual(["private-docs", "private-curate", "private-retrospective"]);
     });
 
     test("treats a delete error (404 / already removed) as success", async () => {

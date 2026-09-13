@@ -30,7 +30,7 @@ export const RENDERED_PREFIXES: readonly string[] = [
   "execute_threshold_percentage",
   "execute_threshold_tokens",
   // Tags & cleanup
-  "protected_tags",
+  "protected_tokens",
   "clear_reasoning_age",
   // Historian
   "history_budget_percentage",
@@ -41,11 +41,6 @@ export const RENDERED_PREFIXES: readonly string[] = [
   // Dreamer (panel renders a curated subset of the agent-override schema)
   // Dreamer renders shared schedules plus OpenCode, Pi, and OMP model task blocks.
   "dreamer",
-  // Sidekick (panel renders a curated subset)
-  "sidekick.model",
-  "sidekick.fallback_models",
-  "sidekick.disable",
-  "sidekick.timeout_ms",
   // Embedding (whole subtree)
   "embedding",
   // Memory
@@ -77,12 +72,10 @@ export const RENDERED_PREFIXES: readonly string[] = [
  * omission was deliberate, not forgotten.
  */
 export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
-  ...agentOverrideTailOmissions(),
   profile:
     "per-repository model-profile selector; deferred until the Alfonso Desktop profile editor is available",
   profiles:
     "user-owned model-profile definitions; deferred until the Alfonso Desktop profile editor is available",
-  "sidekick.system_prompt": "free-form prompt override; raw JSONC",
   "system_prompt_injection.skip_signatures":
     "free-form substring array; raw JSONC (no array widget in the form yet)",
   subc: "user-only subc daemon routing; raw JSONC because project configs cannot provide this connection",
@@ -98,39 +91,11 @@ export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
   // prefix match.
   "models.window_overlay_path":
     "user-only Fusiform overlay path; raw JSONC because it is a filesystem location with a computed default (<dataDir>/fusiform/window-overlay.json), not a value worth a form widget",
+  protected_tags:
+    "deprecated and ignored by every runtime; retained only so existing files receive a migration warning",
+  debug_rpc:
+    "developer-only diagnostics toggle (memory/heap endpoints on the local RPC); never a dashboard knob",
 };
-
-/**
- * The shared AgentOverride schema gives historian/dreamer/sidekick a long tail
- * of advanced knobs (sampling, prompt, tool/permission overrides, etc.). The
- * form surfaces only the high-signal ones per agent; the rest are raw-JSONC by
- * design. Historian and Dreamer are covered by their full harness-editor prefixes;
- * Sidekick remains raw-JSONC for this advanced tail.
- */
-function agentOverrideTailOmissions(): Record<string, string> {
-  const tail = [
-    "temperature",
-    "top_p",
-    "prompt",
-    "tools",
-    "description",
-    "mode",
-    "color",
-    "maxSteps",
-    "permission",
-    "maxTokens",
-    "variant",
-    "thinking_level",
-  ];
-  const agents = ["sidekick"];
-  const out: Record<string, string> = {};
-  for (const agent of agents) {
-    for (const field of tail) {
-      out[`${agent}.${field}`] = "advanced agent-override knob; raw JSONC";
-    }
-  }
-  return out;
-}
 
 /** True when `leaf` is covered by `prefix` (exact match or a dotted descendant). */
 export function isCoveredBy(leaf: string, prefix: string): boolean {

@@ -2,6 +2,7 @@
 
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +17,7 @@ interface HarnessOptions {
     magicContextConfig?: Record<string, unknown>;
     modelContextLimit?: number;
     sharedDataDir?: string;
+    extensionsBeforeMagicContext?: string[];
 }
 
 async function withPiHarness<T>(
@@ -415,8 +417,8 @@ describe("pi cache stability", () => {
     it("materializes queued text drops only on an execute pass, preserving defer-pass prefix stability", async () => {
         await withPiHarness(
             {
-                modelContextLimit: 200,
-                magicContextConfig: { protected_tags: 1, execute_threshold_percentage: 20 },
+                modelContextLimit: 20_000,
+                magicContextConfig: { protected_tokens: 4_000, execute_threshold_percentage: 20 },
             },
             async (h) => {
                 h.mock.script([
@@ -428,19 +430,22 @@ describe("pi cache stability", () => {
                     // by the cutover instead of by a real execute decision.
                     {
                         text: "warm-up: absorb the one-time stable-id cutover",
-                        usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 10 },
+                        usage: { input_tokens: 500, output_tokens: 5, cache_creation_input_tokens: 0 },
                     },
                     {
-                        text: "low pressure one",
-                        usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 10 },
+                        content: Array.from({ length: 24 }, (_, index) => ({
+                            type: "text",
+                            text: `queued-drop aging block ${index + 1}: ${h.ballast(200)}`,
+                        })),
+                        usage: { input_tokens: 500, output_tokens: 5, cache_creation_input_tokens: 0 },
                     },
                     {
                         text: "high pressure marker for next transform",
-                        usage: { input_tokens: 150, output_tokens: 5, cache_creation_input_tokens: 150 },
+                        usage: { input_tokens: 14_000, output_tokens: 5, cache_creation_input_tokens: 0 },
                     },
                     {
                         text: "after materialization",
-                        usage: { input_tokens: 20, output_tokens: 5, cache_creation_input_tokens: 20 },
+                        usage: { input_tokens: 500, output_tokens: 5, cache_creation_input_tokens: 0 },
                     },
                 ]);
 
@@ -499,11 +504,19 @@ describe("pi cache stability", () => {
     it("keeps toolCall/toolResult pairing intact when a queued Pi tool drop materializes", async () => {
         await withPiHarness(
             {
-                modelContextLimit: 200,
-                magicContextConfig: { protected_tags: 1, execute_threshold_percentage: 20 },
+                modelContextLimit: 20_000,
+                magicContextConfig: { protected_tokens: 4_000, execute_threshold_percentage: 20 },
             },
             async (h) => {
                 const callId = "toolu_pi_pairing_cache_stability";
+                const newerOutputPath = join(h.env.workdir, "pairing-newer-output.txt");
+                writeFileSync(
+                    newerOutputPath,
+                    Array.from(
+                        { length: 1_800 },
+                        (_, index) => `newer tool output line ${index + 1}: ${"x".repeat(80)}`,
+                    ).join("\n"),
+                );
                 h.mock.script([
                     {
                         content: [
@@ -515,23 +528,42 @@ describe("pi cache stability", () => {
                             },
                         ],
                         stop_reason: "tool_use",
-                        usage: { input_tokens: 20, output_tokens: 5, cache_creation_input_tokens: 20 },
+                        usage: { input_tokens: 500, output_tokens: 5, cache_creation_input_tokens: 0 },
                     },
+                    ...Array.from({ length: 3 }, (_, index) => ({
+                        content: [
+                            {
+                                type: "tool_use",
+                                id: `toolu_pi_pairing_newer_${index + 1}`,
+                                name: "read",
+                                input: {
+                                    path: newerOutputPath,
+                                    offset: index * 600 + 1,
+                                    limit: 600,
+                                },
+                            },
+                        ],
+                        stop_reason: "tool_use" as const,
+                        usage: { input_tokens: 500, output_tokens: 5, cache_creation_input_tokens: 0 },
+                    })),
                     {
-                        text: "tool loop complete",
-                        usage: { input_tokens: 30, output_tokens: 5, cache_creation_input_tokens: 30 },
+                        content: Array.from({ length: 24 }, (_, index) => ({
+                            type: "text",
+                            text: `tool-drop aging block ${index + 1}`,
+                        })),
+                        usage: { input_tokens: 500, output_tokens: 5, cache_creation_input_tokens: 0 },
                     },
                     {
                         text: "high usage before materialization",
-                        usage: { input_tokens: 150, output_tokens: 5, cache_creation_input_tokens: 150 },
+                        usage: { input_tokens: 14_000, output_tokens: 5, cache_creation_input_tokens: 0 },
                     },
                     {
                         text: "after tool drop",
-                        usage: { input_tokens: 20, output_tokens: 5, cache_creation_input_tokens: 20 },
+                        usage: { input_tokens: 500, output_tokens: 5, cache_creation_input_tokens: 0 },
                     },
                 ]);
 
-                const first = await h.sendPrompt("call ctx_search once so Pi stores a tool pair", {
+                const first = await h.sendPrompt("complete an old ctx_search pair and enough newer read output to age it", {
                     timeoutMs: 60_000,
                 });
                 expect(first.sessionId).toBeTruthy();
@@ -563,11 +595,9 @@ describe("pi cache stability", () => {
                 expect(body).toContain(callId);
                 // The tool call is within the newest-20 skeleton window, so the
                 // drop materializes as a skeleton: tool_use survives with its
-                // input replaced and the paired result set to the one canonical
-                // `[dropped §N§]` placeholder — pairing stays intact instead of
-                // the pair being fully removed. (`__magic_context_replacement__`
-                // is the arg-replacement marker, distinct from the output text.)
-                expect(body).toContain("__magic_context_replacement__");
+                // input replaced by the canonical non-executable dropped marker,
+                // and the paired result uses the same `[dropped §N§]` bytes.
+                expect(body).toContain(`"dropped":"[dropped §${toolTag}§]"`);
                 expect(body).toContain(`dropped \u00a7${toolTag}\u00a7`);
                 expect(body).not.toContain("__magic_context_dropped__");
 
@@ -718,15 +748,53 @@ describe("pi cache stability", () => {
     // anchor/restart sequence without interactive process control.
     it.skip("keeps sticky reminder anchored at the same message across defer passes and restart", () => {});
 
-    // FIXME(pi-cache-stability): native compaction is cancelled by session_before_compact,
-    // but the current e2e harness has no hook to force Pi's native compact event in print mode.
-    it.skip("cancels native Pi compaction and lets Magic Context own compaction", () => {});
+    it("keeps Pi history and cached m0 unchanged when the recovered fail-closed listener precedes the main compact veto", async () => {
+        await withPiHarness(
+            {
+                extensionsBeforeMagicContext: [
+                    join(import.meta.dir, "../src/pi-runner/fail-closed-compaction-extension.mjs"),
+                ],
+            },
+            async (h) => {
+                await h.invokeExtensionCommand("e2e-recover-fail-closed");
+                await h.sendPrompt(
+                    `materialize m0 before compact-hook composition ${h.ballast(10_000)}`,
+                    { timeoutMs: 60_000 },
+                );
+                const turn = await h.sendPrompt(
+                    `add a second compactable turn ${h.ballast(10_000)}`,
+                    { timeoutMs: 60_000, continueSession: true },
+                );
+                if (!turn.sessionId) throw new Error("Pi did not expose the compact fixture session id");
+                const sessionId = turn.sessionId;
+                const beforeMessages = await h.getMessages();
+                const beforeM0Sha = readDb(h, (db) => {
+                    const row = db
+                        .prepare("SELECT cached_m0_bytes AS m0 FROM session_meta WHERE session_id = ?")
+                        .get(sessionId) as { m0: Uint8Array | null } | null;
+                    expect(row?.m0).not.toBeNull();
+                    return createHash("sha256").update(row!.m0!).digest("hex");
+                });
+
+                await h.compactNowExpectCancelled();
+
+                expect(await h.getMessages()).toEqual(beforeMessages);
+                const afterM0Sha = readDb(h, (db) => {
+                    const row = db
+                        .prepare("SELECT cached_m0_bytes AS m0 FROM session_meta WHERE session_id = ?")
+                        .get(sessionId) as { m0: Uint8Array | null } | null;
+                    expect(row?.m0).not.toBeNull();
+                    return createHash("sha256").update(row!.m0!).digest("hex");
+                });
+                expect(afterM0Sha).toBe(beforeM0Sha);
+            },
+        );
+    }, 180_000);
 
     // FIXME(pi-cache-stability): requires reliable print-mode historian publication and
     // inspection of Pi's JSONL compaction entry after appendCompaction(...).
     it.skip("writes a Pi compaction marker at the historian boundary and resumes after it", () => {});
 
-    // FIXME(pi-cache-stability): /ctx-aug subagent runs need a print-mode command/tool
     // harness that can wait for the child Pi process and inspect its session rows.
     it.skip("marks Pi subagents isolated and skips historian/project-docs/user-profile/key-files", () => {});
 

@@ -49,6 +49,53 @@ describe("resolvePiUsableContextLimit", () => {
 		).toBe(1_048_576);
 	});
 
+	test("keeps a successful request as a pressure floor when static model metadata is too small", () => {
+		expect(
+			resolvePiUsableContextLimit({
+				model: {
+					provider: "custom",
+					id: "model",
+					contextWindow: 30_000,
+				},
+				provenInputTokens: 90_000,
+			}),
+		).toBe(90_000);
+	});
+
+	test("bounds successful-request proof by an observed absolute wall", () => {
+		const model = {
+			provider: "openai-codex",
+			id: "gpt-5.6-sol",
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+		};
+		expect(
+			resolvePiUsableContextLimit({
+				rawContextWindow: 272_000,
+				model,
+				provenInputTokens: 255_834,
+			}),
+		).toBe(255_834);
+		expect(
+			resolvePiUsableContextLimit({
+				rawContextWindow: 272_000,
+				model,
+				provenInputTokens: 593_717,
+			}),
+		).toBe(204_000);
+	});
+
+	test("keeps a current detected overflow cap authoritative over older proof", () => {
+		expect(
+			resolvePiUsableContextLimit({
+				rawContextWindow: 200_000,
+				detectedContextLimit: 30_000,
+				provenInputTokens: 90_000,
+				model: { provider: "custom", id: "model" },
+			}),
+		).toBe(30_000);
+	});
+
 	test("applies detected wire truth before output reservation", () => {
 		expect(
 			resolvePiUsableContextLimit({

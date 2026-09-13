@@ -55,6 +55,7 @@ import {
     updateTagTokenCount,
 } from "../features/magic-context/storage-tags";
 import { makeToolCompositeKey, type Tagger } from "../features/magic-context/tagger";
+import { droppedInputMarker } from "../hooks/magic-context/dropped-input-guard";
 import { applyEditMarkerToInput } from "../hooks/magic-context/edit-marker";
 import { estimateImageTokensFromDataUrl } from "../hooks/magic-context/image-token-estimate";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
@@ -247,7 +248,8 @@ export function tagTranscript(
         let toolResultOrdinal = 0;
         const parts = message.parts;
         const messageHasNativeReasoning =
-            message.info.role === "assistant" && parts.some((part) => part.kind === "thinking");
+            message.requiresToolArcSkeleton ??
+            (message.info.role === "assistant" && parts.some((part) => part.kind === "thinking"));
         const contentDerivedTextIds =
             messageId !== undefined && options.textIdentityDriftMessageIds?.has(messageId) === true
                 ? buildContentDerivedTextIds(messageId, parts)
@@ -1056,8 +1058,27 @@ function buildAggregateTarget(
             }
             return occurrences[0]?.part.getText() ?? null;
         },
-        drop(): "removed" | "absent" {
-            // Replace BOTH halves with the dropped sentinel.
+        drop(): "removed" | "absent" | "incomplete" {
+            const complete =
+                occurrences.some((occ) => occ.kind === "tool_use") &&
+                occurrences.some((occ) => occ.kind === "tool_result");
+            if (!complete) return "incomplete";
+            if (!requiresToolArcSkeleton) {
+                const authorization = occurrences.map((occ) => occ.part.canRemove?.());
+                // A failed durable marker is not permission to substitute a new
+                // skeleton. Keep both halves unchanged and leave the drop queued.
+                if (authorization.includes("defer")) return "incomplete";
+                if (
+                    occurrences.every(
+                        (occ, index) => occ.part.remove && authorization[index] !== false,
+                    )
+                ) {
+                    let removed = false;
+                    for (const occ of occurrences) removed = occ.part.remove?.() || removed;
+                    return removed ? "removed" : "absent";
+                }
+            }
+            // Adapters without structural removal retain paired sentinels.
             const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
             let any = false;
             for (const occ of occurrences) {
@@ -1066,14 +1087,14 @@ function buildAggregateTarget(
             return any ? "removed" : "absent";
         },
         truncate(): "truncated" | "absent" {
-            // Skeleton-drop: replace BOTH halves' content with the one
-            // canonical `[dropped §N§]` placeholder (byte-identical to a full
-            // drop and to OpenCode). Frozen by the dropMode column → replays
-            // the same string every pass. The tool_use call survives intact.
+            // Keep the paired call shell, but replace its arguments with one
+            // non-executable marker; result halves carry the matching sentinel.
             const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
             let any = false;
             for (const occ of occurrences) {
-                if (setToolContentOrText(occ.part, sentinel)) {
+                if (occ.kind === "tool_use" && occ.part.setToolInput) {
+                    if (occ.part.setToolInput(droppedInputMarker(tagId))) any = true;
+                } else if (setToolContentOrText(occ.part, sentinel)) {
                     any = true;
                 }
             }
@@ -1101,12 +1122,12 @@ function buildAggregateTarget(
             }
             return any ? "truncated" : "absent";
         },
-        // Non-mutating reclaim predicate (Pi parity with OpenCode's canDrop).
-        // Pi sentinelizes BOTH halves, so unlike OpenCode there's no
-        // result-part requirement — a target reclaims as long as it still has
-        // at least one live occurrence to sentinelize.
+        // Open invocations still belong to the current turn; only complete arcs reclaim.
         canDrop(): boolean {
-            return occurrences.length > 0;
+            return (
+                occurrences.some((occ) => occ.kind === "tool_use") &&
+                occurrences.some((occ) => occ.kind === "tool_result")
+            );
         },
         requiresToolArcSkeleton,
         // Non-mutating read of the invocation input (the tool_use occurrence
@@ -1162,8 +1183,8 @@ function buildTextTarget(
  * TagTarget for a tag-eligible tool part. Tool parts get full-drop or
  * skeleton-drop treatment from `applyFlushedStatuses` based on the stored
  * `drop_mode` column. Both render the SAME canonical `[dropped §N§]`
- * placeholder — full-drop replaces the whole pair, skeleton-drop keeps the
- * tool_use call and replaces only its output. One placeholder string,
+ * placeholder — full-drop replaces the whole pair, while skeleton-drop keeps
+ * the tool_use call with only a dropped-input marker. Marker bytes are
  * byte-identical across passes and across harnesses.
  */
 function buildToolTarget(
@@ -1190,12 +1211,10 @@ function buildToolTarget(
             return replaced ? "removed" : "absent";
         },
         truncate(): "truncated" | "absent" {
-            // Skeleton-drop: replace the tool output with the one canonical
-            // `[dropped §N§]` placeholder (byte-identical to a full drop and to
-            // OpenCode). Frozen by the dropMode column, so it replays the same
-            // string every pass. The tool_use call itself survives intact.
-            const ok = setToolContentOrText(part, `[dropped \u00a7${tagId}\u00a7]`);
-            return ok ? "truncated" : "absent";
+            const changed = part.setToolInput
+                ? part.setToolInput(droppedInputMarker(tagId))
+                : setToolContentOrText(part, `[dropped \u00a7${tagId}\u00a7]`);
+            return changed ? "truncated" : "absent";
         },
         message: {
             info: { id: message.info.id, role: message.info.role },

@@ -12,12 +12,17 @@ use mc_store::{
     StoredNoteSearchRow,
 };
 
+use crate::memory_render::MEMORY_CATEGORY_ORDER;
+
 pub use mc_store::FOREIGN_VISIBLE_SQL;
 
 #[derive(Debug)]
 pub enum MemoryToolError {
     Store(McStoreError),
     EmptyContent,
+    InvalidCategory {
+        category: String,
+    },
     EmptyMerge,
     DuplicateSourceId {
         id: i64,
@@ -53,6 +58,11 @@ impl std::fmt::Display for MemoryToolError {
         match self {
             MemoryToolError::Store(e) => write!(f, "store: {e}"),
             MemoryToolError::EmptyContent => write!(f, "memory content is required"),
+            MemoryToolError::InvalidCategory { .. } => write!(
+                f,
+                "category must be one of {}",
+                MEMORY_CATEGORY_ORDER.join(", ")
+            ),
             MemoryToolError::EmptyMerge => write!(f, "merge requires at least one source memory"),
             MemoryToolError::DuplicateSourceId { id } => {
                 write!(f, "duplicate source memory id {id}")
@@ -153,22 +163,38 @@ pub struct MemoryIdSearchOutcome {
     pub diagnostics: MemorySearchDiagnostics,
 }
 
+pub(crate) fn validate_update_category(
+    category: Option<&str>,
+) -> Result<Option<&str>, MemoryToolError> {
+    let Some(category) = category.map(str::trim) else {
+        return Ok(None);
+    };
+    if !MEMORY_CATEGORY_ORDER.contains(&category) {
+        return Err(MemoryToolError::InvalidCategory {
+            category: category.to_string(),
+        });
+    }
+    Ok(Some(category))
+}
+
 /// Update an owned, primary (active/permanent and not superseded) memory.
 pub fn update_memory(
     store: &McStore,
     project_path: &str,
     id: i64,
     content: &str,
+    category: Option<&str>,
     now_ms: i64,
 ) -> Result<StoredMemoryFull, MemoryToolError> {
     let content = content.trim();
     if content.is_empty() {
         return Err(MemoryToolError::EmptyContent);
     }
+    let category = validate_update_category(category)?;
     let memory = load_owned_memory(store, project_path, id)?;
     ensure_primary_mutable(&memory)?;
     store
-        .update_memory_content(project_path, id, content, now_ms)?
+        .update_memory_content(project_path, id, content, category, now_ms)?
         .ok_or(MemoryToolError::NotFound { id })
 }
 
@@ -416,20 +442,18 @@ pub fn search_available_corpora_for_session_with_diagnostics(
     }
     if options.include_notes {
         for note in store.search_notes_like(project_path, session_id, query)? {
-            if first_match(&note.content, query).is_some()
-                || note
-                    .surface_condition
-                    .as_deref()
-                    .is_some_and(|condition| first_match(condition, query).is_some())
-            {
-                ranked.push(note_search_hit(note, query));
+            if let Some(hit) = note_search_hit(note, query) {
+                ranked.push(hit);
             }
         }
     }
 
     ranked.sort_by(|left, right| {
-        left.rank
-            .cmp(&right.rank)
+        right
+            .result
+            .score_hundredths
+            .cmp(&left.result.score_hundredths)
+            .then_with(|| left.rank.cmp(&right.rank))
             .then_with(|| right.recency.cmp(&left.recency))
             .then_with(|| left.result.id.cmp(&right.result.id))
     });
@@ -584,22 +608,104 @@ fn memory_search_hit(memory: StoredMemorySearchRow, query: &str) -> RankedSearch
     }
 }
 
-fn note_search_hit(note: StoredNoteSearchRow, query: &str) -> RankedSearchResult {
-    let matched_text = if first_match(&note.content, query).is_some() {
+fn tokenize_keyword_needle(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let push_current = |tokens: &mut Vec<String>, current: &mut String| {
+        if current.len() > 1
+            && current.chars().any(|ch| ch.is_ascii_alphanumeric())
+            && !tokens.contains(current)
+        {
+            tokens.push(std::mem::take(current));
+        } else {
+            current.clear();
+        }
+    };
+    for ch in text.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | ':' | '-') {
+            current.push(ch);
+        } else if !current.is_empty() {
+            push_current(&mut tokens, &mut current);
+        }
+    }
+    if !current.is_empty() {
+        push_current(&mut tokens, &mut current);
+    }
+    tokens
+}
+
+fn raw_note_keyword_score(text: &str, query: &str) -> Option<f64> {
+    let normalized_query = query.trim().to_lowercase();
+    if normalized_query.is_empty() {
+        return None;
+    }
+    let normalized_text = text.to_lowercase();
+    let query_tokens = tokenize_keyword_needle(&normalized_query);
+    let note_tokens: BTreeSet<String> = tokenize_keyword_needle(&normalized_text)
+        .into_iter()
+        .collect();
+    let exact = normalized_text.contains(&normalized_query);
+    let matched_tokens = query_tokens
+        .iter()
+        .filter(|token| note_tokens.contains(*token))
+        .count();
+    if !exact && matched_tokens == 0 {
+        return None;
+    }
+    let matched_unique_tokens = query_tokens
+        .iter()
+        .filter(|token| note_tokens.contains(*token))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let coverage = if query_tokens.is_empty() {
+        0.0
+    } else {
+        matched_tokens as f64 / query_tokens.len() as f64
+    };
+    let density = if note_tokens.is_empty() {
+        0.0
+    } else {
+        matched_unique_tokens as f64 / note_tokens.len() as f64
+    };
+    let exact_phrase =
+        exact && (query_tokens.len() > 1 || normalized_text.trim() == normalized_query);
+    let all_tokens = query_tokens.len() > 1 && matched_tokens == query_tokens.len();
+    Some(
+        (if exact_phrase { 2.0 } else { 0.0 })
+            + coverage * density
+            + if all_tokens { 0.5 * density } else { 0.0 },
+    )
+}
+
+fn note_search_hit(note: StoredNoteSearchRow, query: &str) -> Option<RankedSearchResult> {
+    const MAX_NOTE_KEYWORD_SCORE: f64 = 3.5;
+    const SINGLE_SOURCE_SCORE_HUNDREDTHS: f64 = 80.0;
+
+    let mut search_text = note.content.clone();
+    if let Some(condition) = note.surface_condition.as_deref() {
+        search_text.push('\n');
+        search_text.push_str(condition);
+    }
+    let raw_score = raw_note_keyword_score(&search_text, query)?;
+    let score_hundredths = ((raw_score / MAX_NOTE_KEYWORD_SCORE) * SINGLE_SOURCE_SCORE_HUNDREDTHS)
+        .clamp(0.0, SINGLE_SOURCE_SCORE_HUNDREDTHS)
+        .round()
+        .max(1.0) as i64;
+    let matched_text = if raw_note_keyword_score(&note.content, query).is_some() {
         note.content.as_str()
     } else {
         note.surface_condition
             .as_deref()
             .unwrap_or(note.content.as_str())
     };
-    RankedSearchResult {
+    Some(RankedSearchResult {
         rank: 1,
         recency: note.updated_at_ms,
         result: MemorySearchResult {
             source_kind: MemorySearchSourceKind::Note,
             id: note.id,
             snippet: snippet_around_match(matched_text, query),
-            score_hundredths: 95,
+            score_hundredths,
             category: None,
             sequence: None,
             title: None,
@@ -612,7 +718,7 @@ fn note_search_hit(note: StoredNoteSearchRow, query: &str) -> RankedSearchResult
             note_session_id: Some(note.session_id),
             source_project_path: None,
         },
-    }
+    })
 }
 
 fn compartment_search_hit(
@@ -736,7 +842,7 @@ fn snippet_around_match(text: &str, query: &str) -> String {
 mod tests {
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
-    use mc_store::{InsertMemoryInput, StoredCompartment};
+    use mc_store::{InsertMemoryInput, NoteInput, StoredCompartment};
 
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         StorageDescriptor {
@@ -779,6 +885,27 @@ mod tests {
             .unwrap()
     }
 
+    fn insert_note(
+        store: &McStore,
+        project: &str,
+        session_id: &str,
+        content: &str,
+        now_ms: i64,
+    ) -> i64 {
+        store
+            .insert_note(NoteInput {
+                project_path: project,
+                route_project_root: None,
+                session_id,
+                content,
+                surface_condition: None,
+                anchor_block_id: None,
+                now_ms,
+            })
+            .unwrap()
+            .id
+    }
+
     fn workspace(store: &McStore, own: &str, foreign: &str) {
         store
             .seed_workspace_member("ws", own, "[\"CONSTRAINTS\"]")
@@ -786,6 +913,79 @@ mod tests {
         store
             .seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")
             .unwrap();
+    }
+
+    #[test]
+    fn update_recategorizes_and_omitted_category_preserves_current_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let project = "git:proj";
+        let recategorized = insert(&store, project, "CONFIG_VALUES", "old config", 1);
+        let unchanged = insert(&store, project, "NAMING", "old name", 1);
+
+        let updated = update_memory(
+            &store,
+            project,
+            recategorized,
+            "new constraint",
+            Some("CONSTRAINTS"),
+            2,
+        )
+        .unwrap();
+        let preserved = update_memory(&store, project, unchanged, "new name", None, 3).unwrap();
+
+        assert_eq!(updated.category, "CONSTRAINTS");
+        assert_eq!(updated.content, "new constraint");
+        assert_eq!(preserved.category, "NAMING");
+        assert_eq!(preserved.content, "new name");
+    }
+
+    #[test]
+    fn update_rejects_invalid_category_with_typescript_error_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let project = "git:proj";
+        let id = insert(&store, project, "CONFIG_VALUES", "old config", 1);
+
+        let error = update_memory(&store, project, id, "new config", Some("NOT_A_CATEGORY"), 2)
+            .unwrap_err();
+
+        assert!(matches!(error, MemoryToolError::InvalidCategory { .. }));
+        assert_eq!(
+            error.to_string(),
+            "category must be one of PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, NAMING"
+        );
+        assert_eq!(
+            store.get_memory_full(id).unwrap().unwrap().content,
+            "old config"
+        );
+    }
+
+    #[test]
+    fn update_recategorize_duplicate_returns_typed_error_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let project = "git:proj";
+        let duplicate = insert(&store, project, "CONSTRAINTS", "timeout=5s", 1);
+        let target = insert(&store, project, "CONFIG_VALUES", "cache ttl", 1);
+
+        let error = update_memory(
+            &store,
+            project,
+            target,
+            "timeout=5s",
+            Some("CONSTRAINTS"),
+            2,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MemoryToolError::Store(McStoreError::MemoryDuplicateContent { id }) if id == duplicate
+        ));
+        let target = store.get_memory_full(target).unwrap().unwrap();
+        assert_eq!(target.category, "CONFIG_VALUES");
+        assert_eq!(target.content, "cache ttl");
     }
 
     fn comp(seq: i64, title: &str, content: &str, p2: Option<&str>) -> StoredCompartment {
@@ -815,7 +1015,7 @@ mod tests {
         let own_private = insert(&store, own, "PREFERENCES", "own fact", 1);
 
         assert!(matches!(
-            update_memory(&store, own, foreign_private, "edited", 2),
+            update_memory(&store, own, foreign_private, "edited", None, 2),
             Err(MemoryToolError::NotFound { id }) if id == foreign_private
         ));
         assert!(matches!(
@@ -841,7 +1041,7 @@ mod tests {
         let source = insert(&store, foreign, "CONSTRAINTS", "shared source", 1);
 
         assert!(matches!(
-            update_memory(&store, own, updatable, "shared edited", 2),
+            update_memory(&store, own, updatable, "shared edited", None, 2),
             Err(MemoryToolError::NotFound { id }) if id == updatable
         ));
         assert!(matches!(
@@ -926,7 +1126,7 @@ mod tests {
         merge_memories(&store, project, target, &[source], "merged", 2).unwrap();
 
         assert!(matches!(
-            update_memory(&store, project, source, "edit", 3),
+            update_memory(&store, project, source, "edit", None, 3),
             Err(MemoryToolError::Superseded { id, superseded_by })
                 if id == source && superseded_by == target
         ));
@@ -1046,6 +1246,67 @@ mod tests {
             limited[1].source_kind,
             MemorySearchSourceKind::CompartmentTitle
         );
+    }
+
+    #[test]
+    fn note_search_excludes_dismissed_rows_and_scores_keyword_relevance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let project = "git:own";
+        let session_id = "session-notes";
+        let dense = insert_note(
+            &store,
+            project,
+            session_id,
+            "needle semantic calibration decision",
+            10,
+        );
+        let weak = insert_note(
+            &store,
+            project,
+            session_id,
+            "A long unrelated reminder with background context and one needle token",
+            20,
+        );
+        let dismissed = insert_note(
+            &store,
+            project,
+            session_id,
+            "needle semantic calibration decision dismissed",
+            30,
+        );
+        store
+            .dismiss_note(project, session_id, dismissed, None, 40)
+            .unwrap()
+            .unwrap();
+
+        let excluded = BTreeSet::new();
+        let outcome = search_available_corpora_for_session_with_diagnostics(
+            &store,
+            project,
+            session_id,
+            "needle semantic calibration decision",
+            MemorySearchOptions {
+                limit: 10,
+                include_memories: false,
+                include_messages: false,
+                include_notes: true,
+                excluded_memory_ids: &excluded,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome
+                .results
+                .iter()
+                .map(|result| result.id)
+                .collect::<Vec<_>>(),
+            vec![dense, weak]
+        );
+        assert_eq!(outcome.results[0].score_hundredths, 80);
+        assert_eq!(outcome.results[1].score_hundredths, 1);
+        assert!(!outcome.results.iter().any(|result| result.id == dismissed));
     }
 
     #[test]

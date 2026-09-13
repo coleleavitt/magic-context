@@ -34,6 +34,7 @@ import { sessionLog } from "@magic-context/core/shared/logger";
 import type { ResolvedModelEntry } from "@magic-context/core/shared/model-resolution";
 import { piHarnessKindFromExecutable } from "@magic-context/core/shared/pi-executable";
 import type {
+	CompletedSubagentToolCall,
 	SubagentProgressEvent,
 	SubagentRunner,
 	SubagentRunOptions,
@@ -586,8 +587,7 @@ const PI_HISTORIAN_TOOLS = [...PI_READ_ONLY_BUILTINS, "aft_search"] as const;
 
 /**
  * Set of subagent agent ids that get ctx_memory in the lean child extension.
- * Sidekick is retrieval-only and uses ctx_search; only dreamer-equivalent
- * agents need memory mutation/list capabilities.
+ * Only dreamer-equivalent agents need memory mutation/list capabilities.
  *
  * Membership uses the SAME agent strings the Pi callers actually pass
  * (see e.g. `dreamer/index.ts` passing `"magic-context-dreamer"`). If
@@ -606,7 +606,6 @@ const HISTORIAN_AGENTS: ReadonlySet<string> = new Set([
 	"historian-editor",
 ]);
 const SEARCH_ONLY_SUBAGENT_TOOL_AGENTS: ReadonlySet<string> = new Set([
-	"sidekick",
 	"dreamer-retrospective",
 	// Loads the lean extension so ctx_search is REGISTERED (the strict allow-list
 	// only gates an existing registration). Deliberately NOT in
@@ -653,10 +652,6 @@ const STRICT_TOOL_ALLOWLIST_ENTRIES: readonly (readonly [
 	["historian", PI_HISTORIAN_TOOLS],
 	["historian-recomp", PI_HISTORIAN_TOOLS],
 	["historian-editor", PI_HISTORIAN_TOOLS],
-	// Sidekick augments the user's prompt by retrieving memory. It needs the lean
-	// ctx_search registration plus Pi's read-only built-ins for safe local context,
-	// but no write/bash/ctx_memory surface.
-	["sidekick", [...PI_READ_ONLY_BUILTINS, "ctx_search"]],
 	// classify-memories: a pure metadata transform (prompt in → XML out). ZERO
 	// tools — it scores from the memory text and the host applies the columns.
 	["dreamer-classifier", []],
@@ -750,7 +745,6 @@ const KNOWN_PI_SUBAGENT_AGENTS = [
 	"historian",
 	"historian-recomp",
 	"historian-editor",
-	"sidekick",
 	"dreamer-retrospective",
 	"smart-note-compiler",
 	"dreamer-classifier",
@@ -763,7 +757,6 @@ const KNOWN_PI_SUBAGENT_AGENTS = [
 ] as const;
 
 function inferAccountingSubagent(agent: string): SubagentKind {
-	if (agent.includes("sidekick")) return "sidekick";
 	if (agent.includes("retrospective")) return "dreamer";
 	if (agent.includes("dreamer")) return "dreamer";
 	if (agent.includes("compressor")) return "compressor";
@@ -868,7 +861,7 @@ type ExtensionRetryResult = {
  *   fine — we just don't surface intermediate state to the caller.
  * - Per-turn token usage. Pi reports usage in each `message_end`, but
  *   the runner contract only returns the final assistant text. If the
- *   sidekick/historian/dreamer ever needs token accounting, we'll add
+ *   historian/dreamer ever needs token accounting, we'll add
  *   a `usage` field to `SubagentRunResult.meta` rather than changing
  *   the core contract.
  */
@@ -1261,8 +1254,8 @@ export class PiSubagentRunner implements SubagentRunner {
 				cleanupSystemPromptFile();
 				// recordAccounting must never block resolution: a throw here (e.g.
 				// a DB write failure during token accounting) would leave the
-				// promise unresolved and hang the caller (historian/dreamer/
-				// sidekick). Accounting is best-effort telemetry; resolve regardless.
+				// promise unresolved and hang the caller (historian/dreamer).
+				// Accounting is best-effort telemetry; resolve regardless.
 				try {
 					recordAccounting(result, accountingMessages);
 				} catch (err) {
@@ -1517,6 +1510,10 @@ export class PiSubagentRunner implements SubagentRunner {
 				if (e.type === "agent_end" && Array.isArray(e.messages)) {
 					sawAgentEnd = true;
 					agentEndMessages = e.messages;
+					// agent_end is authoritative when a Pi-compatible child emits it;
+					// retain its complete assistant-message list so usage is accounted
+					// even when no message_end events were printed.
+					accountingMessages = e.messages;
 					const result = extractFinalAssistant(e.messages);
 					finalAssistantText = result.text;
 					finalStopReason = result.stopReason;
@@ -1540,6 +1537,9 @@ export class PiSubagentRunner implements SubagentRunner {
 				// max-tokens cap mid-response — still terminal, but we
 				// surface it as model_failed so callers can react.
 				if (e.type === "message_end" && e.message) {
+					// Every assistant message_end is retained. recordChildInvocation
+					// sums message.usage here, matching OpenCode's per-assistant
+					// info.tokens accounting rather than using only the final turn.
 					accumulatedMessages.push(e.message);
 					const m = e.message as {
 						role?: string;
@@ -1678,17 +1678,50 @@ export class PiSubagentRunner implements SubagentRunner {
 				});
 				if (settled) return;
 
+				const settleCompletedToolOnlyDreamer = (
+					messages: unknown[],
+					completedMemoryCalls: CompletedSubagentToolCall[],
+				): boolean => {
+					if (
+						!DREAMER_ACTION_AGENTS.has(options.agent) ||
+						completedMemoryCalls.length === 0
+					) {
+						return false;
+					}
+					settle({
+						ok: true,
+						assistantText: "",
+						toolCallCount: countToolCalls(messages),
+						completedToolCalls: completedMemoryCalls,
+						durationMs: Date.now() - startTime,
+						meta: { stderr: stderr.length > 0 ? stderr : undefined },
+					});
+					return true;
+				};
+
 				// Common case: terminal assistant message_end was observed.
 				// Pi print-mode often needs our drain SIGTERM after producing
 				// the final turn, so the captured stopReason/text is the source
 				// of truth; a signaled close here must not turn a valid answer
 				// into a fake subprocess failure.
 				if (sawAgentEnd) {
+					const outputMessages = agentEndMessages ?? accumulatedMessages;
+					const completedCalls = extractCompletedToolCalls(outputMessages);
+					const completedMemoryCalls = completedCalls.filter(
+						(call) => call.name === "ctx_memory",
+					);
 					const trimmedAssistantText = finalAssistantText?.trim() ?? null;
 					if (
 						trimmedAssistantText === null ||
 						trimmedAssistantText.length === 0
 					) {
+						if (
+							settleCompletedToolOnlyDreamer(
+								outputMessages,
+								completedMemoryCalls,
+							)
+						)
+							return;
 						const emptyAssistantReason =
 							trimmedAssistantText === null
 								? "pi agent_end did not include an assistant message"
@@ -1734,9 +1767,10 @@ export class PiSubagentRunner implements SubagentRunner {
 						// Prefer agent_end's authoritative full array; else the
 						// accumulated message_end stream. Counting toolCall content
 						// parts is event-name-independent (see countToolCalls).
-						toolCallCount: countToolCalls(
-							agentEndMessages ?? accumulatedMessages,
-						),
+						toolCallCount: countToolCalls(outputMessages),
+						...(completedMemoryCalls.length > 0
+							? { completedToolCalls: completedMemoryCalls }
+							: {}),
 						durationMs: Date.now() - startTime,
 						meta: { stderr: stderr.length > 0 ? stderr : undefined },
 					});
@@ -1775,6 +1809,17 @@ export class PiSubagentRunner implements SubagentRunner {
 					});
 					return;
 				}
+
+				const completedMemoryCalls = extractCompletedToolCalls(
+					accumulatedMessages,
+				).filter((call) => call.name === "ctx_memory");
+				if (
+					settleCompletedToolOnlyDreamer(
+						accumulatedMessages,
+						completedMemoryCalls,
+					)
+				)
+					return;
 
 				settle({
 					ok: false,
@@ -1985,8 +2030,8 @@ export function buildArgs(
 		"--mode",
 		"json",
 		// `--no-session` makes Pi use SessionManager.inMemory() — no
-		// JSONL is written to ~/.pi/agent/sessions/<cwd>/, so historian /
-		// sidekick / dreamer / recomp / compressor child sessions never
+		// JSONL is written to ~/.pi/agent/sessions/<cwd>/, so historian,
+		// dreamer, recomp, and compressor child sessions never
 		// show up in `pi resume` or the session picker. We don't need
 		// the persisted JSONL anyway: the result comes back through the
 		// `agent_end` event on stdout (see extractFinalAssistant). Maps
@@ -2047,7 +2092,7 @@ export function buildArgs(
 	// Do not load the lean Magic Context extension for historian/compressor style
 	// subagents. They do not use ctx_* tools, and loading the entry would add
 	// startup cost and an avoidable tool-registration surface. Tool-using agents
-	// (sidekick/dreamer) still receive the lean entry.
+	// Dreamer tool users still receive the lean entry.
 	const subagentEntryPath = opts?.subagentEntryPath ?? SUBAGENT_ENTRY_PATH;
 	const shouldLoadSubagentExtension =
 		subagentEntryPath &&
@@ -2056,8 +2101,7 @@ export function buildArgs(
 	if (shouldLoadSubagentExtension) {
 		args.push("--extension", subagentEntryPath);
 
-		// Only dreamer subagents get ctx_memory in the child extension. Sidekick
-		// loads the same entry for ctx_search but must stay read-only. The flag is
+		// Only dreamer subagents get ctx_memory in the child extension. The flag is
 		// read inside the subagent extension via `pi.getFlag(...)`.
 		if (DREAMER_ACTION_AGENTS.has(options.agent)) {
 			args.push("--magic-context-dreamer-actions");
@@ -2096,7 +2140,7 @@ export function buildArgs(
 		// --append-system-prompt (chain) because subagents are one-shot
 		// and have their own focused system prompt. Mixing in Pi's
 		// default coding-assistant prompt would dilute the historian
-		// / dreamer / sidekick role guidance. The runner always writes that
+		// / dreamer role guidance. The runner always writes that
 		// prompt to a temp file and passes the ABSOLUTE path here because
 		// Windows CreateProcess caps the whole command line at 32,767 chars
 		// and the historian prompt alone is ~60 KB. A temp file also avoids
@@ -2195,6 +2239,74 @@ export function extractFinalAssistant(messages: unknown[]): {
 		};
 	}
 	return { text: null, stopReason: null, errorMessage: null };
+}
+
+/** Pair assistant invocations with non-error tool-result messages from Pi's transcript. */
+export function extractCompletedToolCalls(
+	messages: unknown[],
+): CompletedSubagentToolCall[] {
+	const invocations = new Map<
+		string,
+		{ name: string; arguments: Record<string, unknown> }
+	>();
+	for (const message of messages) {
+		if (typeof message !== "object" || message === null) continue;
+		const candidate = message as { role?: unknown; content?: unknown };
+		if (candidate.role !== "assistant" || !Array.isArray(candidate.content))
+			continue;
+		for (const part of candidate.content) {
+			if (typeof part !== "object" || part === null) continue;
+			const call = part as {
+				type?: unknown;
+				id?: unknown;
+				toolCallId?: unknown;
+				name?: unknown;
+				toolName?: unknown;
+				arguments?: unknown;
+			};
+			if (call.type !== "toolCall") continue;
+			const id = typeof call.id === "string" ? call.id : call.toolCallId;
+			const name = typeof call.name === "string" ? call.name : call.toolName;
+			if (typeof id !== "string" || typeof name !== "string") continue;
+			const args =
+				typeof call.arguments === "object" &&
+				call.arguments !== null &&
+				!Array.isArray(call.arguments)
+					? (call.arguments as Record<string, unknown>)
+					: {};
+			invocations.set(id, { name, arguments: args });
+		}
+	}
+
+	const completed: CompletedSubagentToolCall[] = [];
+	const seen = new Set<string>();
+	for (const message of messages) {
+		if (typeof message !== "object" || message === null) continue;
+		const result = message as {
+			role?: unknown;
+			toolCallId?: unknown;
+			toolName?: unknown;
+			isError?: unknown;
+		};
+		if (
+			result.role !== "toolResult" ||
+			typeof result.toolCallId !== "string" ||
+			result.isError !== false ||
+			seen.has(result.toolCallId)
+		) {
+			continue;
+		}
+		const invocation = invocations.get(result.toolCallId);
+		if (!invocation) continue;
+		if (
+			typeof result.toolName === "string" &&
+			result.toolName !== invocation.name
+		)
+			continue;
+		seen.add(result.toolCallId);
+		completed.push(invocation);
+	}
+	return completed;
 }
 
 /**

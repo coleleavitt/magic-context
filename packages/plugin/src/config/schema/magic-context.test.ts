@@ -23,7 +23,6 @@ describe("MagicContextConfigSchema", () => {
                 cache_ttl: "5m",
                 prompt_surface: { default: "full" },
                 execute_threshold_percentage: 65,
-                protected_tags: 20,
                 clear_reasoning_age: 50,
                 history_budget_percentage: DEFAULT_HISTORY_BUDGET_PERCENTAGE,
                 historian_timeout_ms: DEFAULT_HISTORIAN_TIMEOUT_MS,
@@ -46,7 +45,6 @@ describe("MagicContextConfigSchema", () => {
             expect(result.historian_timeout_ms).toBeGreaterThanOrEqual(10 * 60_000);
             expect(result.historian).toBeUndefined();
             expect(result.dreamer).toBeUndefined();
-            expect(result.sidekick).toBeUndefined();
             expect(result.pi).toBeUndefined();
             expect(result.mural).toEqual({ enabled: false });
         });
@@ -107,6 +105,7 @@ describe("MagicContextConfigSchema", () => {
                 },
                 temporal_awareness: false,
                 keep_subagents: false,
+                debug_rpc: false,
                 todowrite: {
                     enabled: false,
                     overlay: false,
@@ -145,15 +144,6 @@ describe("MagicContextConfigSchema", () => {
                 pi: {
                     subagent_extensions: ["@example/provider", "./extensions/local.ts"],
                 },
-                sidekick: {
-                    disable: false,
-                    model: "qwen-test",
-                    fallback_models: ["qwen-fallback"],
-                    temperature: 0.1,
-                    variant: "fast",
-                    timeout_ms: 12_000,
-                    system_prompt: "Custom prompt",
-                },
                 compaction: {
                     enabled: true,
                 },
@@ -177,19 +167,6 @@ describe("MagicContextConfigSchema", () => {
             ).toBe(false);
         });
 
-        it("applies sidekick defaults when the object is present", () => {
-            const result = MagicContextConfigSchema.parse({
-                sidekick: {
-                    model: "github-copilot/gpt-5.4",
-                },
-            });
-
-            expect(result.sidekick).toEqual({
-                model: "github-copilot/gpt-5.4",
-                timeout_ms: 30000,
-            });
-        });
-
         it("accepts disable on hidden agents and strips deprecated top-level enabled", () => {
             const result = MagicContextConfigSchema.parse({
                 historian: { disable: true },
@@ -203,14 +180,11 @@ describe("MagicContextConfigSchema", () => {
                         "maintain-docs": { schedule: "0 * * * *" },
                     },
                 },
-                sidekick: { disable: true, enabled: true },
             });
 
             expect(result.historian?.disable).toBe(true);
             expect(result.dreamer?.disable).toBe(true);
-            expect(result.sidekick?.disable).toBe(true);
             expect("enabled" in (result.dreamer as Record<string, unknown>)).toBe(false);
-            expect("enabled" in (result.sidekick as Record<string, unknown>)).toBe(false);
             expect(result.dreamer?.tasks["review-user-memories"].schedule).toBe("");
             expect(result.dreamer?.tasks["maintain-docs"].schedule).toBe("0 * * * *");
             expect(result.dreamer?.tasks["classify-memories"].schedule).toBe("0 6 * * *");
@@ -353,10 +327,6 @@ describe("MagicContextConfigSchema", () => {
                                 thinking_level: "inherit",
                             },
                         },
-                        sidekick: {
-                            model: "anthropic/work-sidekick",
-                            fallback_models: ["openai/work-sidekick-fallback"],
-                        },
                     },
                 },
             });
@@ -376,7 +346,6 @@ describe("MagicContextConfigSchema", () => {
                 { model: "opencode/work-historian-fallback", thinking_level: "inherit" },
             ]);
             expect(result.profiles?.work?.dreamer?.omp?.thinking_level).toBe("inherit");
-            expect(result.profiles?.work?.sidekick?.model).toBe("anthropic/work-sidekick");
         });
 
         it("rejects timeout_minutes in a dreamer profile", () => {
@@ -432,7 +401,7 @@ describe("MagicContextConfigSchema", () => {
                     },
                 },
                 { work: { dreamer: { tasks: { verify: { schedule: "0 3 * * *" } } } } },
-                { work: { sidekick: { timeout_ms: 60_000 } } },
+                { work: { dreamer: { timeout_ms: 60_000 } } },
             ];
 
             for (const profiles of profilesWithExcludedFields) {
@@ -667,17 +636,27 @@ describe("MagicContextConfigSchema", () => {
             ).toThrow();
         });
 
-        it("rejects protected_tags greater than 100", () => {
-            expect(() => MagicContextConfigSchema.parse({ protected_tags: 101 })).toThrow();
-        });
-
-        it("rejects protected_tags less than 1", () => {
-            expect(() => MagicContextConfigSchema.parse({ protected_tags: 0 })).toThrow();
-        });
-
-        it("accepts protected_tags boundary values", () => {
-            expect(MagicContextConfigSchema.parse({ protected_tags: 1 }).protected_tags).toBe(1);
+        it("accepts protected_tags at any value including 0 and 101 as deprecated inert key", () => {
+            expect(MagicContextConfigSchema.parse({ protected_tags: 101 }).protected_tags).toBe(
+                101,
+            );
+            expect(MagicContextConfigSchema.parse({ protected_tags: 0 }).protected_tags).toBe(0);
             expect(MagicContextConfigSchema.parse({ protected_tags: 20 }).protected_tags).toBe(20);
+        });
+
+        it("enforces protected_tokens override range at both ends", () => {
+            expect(() => MagicContextConfigSchema.parse({ protected_tokens: 3999 })).toThrow();
+            expect(() => MagicContextConfigSchema.parse({ protected_tokens: 1_000_001 })).toThrow();
+            expect(() => MagicContextConfigSchema.parse({ protected_tokens: 30000.5 })).toThrow();
+            expect(
+                MagicContextConfigSchema.parse({ protected_tokens: 4000 }).protected_tokens,
+            ).toBe(4000);
+            expect(
+                MagicContextConfigSchema.parse({ protected_tokens: 1_000_000 }).protected_tokens,
+            ).toBe(1_000_000);
+            expect(
+                MagicContextConfigSchema.parse({ protected_tokens: 30000 }).protected_tokens,
+            ).toBe(30000);
         });
 
         it("rejects clear_reasoning_age below minimum", () => {
@@ -717,6 +696,35 @@ describe("MagicContextConfigSchema", () => {
                     },
                 }),
             ).toThrow();
+        });
+
+        it("preserves embedding instruction prefixes byte-for-byte and accepts false", () => {
+            const queryInstruction = "Instruct: custom task\nQuery: ";
+            const documentPrefix = "search_document: ";
+            const parsed = MagicContextConfigSchema.parse({
+                embedding: {
+                    provider: "openai-compatible",
+                    endpoint: "http://localhost:1234/v1",
+                    model: "custom/model",
+                    query_instruction: queryInstruction,
+                    document_prefix: documentPrefix,
+                },
+            }).embedding;
+
+            expect(parsed).toMatchObject({
+                query_instruction: queryInstruction,
+                document_prefix: documentPrefix,
+            });
+            expect(
+                MagicContextConfigSchema.parse({
+                    embedding: {
+                        provider: "openai-compatible",
+                        endpoint: "http://localhost:1234/v1",
+                        model: "custom/model",
+                        query_instruction: false,
+                    },
+                }).embedding,
+            ).toMatchObject({ query_instruction: false });
         });
 
         it("defaults local embedding runtime to auto and accepts explicit overrides", () => {

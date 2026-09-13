@@ -166,14 +166,11 @@ describe("source contract: peek-then-drain in runPipeline (history)", () => {
 		expect(segment).toMatch(/if\s*\(\s*args\.isCacheBusting\s*\)/);
 	});
 
-	test("deferred publication drains only on a MID-TURN-AWARE can-consume-late gate", () => {
-		// canConsumeDeferredLate must be a mid-turn-aware gate computed
-		// INDEPENDENTLY (from the mid-turn-adjusted schedulerDecision + force
-		// threshold), NOT derived from shouldRunHeuristics. The old inverted form
-		// `baseShouldApplyPendingOps || shouldRunHeuristics` let a deferred publish
-		// drain mid-turn (shouldRunHeuristics read raw deferred-set membership),
-		// busting cache where OpenCode stayed deferred. It must mirror OpenCode's
-		// canConsumeDeferredOnThisPass.
+	test("deferred publication drains only on a bust-opportunity gate", () => {
+		// canConsumeDeferredLate must be computed independently from the scheduler
+		// decision and force threshold, not derived from shouldRunHeuristics. The
+		// old inverted form let raw deferred-set membership authorize its own bust.
+		// This must mirror OpenCode's canConsumeDeferredOnThisPass.
 		expect(code).not.toMatch(
 			/const\s+canConsumeDeferredLate\s*=\s*baseShouldApplyPendingOps\s*\|\|\s*shouldRunHeuristics/,
 		);
@@ -208,12 +205,6 @@ describe("source contract: peek-then-drain in runPipeline (history)", () => {
 		expect(code).toContain(
 			"rawMessageProviderUnregistersBySession.delete(sessionId)",
 		);
-	});
-
-	test("inline thinking stripping shares the reasoning watermark", () => {
-		expect(code).toContain("stripInlineThinkingPi({");
-		expect(code).toContain("const combinedWatermark = Math.max(");
-		expect(code).toContain("clearedReasoningThroughTag: combinedWatermark");
 	});
 
 	test("model switch reset clears usage, reasoning, failure, limit, and recovery state", () => {
@@ -265,7 +256,9 @@ describe("source contract: peek-then-drain in runPipeline (pending materializati
 		// `if` block (so a throw from applyPendingOperations skips the drain).
 		const idx = code.indexOf("applyPendingOperations(");
 		expect(idx).toBeGreaterThan(0);
-		const segment = code.slice(idx, idx + 800);
+		const catchIndex = code.indexOf("} catch", idx);
+		expect(catchIndex).toBeGreaterThan(idx);
+		const segment = code.slice(idx, catchIndex);
 		expect(segment).toContain("consumePendingMaterialization(args.sessionId)");
 		expect(segment).toMatch(/if\s*\(\s*hasPendingMaterializeSignal\s*\)/);
 	});

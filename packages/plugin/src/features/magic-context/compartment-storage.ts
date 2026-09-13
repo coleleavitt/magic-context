@@ -1,7 +1,9 @@
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { isCompartmentLeaseHeld } from "./compartment-lease";
 import { getIncrementDepthStatement } from "./compression-depth-storage";
+import { isNoContentCompartment } from "./no-content-compartment";
 import { clearCachedM0M1 } from "./storage-meta-shared";
 
 const insertCompartmentStatements = new WeakMap<Database, PreparedStatement>();
@@ -185,7 +187,7 @@ function insertCompartmentRows(
             compartment.p4 ?? null,
             typeof compartment.importance === "number" ? compartment.importance : 50,
             compartment.episodeType ?? null,
-            hasTiers ? 0 : 1,
+            hasTiers || isNoContentCompartment(compartment) ? 0 : 1,
             now,
             getHarness(),
         );
@@ -379,6 +381,7 @@ export function replaceAllCompartmentStateAndBumpDepth(
     depthEndOrdinal: number,
 ): boolean {
     const now = Date.now();
+    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
     let finished = false;
     try {
@@ -405,6 +408,7 @@ export function replaceAllCompartmentStateAndBumpDepth(
 
         db.exec("COMMIT");
         finished = true;
+        logSlowWriteTransaction("compartment_state_replace", transactionStartedAt);
         return true;
     } finally {
         if (!finished) {
@@ -436,6 +440,7 @@ export function buildCompartmentBlock(
     }
 
     for (const c of compartments) {
+        if (isNoContentCompartment(c)) continue;
         const dates = dateRanges?.byId.get(c.id);
         const dateAttr = dates ? ` start-date="${dates.start}" end-date="${dates.end}"` : "";
         lines.push(
@@ -587,6 +592,7 @@ export function promoteRecompStaging(
         })();
     }
 
+    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
     let finished = false;
     try {
@@ -617,6 +623,7 @@ export function promoteRecompStaging(
 
         db.exec("COMMIT");
         finished = true;
+        logSlowWriteTransaction("recomp_staging_promote", transactionStartedAt);
         return { compartments: staging.compartments, facts: staging.facts };
     } finally {
         if (!finished) {

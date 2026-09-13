@@ -23,7 +23,7 @@ Add the schema line for editor validation and autocomplete:
 ```
 
 :::note
-Project-level configs cannot use `{env:VAR}` / `{file:path}` expansion. A cloned repository also cannot set `output_reserve`, `sqlite.*`, `storage.enforce_private_permissions`, hidden-agent prompts/permissions, `historian.model`, or `historian.fallback_models`. Profile definitions in `profiles` are user-level only; a project may set only `profile` to choose a named user profile. Project `execute_threshold_percentage` / `execute_threshold_tokens` may only RAISE thresholds relative to the user's effective settings (a repo may delay compaction, not make it happen earlier). Dreamer model/schedule/task tuning and `memory.enabled` remain allowed project overrides.
+Project-level configs cannot use `{env:VAR}` / `{file:path}` expansion. A cloned repository also cannot set `output_reserve`, `sqlite.*`, `storage.enforce_private_permissions`, `embedding.query_instruction`, `embedding.document_prefix`, hidden-agent prompts/permissions, `historian.model`, or `historian.fallback_models`. Profile definitions in `profiles` are user-level only; a project may set only `profile` to choose a named user profile. Project `execute_threshold_percentage` / `execute_threshold_tokens` may only RAISE thresholds relative to the user's effective settings (a repo may delay compaction, not make it happen earlier). Project `protected_tokens` may likewise only raise the effective user/default protection floor. Dreamer model/schedule/task tuning and `memory.enabled` remain allowed project overrides.
 :::
 
 ## Top-level switches
@@ -34,9 +34,9 @@ Global on/off switches for the plugin and its agent-facing surface.
 |---|---|---|---|
 | `enabled` | boolean | `true` | Enable magic context (default: true) |
 | `allow_home_project` | boolean | `false` | Allow Magic Context sessions launched from the exact canonical home directory. The home session uses its deterministic dir: identity so pre-gate memories reconnect. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace. |
-| `language` | string | — | Output language for Magic Context's generated content and guidance, as a 2-letter ISO 639-1 code (e.g. "tr", "es", "de", "ja", "pt"). When set, the historian, dreamer, sidekick, and the agent-guidance block instruct the model to write its PROSE in this language while keeping all structural tokens (XML tags, the five memory category names, code identifiers, file paths) in English. USER-LEVEL ONLY (ignored in project config for security). Unset = today's behavior (model mirrors the conversation; English scaffolding). Changing it triggers one cache re-materialization; existing compartments/memories keep their original language until naturally rewritten. |
+| `language` | string | — | Output language for Magic Context's generated content and guidance, as a 2-letter ISO 639-1 code (e.g. "tr", "es", "de", "ja", "pt"). When set, the historian, dreamer, and the agent-guidance block instruct the model to write its PROSE in this language while keeping all structural tokens (XML tags, the five memory category names, code identifiers, file paths) in English. USER-LEVEL ONLY (ignored in project config for security). Unset = today's behavior (model mirrors the conversation; English scaffolding). Changing it triggers one cache re-materialization; existing compartments/memories keep their original language until naturally rewritten. |
 | `auto_update` | boolean | — | Enable automatic npm self-update checks for the OpenCode plugin. Security: USER-only in config loader, so hostile project configs cannot suppress updates. |
-| `keep_subagents` | boolean | `false` | Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect. |
+| `keep_subagents` | boolean | `false` | Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect. |
 | `todowrite` | object | — | Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart. |
 | `todowrite.enabled` | boolean | `true` | Pi only: register Magic Context's todowrite task-list tool. Disable if you use your own todo extension. OpenCode ships its own built-in todowrite; this setting has no effect there. |
 | `todowrite.overlay` | boolean | `true` | Pi only: show the persistent todo overlay above the editor while tasks are active. |
@@ -67,7 +67,8 @@ When and how aggressively Magic Context manages the session's context window. Pe
 | `execute_threshold_percentage` | number (20–90) \\| map<string, number (20–90)> | `65` | Context percentage that forces queued operations to execute. Number or per-model object ({ default: 65, "provider/model": 45 }). Values above 90 are rejected because the runtime caps at 90% of the output-reserved safe window (MAX_EXECUTE_THRESHOLD). Default: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE |
 | `execute_threshold_tokens` | object | — | Absolute token thresholds per model. When matched, overrides execute_threshold_percentage for that model. Accepts `default` for all models or per-model keys. Values above 90% × context_limit are clamped with a warning log. Min 5_000, max 2_000_000. |
 | `execute_threshold_tokens.default` | number (5000–2000000) | — |  |
-| `protected_tags` | number (1–100) | — | Number of recent tags to protect from dropping (min: 1, max: 100, default: 20) |
+| `protected_tokens` | integer (4000–1000000) | — | Positive integer token floor to protect from automatic reclaim (min: 4_000, max: 1_000_000). When omitted, the derived default is clamp(round(0.05 × usableSoft), min(16_000, round(0.08 × usableSoft)), 64_000). |
+| `protected_tags` | unknown | — | Deprecated: number of recent tags to protect. Ignored for behaviour; use protected_tokens instead. |
 | `clear_reasoning_age` | number (10–) | `50` | Clear reasoning/thinking blocks older than N tags (default: 50) |
 | `history_budget_percentage` | number (0.05–0.5) | `0.15` | Fraction of usable context (context_limit × execute_threshold) reserved for the session history block (default: 0.15) |
 
@@ -78,7 +79,7 @@ Named user-owned model-selection overlays. A project may select a profile name b
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `profile` | string | — | Select a named user-owned model profile. A valid project name overrides this user default; an empty string, null, or other non-string project value is ignored with a warning so the user selection still applies. Unknown names warn and use the base configuration. |
-| `profiles` | map<string, object> | — | User-level named model profiles. A profile may contain only historian/dreamer model, fallback_models, OpenCode variant, and Pi/OMP thinking_level fields plus sidekick model-selection fields; task execution policy (including timeout_minutes) is excluded. Project configs may select a name but cannot define profiles. |
+| `profiles` | map<string, object> | — | User-level named model profiles. A profile may contain only historian/dreamer model, fallback_models, OpenCode variant, and Pi/OMP thinking_level fields; task execution policy (including timeout_minutes) is excluded. Project configs may select a name but cannot define profiles. |
 
 ## Historian
 
@@ -124,7 +125,7 @@ The background agent that condenses old conversation into compact history.
 
 ## Memory & recall
 
-Durable project memory, semantic search, and recall features.
+Durable project memory, semantic search, and recall features. OpenAI-compatible instruction-tuned embedding families receive their documented query instruction automatically because those models were trained to distinguish retrieval queries from passages; plain local encoders remain unchanged. Query instructions affect only live search vectors, not stored vectors, so changing `embedding.query_instruction` does not re-embed the corpus. A non-empty `embedding.document_prefix` does affect stored vectors and therefore changes the embedding identity.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -149,6 +150,8 @@ Durable project memory, semantic search, and recall features.
 | `embedding.api_key` | string | — | API key for remote embedding provider (optional) |
 | `embedding.input_type` | string | — | Default input_type for stored/indexed (passage) embeddings in the request body. Required by some openai-compatible providers (e.g. NVIDIA NIM). Omitted from the request when unset. |
 | `embedding.query_input_type` | string | — | Optional input_type for query (search) embeddings on asymmetric models (e.g. NVIDIA NIM 'query'). When unset, query embeddings use embedding.input_type. Passage/stored content always uses embedding.input_type. |
+| `embedding.query_instruction` | string \\| boolean | — | OpenAI-compatible query prefix override. A string is prepended verbatim to search queries; false disables the built-in model-family instruction. Qwen3-Embedding, gte-Qwen instruct, e5 instruct, and Nomic families have built-in recipes. Query-only changes do not re-embed stored content. User-level only; project values are ignored. |
+| `embedding.document_prefix` | string | — | OpenAI-compatible stored-document prefix override, prepended verbatim. Defaults to the model-family recipe (empty for Qwen3/gte/e5 instruct; 'search_document: ' for Nomic). Changing it changes stored vectors and triggers re-embedding. User-level only; project values are ignored. |
 | `embedding.truncate` | string | — | Optional truncate mode sent in the embedding request body (e.g. NVIDIA NIM accepts 'NONE' \| 'START' \| 'END'). Omitted from the request when unset. |
 | `embedding.max_input_tokens` | integer (–9007199254740991) | — | Optional maximum input tokens for chunk embeddings. Defaults conservatively to 512 when omitted. |
 | `embedding.local_runtime` | `"auto"` \\| `"native"` \\| `"wasm"` | `"auto"` | Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Set 'native' only to prefer speed while accepting that pre-1.4.0 Bun crash risk, or 'wasm' to avoid loading the native addon. |
@@ -156,7 +159,7 @@ Durable project memory, semantic search, and recall features.
 
 ## Background agents
 
-Off-hours maintenance (Dreamer) and on-demand prompt augmentation (Sidekick).
+Off-hours maintenance through Dreamer.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -208,29 +211,6 @@ Off-hours maintenance (Dreamer) and on-demand prompt augmentation (Sidekick).
 | `dreamer.tasks.promote-primers.promotion_threshold` | number (2–20) | — | promote-primers: min recurring source days before promotion is considered (default: 2) |
 | `dreamer.tasks.refresh-primers.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
 | `dreamer.inject_docs` | boolean | `true` | Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true) |
-| `sidekick` | object | — | Optional sidekick agent configuration for session-start memory retrieval |
-| `sidekick.model` | string | — | Primary model ID (e.g. 'claude-sonnet-4-6') |
-| `sidekick.temperature` | number (0–2) | — | Sampling temperature (0-2) |
-| `sidekick.top_p` | number (0–1) | — | Nucleus sampling top_p (0-1) |
-| `sidekick.prompt` | string | — | Additional system prompt text |
-| `sidekick.tools` | map<string, boolean> | — | Tool enable/disable overrides |
-| `sidekick.disable` | boolean | — | Disable this agent |
-| `sidekick.description` | string | — | Agent description |
-| `sidekick.mode` | `"subagent"` \\| `"primary"` \\| `"all"` | — | Agent mode (subagent, primary, or all) |
-| `sidekick.color` | string | — | Hex color for the agent (e.g. '#a1b2c3') |
-| `sidekick.maxSteps` | number | — | Maximum tool-call steps per invocation |
-| `sidekick.permission` | object | — | Per-tool permission overrides |
-| `sidekick.permission.edit` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
-| `sidekick.permission.bash` | `"ask"` \\| `"allow"` \\| `"deny"` \\| map<string, `"ask"` \\| `"allow"` \\| `"deny"`> | — |  |
-| `sidekick.permission.webfetch` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
-| `sidekick.permission.doom_loop` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
-| `sidekick.permission.external_directory` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
-| `sidekick.maxTokens` | number | — | Maximum output tokens |
-| `sidekick.variant` | string | — | OpenCode reasoning variant (e.g. for extended thinking) |
-| `sidekick.fallback_models` | string \\| string[] | — | Fallback model IDs if primary is unavailable |
-| `sidekick.timeout_ms` | number | `30000` | Timeout for sidekick calls in milliseconds |
-| `sidekick.system_prompt` | string | — | Custom system prompt for sidekick |
-| `sidekick.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi only: explicit thinking level for sidekick subagent invocations. See historian.pi.thinking_level. |
 
 ## Advanced
 
@@ -259,6 +239,7 @@ Behavior tuning most installs never need to touch.
 | `models.window_overlay_path` | string | — |  |
 | `toast_duration_ms` | number (0–60000) | `5000` | TUI toast lifetime in milliseconds for Magic Context notifications. Set to 0 to disable Magic Context toasts entirely (min: 0, max: 60000, default: 5000) |
 | `subc.connection_file` | string | — | Path to the owner-only subc connection file. |
+| `debug_rpc` | boolean | `false` | Developer-only: enable authenticated loopback RPCs for memory counters and heap snapshots. Disabled by default. USER-LEVEL ONLY and requires a restart. |
 | `fail_closed_blocking` | boolean | `true` | When Magic Context cannot operate (schema fence mismatch, storage open/migration failure), block the primary-session prompt with a loud recovery error instead of silently degrading to native compaction. Default true. Set false only to restore the old degrade-silently behavior (not recommended). USER-LEVEL ONLY — ignored in project config for security. Requires a restart. |
 | `compaction.enabled` | boolean | `true` | When false, Magic Context stops managing the context window and keeps its knowledge layer: memory and docs/user-profile/key-files injection through additive m[0]/m[1], raw-message FTS indexing, dreamer, notes, ctx_search, ctx_expand, ctx_memory, and /ctx-embed remain available. MC's historian/compartment preparation, tagging, markers, pruning, folding, drops, strips, splicing, synthetic context-management todos, temporal markers, nudges, and fail-closed blocking stop; ctx_expand remains a knowledge-surface tool. fail_closed_blocking is inert: a transform failure passes the input messages through without blocking or cancelling. This setting does not enable native compaction: OpenCode's compaction.auto / compaction.prune or Pi's equivalent owns the window, or nothing does. MC's compaction.enabled in magic-context.jsonc is distinct from OpenCode's compaction.auto / compaction.prune in opencode.jsonc; they are different files and different owners. On the first turn after disabling, a long session may trigger one native compaction cycle; MC removes only its own marker boundary, leaves native boundaries and stored compartments intact, and does no pre-trimming mitigation. Marker cleanup is lazy per session, so an unresumed session is cleaned when it is next resumed. If compaction is enabled again, run /ctx-wrapup when the historian is runnable to catch up. OpenCode peer verification against v1.18.4 confirms native compaction covers child sessions: subagents receive additive memory/docs injection and no MC reclaim in this mode, so keep subagent tasks small or leave compaction.enabled on for long subagent runs. This is boot-resolved and requires a process restart; project-tier compaction.enabled is stripped so a cloned repository cannot disable the user's setting. The sidebar reports raw usage as Context: <pct>% · native compaction or Context: <pct>% · no active compaction and does not show an MC execute-threshold fill. /ctx-wrapup, /ctx-recomp, /ctx-flush, and /ctx-session-upgrade refuse without context-management side effects; /ctx-embed remains functional. Raw content hidden by a native boundary before Magic Context's first pass is not retroactively indexed. |
 | `pi.subagent_extensions` | string[] | — | User-only allowlist of Pi extensions for Magic Context subagent children. When set, children use --no-extensions and load only these entries (plus Magic Context's scoped child extension where applicable). Relative paths resolve from ~/.pi/agent, matching Pi's settings.json package location. Unset preserves normal Pi extension discovery. |

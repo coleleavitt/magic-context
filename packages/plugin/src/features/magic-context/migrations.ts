@@ -744,7 +744,7 @@ export const MIGRATIONS: Migration[] = [
     },
     {
         version: 15,
-        description: "Add deferred_execute_state column for boundary execution drain",
+        description: "Add the now-retired deferred_execute_state column",
         up: (db: Database) => {
             const cols = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{
                 name?: string;
@@ -2914,6 +2914,15 @@ export const MIGRATIONS: Migration[] = [
                     (id, watermark_rowid, completed, updated_at)
                 VALUES (1, 0, 0, 0);
             `);
+        },
+    },
+    {
+        version: 84,
+        description: "persist protected-token floor state per session",
+        up(db: Database): void {
+            if (!tableExists(db, "session_meta")) return;
+            ensureColumn(db, "session_meta", "protected_tokens_effective", "INTEGER");
+            ensureColumn(db, "session_meta", "protected_tokens_pre_snapshot", "TEXT");
         },
     },
 ];

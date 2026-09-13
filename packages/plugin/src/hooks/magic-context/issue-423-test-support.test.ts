@@ -101,7 +101,9 @@ export function registerIssue423Tests(
                 expect(getEmergencyInputSample(db, sessionId)).toBe(0);
                 expect(adapter.cleanup(db, sessionId, growing, 312)).toBeGreaterThan(0);
                 expect(getEmergencyInputSample(db, sessionId)).toBeGreaterThan(0);
-                expect(adapter.cleanup(db, sessionId, issue423Fixture(), 314)).toBe(0);
+                expect(adapter.cleanup(db, sessionId, issue423Fixture(), 90)).toBe(0);
+                // The absolute emergency arm may drain remaining candidates even in a consumed episode.
+                expect(adapter.cleanup(db, sessionId, issue423Fixture(), 314)).toBeGreaterThan(0);
             } finally {
                 closeQuietly(db);
             }
@@ -113,14 +115,18 @@ export function registerIssue423Tests(
             try {
                 const fixture = issue423Fixture(15);
                 expect(adapter.cleanup(db, sessionId, fixture, 95)).toBeGreaterThan(0);
-                // Open invocations have no output tag; inspect the actual wire, not the tag store.
+                // Pi tags open invocations, but neither harness may remove them before a result exists.
                 expect(JSON.stringify(harness === "pi" ? fixture.pi : fixture.opencode)).toContain(
                     "call-15",
                 );
                 const tools = getTagsBySession(db, sessionId).filter((tag) => tag.type === "tool");
                 expect(
                     tools.filter((tag) => tag.status === "active").map((tag) => tag.messageId),
-                ).toEqual(["call-12", "call-13", "call-14"]);
+                ).toEqual(
+                    harness === "pi"
+                        ? ["call-12", "call-13", "call-14", "call-15"]
+                        : ["call-12", "call-13", "call-14"],
+                );
                 expect(
                     tools
                         .filter((tag) => tag.status === "dropped")

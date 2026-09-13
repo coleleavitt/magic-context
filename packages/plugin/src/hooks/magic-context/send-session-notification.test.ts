@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import {
     __ignoredNotificationTest,
     flushIgnoredMessages,
@@ -9,8 +9,19 @@ import {
 const DEFAULT_TITLE = "New session - 2026-06-11T12:00:00.000Z";
 
 describe("sendIgnoredMessage", () => {
+    // Delivery-unit tests supply an idle harness; the lifecycle timeline is tested separately.
+    beforeEach(() => __ignoredNotificationTest.setHoldDetector(() => false));
     afterEach(() => {
         __ignoredNotificationTest.reset();
+    });
+
+    it("skips the hold-state probe when no notification is queued", async () => {
+        const holdDetector = mock(() => true);
+        __ignoredNotificationTest.setHoldDetector(holdDetector);
+
+        await flushIgnoredMessages("ses-empty-queue");
+
+        expect(holdDetector).not.toHaveBeenCalled();
     });
 
     it("returns skipped and does not post when the session never gets a real title", async () => {
@@ -72,7 +83,7 @@ describe("sendIgnoredMessage", () => {
     it("queues without creating a user row while the session is active", async () => {
         const session = titledClientWithLastTurn();
         const diagnostics: string[] = [];
-        __ignoredNotificationTest.setMidTurnDetector(() => true);
+        __ignoredNotificationTest.setHoldDetector(() => true);
         __ignoredNotificationTest.setDiagnosticObserver((message) => diagnostics.push(message));
 
         const result = await sendIgnoredMessage({ session }, "ses-active", "background status", {});
@@ -89,7 +100,7 @@ describe("sendIgnoredMessage", () => {
         const session = titledClientWithLastTurn();
         let active = true;
         const onDelivered = mock(() => {});
-        __ignoredNotificationTest.setMidTurnDetector(() => active);
+        __ignoredNotificationTest.setHoldDetector(() => active);
 
         const result = await sendIgnoredMessage({ session }, "ses-callback", "callback status", {
             onDelivered,
@@ -107,7 +118,7 @@ describe("sendIgnoredMessage", () => {
     it("flushes queued notices in order after the session becomes idle", async () => {
         const session = titledClientWithLastTurn();
         let active = true;
-        __ignoredNotificationTest.setMidTurnDetector(() => active);
+        __ignoredNotificationTest.setHoldDetector(() => active);
 
         await sendIgnoredMessage({ session }, "ses-idle-flush", "first status", {});
         await sendIgnoredMessage({ session }, "ses-idle-flush", "second status", {});
@@ -127,7 +138,7 @@ describe("sendIgnoredMessage", () => {
 
     it("keeps only the newest notices when the active queue is full", async () => {
         const session = titledClientWithLastTurn();
-        __ignoredNotificationTest.setMidTurnDetector(() => true);
+        __ignoredNotificationTest.setHoldDetector(() => true);
 
         for (let index = 0; index < MAX_QUEUED_IGNORED_NOTIFICATIONS + 3; index += 1) {
             await sendIgnoredMessage({ session }, "ses-bounded", `status ${index}`, {});
@@ -179,13 +190,10 @@ describe("sendIgnoredMessage", () => {
         expect(input.body?.noReply).toBe(true);
     });
 
-    it("pins the session's last turn for a startup config warning too (no pinContext opt-out)", async () => {
-        // The config warning previously opted out of pinning, which made OpenCode
-        // record the DEFAULT agent/model — mis-attributing the notice and
-        // switching the model on the user's next turn. It now pins like any other
-        // notification.
+    it("pins the session's last turn for an explicit command reply without supplied context", async () => {
+        // Command replies must not switch the model used for the next real turn.
         const session = titledClientWithLastTurn();
-        const result = await sendIgnoredMessage({ session }, "ses-titled", "config warning", {});
+        const result = await sendIgnoredMessage({ session }, "ses-titled", "command result", {});
         expect(result).toBe("sent");
         const body = lastPromptBody(session.prompt);
         expect(body.agent).toBe("build");
@@ -193,12 +201,12 @@ describe("sendIgnoredMessage", () => {
         expect(body.variant).toBe("thinking");
     });
 
-    it("rolls back a notice that lands after a run starts and re-queues it", async () => {
+    it("rolls back a notice that lands after a run starts and consumes the attempt", async () => {
         const session = titledClientWithLastTurn();
         const observedRows = new Set(["msg_notice"]);
         const diagnostics: string[] = [];
         let hold = false;
-        __ignoredNotificationTest.setMidTurnDetector(() => hold);
+        __ignoredNotificationTest.setHoldDetector(() => hold);
         __ignoredNotificationTest.setDiagnosticObserver((message) => diagnostics.push(message));
         const deleter = mock(async (_sessionId: string, messageId: string) =>
             observedRows.delete(messageId),
@@ -211,14 +219,14 @@ describe("sendIgnoredMessage", () => {
 
         const result = await sendIgnoredMessage({ session }, "ses-rollback", "late status", {});
 
-        expect(result).toBe("queued");
+        expect(result).toBe("skipped");
         expect(observedRows.has("msg_notice")).toBe(false);
         expect(deleter).toHaveBeenCalledTimes(1);
         expect(deleter.mock.calls[0]?.[0]).toBe("ses-rollback");
         expect(deleter.mock.calls[0]?.[1]).toBe("msg_notice");
-        expect(__ignoredNotificationTest.pendingTexts("ses-rollback")).toEqual(["late status"]);
+        expect(__ignoredNotificationTest.pendingTexts("ses-rollback")).toEqual([]);
         expect(diagnostics).toEqual([
-            "notice rolled back (deleted row msg_notice); queued for idle delivery",
+            "notice rolled back (deleted row msg_notice); consumed after append",
         ]);
     });
 

@@ -6,12 +6,26 @@ import { join } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
 import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
+import {
+    REMOVED_AGENT_CONFIG_WARNING,
+    stripRemovedAgentConfig,
+} from "@magic-context/core/config/removed-agent-config";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import type { LocalEmbeddingRuntime } from "@magic-context/core/features/magic-context/memory/embedding-local";
 import {
     type EmbeddingProbeOutcome,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
+import {
+    formatSynapseLaneDescriptor,
+    SYNAPSE_DEFAULT_MODEL,
+    SynapseEmbeddingProvider,
+    toSynapseLaneDescriptor,
+} from "@magic-context/core/features/magic-context/memory/embedding-synapse";
+import {
+    formatShadowBackfillStall,
+    listShadowBackfillStalls,
+} from "@magic-context/core/features/magic-context/shadow-backfill-state";
 import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
@@ -20,6 +34,12 @@ import {
     getMagicContextStorageResolution,
 } from "@magic-context/core/shared/data-path";
 import { parseJsoncRecovering } from "@magic-context/core/shared/jsonc-parser";
+import {
+    formatOpenCodeDbDoctorLine,
+    type OpenCodeDbPathResolution,
+    openCodeDbPathExists,
+    resolveOpenCodeDbPath,
+} from "@magic-context/core/shared/opencode-db-path";
 import { ensureTuiPluginEntry } from "@magic-context/core/shared/tui-config";
 import { parse, stringify } from "comment-json";
 import {
@@ -77,6 +97,17 @@ import { clearPluginCache } from "./doctor-opencode-cache";
 
 const CLI_PACKAGE_NAME = "@cortexkit/magic-context";
 
+export function describeOpenCodeDatabaseDoctorCheck(
+    resolution: OpenCodeDbPathResolution,
+    exists = openCodeDbPathExists(resolution),
+): { ok: boolean; message: string } {
+    if (!exists) return { ok: false, message: formatOpenCodeDbDoctorLine(resolution) };
+    return {
+        ok: true,
+        message: `OpenCode session database: ${resolution.path} (source=${resolution.source}${resolution.channel ? `, channel=${resolution.channel}` : ""})`,
+    };
+}
+
 /**
  * Resolve the MC compaction mode for the doctor using the SAME loader the
  * plugin uses and the SAME accessor. On load failure the helper takes the
@@ -114,7 +145,16 @@ export function migrateLegacyAgentEnabledConfigForDoctor(
     let changed = false;
     let fixes = 0;
 
-    const migrateLegacyAgentEnabled = (agentName: "dreamer" | "sidekick" | "historian"): void => {
+    const sanitized = stripRemovedAgentConfig(mcConfig, []);
+    if (sanitized !== mcConfig) {
+        for (const key of Object.keys(mcConfig)) delete mcConfig[key];
+        Object.assign(mcConfig, sanitized);
+        logs.warn(REMOVED_AGENT_CONFIG_WARNING);
+        changed = true;
+        fixes++;
+    }
+
+    const migrateLegacyAgentEnabled = (agentName: "dreamer" | "historian"): void => {
         const agent = mcConfig[agentName] as Record<string, unknown> | undefined;
         if (!agent || typeof agent !== "object" || !("enabled" in agent)) return;
 
@@ -142,21 +182,10 @@ export function migrateLegacyAgentEnabledConfigForDoctor(
                     'Removed deprecated dreamer.enabled (use dreamer.disable=true to turn off the Dreamer agent; use schedule="" for manual-only dreaming).',
                 );
             }
-            return;
-        }
-
-        if (disable !== true && enabled === false) {
-            agent.disable = true;
-            logs.success("Migrated sidekick.enabled=false → sidekick.disable=true.");
-        } else {
-            logs.success(
-                "Removed deprecated sidekick.enabled (use sidekick.disable=true to turn off Sidekick).",
-            );
         }
     };
 
     migrateLegacyAgentEnabled("dreamer");
-    migrateLegacyAgentEnabled("sidekick");
     migrateLegacyAgentEnabled("historian");
 
     return { changed, fixes };
@@ -488,9 +517,46 @@ async function checkEmbeddingConfig(
         return checkLocalEmbeddingRuntimeForDoctor(runtimePreference);
     }
 
+    if (provider === "synapse") {
+        const loaded = loadPluginConfig(process.cwd());
+        if (!loaded.subc) {
+            log.error("Embedding provider is synapse but the subc connection block is missing");
+            return { issues: 1 };
+        }
+        const model =
+            typeof embedding?.model === "string" && embedding.model.trim().length > 0
+                ? embedding.model.trim()
+                : SYNAPSE_DEFAULT_MODEL;
+        const probeSpinner = spinner();
+        probeSpinner.start(`Testing Synapse embedding lane ${sanitizeDiagnosticText(model)}`);
+        try {
+            const metadata = await SynapseEmbeddingProvider.discover({
+                connectionFile: loaded.subc.connection_file,
+                projectRoot: process.cwd(),
+                session: "doctor:opencode",
+                model,
+            });
+            probeSpinner.stop("Synapse embedding lane probed");
+            log.success(
+                `Embedding provider: synapse — ${sanitizeDiagnosticText(
+                    formatSynapseLaneDescriptor(toSynapseLaneDescriptor(metadata)),
+                )}`,
+            );
+            return { issues: 0 };
+        } catch (error) {
+            probeSpinner.stop("Synapse embedding probe failed");
+            log.error(
+                `Synapse embedding lane unavailable: ${sanitizeDiagnosticText(
+                    error instanceof Error ? error.message : String(error),
+                )}`,
+            );
+            return { issues: 1 };
+        }
+    }
+
     if (provider !== "openai-compatible") {
         log.warn(
-            `Unknown embedding provider: ${String(provider)} (expected local | openai-compatible | off)`,
+            `Unknown embedding provider: ${String(provider)} (expected local | openai-compatible | synapse | off)`,
         );
         return { issues: 1 };
     }
@@ -733,6 +799,10 @@ export async function runDoctor(
                 : `OpenCode ${activeInstallation.version} installed`,
         );
     }
+
+    const openCodeDbCheck = describeOpenCodeDatabaseDoctorCheck(resolveOpenCodeDbPath());
+    if (openCodeDbCheck.ok) pass(openCodeDbCheck.message);
+    else fail(openCodeDbCheck.message);
 
     // 1b. CLI vs npm latest
     const selfVersion = getSelfVersion();
@@ -1384,6 +1454,9 @@ export async function runDoctor(
                     log.info(`Shared DB row counts: ${summary}`);
                 } catch {
                     // Don't fail the doctor on row-count introspection issues
+                }
+                for (const stall of listShadowBackfillStalls(db)) {
+                    warn(formatShadowBackfillStall(stall));
                 }
             } finally {
                 db.close();

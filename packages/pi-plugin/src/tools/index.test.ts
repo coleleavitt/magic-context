@@ -35,7 +35,7 @@ describe("registerMagicContextTools", () => {
 		]);
 	});
 
-	it("can omit ctx_memory for retrieval-only sidekick subagents", () => {
+	it("can omit ctx_memory for lean child processes", () => {
 		const db = createTestDb();
 		try {
 			const registered: string[] = [];
@@ -126,6 +126,7 @@ describe("registerMagicContextTools", () => {
 					"content",
 					"surface_condition",
 					"note_id",
+					"note_ids",
 					"filter",
 					"limit",
 					"offset",

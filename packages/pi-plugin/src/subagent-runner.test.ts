@@ -29,6 +29,7 @@ import {
 	__resetSchemaFenceStateForTests,
 	LATEST_SUPPORTED_VERSION,
 } from "@magic-context/core/features/magic-context/storage-db";
+import { getSubagentInvocations } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import type { SubagentRunOptions } from "@magic-context/core/shared/subagent-runner";
 
@@ -583,8 +584,8 @@ describe("subagent-runner pure helpers", () => {
 			"--print",
 			"--mode",
 			"json",
-			// `--no-session` keeps historian / sidekick / dreamer /
-			// recomp / compressor child sessions out of `pi resume`
+			// `--no-session` keeps historian, dreamer, recomp, and compressor
+			// child sessions out of `pi resume`
 			// and the session picker (uses Pi's
 			// SessionManager.inMemory()).
 			"--no-session",
@@ -613,11 +614,11 @@ describe("subagent-runner pure helpers", () => {
 		expect(historian).toEqual(
 			expect.arrayContaining(["--extension", "/tmp/historian-calibration.js"]),
 		);
-		const sidekick = buildArgsForTest(
-			{ ...baseOptions, agent: "sidekick" },
+		const dreamer = buildArgsForTest(
+			{ ...baseOptions, agent: "dreamer" },
 			{ historianCalibrationEntryPath: "/tmp/historian-calibration.js" },
 		);
-		expect(sidekick).not.toContain("/tmp/historian-calibration.js");
+		expect(dreamer).not.toContain("/tmp/historian-calibration.js");
 	});
 
 	it("passes the active entry thinking level through Pi's --thinking flag", () => {
@@ -651,7 +652,7 @@ describe("subagent-runner pure helpers", () => {
 		const args = buildArgsForTest(
 			{
 				...baseOptions,
-				agent: "sidekick",
+				agent: "dreamer-retrospective",
 				model: "anthropic/claude-sonnet",
 			},
 			{
@@ -889,7 +890,7 @@ describe("subagent-runner pure helpers", () => {
 
 	it("always includes --no-session so child sessions don't appear in pi resume", () => {
 		// Pinned-down regression: the user-visible promise of magic-context
-		// hidden subagents is that historian/sidekick/dreamer runs never
+		// hidden subagents is that historian/dreamer runs never
 		// pollute Pi's session list. If this assertion ever fails, the
 		// child sessions WILL show up in `pi resume` again.
 		const args = buildArgsForTest({
@@ -965,20 +966,13 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--no-tools");
 	});
 
-	it("locks historian and sidekick to explicit read-only allow-lists", () => {
+	it("locks historian to an explicit read-only allow-list", () => {
 		const historianArgs = buildArgsForTest({
 			...baseOptions,
 			agent: "historian",
 		});
 		expect(historianArgs).toEqual(
 			expect.arrayContaining(["--tools", "read,grep,find,ls,aft_search"]),
-		);
-		const sidekickArgs = buildArgsForTest({
-			...baseOptions,
-			agent: "sidekick",
-		});
-		expect(sidekickArgs).toEqual(
-			expect.arrayContaining(["--tools", "read,grep,find,ls,ctx_search"]),
 		);
 	});
 
@@ -1253,9 +1247,9 @@ describe("subagent-runner pure helpers", () => {
 
 	it("does not set --magic-context-dreamer-actions for non-dreamer agents", () => {
 		// Even if the bundle were present, only dreamer-equivalent agents should
-		// receive ctx_memory in the child extension. Historian, sidekick,
-		// compressor etc. stay without the dreamer flag.
-		for (const agent of ["historian", "sidekick", "compressor", "recomp"]) {
+		// receive ctx_memory in the child extension. Historian, compressor,
+		// and recomp agents stay without the dreamer flag.
+		for (const agent of ["historian", "compressor", "recomp"]) {
 			const args = buildArgsForTest({
 				...baseOptions,
 				agent,
@@ -1267,6 +1261,139 @@ describe("subagent-runner pure helpers", () => {
 });
 
 describe("PiSubagentRunner spawn lifecycle", () => {
+	it("records OMP message_end usage in subagent_invocations", async () => {
+		__setPiHarnessKindForTesting("omp");
+		const child = createMockChild();
+		const { runner } = runnerWith(child, {
+			invocation: { command: "omp", prefixArgs: [], targetHarness: "omp" },
+		});
+		const testDataDir = mkdtempSync(join(tmpdir(), "mc-pi-accounting-"));
+		const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+		const previousXdgDataHome = process.env.XDG_DATA_HOME;
+		process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
+		process.env.XDG_DATA_HOME = testDataDir;
+		closeDatabase();
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "anthropic/claude-sonnet",
+				accountingSessionId: "omp-accounting-session",
+				accountingSubagent: "historian",
+			});
+			child.writeStdoutLine({
+				// Captured OMP 18.1.11 shape: usage lives on each assistant
+				// message_end message, including intermediate tool turns.
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", name: "read", id: "call-1" }],
+					stopReason: "toolUse",
+					usage: {
+						input: 1_200,
+						output: 80,
+						cacheRead: 300,
+						cacheWrite: 20,
+						totalTokens: 1_600,
+						reasoningTokens: 10,
+						cost: { input: 0.01 },
+					},
+				},
+			});
+			child.writeStdoutLine({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					stopReason: "stop",
+					usage: {
+						input: 400,
+						output: 30,
+						cacheRead: 100,
+						cacheWrite: 5,
+						totalTokens: 535,
+						reasoningTokens: 4,
+						cost: { output: 0.02 },
+					},
+				},
+			});
+			child.emitClose(0);
+
+			expect(await resultPromise).toMatchObject({
+				ok: true,
+				assistantText: "done",
+			});
+			const db = openDatabase();
+			if (!db) throw new Error("accounting test database did not open");
+			const [row] = getSubagentInvocations(db, "omp-accounting-session");
+			expect(row).toMatchObject({
+				harness: "omp",
+				inputTokens: 1_600,
+				outputTokens: 110,
+				cacheReadTokens: 400,
+				cacheWriteTokens: 25,
+			});
+		} finally {
+			closeDatabase();
+			if (previousTestDataDir === undefined)
+				delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+			else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = previousTestDataDir;
+			if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+			else process.env.XDG_DATA_HOME = previousXdgDataHome;
+			rmSync(testDataDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps successful OMP invocation at zero tokens when stream omits usage", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child, {
+			invocation: { command: "omp", prefixArgs: [], targetHarness: "omp" },
+		});
+		const testDataDir = mkdtempSync(join(tmpdir(), "mc-pi-accounting-empty-"));
+		const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+		const previousXdgDataHome = process.env.XDG_DATA_HOME;
+		process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
+		process.env.XDG_DATA_HOME = testDataDir;
+		closeDatabase();
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				accountingSessionId: "omp-accounting-empty",
+				accountingSubagent: "historian",
+			});
+			child.writeStdoutLine({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					stopReason: "stop",
+				},
+			});
+			child.emitClose(0);
+
+			expect(await resultPromise).toMatchObject({
+				ok: true,
+				assistantText: "done",
+			});
+			const db = openDatabase();
+			if (!db) throw new Error("accounting test database did not open");
+			const [row] = getSubagentInvocations(db, "omp-accounting-empty");
+			expect(row).toMatchObject({
+				inputTokens: 0,
+				outputTokens: 0,
+				cacheReadTokens: 0,
+				cacheWriteTokens: 0,
+			});
+		} finally {
+			closeDatabase();
+			if (previousTestDataDir === undefined)
+				delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+			else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = previousTestDataDir;
+			if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+			else process.env.XDG_DATA_HOME = previousXdgDataHome;
+			rmSync(testDataDir, { recursive: true, force: true });
+		}
+	});
+
 	it("refuses to spawn known zero-tool agents without a system prompt", async () => {
 		const spawnImpl = mock(() => {
 			throw new Error("spawn must not be reached");
@@ -1392,6 +1519,87 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const result = await resultPromise;
 		expect(result.ok).toBe(true);
 		if (result.ok) expect(result.toolCallCount).toBe(2);
+	});
+
+	it("accepts a tool-only dreamer run after a completed ctx_memory result", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+
+		const resultPromise = runner.run({ ...baseOptions, agent: "dreamer" });
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "curate-1",
+						name: "ctx_memory",
+						arguments: { action: "archive" },
+					},
+				],
+				stopReason: "toolUse",
+			},
+		});
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "toolResult",
+				toolCallId: "curate-1",
+				toolName: "ctx_memory",
+				content: [{ type: "text", text: "Archived memory." }],
+				isError: false,
+			},
+		});
+		child.emitClose(0);
+
+		expect(await resultPromise).toEqual({
+			ok: true,
+			assistantText: "",
+			toolCallCount: 1,
+			completedToolCalls: [
+				{ name: "ctx_memory", arguments: { action: "archive" } },
+			],
+			durationMs: expect.any(Number),
+			meta: { stderr: undefined },
+		});
+	});
+
+	it("rejects a tool-only dreamer run when ctx_memory returned an error", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+
+		const resultPromise = runner.run({ ...baseOptions, agent: "dreamer" });
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "curate-error",
+						name: "ctx_memory",
+						arguments: { action: "archive" },
+					},
+				],
+				stopReason: "toolUse",
+			},
+		});
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "toolResult",
+				toolCallId: "curate-error",
+				toolName: "ctx_memory",
+				content: [{ type: "text", text: "Archive rejected." }],
+				isError: true,
+			},
+		});
+		child.emitClose(0);
+
+		const result = await resultPromise;
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("no_assistant");
 	});
 
 	it("spawns pi, parses stdout, trims assistant text, and captures stderr", async () => {
@@ -2057,6 +2265,9 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const child = createMockChild();
 		const { runner } = runnerWith(child);
 		const sourceLine =
+			// The literal `${VERSION2}` imitates minified source text quoted by a
+			// stack trace; it is data, not an interpolation.
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: fixture reproduces raw source text
 			`263 | ${"FROM cacheInterceptorV${VERSION2} ".repeat(100)}`.slice(
 				0,
 				3_000,
@@ -2733,7 +2944,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const args = buildArgsForTest(
 			{
 				...baseOptions,
-				agent: "sidekick",
+				agent: "dreamer-retrospective",
 				model: "anthropic/claude-sonnet",
 			},
 			{

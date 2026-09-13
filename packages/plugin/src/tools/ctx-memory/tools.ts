@@ -1,6 +1,5 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { DREAMER_AGENT } from "../../agents/dreamer";
-import { SIDEKICK_AGENT } from "../../agents/sidekick";
 import { getAuthorityManagedMarker } from "../../features/magic-context/context-authority";
 import {
     assessCurateMutationSafety,
@@ -51,6 +50,7 @@ import {
     toolCallIdFromContext,
 } from "../../plugin/rust-tool-backends";
 import { sessionLog } from "../../shared/logger";
+import { renderCapabilityRefusal } from "../../shared/user-facing-codes";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_TOOL_NAME, DEFAULT_SEARCH_LIMIT } from "./constants";
 import {
@@ -96,14 +96,10 @@ function normalizeCategory(category?: string): string | undefined {
     return trimmed ? trimmed : undefined;
 }
 
-function memoryAuthorityRefusal(args: CtxMemoryArgs, cause?: string): string {
-    const readiness = "Rust memory authority is not ready.";
-    const refusal =
-        (args.action === "write" || args.action === "update" || args.action === "merge") &&
-        typeof args.content === "string"
-            ? `Error: ${readiness} Write REFUSED and NOT saved; RESEND the same call after authority is ready; the Rust module typically recovers in seconds-to-minutes.\nContent to resend:\n${args.content}`
-            : `Error: ${readiness} Request REFUSED and NOT applied; RESEND the same call after authority is ready; the Rust module typically recovers in seconds-to-minutes.`;
-    return cause ? `${cause}\n${refusal}` : refusal;
+function memoryAuthorityRefusal(args: CtxMemoryArgs): string {
+    const isMutation =
+        args.action !== undefined && ["write", "update", "archive", "merge"].includes(args.action);
+    return renderCapabilityRefusal(isMutation ? "memory_write" : "memory_access");
 }
 
 function moduleMemoryText(response: unknown, args: CtxMemoryArgs): string | null {
@@ -390,15 +386,32 @@ function inactiveMemoryError(id: number, action: "updating" | "merging" | "archi
     return `Error: Memory with ID ${id} is archived or superseded; restore it before ${action}.`;
 }
 
+function isUniqueConstraintError(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+        return false;
+    }
+    const code = "code" in error ? (error as { code?: unknown }).code : undefined;
+    if (code === "SQLITE_CONSTRAINT_UNIQUE") {
+        return true;
+    }
+    // bun:sqlite sets SQLITE_CONSTRAINT_UNIQUE; node:sqlite may omit or remap
+    // the code. sqlite3_errmsg text is stable across adapters.
+    return /UNIQUE constraint failed/i.test(error.message);
+}
+
+const DUPLICATE_MEMORY_ERROR = (id: number): string =>
+    `Error: Memory content already exists as ID ${id}; merge or archive duplicates instead.`;
+
 function updateMemoryContentInCurrentTransaction(
     db: CtxMemoryToolDeps["db"],
     memory: Memory,
     content: string,
     normalizedHash: string,
+    targetCategory: MemoryCategory = memory.category,
 ): void {
     db.prepare(
-        "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
-    ).run(content, normalizedHash, Date.now(), memory.id);
+        "UPDATE memories SET content = ?, category = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
+    ).run(content, targetCategory, normalizedHash, Date.now(), memory.id);
     // The classify `shareable` verdict was scored against the OLD content; new
     // content invalidates it. Fail closed → private; the dreamer re-scores later.
     if (hasMemoryShareableColumn(db)) {
@@ -429,7 +442,9 @@ const ctxMemoryArgsShape = {
     category: tool.schema
         .enum([...V2_MEMORY_CATEGORIES])
         .optional()
-        .describe("What kind of fact this is (required for write; optional merge override)"),
+        .describe(
+            "What kind of fact this is (required for write; optional on update to recategorize, omitted keeps the current category; optional merge override)",
+        ),
     ids: tool.schema
         .array(tool.schema.number())
         .optional()
@@ -470,11 +485,6 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 reason: "string",
                 superseded_by: "number",
             });
-            // Sidekick consumes untrusted `/ctx-aug` prompt text and is retrieval-only;
-            // fail closed even if a future permission list accidentally exposes this tool.
-            if (toolContext.agent === SIDEKICK_AGENT) {
-                return "Error: ctx_memory is not available to the sidekick agent.";
-            }
             if (
                 args.action === undefined ||
                 (toolContext.agent !== DREAMER_AGENT && !allowedActions.includes(args.action))
@@ -513,17 +523,14 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         })) ?? null;
                 } catch (error) {
                     if (marker) {
-                        const detail = error instanceof Error ? error.message : String(error);
-                        return memoryAuthorityRefusal(
-                            args,
-                            `Error: Rust memory authority is unavailable. ${detail}`,
-                        );
+                        sessionLog(toolContext.sessionID, "ctx_memory capability refusal", error);
+                        return memoryAuthorityRefusal(args);
                     }
                 }
                 if (authorityState === "MODULE") {
                     const memoryBackend = deps.rustToolBackends?.memory;
                     if (!memoryBackend) {
-                        return "Error: Rust memory authority is active, but this module transport does not support ctx_memory.";
+                        return memoryAuthorityRefusal(args);
                     }
                     try {
                         const commandId = toolCallIdFromContext(toolContext);
@@ -561,18 +568,13 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                             }),
                             moduleArgs,
                         );
-                        return (
-                            text ?? "Error: Rust module returned an invalid ctx_memory response."
-                        );
+                        return text ?? memoryAuthorityRefusal(args);
                     } catch (error) {
                         if (isRustAuthorityDrainingError(error)) {
                             return memoryAuthorityRefusal(args);
                         }
-                        const detail = error instanceof Error ? error.message : String(error);
-                        return memoryAuthorityRefusal(
-                            args,
-                            `Error: Rust module ctx_memory failed. ${detail}`,
-                        );
+                        sessionLog(toolContext.sessionID, "ctx_memory capability refusal", error);
+                        return memoryAuthorityRefusal(args);
                     }
                 }
                 if (marker || authorityState === "PREPARING" || authorityState === "DRAINING") {
@@ -758,32 +760,64 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 }
 
                 const normalizedHash = computeNormalizedHash(content);
-                const duplicate = getMemoryByHash(
-                    deps.db,
-                    targetIdentityForStoredPath(rawProjectPath),
-                    memory.category,
-                    normalizedHash,
-                );
-                if (duplicate && duplicate.id !== memory.id) {
-                    return `Error: Memory content already exists as ID ${duplicate.id}; merge or archive duplicates instead.`;
-                }
-
+                const targetCategory =
+                    args.category &&
+                    (V2_MEMORY_CATEGORIES as readonly string[]).includes(args.category)
+                        ? (args.category as MemoryCategory)
+                        : memory.category;
+                // UNIQUE(project_path, category, normalized_hash) is on the
+                // stored path, which UPDATE leaves unchanged (legacy raw paths
+                // stay raw). Lookup with that same identity so a recategorize
+                // collision returns the duplicate error instead of throwing.
+                // Probe + write share one BEGIN IMMEDIATE so a concurrent insert
+                // cannot slip in between; UNIQUE remains the friendly fallback.
                 const projectIdentity = targetIdentityForStoredPath(rawProjectPath);
-                runImmediateTransaction(deps.db, () => {
-                    updateMemoryContentInCurrentTransaction(
+                let duplicateId: number | null = null;
+                try {
+                    runImmediateTransaction(deps.db, () => {
+                        const duplicate = getMemoryByHash(
+                            deps.db,
+                            rawProjectPath,
+                            targetCategory,
+                            normalizedHash,
+                        );
+                        if (duplicate && duplicate.id !== memory.id) {
+                            duplicateId = duplicate.id;
+                            return;
+                        }
+                        updateMemoryContentInCurrentTransaction(
+                            deps.db,
+                            memory,
+                            content,
+                            normalizedHash,
+                            targetCategory,
+                        );
+                        queueMemoryMutation(deps.db, {
+                            projectPath: projectIdentity,
+                            mutationType: "update",
+                            targetMemoryId: memory.id,
+                            category: targetCategory,
+                            newContent: content,
+                        });
+                    });
+                } catch (error) {
+                    if (!isUniqueConstraintError(error)) {
+                        throw error;
+                    }
+                    const raced = getMemoryByHash(
                         deps.db,
-                        memory,
-                        content,
+                        rawProjectPath,
+                        targetCategory,
                         normalizedHash,
                     );
-                    queueMemoryMutation(deps.db, {
-                        projectPath: projectIdentity,
-                        mutationType: "update",
-                        targetMemoryId: memory.id,
-                        category: memory.category,
-                        newContent: content,
-                    });
-                });
+                    if (raced && raced.id !== memory.id) {
+                        return DUPLICATE_MEMORY_ERROR(raced.id);
+                    }
+                    throw error;
+                }
+                if (duplicateId !== null) {
+                    return DUPLICATE_MEMORY_ERROR(duplicateId);
+                }
                 queueMemoryEmbedding({
                     deps,
                     sessionId: toolContext.sessionID,
@@ -793,7 +827,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 });
                 requestRustMemorySync(deps, toolContext.sessionID);
 
-                return `Updated memory [ID: ${memory.id}] in ${memory.category}.`;
+                return `Updated memory [ID: ${memory.id}] in ${targetCategory}.`;
             }
 
             if (args.action === "merge") {

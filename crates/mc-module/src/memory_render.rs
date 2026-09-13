@@ -15,7 +15,9 @@
 //! is the slice-4d integration decision, already ruled; the byte render here is pure.
 
 use crate::decay_render::{render_decayed_compartments, DecayRenderCompartment};
-use mc_store::{StoredMemory, StoredMemoryMutation, WorkspaceMembership};
+use mc_store::{
+    StoredMemory, StoredMemoryMutation, WorkspaceMembership, MEMORY_VISIBILITY_MUTATION_CATEGORY,
+};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
@@ -211,6 +213,13 @@ pub struct M0Inputs<'a> {
 /// estimator-independent). This function only composes; sub-block budget trims happen in
 /// the caller (they need the token estimator, a separate subsystem).
 pub fn render_m0(inputs: &M0Inputs, estimate_tokens: impl Fn(&str) -> usize) -> String {
+    let effective_budget = inputs.history_budget_tokens / inputs.decay_pressure_multiplier.max(1.0);
+    let history =
+        render_decayed_compartments(inputs.compartments, effective_budget, estimate_tokens);
+    render_m0_with_history(inputs, &history)
+}
+
+pub(crate) fn render_m0_with_history(inputs: &M0Inputs, session_history: &str) -> String {
     let mut sections: Vec<String> = Vec::new();
     if !inputs.project_docs.is_empty() {
         sections.push(inputs.project_docs.to_string());
@@ -224,9 +233,6 @@ pub fn render_m0(inputs: &M0Inputs, estimate_tokens: impl Fn(&str) -> usize) -> 
         sections.push(covered_systems);
     }
 
-    let effective_budget = inputs.history_budget_tokens / inputs.decay_pressure_multiplier.max(1.0);
-    let session_history =
-        render_decayed_compartments(inputs.compartments, effective_budget, estimate_tokens);
     sections.push(if session_history.is_empty() {
         M0_EMPTY_BODY.to_string()
     } else {
@@ -295,7 +301,11 @@ pub fn render_new_compartments(
     let bodies: Vec<String> = compartments
         .iter()
         .map(|c| crate::decay_render::render_compartment_at_tier(c, 1))
+        .filter(|body| !body.is_empty())
         .collect();
+    if bodies.is_empty() {
+        return String::new();
+    }
     format!(
         "<new-compartments>\n{}\n</new-compartments>",
         bodies.join("\n\n")
@@ -317,11 +327,23 @@ pub fn render_memory_updates(
         vec!["These memories changed since the snapshot below — trust these:".to_string()];
     for m in mutations {
         match m.mutation_type.as_str() {
-            "update" => lines.push(format!(
-                "  <updated id=\"{}\">{}</updated>",
-                m.target_memory_id,
-                escape_xml_content(m.new_content.as_deref().unwrap_or(""))
-            )),
+            "update" => {
+                let category_attr = match &m.category {
+                    Some(category)
+                        if category != MEMORY_VISIBILITY_MUTATION_CATEGORY
+                            && !category.is_empty() =>
+                    {
+                        format!(" category=\"{}\"", escape_xml_attr(category))
+                    }
+                    _ => String::new(),
+                };
+                lines.push(format!(
+                    "  <updated id=\"{}\"{}>{}</updated>",
+                    m.target_memory_id,
+                    category_attr,
+                    escape_xml_content(m.new_content.as_deref().unwrap_or(""))
+                ));
+            }
             "superseded" => match m.superseded_by_id {
                 Some(by) if resolvable_ids.contains(&by) => lines.push(format!(
                     "  <superseded id=\"{}\" by=\"{by}\"/>",

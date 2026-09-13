@@ -1,13 +1,18 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
 import {
     appendCompartments,
     replaceAllCompartmentState,
 } from "../../features/magic-context/compartment-storage";
+import { archiveExpiredMemories } from "../../features/magic-context/dreamer/expire-memories";
+import { acquireLeaseWithAcquisition } from "../../features/magic-context/dreamer/lease";
+import { leaseKeyFor } from "../../features/magic-context/dreamer/task-registry";
 import {
     archiveMemory,
     getMemoriesByProject,
@@ -17,6 +22,7 @@ import {
     updateMemoryContent,
 } from "../../features/magic-context/memory/storage-memory";
 import type { Memory } from "../../features/magic-context/memory/types";
+import { __projectDocsHashTest } from "../../features/magic-context/project-docs-hash";
 import { unifiedSearch } from "../../features/magic-context/search";
 import {
     bumpSessionFactsVersion,
@@ -1480,12 +1486,20 @@ describe("m[0]/m[1] materialization", () => {
         expect(renderedText(second[0])).not.toContain("FLAG_OFF_STRUCTURE_DOCS");
     });
 
-    it("folds current project docs on the next natural HARD materialization", () => {
+    it("keeps SOFT bytes stable across a docs edit and adopts it on the next HARD fold", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
         writeFileSync(join(projectDirectory, "ARCHITECTURE.md"), "# Old architecture\n");
         const state = readStateFromMeta();
-        const first = [userMessage("m1", "hello")];
+        __projectDocsHashTest.reset();
+        const stableSignals = {
+            systemHash: "sys-v1",
+            modelKey: "model-v1",
+            cacheExpired: false,
+            lastResponseTime: 0,
+        };
+        const input = [userMessage("m1", "identical input")];
+        const first = structuredClone(input) as MessageLike[];
         injectM0M1({
             db,
             sessionId: SESSION_ID,
@@ -1493,56 +1507,60 @@ describe("m[0]/m[1] materialization", () => {
             state,
             projectPath: PROJECT_PATH,
             projectDirectory,
-            hardSignals: {
-                systemHash: "sys-v1",
-                modelKey: "model-v1",
-                cacheExpired: false,
-                lastResponseTime: 0,
-            },
+            hardSignals: stableSignals,
         });
         expect(renderedText(first[0])).toContain("Old architecture");
-        expect(
-            mustMaterialize({
-                db,
-                sessionId: SESSION_ID,
-                state,
-                projectPath: PROJECT_PATH,
-                projectDirectory,
-                injectDocs: false,
-                hardSignals: {
-                    systemHash: "sys-v1",
-                    modelKey: "model-v1",
-                    cacheExpired: false,
-                    lastResponseTime: 0,
-                },
-            }),
-        ).toEqual({ value: false, reason: null });
+        expect(__projectDocsHashTest.readCount()).toBe(1);
 
+        const softBeforeEdit = structuredClone(input) as MessageLike[];
+        injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: softBeforeEdit,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            hardSignals: stableSignals,
+        });
         writeFileSync(
             join(projectDirectory, "ARCHITECTURE.md"),
             "# Updated architecture\nFresh docs folded on hard bust.\n",
         );
-        const second = [userMessage("m2", "hello again")];
-        const result = injectM0M1({
+        const softAfterEdit = structuredClone(input) as MessageLike[];
+        const softResult = injectM0M1({
             db,
             sessionId: SESSION_ID,
-            messages: second,
+            messages: softAfterEdit,
             state,
             projectPath: PROJECT_PATH,
             projectDirectory,
-            hardSignals: {
-                systemHash: "sys-v2",
-                modelKey: "model-v1",
-                cacheExpired: false,
-                lastResponseTime: 0,
-            },
+            hardSignals: stableSignals,
+        });
+        const digest = (messages: MessageLike[]) =>
+            createHash("sha256").update(JSON.stringify(messages)).digest("hex");
+        expect(softResult.m0RematerializedThisPass).toBe(false);
+        expect(digest(softAfterEdit)).toBe(digest(softBeforeEdit));
+        expect(renderedText(softAfterEdit[0])).toContain("Old architecture");
+        expect(__projectDocsHashTest.readCount()).toBe(1);
+
+        const hard = structuredClone(input) as MessageLike[];
+        const result = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: hard,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            hardSignals: { ...stableSignals, systemHash: "sys-v2" },
         });
 
         expect(result.m0RematerializedThisPass).toBe(true);
         expect(result.decision.reason).toBe("system_hash");
-        expect(renderedText(second[0])).toContain("Updated architecture");
-        expect(renderedText(second[0])).toContain("Fresh docs folded on hard bust.");
-        expect(renderedText(second[0])).not.toContain("Old architecture");
+        expect(renderedText(hard[0])).toContain("Updated architecture");
+        expect(renderedText(hard[0])).toContain("Fresh docs folded on hard bust.");
+        expect(renderedText(hard[0])).not.toContain("Old architecture");
+        expect(digest(hard)).not.toBe(digest(softAfterEdit));
+        expect(__projectDocsHashTest.readCount()).toBe(2);
     });
 
     it("classify writes stay cache-neutral until the next natural HARD materialization", () => {
@@ -2495,6 +2513,106 @@ describe("m[0]/m[1] materialization", () => {
         expect(result.m1Text).toContain("no new content since last materialization");
     });
 
+    it("keeps expiry-transition defer bytes pinned until the next cache-busting delta", async () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        replaceAllCompartmentState(
+            db,
+            SESSION_ID,
+            [
+                {
+                    sequence: 1,
+                    startMessage: 1,
+                    endMessage: 1,
+                    startMessageId: "m0",
+                    endMessageId: "m0",
+                    title: "large baseline",
+                    content: "baseline ".repeat(300),
+                },
+            ],
+            [],
+        );
+        const expiresAt = Date.now() + 60_000;
+        const expiring = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "KNOWN_ISSUES",
+            content: "A TTL memory remains frozen in the cached baseline. ".repeat(100),
+            expiresAt,
+        });
+        const state = readStateFromMeta();
+        injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: [userMessage("m1", "initial")],
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            isCacheBustingPass: true,
+        });
+
+        const firstDefer = [userMessage("m2", "defer before expiry transition")];
+        const before = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: firstDefer,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            isCacheBustingPass: false,
+        });
+        const holderId = "expiry-cache-proof";
+        const leaseKey = leaseKeyFor("curate", PROJECT_PATH);
+        const leaseAcquisition = acquireLeaseWithAcquisition(db, holderId, leaseKey);
+        expect(leaseAcquisition).not.toBeNull();
+        await archiveExpiredMemories({
+            db,
+            projectIdentity: PROJECT_PATH,
+            holderId,
+            leaseKey,
+            leaseAcquisition: leaseAcquisition!,
+            now: expiresAt + 1,
+        });
+
+        const secondDefer = [userMessage("m3", "defer after expiry transition")];
+        const after = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: secondDefer,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            isCacheBustingPass: false,
+        });
+        const pin = (result: { m0Bytes: Buffer | null; m1Text: string | null }): string =>
+            createHash("sha256")
+                .update(result.m0Bytes ?? Buffer.alloc(0))
+                .update("\0")
+                .update(result.m1Text ?? "")
+                .digest("hex");
+        const beforePin = pin(before);
+        const afterPin = pin(after);
+
+        expect(beforePin).toBe("4eaba563c2a26f33c8e4087f199a0e31620b6e3d7adc8981b5c2d88a12fe10d4");
+        expect(afterPin).toBe(beforePin);
+        expect(after.m0RematerializedThisPass).toBe(false);
+        expect(db.prepare("SELECT status FROM memories WHERE id = ?").get(expiring.id)).toEqual({
+            status: "archived",
+        });
+
+        const bust = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            messages: [userMessage("m4", "cache bust")],
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            isCacheBustingPass: true,
+        });
+        expect(bust.m0Bytes).toEqual(after.m0Bytes);
+        expect(bust.m1Text).toContain("<memory-updates>");
+        expect(bust.m1Text).toContain(`<removed id="${expiring.id}"/>`);
+    });
+
     it("replays byte-identical m[1] on defer and surfaces additive memory on next cache-busting pass", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
@@ -3140,6 +3258,55 @@ describe("m[0]/m[1] materialization", () => {
 
         expect(renderedText(bust[1])).not.toContain("<memory-updates>");
         expect(renderedText(bust[1])).not.toContain("Updated but not resident.");
+    });
+
+    it("renders the recategorize category on <updated> in memory-updates", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const memory = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "CONFIG_VALUES",
+            content: "old category fact",
+        });
+        const state = readStateFromMeta();
+        const hard = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            injectDocs: false,
+            memoryInjectionBudgetTokens: 8_000,
+        });
+        expect(hard.renderedMemoryIds).toEqual([memory.id]);
+
+        db.prepare(
+            "UPDATE memories SET content = ?, category = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
+        ).run("new category fact", "CONSTRAINTS", "new-category-fact", Date.now(), memory.id);
+        queueMemoryMutation(db, {
+            projectPath: PROJECT_PATH,
+            mutationType: "update",
+            targetMemoryId: memory.id,
+            category: "CONSTRAINTS",
+            newContent: "new category fact",
+            queuedAt: 10,
+        });
+
+        const m1 = renderM1(
+            {
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                memoryInjectionBudgetTokens: 8_000,
+            },
+            hard.snapshotMarkers,
+            hard.renderedMemoryIds,
+        );
+        const updates = m1.match(/<memory-updates>[\s\S]*?<\/memory-updates>/)?.[0];
+        expect(updates).toContain(
+            `<updated id="${memory.id}" category="CONSTRAINTS">new category fact</updated>`,
+        );
     });
 
     it("reconcile rematerialization advances the memory mutation cursor and omits memory-updates", () => {

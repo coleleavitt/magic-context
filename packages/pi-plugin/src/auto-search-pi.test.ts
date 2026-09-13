@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import type { UnifiedSearchResult } from "@magic-context/core/features/magic-context/search";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import {
@@ -10,7 +11,12 @@ import {
 	clearAutoSearchForPiSession,
 	runAutoSearchHintForPi,
 } from "./auto-search-pi";
-import { createTestDb, textOf, userMessage } from "./test-utils.test";
+import {
+	assistantMessage,
+	createTestDb,
+	textOf,
+	userMessage,
+} from "./test-utils.test";
 
 const baseOptions = {
 	enabled: true,
@@ -298,7 +304,7 @@ describe("runAutoSearchHintForPi", () => {
 		}
 	});
 
-	it("skips stacked sidekick augmentation without searching", async () => {
+	it("skips stacked search augmentation without searching", async () => {
 		const db = createTestDb();
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
 			async () => [memoryResult()],
@@ -306,7 +312,7 @@ describe("runAutoSearchHintForPi", () => {
 		try {
 			const messages = [
 				userMessage(
-					"Implement this\n\n<sidekick-augmentation>context</sidekick-augmentation>",
+					"Implement this\n\n<ctx-search-hint>context</ctx-search-hint>",
 					1,
 				),
 			];
@@ -319,7 +325,9 @@ describe("runAutoSearchHintForPi", () => {
 			});
 
 			expect(spy).toHaveBeenCalledTimes(0);
-			expect(textOf(messages[0])).not.toContain("<ctx-search-hint>");
+			expect(textOf(messages[0])).toBe(
+				"Implement this\n\n<ctx-search-hint>context</ctx-search-hint>",
+			);
 		} finally {
 			spy.mockRestore();
 			closeQuietly(db);
@@ -360,6 +368,49 @@ describe("runAutoSearchHintForPi", () => {
 			});
 
 			expect(capturedPrompt).toBe("actual project prompt survives");
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("does not append a recovered hint to a buried user message", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "unifiedSearch")
+			.mockImplementationOnce(async () => {
+				throw new Error("temporary search failure");
+			})
+			.mockImplementationOnce(async () => [memoryResult()]);
+		try {
+			const firstPass = [userMessage("explain the historian cache wiring", 1)];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages: firstPass,
+				entryIds: ["entry-user"],
+				options: baseOptions,
+			});
+
+			const secondPass = [
+				userMessage("explain the historian cache wiring", 1),
+				assistantMessage("already served answer", 2),
+			];
+			const beforeHash = createHash("sha256")
+				.update(JSON.stringify(secondPass))
+				.digest("hex");
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages: secondPass,
+				entryIds: ["entry-user", "entry-assistant"],
+				options: baseOptions,
+			});
+
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect(
+				createHash("sha256").update(JSON.stringify(secondPass)).digest("hex"),
+			).toBe(beforeHash);
+			expect(getAutoSearchHintDecisions(db, "ses-auto")).toHaveLength(0);
 		} finally {
 			spy.mockRestore();
 			closeQuietly(db);

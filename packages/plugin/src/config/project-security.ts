@@ -18,7 +18,7 @@ import {
  */
 
 /** Hidden agents that run with elevated/autonomous capability. */
-const HIDDEN_AGENT_KEYS = ["historian", "dreamer", "sidekick"] as const;
+const HIDDEN_AGENT_KEYS = ["historian", "dreamer"] as const;
 const HARNESS_KEYS = PER_HARNESS_MODEL_KEYS;
 /** Every historian model-resolution field, including per-harness qualifiers.
  *  Variant and thinking_level merge onto the user's historian model at resolve
@@ -36,27 +36,28 @@ const PROMPT_SURFACE_USER_ONLY_FIELDS = ["guidance_override_path", "tool_descrip
  *  - `permission` — broadens the agent's per-tool permissions.
  *  - `tools`      — enable/disable map; could flip a denied tool (e.g. `bash`)
  *                   on for an agent whose allow-list intentionally excludes it.
- *  - `system_prompt` — sidekick's custom system prompt. It takes precedence over
- *                   the built-in prompt (sidekick/agent.ts reads
- *                   `config.system_prompt` before `config.prompt`), so leaving it
- *                   unstripped reopens the exact reprogramming vector `prompt`
- *                   closes — a cloned repo could rewrite sidekick's instructions
- *                   via `/ctx-aug`.
- *
  * Dreamer model/cadence fields are deliberately NOT stripped: a repo may tune
  * its own dreamer overlays and schedules through the user's provider auth.
  * Historian model selection stays USER-tier only, and compaction thresholds are
  * project raise-only, so a cloned repo cannot force earlier compaction or extra
  * historian spend on the user's dime.
  */
-const AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools", "system_prompt"] as const;
-const EMBEDDING_DESTINATION_FIELDS = ["endpoint", "provider", "fallback_provider"] as const;
+const AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools"] as const;
+const EMBEDDING_USER_ONLY_FIELDS = [
+    "endpoint",
+    "provider",
+    "fallback_provider",
+    "query_instruction",
+    "document_prefix",
+] as const;
 const PERCENTAGE_THRESHOLD_REASON =
     "security: a repository may only raise compaction thresholds above the user's effective value; it cannot force earlier historian work or cloned-repo cost escalation.";
 const TOKEN_THRESHOLD_REASON =
     "security: a repository may only raise execute_threshold_tokens above the user's trusted token threshold; it cannot force earlier historian work or cloned-repo cost escalation.";
 const TOKEN_THRESHOLD_INTRODUCTION_REASON =
     "security: a repository cannot introduce a new execute_threshold_tokens override when the user has no trusted token threshold for that key; that could force earlier historian work or cloned-repo cost escalation.";
+const PROTECTED_TOKENS_REASON =
+    "security: a repository may only raise protected_tokens above the resolved user-or-derived floor; it cannot lower protection.";
 
 interface PercentageThresholdConfig {
     defaultValue: number;
@@ -70,6 +71,66 @@ interface TokenThresholdConfig {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function resolveProtectedTokensScalar(value: unknown): number | undefined {
+    if (
+        typeof value === "number" &&
+        Number.isInteger(value) &&
+        value >= 4000 &&
+        value <= 1_000_000
+    ) {
+        return value;
+    }
+    return undefined;
+}
+
+export interface ProtectedTokensTierOverrides {
+    readonly user?: number;
+    readonly project?: number;
+}
+
+const PROTECTED_TOKENS_TIER_OVERRIDES = Symbol.for(
+    "@cortexkit/magic-context/protected-tokens-tier-overrides",
+);
+
+type ConfigWithProtectedTokensTiers = {
+    [PROTECTED_TOKENS_TIER_OVERRIDES]?: ProtectedTokensTierOverrides;
+};
+
+/**
+ * Retain trusted user and project values outside the public config schema until
+ * live context geometry is available. The symbol is non-enumerable so runtime
+ * provenance cannot leak into saved JSON or generated schema surfaces.
+ */
+export function attachProtectedTokensTierOverrides<T extends object>(
+    config: T,
+    args: { trustedUser: unknown; project: unknown },
+): T {
+    const user = resolveProtectedTokensScalar(args.trustedUser);
+    const rawProject = resolveProtectedTokensScalar(args.project);
+    const project =
+        rawProject !== undefined && (user === undefined || rawProject >= user)
+            ? rawProject
+            : undefined;
+    if (user === undefined && project === undefined) return config;
+
+    Object.defineProperty(config, PROTECTED_TOKENS_TIER_OVERRIDES, {
+        value: {
+            ...(user !== undefined ? { user } : {}),
+            ...(project !== undefined ? { project } : {}),
+        },
+        configurable: false,
+        enumerable: false,
+        writable: false,
+    });
+    return config;
+}
+
+export function getProtectedTokensTierOverrides(
+    config: object,
+): ProtectedTokensTierOverrides | undefined {
+    return (config as ConfigWithProtectedTokensTiers)[PROTECTED_TOKENS_TIER_OVERRIDES];
 }
 
 function stripListedFields(
@@ -264,6 +325,7 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    carry security fixes).
  *  - `fail_closed_blocking` — a repo must not un-block (or force-block) the
  *    loud inoperability gate; only the user may restore silent degrade.
+ *  - `debug_rpc` — a repo must not enable process heap capture or memory diagnostics.
  *  - `allow_home_project` — only the user may opt a home-directory session
  *    into a durable project identity.
  *  - `output_reserve` / `models.window_overlay_path` — only the user may change
@@ -279,8 +341,9 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    confidentiality. Only the machine operator's user config may opt into an
  *    externally managed trusted-group deployment.
  *  - `embedding.endpoint` / `embedding.provider` — a repo must not choose
- *    where private memory/search/commit text is embedded. User-level config is
- *    the trust boundary for embedding destinations.
+ *    where private memory/search/commit text is embedded. Query/document prefix
+ *    overrides also remain user-owned so a repository cannot alter the text sent
+ *    to that destination or silently force a corpus re-embed.
  *  - `transform_mode` is intentionally allowed at project tier so a repository
  *    can opt its own runtime into the experimental Rust pipeline. The resolver
  *    requires trusted user-level `subc` configuration before Rust can activate.
@@ -322,6 +385,13 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         delete projectRaw.fail_closed_blocking;
         warnings.push(
             "Ignoring fail_closed_blocking from project config (security: only user-level config may disable or force the loud inoperability gate).",
+        );
+    }
+
+    if ("debug_rpc" in projectRaw) {
+        delete projectRaw.debug_rpc;
+        warnings.push(
+            "Ignoring debug_rpc from project config (security: only user-level config may enable process heap diagnostics).",
         );
     }
 
@@ -431,7 +501,7 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
     const embedding = projectRaw.embedding;
     if (isPlainObject(embedding)) {
         const removed: string[] = [];
-        for (const field of EMBEDDING_DESTINATION_FIELDS) {
+        for (const field of EMBEDDING_USER_ONLY_FIELDS) {
             if (field in embedding) {
                 delete embedding[field];
                 removed.push(field);
@@ -440,7 +510,7 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         if (removed.length > 0) {
             warnings.push(
                 `Ignoring embedding.${removed.join("/")} from project config ` +
-                    "(security: a repository cannot choose where private text is embedded).",
+                    "(security: a repository cannot choose where or how private text is embedded).",
             );
         }
     }
@@ -563,6 +633,7 @@ export function constrainProjectThresholdOverrides(args: {
     trustedBaseConfig: {
         execute_threshold_percentage?: unknown;
         execute_threshold_tokens?: unknown;
+        protected_tokens?: unknown;
     };
 }): string[] {
     const warnings: string[] = [];
@@ -703,6 +774,36 @@ export function constrainProjectThresholdOverrides(args: {
 
         if (touchedValidEntry) {
             setMergedTokenThreshold(args.mergedRaw, constrained);
+        }
+    }
+
+    if ("protected_tokens" in args.projectRaw) {
+        const rawProject = args.projectRaw.protected_tokens;
+        const projectVal = resolveProtectedTokensScalar(rawProject);
+        const trustedUserVal = resolveProtectedTokensScalar(
+            args.trustedBaseConfig.protected_tokens,
+        );
+
+        if (projectVal !== undefined) {
+            if (trustedUserVal !== undefined) {
+                if (projectVal >= trustedUserVal) {
+                    args.mergedRaw.protected_tokens = projectVal;
+                } else {
+                    args.mergedRaw.protected_tokens = trustedUserVal;
+                    warnings.push(
+                        makeProjectThresholdWarning("protected_tokens", PROTECTED_TOKENS_REASON),
+                    );
+                }
+            } else {
+                args.mergedRaw.protected_tokens = projectVal;
+            }
+        } else {
+            if (trustedUserVal !== undefined) {
+                args.mergedRaw.protected_tokens = trustedUserVal;
+            } else {
+                delete args.mergedRaw.protected_tokens;
+            }
+            warnings.push(makeProjectThresholdWarning("protected_tokens", PROTECTED_TOKENS_REASON));
         }
     }
 

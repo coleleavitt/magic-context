@@ -21,6 +21,7 @@ export interface PiTestHarnessOptions {
   piSettingsExtra?: Record<string, unknown>;
   modelContextLimit?: number;
   mockDefault?: MockResponse;
+  extensionsBeforeMagicContext?: string[];
   /** Share the cortexkit DB with another harness. */
   sharedDataDir?: string;
   /** Optional working directory override before the persistent Pi process starts. */
@@ -222,6 +223,24 @@ export class PiTestHarness {
     requireSuccessfulResponse(response);
   }
 
+  async compactNowExpectCancelled(): Promise<void> {
+    const response = await this.rpc.sendCommand("compact");
+    if (response.success || !response.error?.includes("Compaction cancelled")) {
+      throw new Error(`Expected Pi compaction cancellation, received ${JSON.stringify(response)}`);
+    }
+  }
+
+  async invokeExtensionCommand(command: string): Promise<void> {
+    const response = await this.rpc.sendCommand("prompt", { message: `/${command}` });
+    requireSuccessfulResponse(response);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const state = await this.getState();
+      if (!state.isStreaming && !state.isCompacting) return;
+      await Bun.sleep(20);
+    }
+    throw new Error(`Pi extension command /${command} did not settle`);
+  }
+
   async newSession(): Promise<void> {
     const response = await this.rpc.sendCommand<{ cancelled?: boolean }>("new_session");
     const data = requireSuccessfulResponse(response);
@@ -242,10 +261,27 @@ export class PiTestHarness {
     }
   }
 
-  /** Restart Pi against the same isolated session, data, and config roots. */
+  /** Restart Pi and explicitly resume the same saved session. */
   async restart(): Promise<void> {
+    const beforeRestart = await this.getState();
     this.closeContextDb();
     await this.rpc.restart();
+
+    if (!beforeRestart.sessionFile) return;
+    const response = await this.rpc.sendCommand<{ cancelled?: boolean }>(
+      "switch_session",
+      { sessionPath: beforeRestart.sessionFile },
+      { timeoutMs: 60_000, label: "resume Pi session after restart" },
+    );
+    const resumed = requireSuccessfulResponse(response);
+    if (resumed.cancelled) throw new Error("Pi session resume was cancelled by an extension");
+
+    const afterRestart = await this.getState();
+    if (beforeRestart.sessionId && afterRestart.sessionId !== beforeRestart.sessionId) {
+      throw new Error(
+        `Pi restart resumed session ${afterRestart.sessionId ?? "missing"}, expected ${beforeRestart.sessionId}`,
+      );
+    }
   }
 
   get lastTurn(): PiRunResult | null {

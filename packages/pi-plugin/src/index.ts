@@ -4,7 +4,7 @@
  * Loaded once per Pi session via `pi.extensions` in package.json. Boots
  * Magic Context's shared SQLite store and registers session lifecycle
  * hooks: tools, transform pipeline (tagging + drops), historian trigger,
- * /ctx-aug command, system-prompt injection, dreamer scheduling, and
+ * system-prompt injection, dreamer scheduling, and
  * agent_end cleanup.
  *
  * Storage: shares one SQLite database with the OpenCode plugin at
@@ -29,11 +29,11 @@ import {
 	isDreamerRunnable,
 } from "@magic-context/core/config/agent-disable";
 import { migrateMagicContextConfigLocations } from "@magic-context/core/config/migrate-config-location";
+import { getProtectedTokensTierOverrides } from "@magic-context/core/config/project-security";
 import type {
 	DreamerConfig,
 	HistorianConfig,
 	MagicContextConfig,
-	SidekickConfig,
 } from "@magic-context/core/config/schema/magic-context";
 import {
 	summarizeDreamSchedule,
@@ -61,7 +61,10 @@ import {
 	openDatabaseAsync,
 	setSqlitePragmaConfig,
 } from "@magic-context/core/features/magic-context/storage-db";
-import { getOverflowState } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import {
+	clearDetectedContextLimit,
+	getOverflowState,
+} from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { runDeferredV22Backfill } from "@magic-context/core/features/magic-context/v22-deferred-backfill";
 import { setCtxReduceRegisteredGlobally } from "@magic-context/core/hooks/magic-context/ctx-reduce-availability";
 import {
@@ -103,16 +106,14 @@ import {
 	createPromptSurfaceGuidanceEpochCache,
 	createPromptSurfaceRuntime,
 } from "@magic-context/core/shared/prompt-surface-runtime";
-import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbacks";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
-import { reloadWindowOverlay } from "@magic-context/core/shared/window-geometry";
+import {
+	hasTrustedAbsoluteWall,
+	reloadWindowOverlay,
+} from "@magic-context/core/shared/window-geometry";
 
 import { handlePiCloneSessionStart } from "./clone-inheritance";
-import {
-	type PiSidekickConfig,
-	registerCtxAugCommand,
-} from "./commands/ctx-aug";
 import { registerCtxDreamCommand } from "./commands/ctx-dream";
 import {
 	maybeAutoEmbedPiSession,
@@ -160,10 +161,14 @@ import {
 	unregisterPiDreamerProject,
 } from "./dreamer";
 import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
+import { registerPiDroppedInputGuard } from "./dropped-input-guard-pi";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
 import { bootPiRuntimeWithDeadline } from "./pi-boot-deadline";
-import { resolvePiUsableContextLimit } from "./pi-context-limit";
+import {
+	resolvePiUsableContextLimit,
+	resolvePiWindowGeometry,
+} from "./pi-context-limit";
 import {
 	type PiHarnessKind,
 	resolvePiHarnessDetection,
@@ -300,15 +305,19 @@ export function signalPiDeferredCompactionMarkerDrain(sessionId: string): void {
 }
 
 /**
- * Pi native compaction invalidates MC's cached m[0]/m[1] bytes. In normal mode
- * MC still owns compaction and cancels this event; compaction-off mode clears
- * only that cache and deliberately returns no cancellation result.
+ * Only an allowed native compaction invalidates MC's cached m[0]/m[1].
+ * A cancelled attempt changes no history; clearing its cache would manufacture
+ * a first_render HARD fold on the next context pass.
  */
 export async function handlePiSessionBeforeCompact(args: {
 	db: ContextDatabase;
 	compactionOff: boolean;
 	ctx: { sessionManager?: { getSessionId?: () => string | undefined } };
 }): Promise<{ cancel: true } | undefined> {
+	if (!args.compactionOff) {
+		info("session_before_compact: cancelling — magic-context owns compaction");
+		return { cancel: true };
+	}
 	try {
 		const sessionId = args.ctx.sessionManager?.getSessionId?.();
 		if (typeof sessionId === "string" && sessionId.length > 0) {
@@ -317,14 +326,9 @@ export async function handlePiSessionBeforeCompact(args: {
 	} catch {
 		// Cache invalidation is best-effort; it must not suppress Pi's native path.
 	}
-	if (args.compactionOff) {
-		info(
-			"session_before_compact: native Pi compaction proceeds (compaction-off mode)",
-		);
-		return;
-	}
-	info("session_before_compact: cancelling — magic-context owns compaction");
-	return { cancel: true };
+	info(
+		"session_before_compact: native Pi compaction proceeds (compaction-off mode)",
+	);
 }
 
 export function canonicalPiModelKey(provider: string, model: string): string {
@@ -556,11 +560,29 @@ function getPiMessageModel(message: unknown): {
 	};
 }
 
+const piUsageBoundLogSeen = new Set<string>();
+
+function logPiUsageBoundOnce(
+	sessionId: string,
+	reading: number,
+	absoluteWall: number,
+	reason: "current reading" | "persisted floor",
+): void {
+	const key = `${sessionId}|${reason}`;
+	if (piUsageBoundLogSeen.has(key)) return;
+	piUsageBoundLogSeen.add(key);
+	info(
+		`message_end: session=${sessionId} bounded ${reason} ${reading} at trusted absolute wall ${absoluteWall}; pressure_proof_not_capacity`,
+	);
+}
+
 function resolvePiPressureContextLimit(args: {
 	db: ContextDatabase;
 	sessionId: string;
 	piContextWindow: number;
+	piContextWindowSource?: "observed" | "catalog";
 	model?: { provider?: string; id?: string; maxTokens?: number };
+	provenInputTokens?: number;
 }): number {
 	// Pi reports the model's context window directly (ctx.getContextUsage() /
 	// ctx.model.contextWindow) — its own authoritative source. We no longer
@@ -568,7 +590,11 @@ function resolvePiPressureContextLimit(args: {
 	// garbage window can't poison pressure (mirrors OpenCode's SDK sane bound).
 	let detectedContextLimit: number | undefined;
 	try {
-		const overflowState = getOverflowState(args.db, args.sessionId);
+		const modelKey =
+			args.model?.provider && args.model.id
+				? piModelRefToCanonical(`${args.model.provider}/${args.model.id}`)
+				: undefined;
+		const overflowState = getOverflowState(args.db, args.sessionId, modelKey);
 		if (overflowState.detectedContextLimit > 0) {
 			detectedContextLimit = overflowState.detectedContextLimit;
 		}
@@ -578,8 +604,10 @@ function resolvePiPressureContextLimit(args: {
 	return (
 		resolvePiUsableContextLimit({
 			rawContextWindow: args.piContextWindow,
+			rawContextWindowSource: args.piContextWindowSource,
 			model: args.model,
 			detectedContextLimit,
+			provenInputTokens: args.provenInputTokens,
 		}) ?? 0
 	);
 }
@@ -589,19 +617,46 @@ export async function persistPiPressureFromMessageEnd(args: {
 	sessionId: string;
 	message: unknown;
 	piContextWindow: number;
+	piContextWindowSource?: "observed" | "catalog";
 	piModel?: { provider?: string; id?: string; maxTokens?: number };
 	piTokens?: number;
 	notifyIssue?: (message: string) => unknown | Promise<unknown>;
 }): Promise<void> {
 	const { provider, model } = getPiMessageModel(args.message);
-	const effectiveContextLimit = resolvePiPressureContextLimit({
-		db: args.db,
-		sessionId: args.sessionId,
-		piContextWindow: args.piContextWindow,
-		model: args.piModel ?? { provider, id: model },
-	});
+	const activeModel = args.piModel ?? { provider, id: model };
+	const modelKey =
+		activeModel.provider && activeModel.id
+			? piModelRefToCanonical(`${activeModel.provider}/${activeModel.id}`)
+			: undefined;
 	const usage = extractAssistantUsage(args.message);
-	const pressure = computePiPressure(usage, effectiveContextLimit);
+	const reportedGeometry = resolvePiWindowGeometry({
+		rawContextWindow: args.piContextWindow,
+		rawContextWindowSource: args.piContextWindowSource,
+		model: activeModel,
+	});
+	const trustedAbsoluteWall =
+		reportedGeometry && hasTrustedAbsoluteWall(reportedGeometry)
+			? reportedGeometry.derivation.absoluteWall
+			: undefined;
+	const unboundedPressure = computePiPressure(usage, args.piContextWindow);
+	const rawPressure = computePiPressure(
+		usage,
+		args.piContextWindow,
+		trustedAbsoluteWall,
+	);
+	if (
+		unboundedPressure &&
+		trustedAbsoluteWall !== undefined &&
+		unboundedPressure.inputTokens > trustedAbsoluteWall
+	) {
+		logPiUsageBoundOnce(
+			args.sessionId,
+			unboundedPressure.inputTokens,
+			trustedAbsoluteWall,
+			"current reading",
+		);
+	}
+
 	const msg =
 		args.message && typeof args.message === "object"
 			? (args.message as { errorMessage?: unknown })
@@ -609,55 +664,128 @@ export async function persistPiPressureFromMessageEnd(args: {
 	const messageHadOverflowError =
 		typeof msg?.errorMessage === "string" &&
 		detectOverflow(msg.errorMessage).isOverflow;
+	// A bounded provider sample proves pressure, not that the impossible request fit.
+	const requestSucceeded =
+		!messageHadOverflowError &&
+		!(
+			unboundedPressure &&
+			trustedAbsoluteWall !== undefined &&
+			unboundedPressure.inputTokens > trustedAbsoluteWall
+		);
+	if (requestSucceeded && rawPressure) {
+		const rawOverflow = getOverflowState(args.db, args.sessionId);
+		const detectedLimitMatchesModel =
+			rawOverflow.detectedContextLimitModelKey === null ||
+			(modelKey !== undefined &&
+				rawOverflow.detectedContextLimitModelKey === modelKey);
+		if (
+			rawOverflow.detectedContextLimit > 0 &&
+			detectedLimitMatchesModel &&
+			rawPressure.inputTokens > rawOverflow.detectedContextLimit
+		) {
+			clearDetectedContextLimit(args.db, args.sessionId);
+			info(
+				`message_end: detected limit ${rawOverflow.detectedContextLimit} invalidated by a successful ${rawPressure.inputTokens}-token request; using Pi contextWindow`,
+			);
+		}
+	}
+
+	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
+	let observedSafeInputTokens = meta.observedSafeInputTokens ?? 0;
 	const updates: Partial<{
 		lastResponseTime: number;
 		lastContextPercentage: number;
 		lastInputTokens: number;
+		lastUsageContextLimit: number;
 		observedSafeInputTokens: number;
 		cacheAlertSent: boolean;
 	}> = { lastResponseTime: Date.now() };
 
+	if (
+		trustedAbsoluteWall !== undefined &&
+		observedSafeInputTokens > trustedAbsoluteWall
+	) {
+		logPiUsageBoundOnce(
+			args.sessionId,
+			observedSafeInputTokens,
+			trustedAbsoluteWall,
+			"persisted floor",
+		);
+		observedSafeInputTokens = 0;
+		updates.observedSafeInputTokens = 0;
+		updates.cacheAlertSent = false;
+		updates.lastUsageContextLimit = reportedGeometry?.usableSoft ?? 0;
+		if (meta.lastInputTokens > trustedAbsoluteWall) {
+			updates.lastInputTokens = trustedAbsoluteWall;
+			updates.lastContextPercentage =
+				reportedGeometry && reportedGeometry.usableSoft > 0
+					? (trustedAbsoluteWall / reportedGeometry.usableSoft) * 100
+					: 0;
+		}
+	}
+
+	const effectiveContextLimit = resolvePiPressureContextLimit({
+		db: args.db,
+		sessionId: args.sessionId,
+		piContextWindow: args.piContextWindow,
+		piContextWindowSource: args.piContextWindowSource,
+		model: activeModel,
+		provenInputTokens: observedSafeInputTokens,
+	});
+	const reportedContextLimit = reportedGeometry?.usableSoft ?? 0;
+	const pressure = computePiPressure(
+		usage,
+		effectiveContextLimit,
+		trustedAbsoluteWall,
+	);
+
 	if (pressure) {
-		const percentage = pressure.percentage;
-		const contextLimit = effectiveContextLimit;
-		const meta = getOrCreateSessionMeta(args.db, args.sessionId);
-		const observedSafeInputTokens = meta.observedSafeInputTokens ?? 0;
+		const provenSafeInputTokens = requestSucceeded
+			? Math.max(observedSafeInputTokens, pressure.inputTokens)
+			: observedSafeInputTokens;
+		const contextLimit = requestSucceeded
+			? resolvePiPressureContextLimit({
+					db: args.db,
+					sessionId: args.sessionId,
+					piContextWindow: args.piContextWindow,
+					piContextWindowSource: args.piContextWindowSource,
+					model: activeModel,
+					provenInputTokens: provenSafeInputTokens,
+				})
+			: effectiveContextLimit;
+		const percentage =
+			contextLimit > 0 ? (pressure.inputTokens / contextLimit) * 100 : 0;
 		if (
-			percentage > 100 &&
-			observedSafeInputTokens > 0 &&
-			pressure.inputTokens <= observedSafeInputTokens * 2
+			requestSucceeded &&
+			reportedContextLimit > 0 &&
+			reportedContextLimit < provenSafeInputTokens &&
+			!meta.cacheAlertSent
 		) {
-			// Pi resolves the window from its own runtime, not a cache we could
-			// reload — so a >100% reading with a known-good safe baseline means
-			// Pi's reported contextWindow is genuinely wrong. There's nothing to
-			// re-fetch; surface the alert (overflow detection still captures a
-			// real lower cap separately).
-			if (!meta.cacheAlertSent) {
-				updates.cacheAlertSent = true;
-				const safeTokens = Math.max(
-					observedSafeInputTokens,
-					pressure.inputTokens,
-				);
-				const modelLabel =
-					provider && model ? `${provider}/${model}` : "the active model";
-				await args.notifyIssue?.(
-					`⚠️ Magic Context: Pi reports a context limit of ${formatTokens(contextLimit)} tokens for ${modelLabel} but you've successfully sent ${formatTokens(safeTokens)} tokens in this session — the reported limit looks wrong. Restart Pi if you suspect this is incorrect.`,
-				);
-			}
+			updates.cacheAlertSent = true;
+			const modelLabel =
+				activeModel.provider && activeModel.id
+					? `${activeModel.provider}/${activeModel.id}`
+					: "the active model";
+			await args.notifyIssue?.(
+				`⚠️ Magic Context: Pi reports a context limit of ${formatTokens(reportedContextLimit)} tokens for ${modelLabel}, but this session has sent ${formatTokens(provenSafeInputTokens)} tokens successfully. Magic Context will keep using the larger proven value for its pressure math. If Pi's model metadata is wrong for your provider, set contextWindow for that model in Pi's model configuration.`,
+			);
 		}
 		updates.lastContextPercentage = percentage;
 		updates.lastInputTokens = pressure.inputTokens;
-		if (!messageHadOverflowError) {
-			updates.observedSafeInputTokens = Math.max(
-				observedSafeInputTokens,
-				pressure.inputTokens,
-			);
+		updates.lastUsageContextLimit = contextLimit;
+		if (requestSucceeded) {
+			updates.observedSafeInputTokens = provenSafeInputTokens;
 		}
-	} else if (typeof args.piTokens === "number") {
+	} else if (
+		usage === null &&
+		typeof args.piTokens === "number" &&
+		(trustedAbsoluteWall === undefined || args.piTokens <= trustedAbsoluteWall)
+	) {
 		updates.lastInputTokens = args.piTokens;
 		if (effectiveContextLimit > 0) {
 			updates.lastContextPercentage =
 				(args.piTokens / effectiveContextLimit) * 100;
+			updates.lastUsageContextLimit = effectiveContextLimit;
 		}
 	}
 
@@ -691,24 +819,6 @@ setHarness(PI_HARNESS_KIND);
 // Each resolver returns `undefined` when the relevant feature is disabled
 // in config, so the registration helpers can short-circuit cleanly.
 // ---------------------------------------------------------------------------
-
-export function resolveSidekickFromConfig(
-	config: MagicContextConfig,
-): PiSidekickConfig | undefined {
-	const sidekick = config.sidekick as SidekickConfig | undefined;
-	if (!sidekick || sidekick.disable === true) return undefined;
-	const model = sidekick.model?.trim();
-	if (!model || model.length === 0) return undefined;
-	return {
-		model,
-		systemPrompt: sidekick.system_prompt,
-		timeoutMs: sidekick.timeout_ms,
-		thinking_level: sidekick.thinking_level,
-		fallbackModels: resolveFallbackChain(sidekick.fallback_models),
-		language: config.language,
-		allowHomeProject: config.allow_home_project,
-	};
-}
 
 export function resolveHistorianFromConfig(
 	config: MagicContextConfig,
@@ -792,7 +902,7 @@ export function resolveDreamerFromConfig(
  *
  * Registers the full Magic Context Pi runtime: tools, transform pipeline
  * (tagging + drops), historian trigger, nudges, auto-search hint,
- * /ctx-aug command, system-prompt injection, and dreamer scheduling.
+ * system-prompt injection and dreamer scheduling.
  * All driven by the user's `magic-context.jsonc` (Pi convention paths).
  */
 export default async function (pi: ExtensionAPI): Promise<void> {
@@ -1122,7 +1232,6 @@ async function startPiMagicContextRuntime(
 		historianConfig: PiHistorianOptions | undefined;
 		autoSearchConfig: PiAutoSearchHandlerOptions;
 		contextOptions: PiContextHandlerOptions;
-		sidekickConfig: PiSidekickConfig | undefined;
 		dreamerConfig: DreamerConfig | undefined;
 		dreamerEnabled: boolean;
 		configParseFailures: typeof configParseFailures;
@@ -1143,6 +1252,8 @@ async function startPiMagicContextRuntime(
 	): PiContextHandlerOptions => ({
 		db: database,
 		smartDrops: cfg.smart_drops === true,
+		protectedTokens: cfg.protected_tokens,
+		protectedTokenTierOverrides: getProtectedTokensTierOverrides(cfg) ?? {},
 		protectedTags: cfg.protected_tags ?? 20,
 		heuristics: {
 			caveman: cfg.caveman_text_compression
@@ -1221,7 +1332,6 @@ async function startPiMagicContextRuntime(
 			historianConfig: hist,
 			autoSearchConfig: auto,
 			contextOptions: buildContextOptions(cfg, hist, auto),
-			sidekickConfig: resolveSidekickFromConfig(cfg),
 			dreamerConfig: resolveDreamerFromConfig(cfg),
 			dreamerEnabled: isDreamerRunnable(cfg),
 			configParseFailures: loadMetadata.configParseFailures,
@@ -1320,6 +1430,7 @@ async function startPiMagicContextRuntime(
 			onAdjunctsRefreshNeeded: signalPiSystemPromptRefreshForProject,
 		});
 	}
+	registerPiDroppedInputGuard(pi);
 	const todowriteEnabled = bootProjectDeps.config.todowrite.enabled !== false;
 	const todowriteOverlayEnabled =
 		todowriteEnabled && bootProjectDeps.config.todowrite.overlay !== false;
@@ -1344,8 +1455,8 @@ async function startPiMagicContextRuntime(
 		// Keep the definition registered so Pi can activate it in a later session
 		// after a project config flip. session_start below removes it from the
 		// active tool set when the resolved project disables memory. (The subagent
-		// entry still uses memoryToolEnabled to keep ctx_memory off the retrieval-
-		// only sidekick, a separate security concern.)
+		// entry still uses memoryToolEnabled to keep ctx_memory off read-only
+		// Dreamer tasks, a separate security concern.)
 		memoryToolEnabled: true,
 		protectedTags: config.protected_tags ?? 20,
 		resolveProtectedTags: (ctx) =>
@@ -1444,19 +1555,6 @@ async function startPiMagicContextRuntime(
 			: "registered auto-search hint: DISABLED (memory.auto_search.enabled=false)",
 	);
 
-	// Register /ctx-aug once, but resolve sidekick config from the active cwd
-	// every invocation so `/cd` follows the current project's model/language.
-	registerCtxAugCommand(
-		pi,
-		(ctx) => resolveCurrentProjectDeps(ctx).sidekickConfig,
-		childRunner,
-	);
-	info(
-		bootProjectDeps.sidekickConfig
-			? `registered /ctx-aug (sidekick model=${bootProjectDeps.sidekickConfig.model})`
-			: "registered /ctx-aug (sidekick disabled — set sidekick.disable=false and sidekick.model in config)",
-	);
-
 	// Register the shared renderer before any command can append a status entry.
 	// Plain custom entries render in interactive Pi without entering model context.
 	const statusEntryRendererAvailable = registerCtxStatusEntryRenderer(pi);
@@ -1493,6 +1591,7 @@ async function startPiMagicContextRuntime(
 		cacheTtlConfigured: bootProjectDeps.cacheTtlConfigured,
 		configParseFailures: bootProjectDeps.configParseFailures,
 		hasDeprecatedProtectedTags: bootProjectDeps.hasDeprecatedProtectedTags,
+		compactionEnabled: isCompactionEnabled(bootProjectDeps.config),
 		resolveStatusDeps: (ctx) => {
 			const current = resolveCurrentProjectDeps(ctx);
 			return {
@@ -1513,6 +1612,7 @@ async function startPiMagicContextRuntime(
 				cacheTtlConfigured: current.cacheTtlConfigured,
 				configParseFailures: current.configParseFailures,
 				hasDeprecatedProtectedTags: current.hasDeprecatedProtectedTags,
+				compactionEnabled: isCompactionEnabled(current.config),
 			};
 		},
 	});
@@ -1861,7 +1961,7 @@ async function startPiMagicContextRuntime(
 						{
 							client: null,
 							db,
-							sendIgnoredMessage: async (_client, _sid, text) => {
+							sendStatusNotification: async (_client, _sid, text) => {
 								ctx.ui.notify(text, "info");
 								return "sent";
 							},
@@ -2233,9 +2333,11 @@ async function startPiMagicContextRuntime(
 		}
 	});
 
-	// In normal mode MC owns compaction and cancels Pi's native hook. In
-	// compaction-off mode the same hook must return nothing: native Pi compaction
-	// is the selected context manager and cancelling it would leave no manager.
+	// In normal mode MC owns compaction and cancels Pi's native hook. Pi's
+	// ExtensionRunner checks session-before handlers in registration order, ignores
+	// undefined, and short-circuits on the first truthy `cancel`; listener order
+	// therefore cannot undo this veto. In compaction-off mode the same hook must
+	// return nothing because native Pi compaction is the selected context manager.
 	pi.on("session_before_compact", async (_event, ctx) =>
 		handlePiSessionBeforeCompact({ db, compactionOff, ctx }),
 	);
@@ -2305,26 +2407,32 @@ async function startPiMagicContextRuntime(
 				cacheTtlConfig: resolveCurrentProjectDeps(ctx).config.cache_ttl,
 			});
 			// Compute pressure with OpenCode-equivalent semantics: pull
-			// the assistant's `usage` field and use
-			// `input + cacheRead + cacheWrite` (NOT output) divided by
-			// the effective context limit. The window comes from Pi's own
+			// the assistant's `usage` field, normalize inclusive OpenAI
+			// cached-input shapes against `totalTokens - output`, and reject
+			// impossible prompt readings above the observed hard wall. The
+			// accepted prompt count is divided by the effective context limit.
+			// The window comes from Pi's own
 			// runtime — `getContextUsage().contextWindow`, falling back to
 			// `ctx.model.contextWindow` if usage hasn't populated — NOT
 			// models.dev. `session_meta.detected_context_limit` still overrides
 			// it (in persistPiPressureFromMessageEnd) so post-overflow pressure
 			// reflects the real, lower limit. See `pi-pressure.ts` for rationale.
 			const piUsage = ctx.getContextUsage?.();
-			const piContextWindow =
+			const hasObservedContextWindow =
 				piUsage &&
 				typeof piUsage.contextWindow === "number" &&
-				piUsage.contextWindow > 0
-					? piUsage.contextWindow
-					: (ctx.model?.contextWindow ?? 0);
+				piUsage.contextWindow > 0;
+			const piContextWindow = hasObservedContextWindow
+				? piUsage.contextWindow
+				: (ctx.model?.contextWindow ?? 0);
 			await persistPiPressureFromMessageEnd({
 				db,
 				sessionId,
 				message: event.message,
 				piContextWindow,
+				piContextWindowSource: hasObservedContextWindow
+					? "observed"
+					: "catalog",
 				piModel: ctx.model,
 				piTokens:
 					piUsage && typeof piUsage.tokens === "number"

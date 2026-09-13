@@ -26,9 +26,11 @@ import {
     parseRpcPortFile,
     readProcessProbeEvidence,
 } from "../../shared/rpc-utils";
-import { Database, detectSqliteRuntime } from "../../shared/sqlite";
+import { Database, detectSqliteRuntime, registerSlowWriteReporter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
+import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+
 import { ensureContextStoreUuid } from "./context-authority";
 import {
     attachFailClosedBlockingProcessEvidence,
@@ -43,6 +45,11 @@ import {
     setDatabase as setToolDefinitionDatabase,
 } from "./tool-definition-tokens";
 import { runToolOwnerBackfill } from "./tool-owner-backfill";
+
+// The SQLite chokepoint cannot import the logging chain itself (it is executed
+// directly by Node in the backend smoke); every storage open path runs through
+// this module, so registering here covers privileged writes on both runtimes.
+registerSlowWriteReporter(logSlowWriteTransaction);
 
 // Re-exported so existing `from "./storage-db"` importers (and tests) keep
 // resolving these; the definitions live in the leaf module to break the
@@ -97,7 +104,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 83;
+export const LATEST_SUPPORTED_VERSION = 84;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema
@@ -1556,10 +1563,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       pending_pi_compaction_marker_state TEXT,
       new_work_tokens INTEGER NOT NULL DEFAULT 0,
       total_input_tokens INTEGER NOT NULL DEFAULT 0,
-      -- deferred_execute_state: intentionally NULLABLE without a default.
-      -- Absence is SQL NULL; presence is a JSON blob written via
-      -- setDeferredExecutePendingIfAbsent. Excluded from the
-      -- healAllNullColumns fallback list.
+      -- Retired columns remain in place so existing databases keep the same schema:
+      -- deferred_execute_state was used by the removed turn-boundary execute hold.
       deferred_execute_state TEXT,
       cached_m0_bytes BLOB,
       cached_m0_project_memory_epoch INTEGER,
@@ -1574,6 +1579,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       last_observed_model_key TEXT,
       last_usage_context_limit INTEGER NOT NULL DEFAULT 0,
       prior_boundary_ordinal INTEGER NOT NULL DEFAULT 1,
+      protected_tokens_effective INTEGER,
+      protected_tokens_pre_snapshot TEXT,
       protected_tail_policy_version INTEGER NOT NULL DEFAULT 0,
       protected_tail_drain_window_started_at INTEGER NOT NULL DEFAULT 0,
       protected_tail_drain_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1987,6 +1994,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "last_observed_model_key", "TEXT");
     ensureColumn(db, "session_meta", "last_usage_context_limit", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "prior_boundary_ordinal", "INTEGER NOT NULL DEFAULT 1");
+    ensureColumn(db, "session_meta", "protected_tokens_effective", "INTEGER");
+    ensureColumn(db, "session_meta", "protected_tokens_pre_snapshot", "TEXT");
     ensureColumn(db, "session_meta", "protected_tail_policy_version", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(
         db,

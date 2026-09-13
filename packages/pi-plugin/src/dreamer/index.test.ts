@@ -1,4 +1,9 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
+import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import {
 	type DreamerConfig,
 	DreamerConfigSchema,
@@ -11,9 +16,16 @@ import { getTaskScheduleState } from "@magic-context/core/features/magic-context
 import { leaseKeyFor } from "@magic-context/core/features/magic-context/dreamer/task-registry";
 import { insertMemory } from "@magic-context/core/features/magic-context/memory";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
+import {
+	closeDatabase,
+	openDatabase,
+} from "@magic-context/core/features/magic-context/storage";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
+import { getSubagentInvocations } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { __setPiHarnessKindForTesting } from "../pi-harness-kind";
+import { PiSubagentRunner } from "../subagent-runner";
 import {
 	__test,
 	awaitInFlightDreamers,
@@ -98,6 +110,32 @@ function deferred<T>() {
 async function flushMicrotasks(): Promise<void> {
 	await Promise.resolve();
 	await Promise.resolve();
+}
+
+function createEventStreamChild() {
+	const events = new EventEmitter();
+	const stdout = new PassThrough();
+	const stderr = new PassThrough();
+	const stdin = new PassThrough();
+	return {
+		pid: 42,
+		stdin,
+		stdout,
+		stderr,
+		killed: false,
+		kill: mock(() => true),
+		on: events.on.bind(events),
+		once: events.once.bind(events),
+		writeStdoutLine: (event: unknown) => {
+			stdout.write(`${JSON.stringify(event)}\n`);
+		},
+		emitClose: () => {
+			stdout.end();
+			stderr.end();
+			stdin.end();
+			setTimeout(() => events.emit("close", 0, null), 0);
+		},
+	};
 }
 
 const CURATE_PSEUDO_TOOL_CALL = `归档与全局用户画像完全重复且无项目特化信息的记忆条目。[historical tool call]
@@ -356,6 +394,7 @@ describe("Pi dreamer wiring", () => {
 			deferredBusy: [],
 			failed: [],
 			failureDetails: [],
+			details: [],
 			backlogBefore: { curate: { pending: 1, total: 1 } },
 			backlogAfter: { curate: { pending: 1, total: 1 } },
 		});
@@ -363,6 +402,148 @@ describe("Pi dreamer wiring", () => {
 		expect(capturedSystem).toContain(
 			"Write human-readable prose you author in: Spanish (Español).",
 		);
+	});
+
+	test("persists an OMP 18.1.11 dreamer task stream with tokens and task label", async () => {
+		const testDataDir = mkdtempSync(
+			join(tmpdir(), "mc-pi-dreamer-accounting-"),
+		);
+		const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+		const previousXdgDataHome = process.env.XDG_DATA_HOME;
+		process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
+		process.env.XDG_DATA_HOME = testDataDir;
+		closeDatabase();
+		__setPiHarnessKindForTesting("omp");
+		try {
+			db = openDatabase();
+			if (!db) throw new Error("dreamer accounting test database did not open");
+			const child = createEventStreamChild();
+			const spawned = deferred<void>();
+			const runner = new PiSubagentRunner({
+				invocation: { command: "omp", prefixArgs: [], targetHarness: "omp" },
+				spawnImpl: mock(() => {
+					spawned.resolve();
+					return child as never;
+				}) as never,
+			});
+			__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+			__test.setPiSubagentRunnerFactory(() => runner);
+			const projectIdentity = "git:omp-dreamer-accounting";
+			insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "PROJECT_RULES",
+				content: "Persist Pi dreamer token accounting once per task.",
+			});
+			const opts = dreamerOptions({
+				database: db,
+				projectDir: process.cwd(),
+				projectIdentity,
+				harness: "omp",
+				config: {
+					...DreamerConfigSchema.parse({
+						tasks: { curate: { schedule: "0 4 * * *" } },
+					}),
+					omp: { model: "anthropic/claude-sonnet" },
+				} as never,
+			});
+			registerPiDreamerProject(opts);
+
+			const manualRun = runPiDreamForProject(
+				projectIdentity,
+				"curate",
+				opts.registrationOwner,
+			);
+			await spawned.promise;
+			child.writeStdoutLine({
+				// OMP 18.1.11 reports provider usage on each message_end message.
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "curation complete" }],
+					stopReason: "stop",
+					usage: {
+						input: 1_200,
+						output: 80,
+						cacheRead: 300,
+						cacheWrite: 20,
+					},
+				},
+			});
+			child.emitClose();
+
+			expect((await manualRun).ran).toEqual(["curate"]);
+			const rows = getSubagentInvocations(db, projectIdentity);
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({
+				harness: "omp",
+				subagent: "dreamer",
+				task: "curate",
+				providerId: "anthropic",
+				modelId: "claude-sonnet",
+				inputTokens: 1_200,
+				outputTokens: 80,
+				cacheReadTokens: 300,
+				cacheWriteTokens: 20,
+			});
+		} finally {
+			closeDatabase();
+			__setPiHarnessKindForTesting(undefined);
+			db = null;
+			if (previousTestDataDir === undefined)
+				delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+			else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = previousTestDataDir;
+			if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+			else process.env.XDG_DATA_HOME = previousXdgDataHome;
+			rmSync(testDataDir, { recursive: true, force: true });
+		}
+	});
+
+	test("preserves completed ctx_memory results for a tool-only curate run", async () => {
+		db = createDb();
+		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: mock(async () => ({
+						ok: true,
+						assistantText: "",
+						toolCallCount: 1,
+						completedToolCalls: [
+							{
+								name: "ctx_memory",
+								arguments: { action: "archive" },
+							},
+						],
+					})),
+				}) as never,
+		);
+		insertMemory(db, {
+			projectPath: "git:pi-curate-tool-only",
+			category: "PROJECT_RULES",
+			content: "Keep the memory pool concise.",
+		});
+		const opts = dreamerOptions({
+			database: db,
+			projectDir: process.cwd(),
+			projectIdentity: "git:pi-curate-tool-only",
+			config: DreamerConfigSchema.parse({
+				model: "primary/curator",
+				tasks: { curate: { schedule: "0 4 * * *" } },
+			}),
+		});
+		registerPiDreamerProject(opts);
+
+		const result = await runPiDreamForProject(
+			"git:pi-curate-tool-only",
+			"curate",
+			opts.registrationOwner,
+		);
+
+		expect(result.failed).toEqual([]);
+		expect(result.ran).toEqual(["curate"]);
+		expect(result.details).toEqual([
+			"curate: 1 memory operation applied (archive)",
+		]);
 	});
 
 	test("shared curate validation retries Pi pseudo-tool-call text with the fallback model", async () => {

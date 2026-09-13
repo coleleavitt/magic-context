@@ -44,7 +44,6 @@ Use user-owned `profiles` when your work repositories and personal repositories 
         "pi": { "model": "github-copilot/claude-sonnet-4-6" },
         "omp": { "model": "opencode/claude-sonnet-4-6", "thinking_level": "auto" }
       },
-      "sidekick": { "model": "anthropic/claude-haiku-4-5" }
     },
     "work": {
       "historian": {
@@ -55,7 +54,6 @@ Use user-owned `profiles` when your work repositories and personal repositories 
       "dreamer": {
         "opencode": { "model": "openai/gpt-5.2-codex" }
       },
-      "sidekick": { "model": "openai/gpt-5.2-codex-mini" }
     }
   }
 }
@@ -68,7 +66,7 @@ A work repository then needs only a selection key:
 { "profile": "work" }
 ```
 
-Resolution is `user base → selected user profile → project config`; a project selection wins over the user default. Profile overlays deep-merge, so a profile can override one harness model while base fallback chains and other settings stay intact. Profiles are defined only in user config: a project may select a known name, but project-supplied `profiles` content is ignored with a warning. An unknown selected name also warns and uses the base configuration with no profile rather than disabling Magic Context. Profiles admit only hidden-agent model selection (`historian.opencode` / `historian.pi` / `historian.omp`, `dreamer.opencode` / `dreamer.pi` / `dreamer.omp`, and sidekick model fields); embeddings, prompts, storage, compaction, memory gates, thresholds, and other durable behavior stay outside them.
+Resolution is `user base → selected user profile → project config`; a project selection wins over the user default. Profile overlays deep-merge, so a profile can override one harness model while base fallback chains and other settings stay intact. Profiles are defined only in user config: a project may select a known name, but project-supplied `profiles` content is ignored with a warning. An unknown selected name also warns and uses the base configuration with no profile rather than disabling Magic Context. Profiles admit only hidden-agent model selection (`historian.opencode` / `historian.pi` / `historian.omp`, `dreamer.opencode` / `dreamer.pi` / `dreamer.omp`); embeddings, prompts, storage, compaction, memory gates, thresholds, and other durable behavior stay outside them.
 
 ### Cross-harness scoping
 
@@ -220,9 +218,9 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `language` | `string` | unset | User-config-only output language for Magic Context generated prose and primary guidance, as a 2-letter ISO 639-1 code, for example `"tr"`, `"es"`, or `"pt"`. Structural tokens stay in English. |
 | `cache_ttl` | `string` or `object` | `"5m"` | Time after a response before applying pending ops. String or per-model map. |
 | `output_reserve` | `number` or `object` | automatic | User-config-only output-token reservation override. `0` disables reservation; supports per-model maps. See below. |
-| `protected_tags` | `number` (1–100) | `20` | Last N active tags immune from immediate dropping. |
+| `protected_tokens` | absolute integer (4,000–1,000,000) | derived | Token floor protected from automatic reclaim. When omitted, derives as `clamp(round(0.05 × usableSoft), min(16,000, round(0.08 × usableSoft)), 64,000)`. Project config may only raise the resolved user-or-derived floor. |
 | `toast_duration_ms` | `number` (0–60000) | `5000` | TUI toast lifetime for Magic Context notifications in milliseconds. Increase this if toasts disappear too quickly, or set to `0` to disable Magic Context toasts entirely. |
-| `execute_threshold_percentage` | `number` (20–90) or `object` | `65` | Context usage that forces queued ops to execute. Capped at 90% of the output-reserved safe window, leaving about 10% for mid-turn input growth. Supports per-model maps. |
+| `execute_threshold_percentage` | `number` (20–90) or `object` | `65` | Context usage that forces queued ops to execute. Capped at 90% of the output-reserved safe window, leaving about 10% for in-turn input growth. Supports per-model maps. |
 | `execute_threshold_tokens` | `object` (per-model map) | — | **Optional absolute-tokens variant of `execute_threshold_percentage`.** Per-model map (e.g. `{ "default": 150000, "github-copilot/gpt-5.2-codex": 40000 }`). When set for a model, overrides the percentage-based threshold for that model. Clamped to `90% × context_limit` with a warn log. Requires a resolvable context limit — falls through to percentage if unavailable. See below. |
 | `clear_reasoning_age` | `number` | `50` | Clear thinking/reasoning blocks older than N tags. |
 | `historian_timeout_ms` | `number` | `600000` | Timeout per historian call (ms). |
@@ -230,10 +228,12 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `compaction.enabled` | `boolean` | `true` | When `false`, use compaction-off mode: keep Magic Context's knowledge layer and let native compaction (or nothing) own the context window. Boot-resolved; restart after changing it. See below. |
 | `commit_cluster_trigger` | `object` | See below | Controls the commit-cluster historian trigger. |
 | `system_prompt_injection` | `object` | See below | Controls whether and where Magic Context augments the system prompt; lets you opt specific agents out. |
-| `keep_subagents` | `boolean` | `false` | Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, sidekick, memory-migration) instead of deleting them on success, so their full transcript stays in the host session store for inspection. Kept sessions accumulate until cleared manually — leave `false` for normal use. |
+| `keep_subagents` | `boolean` | `false` | Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, memory-migration) instead of deleting them on success, so their full transcript stays in the host session store for inspection. Kept sessions accumulate until cleared manually — leave `false` for normal use. |
 | `todowrite` | `object` | See below | **Pi only.** Controls Magic Context's built-in `todowrite` tool and persistent task overlay. OpenCode has its own built-in `todowrite`, so this setting has no effect there. |
 | `sqlite` | `object` | See below | Per-connection SQLite tuning for Magic Context's own `context.db`. |
 | `storage.enforce_private_permissions` | `boolean` | `true` | User-config-only. Keep owner-only `0700` directories and `0600` files. Set `false` only for an externally managed trusted-group deployment; Magic Context will never re-tighten storage permissions. |
+
+`protected_tags` is deprecated and ignored. Remove it and use `protected_tokens` when an explicit absolute floor is needed.
 
 ### `fail_closed_blocking`
 
@@ -257,7 +257,7 @@ Set `language` in your **user config** when you want Magic Context generated pro
 }
 ```
 
-This affects historian summaries, dreamer content, sidekick output, and the Magic Context guidance block. It does not translate schemas, XML tags, memory category names, code identifiers, file paths, commands, logs, or quoted text. Project configs cannot set this field for security, since it is injected into hidden-agent system prompts.
+This affects historian summaries, dreamer content, and the Magic Context guidance block. It does not translate schemas, XML tags, memory category names, code identifiers, file paths, commands, logs, or quoted text. Project configs cannot set this field for security, since it is injected into hidden-agent system prompts.
 
 Changing `language` does not rewrite existing compartments or memories. A project can temporarily have a mixed-language pool after a mid-project switch; older stored entries keep their original language until they are naturally rewritten or superseded.
 
@@ -409,12 +409,12 @@ An absolute-tokens alternative to `execute_threshold_percentage`. Useful when yo
 
 ## Model Resolution
 
-Each hidden agent (historian, dreamer, sidekick) uses the `model` you configure for it. There is **no built-in fallback chain** — Magic Context never silently tries models you haven't configured (a hardcoded chain inevitably names providers you don't have, producing confusing `Model not found` errors).
+Each hidden agent (historian and dreamer) uses the `model` you configure for it. There is **no built-in fallback chain** — Magic Context never silently tries models you haven't configured (a hardcoded chain inevitably names providers you don't have, producing confusing `Model not found` errors).
 
 For OMP, harness selection is whole-block precedence: `historian.omp ?? historian.pi` and `dreamer.omp ?? dreamer.pi` (including task overrides). An explicit OMP block is authoritative even if it omits a model; only an absent block falls back to Pi. Within the selected block, if the configured primary fails (auth, transient, or returns unusable output), the fallback order is:
 
 1. Your explicit `fallback_models` for that agent, in order.
-2. **Historian only:** your active session model, as a last resort (a model you're already using). The dreamer and sidekick use only their configured `fallback_models`.
+2. **Historian only:** your active session model, as a last resort (a model you're already using). The dreamer uses only its configured `fallback_models`.
 
 If you set no `fallback_models`, a failing primary simply retries — it never jumps to an unconfigured model. Set `fallback_models` to add alternates of your own (each `"provider/model-id"`).
 
@@ -422,7 +422,7 @@ If you set no `fallback_models`, a failing primary simply retries — it never j
 
 ### Advanced agent fields
 
-All three agents (`historian`, `dreamer`, `sidekick`) accept these additional fields beyond the common `model`, `fallback_models`, `temperature`, `variant`, `prompt`. Most map directly to OpenCode's `AgentConfig` and pass through unchanged.
+Both agents (`historian` and `dreamer`) accept these additional fields beyond the common `model`, `fallback_models`, `temperature`, `variant`, `prompt`. Most map directly to OpenCode's `AgentConfig` and pass through unchanged.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -485,6 +485,8 @@ When turning compaction back on, run `/ctx-wrapup` if the historian is runnable 
 If `transform_mode: "rust"` is also configured, compaction-off mode resolves to the TypeScript transform and emits one frozen boot warning. There is no Rust reduced-mode contract in this cycle.
 
 ## `historian`
+
+Automatic tool drops ride folds and flushes; below the force band they wait for the next fold rather than creating a pressure-only cache bust.
 
 Historian retains agent metadata at `historian`, while each harness receives its own strict model-resolution block:
 
@@ -621,6 +623,10 @@ Controls semantic search for cross-session memories.
 | `local_dtype` | `string` | — | Local provider only. ONNX model dtype passed to the transformers.js feature-extraction pipeline (`auto`, `fp32`, `fp16`, `q8`, `int8`, `uint8`, `q4`, `bnb4`, `q4f16`, `q2`, `q2f16`, `q1`, `q1f16`). Omitted keeps the default `fp32` behavior. |
 | `endpoint` | `string` | — | Required for `"openai-compatible"`. |
 | `api_key` | `string` | — | Optional API key for remote endpoints. |
+| `query_instruction` | `string` \| `false` | model-family recipe | OpenAI-compatible query prefix. A string is prepended verbatim; `false` disables the built-in recipe. User-level only. |
+| `document_prefix` | `string` | model-family recipe | OpenAI-compatible stored-document prefix. Empty for Qwen3/gte/e5 instruct and `"search_document: "` for Nomic by default. User-level only. |
+
+Instruction-tuned embedding models are trained to distinguish retrieval queries from passages, so Magic Context automatically prepends the model card's query recipe for Qwen3-Embedding, gte-Qwen instruct, e5 instruct, and Nomic families. Plain local encoders are unchanged. Query instructions affect only live search vectors, not stored document vectors, so changing `query_instruction` does not re-embed the corpus; changing a non-empty `document_prefix` does because it changes every stored vector.
 
 When `provider: "off"`:
 
@@ -661,44 +667,6 @@ Cross-session memory settings. All memories are scoped to the current project (i
 
 ---
 
-## `sidekick`
-
-Optional prompt augmenter that runs on `/ctx-aug`. Sidekick is a hidden OpenCode subagent that creates an ephemeral child session, searches memories with `ctx_memory`, and returns a focused context briefing. 
-It is useful when starting a new session. It's better to choose a fast and cheap model, even small local models.
-
-```jsonc
-{
-  "sidekick": {
-    "enabled": true,
-    "model": "github-copilot/grok-code-fast-1",
-    "fallback_models": ["cerebras/qwen-3-235b-a22b-instruct-2507"],
-    "timeout_ms": 30000
-  }
-}
-```
-
-### Agent fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `model` | `string` | Primary model. |
-| `fallback_models` | `string` or `string[]` | Fallback models. |
-| `temperature` | `number` (0–2) | Sampling temperature. Opt-in across every harness: omission sends no `temperature` instruction to the provider; set it explicitly for flash-class calibration. Some reasoning models reject or constrain temperature, so only set it for models that accept it. |
-| `variant` | `string` | **OpenCode only.** Agent variant — selects a thinking/reasoning preset. Pi uses `thinking_level` instead. |
-| `thinking_level` | `string` | **Pi only.** Explicit reasoning level (`off`/`low`/`medium`/`high`) passed to Pi for sidekick subagent runs. See `historian.thinking_level`. |
-| `prompt` | `string` | Persistent agent-level system prompt override. Applies to every sidekick run. |
-
-### Operational fields
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | `boolean` | `false` | Enable sidekick. |
-| `timeout_ms` | `number` | `30000` | Timeout per run (ms). |
-| `system_prompt` | `string` | — | Per-invocation system prompt prepended to the sidekick child session for this `/ctx-aug` call only. Layered on top of `prompt` if both are set. |
-
-> **`prompt` vs `system_prompt`:** `prompt` is the persistent agent definition applied to every sidekick run. `system_prompt` is a per-call override injected into that specific child session — useful when a single `/ctx-aug` invocation needs different guidance than the default.
-
----
 
 ## Dreamer Sub-Features
 
@@ -775,7 +743,7 @@ Run ctx_search to retrieve full context if relevant.
 
 **Suppression rules.** The hint is not appended when:
 
-1. `<ctx-search-hint>`, `<sidekick-augmentation>`, or `<ctx-search-auto>` is already present on the user message (avoids double-nudging when `/ctx-aug` was invoked).
+1. `<ctx-search-hint>` or `<ctx-search-auto>` is already present on the user message (avoids double-nudging).
 2. The user message is shorter than `min_prompt_chars`.
 3. No result clears the threshold.
 4. An earlier pass already appended a hint for this message id (replayed verbatim on defer passes for cache safety).
@@ -842,7 +810,6 @@ Tier boundaries are hardcoded to keep behavior predictable and prevent cache-bus
 | `/ctx-recomp` | Rebuild all compartments and facts from raw session history. Resumable across restarts. |
 | `/ctx-recomp <start>-<end>` | Partial rebuild of a message range (e.g. `/ctx-recomp 1-11322`). Snaps to enclosing compartment boundaries, rebuilds only those compartments using current historian rules, and leaves prior/tail compartments and all session facts untouched. Useful after upgrading historian prompt versions or model quality. Resumable across restarts; running with a different range while partial-recomp staging exists is rejected. Currently Desktop/Web-only (TUI falls back to full-recomp dialog; ranged TUI dialog is planned). |
 | `/ctx-dream` | Enqueue the current project for a dream run and process immediately. |
-| `/ctx-aug` | Run sidekick augmentation on the provided prompt. |
 
 ---
 
@@ -859,7 +826,7 @@ Tier boundaries are hardcoded to keep behavior predictable and prevent cache-bus
     "default": 65,
     "anthropic/claude-opus-4-6": 50
   },
-  "protected_tags": 10,
+  "protected_tokens": 20000,
   "toast_duration_ms": 12000,
   "history_budget_percentage": 0.15,
   "temporal_awareness": true,
@@ -898,11 +865,5 @@ Tier boundaries are hardcoded to keep behavior predictable and prevent cache-bus
     "auto_search": { "enabled": true, "score_threshold": 0.6, "min_prompt_chars": 20 },
     "git_commit_indexing": { "enabled": false, "since_days": 365, "max_commits": 2000 }
   },
-
-  "sidekick": {
-    "model": "github-copilot/gpt-5.4",
-    "fallback_models": ["anthropic/claude-sonnet-4-6"],
-    "timeout_ms": 30000
-  }
 }
 ```

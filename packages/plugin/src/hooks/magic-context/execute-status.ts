@@ -8,6 +8,7 @@ import type {
     DreamTaskProgress,
 } from "../../features/magic-context/dreamer/task-registry";
 import { formatDreamTaskBacklogs } from "../../features/magic-context/dreamer/task-registry";
+import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
 import { getPendingOps } from "../../features/magic-context/storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
@@ -21,10 +22,19 @@ import { getMagicContextStorageResolution } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
 import { formatThresholdClampNote } from "../../shared/format-threshold";
 import { sessionLog } from "../../shared/logger";
+import {
+    formatOpenCodeDbMissingStatusLine,
+    formatOpenCodeDbReadFailureStatusLine,
+    getOpenCodeDbReadFailure,
+    openCodeDbPathExists,
+    resolveOpenCodeDbPath,
+} from "../../shared/opencode-db-path";
 import type { TailHygieneStatus } from "../../shared/rpc-types";
 import { RUST_MODE_HOST_PATHS_LINE } from "../../shared/rust-mode-status";
 import type { Database } from "../../shared/sqlite";
+import { renderUserStatusSummary } from "../../shared/status-summary";
 import { formatTailHygiene } from "../../shared/tail-hygiene-status";
+import { renderUserFacingFailure, userFacingFailureCode } from "../../shared/user-facing-codes";
 import {
     formatWindowDerivationLine,
     type WindowGeometryResult,
@@ -67,7 +77,6 @@ function formatExecuteThreshold(detail: ExecuteThresholdDetail, contextLimit: nu
 export function executeStatus(
     db: Database,
     sessionId: string,
-    protectedTags: number,
     executeThresholdPercentageConfig:
         | number
         | { default: number; [modelKey: string]: number } = DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
@@ -85,6 +94,8 @@ export function executeStatus(
         cacheTtlConfig: MagicContextConfig["cache_ttl"];
         cacheTtlConfigured: boolean;
         configParseFailures: ConfigParseFailure[];
+        diagnostics?: boolean;
+        compactionEnabled?: boolean;
     },
 ): string {
     // Single source of truth — resolver tells us both the effective percentage AND
@@ -102,10 +113,18 @@ export function executeStatus(
         },
     );
     const executeThresholdPercentage = thresholdDetail.percentage;
+    const openCodeDbResolution = resolveOpenCodeDbPath();
+    const openCodeDbReadFailure = getOpenCodeDbReadFailure();
+    const openCodeDbStatusLine = !openCodeDbPathExists(openCodeDbResolution)
+        ? formatOpenCodeDbMissingStatusLine(openCodeDbResolution)
+        : openCodeDbReadFailure?.path === openCodeDbResolution.path
+          ? formatOpenCodeDbReadFailureStatusLine(openCodeDbReadFailure)
+          : null;
     try {
         const meta = getOrCreateSessionMeta(db, sessionId);
         const tags = getTagsBySession(db, sessionId);
         const pendingOps = getPendingOps(db, sessionId);
+        const protectionWindow = getProtectionWindowForSession(db, sessionId);
 
         const activeTags = tags.filter((t) => t.status === "active");
         const droppedTags = tags.filter((t) => t.status === "dropped");
@@ -150,6 +169,7 @@ export function executeStatus(
             formatConfigParseStatusLine,
         );
         const lines: string[] = [
+            ...(openCodeDbStatusLine ? [openCodeDbStatusLine, ""] : []),
             ...parseFailureLines,
             ...(parseFailureLines.length > 0 ? [""] : []),
             "## Magic Status",
@@ -167,7 +187,7 @@ export function executeStatus(
             `- Total queued: ${pendingOps.length}`,
             "",
             ...(meta.lastTransformError
-                ? ["### Last Transform Error", `- ${meta.lastTransformError}`, ""]
+                ? ["### Warning", `- ${renderUserFacingFailure("transform_update_failed")}`, ""]
                 : []),
             "### Cache TTL",
             `- ${formatCacheTtlDisplay(ttlDisplay)}`,
@@ -179,7 +199,8 @@ export function executeStatus(
             `- Execute threshold: ${formatExecuteThreshold(thresholdDetail, displayContextLimit)}`,
             `- Last input tokens: ${displayInputTokens.toLocaleString()} tokens`,
             "",
-            `**Protected tags:** ${protectedTags}`,
+            `**Protected tool tags:** ${protectionWindow.status.protectedCount} (${protectionWindow.status.protectedMass.toLocaleString()} tokens)`,
+            `**Protection floor:** ${protectionWindow.status.floor.toLocaleString()} tokens`,
             `**Subagent session:** ${meta.isSubagent}`,
         ];
 
@@ -251,6 +272,41 @@ export function executeStatus(
             ? ((historyBlockTokens / budgetTokens) * 100).toFixed(0)
             : null;
 
+        if (display?.diagnostics === false) {
+            return renderUserStatusSummary(
+                {
+                    inputTokens: displayInputTokens,
+                    usableContextTokens: displayContextLimit,
+                    usagePercentage: displayPercentage,
+                    cacheLifetime: formatCacheTtlDisplay(ttlDisplay).replace(/^Cache TTL:\s*/, ""),
+                    automaticCompressionThreshold:
+                        display?.compactionEnabled === false ? null : thresholdDetail.percentage,
+                    compression: {
+                        state: meta.compartmentInProgress
+                            ? "compressing"
+                            : compartments.length > 0
+                              ? "ready"
+                              : "waiting",
+                        historyBlockCount: compartments.length,
+                    },
+                    reclaimable: {
+                        toolOutputCount: tailHygiene?.reclaimableToolOutputCount ?? 0,
+                        tokens: tailHygiene?.u ?? 0,
+                    },
+                    memoryCount: 0,
+                    noteCount: 0,
+                    embedding: { state: "waiting", indexed: 0, total: 0 },
+                    warnings: [
+                        ...(meta.lastTransformError ? (["transform_update_failed"] as const) : []),
+                        ...(parseFailureLines.length > 0
+                            ? (["configuration_warning"] as const)
+                            : []),
+                    ],
+                },
+                "markdown",
+            );
+        }
+
         lines.push(
             "",
             "### History Compression",
@@ -284,7 +340,10 @@ export function executeStatus(
 
         return lines.join("\n");
     } catch (error) {
-        sessionLog(sessionId, "ctx-status failed:", error);
-        return `Error: Failed to read context status. ${getErrorMessage(error)}`;
+        sessionLog(
+            sessionId,
+            `ctx-status failed code=${userFacingFailureCode("status_unavailable")}: ${getErrorMessage(error)}`,
+        );
+        return `Error: ${renderUserFacingFailure("status_unavailable")}`;
     }
 }

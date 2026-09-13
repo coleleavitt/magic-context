@@ -1,7 +1,8 @@
+import { drainNotifications } from "../../shared/rpc-notifications";
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it, mock } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -35,8 +36,10 @@ import {
     appendNoteNudgeAnchor,
     getAutoSearchHintDecisions,
     getNoteNudgeAnchors,
+    getOverflowState,
     getPersistedNoteNudge,
     getThinkingBindingRecoveryTarget,
+    recordDetectedContextLimit,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
     normalizeMaterializeReason,
@@ -49,7 +52,12 @@ import type { ContextUsage } from "../../features/magic-context/types";
 import { getWindowReportsPath } from "../../features/magic-context/window-report-ledger";
 import { createEventHandler as createPluginEventHandler } from "../../plugin/event";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
+import { clearWindowOverlayCacheForTest, setWindowOverlayPath } from "../../shared/window-geometry";
 import { createEventHandler } from "./event-handler";
+import { __ignoredNotificationTest } from "./send-session-notification";
+
+// These alert-content units supply idle authorization independently of the harness event hook.
+beforeEach(() => __ignoredNotificationTest.setHoldDetector(() => false));
 
 type ContextUsageCacheEntry = {
     usage: ContextUsage;
@@ -62,10 +70,13 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 afterEach(() => {
+    __ignoredNotificationTest.reset();
     __resetMessageIndexAsyncForTests();
     transformDecisionLogTest.reset();
     closeDatabase();
     clearModelsDevCache();
+    setWindowOverlayPath(undefined);
+    clearWindowOverlayCacheForTest();
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
 
@@ -144,7 +155,6 @@ function createDeps(contextUsageMap: Map<string, ContextUsageCacheEntry>) {
         contextUsageMap,
         compactionHandler: { onCompacted: mock(() => {}) },
         config: {
-            protected_tags: 5,
             cache_ttl: "5m" as string | Record<string, string>,
         },
         tagger: {
@@ -515,7 +525,7 @@ describe("createEventHandler", () => {
             internalChildSessions,
         });
 
-        // A magic-context child (historian/dreamer/sidekick/migration title).
+        // A Magic Context child (historian, Dreamer, or migration title).
         await handler({
             event: {
                 type: "session.created",
@@ -590,6 +600,132 @@ describe("createEventHandler", () => {
         expect(getOrCreateSessionMeta(openDatabase(), "ses-usage").observedSafeInputTokens).toBe(
             135_000,
         );
+    });
+
+    it("refuses an impossible success reading above an overlay-backed wall", async () => {
+        useTempDataHome("context-event-impossible-usage-");
+        const overlayPath = join(makeTempDir("context-event-overlay-"), "window-overlay.json");
+        writeFileSync(
+            overlayPath,
+            JSON.stringify({
+                schema: "fusiform-window-overlay/v1",
+                generated_at: "2026-09-11T00:00:00Z",
+                minted_provider_ids: [],
+                cells: [
+                    {
+                        provider_id: "test-provider",
+                        model_id: "test-model",
+                        facts: {
+                            "window.enforced": {
+                                value: { kind: "stated", value: 272_000 },
+                                grade: "measured",
+                                units: "provider",
+                                boundary: "Observed",
+                                source_ref: "session regression fixture",
+                                observed_at: "2026-09-11T00:00:00Z",
+                            },
+                        },
+                    },
+                ],
+            }),
+        );
+        setWindowOverlayPath(overlayPath);
+        await refreshModelLimitsFromApi({
+            config: {
+                providers: async () => ({
+                    data: {
+                        providers: [
+                            {
+                                id: "test-provider",
+                                models: {
+                                    "test-model": {
+                                        limit: { context: 272_000, output: 128_000 },
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                }),
+            },
+        });
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        const deps = createDeps(contextUsageMap);
+        const handler = createEventHandler(deps);
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        role: "assistant",
+                        finish: "stop",
+                        sessionID: "ses-impossible-usage",
+                        providerID: "test-provider",
+                        modelID: "test-model",
+                        tokens: { input: 585_397, cache: { read: 8_320, write: 0 } },
+                    },
+                },
+            },
+        });
+
+        const meta = getOrCreateSessionMeta(deps.db, "ses-impossible-usage");
+        expect(meta.observedSafeInputTokens).toBe(0);
+        expect(meta.lastInputTokens).toBe(0);
+        expect(meta.lastUsageContextLimit).toBe(240_000);
+        expect(contextUsageMap.get("ses-impossible-usage")?.usage.inputTokens).toBe(0);
+    });
+
+    it("clears a stale unkeyed detected limit on the first successful event after restart", async () => {
+        useTempDataHome("context-event-stale-detected-restart-");
+        const sessionId = "ses-stale-detected-restart";
+        recordDetectedContextLimit(openDatabase(), sessionId, 131_232);
+        closeDatabase();
+
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        const prompt = mock(async () => ({}));
+        const deps = createDeps(contextUsageMap);
+        deps.client = {
+            config: { providers: async () => ({ data: { providers: [] } }) },
+            session: { prompt },
+        };
+        const handler = createEventHandler(deps);
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        role: "assistant",
+                        finish: "stop",
+                        sessionID: sessionId,
+                        providerID: "ninfer",
+                        modelID: "qwen3.8-27b-nvfp4",
+                        tokens: { input: 148_241, cache: { read: 0, write: 0 } },
+                    },
+                },
+            },
+        });
+
+        expect(getOverflowState(deps.db, sessionId).detectedContextLimit).toBe(0);
+        const meta = getOrCreateSessionMeta(deps.db, sessionId);
+        expect(meta.lastUsageContextLimit).toBe(200_000);
+        expect(meta.lastContextPercentage).toBeCloseTo((148_241 / 200_000) * 100, 10);
+        expect(prompt).not.toHaveBeenCalled();
+
+        await handler({
+            event: {
+                type: "session.error",
+                properties: {
+                    sessionID: sessionId,
+                    error: "This model's maximum context length is 131232 tokens.",
+                },
+            },
+        });
+
+        expect(getOverflowState(deps.db, sessionId, "ninfer/qwen3.8-27b-nvfp4")).toMatchObject({
+            detectedContextLimit: 131_232,
+            detectedContextLimitModelKey: "ninfer/qwen3.8-27b-nvfp4",
+        });
     });
 
     it("recovers silently when a cache-regressed context limit is fixed by refresh", async () => {
@@ -693,14 +829,20 @@ describe("createEventHandler", () => {
 
         const meta = getOrCreateSessionMeta(openDatabase(), "ses-regression-alert");
         expect(meta.cacheAlertSent).toBe(true);
-        expect(meta.lastContextPercentage).toBe(400);
-        expect(prompt).toHaveBeenCalledTimes(1);
-        const call = prompt.mock.calls[0]?.[0] as { body?: { parts?: Array<{ text?: string }> } };
-        expect(call.body?.parts?.[0]?.text).toContain("context limit of 30,000 tokens");
-        expect(call.body?.parts?.[0]?.text).toContain("successfully sent 90,000 tokens");
+        expect(meta.lastContextPercentage).toBe(100);
+        expect(meta.lastUsageContextLimit).toBe(120_000);
+        expect(prompt).not.toHaveBeenCalled();
+        const notices = drainNotifications(0, "ses-regression-alert");
+        expect(notices).toHaveLength(1);
+        const text = String(notices[0].payload.message);
+        expect(text).toContain("OpenCode's catalog reports a context limit of 30,000 tokens");
+        expect(text).toContain("this session has sent 90,000 tokens successfully");
+        expect(text).toContain("larger proven value for its pressure math");
+        expect(text).toContain("provider.<provider-id>.models.<model-id>.limit.context");
+        expect(text).not.toContain("Restart OpenCode");
     });
 
-    it("does not mark the cache alert sent when notification delivery fails", async () => {
+    it("delivers the cache alert over RPC even when the prompt transport is unavailable", async () => {
         useTempDataHome("context-event-cache-regression-alert-failed-");
         const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
         await refreshModelLimitsFromApi(providersClient(100_000));
@@ -745,8 +887,9 @@ describe("createEventHandler", () => {
         });
 
         const meta = getOrCreateSessionMeta(openDatabase(), "ses-regression-alert-failed");
-        expect(prompt).toHaveBeenCalledTimes(1);
-        expect(meta.cacheAlertSent).toBe(false);
+        expect(prompt).not.toHaveBeenCalled();
+        expect(meta.cacheAlertSent).toBe(true);
+        expect(drainNotifications(0, "ses-regression-alert-failed")).toHaveLength(1);
     });
 
     it("refreshes ttl for tokenless assistant updates when prior usage exists", async () => {
@@ -1504,6 +1647,34 @@ describe("createEventHandler — compaction-off overflow gating (issue #266 S3)"
         const state = readOverflowState("ses-on");
         expect(state.needsEmergencyRecovery).toBe(1);
         expect(state.detectedContextLimit).toBe(120000);
+    });
+
+    it("uses model identity carried by session.error instead of a prior session model", async () => {
+        useTempDataHome("context-event-overflow-explicit-model-");
+        const deps = createDeps(new Map());
+        updateSessionMeta(deps.db, "ses-explicit-model", {
+            lastObservedModelKey: "prior/model",
+        });
+        const handler = createEventHandler(deps);
+
+        await handler({
+            event: {
+                type: "session.error",
+                properties: {
+                    sessionID: "ses-explicit-model",
+                    providerID: "current-provider",
+                    modelID: "current-model",
+                    error: OVERFLOW_ERROR,
+                },
+            },
+        });
+
+        expect(
+            getOverflowState(deps.db, "ses-explicit-model", "current-provider/current-model"),
+        ).toMatchObject({
+            detectedContextLimit: 120_000,
+            detectedContextLimitModelKey: "current-provider/current-model",
+        });
     });
 
     it("compaction OFF: overflow never arms recovery, but the provider limit is still recorded for raw-usage math", async () => {

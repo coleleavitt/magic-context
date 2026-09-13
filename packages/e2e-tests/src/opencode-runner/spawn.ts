@@ -20,7 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { prepareContextDatabase } from "../prepare-context-db";
-import { assertMockEndpoint, pinMockAgents } from "../mock-routing";
+import { assertMockEndpoint, assertMockProviders, pinMockAgents } from "../mock-routing";
 import {
     buildHermeticBinaries,
     detectRustModePrereqs,
@@ -91,7 +91,7 @@ export interface SpawnOptions {
     /** Pre-create the isolated Magic Context DB unless the test expects the plugin to stay disabled. */
     prepareContextDatabase?: boolean;
     /** Expected Magic Context state after startup; readiness waits for this state. Defaults to enabled. */
-    expectedMagicContextState?: "enabled" | "conflict-disabled";
+    expectedMagicContextState?: "enabled" | "configured-disabled" | "conflict-disabled";
     /**
      * Reuse a pre-created isolated env instead of allocating a fresh one. The
      * Rust-mode harness creates the env first so a hermetic subc daemon can
@@ -320,6 +320,14 @@ function writeConfigs(
 
     const registeredProviders = opencodeConfig.provider as Record<string, { options?: { baseURL?: string } }>;
     assertMockEndpoint(registeredProviders[mockProviderID]?.options?.baseURL, mockProviderURL);
+    for (const provider of Object.values(registeredProviders)) {
+        assertMockEndpoint(provider.options?.baseURL, mockProviderURL);
+    }
+    // Prevent environment credentials and the built-in catalog from enabling
+    // providers absent from the fixture, including automatic small-model calls.
+    opencodeConfig.enabled_providers = Object.keys(registeredProviders);
+    opencodeConfig.model = `${mockProviderID}/${mockModelID}`;
+    opencodeConfig.small_model = `${mockProviderID}/${mockModelID}`;
 
     // magic-context defaults tuned for fast triggering in tests. This is the
     // USER-tier config: thresholds live here because project-tier thresholds are
@@ -334,7 +342,6 @@ function writeConfigs(
         execute_threshold_percentage: 40,
         history_budget_percentage: 0.15,
         dreamer: { disable: true },
-        sidekick: { disable: true },
         ...pinMockAgents(opts.magicContextConfig, `${mockProviderID}/${mockModelID}`),
     };
     if (opts.userSubcConnectionFile) {
@@ -342,6 +349,9 @@ function writeConfigs(
     }
 
     writeFileSync(join(env.configDir, "opencode.json"), JSON.stringify(opencodeConfig, null, 2));
+    if (process.env.MC_E2E_TRACE_PROVIDER === "1") {
+        console.error(`[mock-config] ${JSON.stringify({ configDir: env.configDir, mockProviderURL, opencodeConfig, magicContext })}`);
+    }
 
     // The plugin's loadPluginConfig() looks for magic-context.jsonc under
     // ${XDG_CONFIG_HOME}/opencode/magic-context.jsonc (user config) or
@@ -384,7 +394,7 @@ function writeConfigs(
 }
 
 export interface ReadinessOptions {
-    expectedMagicContextState?: "enabled" | "conflict-disabled";
+    expectedMagicContextState?: "enabled" | "configured-disabled" | "conflict-disabled";
     pluginLogPath?: string;
     pluginLogStartOffset?: number;
     mockProviderID?: string;
@@ -507,7 +517,7 @@ export async function waitForReady(
                 throw new Error("Magic Context conflict-disable verdict is not ready");
             }
         });
-    } else {
+    } else if (expectedMagicContextState === "enabled") {
         await waitForStage("magicContext", async () => {
             const toolIds = await fetchJson(toolsUrl, "plugin tools");
             if (!Array.isArray(toolIds) || !toolIds.includes("ctx_search")) {
@@ -718,6 +728,13 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
             mockProviderID: resolvedOpts.mockProviderID,
             mockModelID: resolvedOpts.mockModelID,
         });
+        const providers = await fetch(`${url}/config/providers`).then((response) => response.json());
+        assertMockProviders(providers, resolvedOpts.mockProviderURL);
+        if (process.env.MC_E2E_TRACE_PROVIDER === "1") {
+            const endpoints = (providers as { providers: Array<{ id: string; options?: { baseURL?: string } }> }).providers
+                .map((provider) => ({ id: provider.id, baseURL: provider.options?.baseURL }));
+            console.error(`[mock-effective-providers] ${JSON.stringify({ url, endpoints })}`);
+        }
     } catch (err) {
         // Surface captured output on boot failure to help debugging.
         child.kill("SIGTERM");

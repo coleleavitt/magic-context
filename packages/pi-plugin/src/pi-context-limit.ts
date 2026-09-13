@@ -3,6 +3,7 @@ import {
 	resolveOutputReserve,
 } from "@magic-context/core/shared/models-dev-cache";
 import {
+	applyProvenInputFloor,
 	deriveWindowGeometry,
 	getWindowOverlay,
 	resolveWindowOverlayFacts,
@@ -21,8 +22,11 @@ export interface PiModelLimit {
 
 export interface ResolvePiWindowGeometryArgs {
 	rawContextWindow?: number;
+	/** Defaults to observed for Pi's live getContextUsage() window. */
+	rawContextWindowSource?: "observed" | "catalog";
 	model?: PiModelLimit;
 	detectedContextLimit?: number;
+	provenInputTokens?: number;
 	persistedInputTokens?: number;
 	persistedPercentage?: number;
 	reserveConfig?: OutputReserveConfig;
@@ -40,11 +44,17 @@ function isSaneLimit(value: number | undefined): value is number {
 export function resolvePiWindowGeometry(
 	args: ResolvePiWindowGeometryArgs,
 ): WindowGeometryResult | undefined {
-	const runtimeWindow = isSaneLimit(args.rawContextWindow)
+	const rawWindow = isSaneLimit(args.rawContextWindow)
 		? args.rawContextWindow
-		: isSaneLimit(args.model?.contextWindow)
-			? args.model.contextWindow
-			: undefined;
+		: undefined;
+	const observedWindow =
+		args.rawContextWindowSource === "catalog" ? undefined : rawWindow;
+	const catalogWindow =
+		args.rawContextWindowSource === "catalog" && rawWindow !== undefined
+			? rawWindow
+			: isSaneLimit(args.model?.contextWindow)
+				? args.model.contextWindow
+				: undefined;
 	const persistedUsable =
 		isSaneLimit(args.persistedInputTokens) &&
 		typeof args.persistedPercentage === "number" &&
@@ -59,7 +69,7 @@ export function resolvePiWindowGeometry(
 		args.persistedPercentage > 0
 			? args.persistedInputTokens / (args.persistedPercentage / 100)
 			: undefined;
-	const context = runtimeWindow ?? persistedWindow;
+	const context = observedWindow ?? catalogWindow ?? persistedWindow;
 	if (!isSaneLimit(context)) return undefined;
 	const providerID = args.model?.provider ?? "unknown";
 	const modelID = args.model?.id ?? "unknown";
@@ -76,6 +86,8 @@ export function resolvePiWindowGeometry(
 			output: args.model?.maxTokens,
 		},
 		{
+			providerLimit:
+				observedWindow === undefined ? undefined : { context: observedWindow },
 			overlay: resolveWindowOverlayFacts(
 				providerID,
 				modelID,
@@ -88,22 +100,35 @@ export function resolvePiWindowGeometry(
 			harness: "pi",
 		},
 	);
+	if (!result) return result;
+	let resolved = result;
+	if (outputReserveOverride === undefined && isSaneLimit(persistedUsable)) {
+		const persistedDenominator = Math.round(persistedUsable);
+		if (persistedDenominator < resolved.usableSoft) {
+			resolved = {
+				...resolved,
+				usableSoft: persistedDenominator,
+				derivation: {
+					...resolved.derivation,
+					reserve: Math.max(
+						0,
+						resolved.derivation.window - persistedDenominator,
+					),
+				},
+			};
+		} else {
+			resolved = applyProvenInputFloor(resolved, persistedDenominator).geometry;
+		}
+	}
+
 	if (
-		!result ||
-		outputReserveOverride !== undefined ||
-		!isSaneLimit(persistedUsable)
-	)
-		return result;
-	const usableSoft = Math.round(persistedUsable);
-	return {
-		...result,
-		usableSoft,
-		usableHard: Math.max(usableSoft, result.usableHard),
-		derivation: {
-			...result.derivation,
-			reserve: Math.max(0, result.derivation.window - usableSoft),
-		},
-	};
+		!isSaneLimit(args.detectedContextLimit) &&
+		isSaneLimit(args.provenInputTokens)
+	) {
+		resolved = applyProvenInputFloor(resolved, args.provenInputTokens).geometry;
+	}
+
+	return resolved;
 }
 
 export function resolvePiUsableContextLimit(

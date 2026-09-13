@@ -2,6 +2,7 @@
 
 import { afterEach, describe, expect, mock, test } from "bun:test";
 
+import { MagicContextConfigSchema } from "../config/schema/magic-context";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
 import { insertMemory } from "../features/magic-context/memory";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
@@ -12,19 +13,27 @@ import {
     initializeDatabase,
     LATEST_SUPPORTED_VERSION,
 } from "../features/magic-context/storage-db";
+import {
+    resetEpochFloorRegistryForTest,
+    resolveEpochFloorForPass,
+} from "../features/magic-context/storage-meta-persisted";
 import { createLiveSessionState } from "../hooks/magic-context/live-session-state";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import type { RustModeModuleClient } from "../hooks/magic-context/rust-mode-transform";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
+import type { MagicContextRpcServer } from "../shared/rpc-server";
 import { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
 import {
     buildCompartmentCount,
+    buildDebugMemoryUsage,
     buildSidebarSnapshot,
     buildSidebarSnapshotRpcResponse,
     buildStatusDetail,
     executeRustRecompRpc,
+    isDebugRpcEnabled,
     loadRustSessionStatus,
+    registerRpcHandlers,
 } from "./rpc-handlers";
 import { resetSidebarSnapshotCache } from "./sidebar-snapshot-cache";
 
@@ -35,9 +44,77 @@ function createTestDb(): Database {
     return db;
 }
 
+type TestRpcHandler = (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
+
+function registeredRpcMethods(debugRpc: boolean): Map<string, TestRpcHandler> {
+    const handlers = new Map<string, TestRpcHandler>();
+    const rpcServer = {
+        handle(method: string, handler: TestRpcHandler) {
+            handlers.set(method, handler);
+        },
+    } as unknown as MagicContextRpcServer;
+    registerRpcHandlers(rpcServer, {
+        directory: process.cwd(),
+        config: MagicContextConfigSchema.parse({ debug_rpc: debugRpc }),
+        client: {},
+        liveSessionState: createLiveSessionState(),
+    });
+    return handlers;
+}
+
 afterEach(() => {
     resetSidebarSnapshotCache();
     clearModelsDevCache();
+});
+
+describe("debug RPC guard", () => {
+    test("reports process and readable native allocation counters", () => {
+        const memory = buildDebugMemoryUsage();
+        expect(memory.memoryUsage).toMatchObject({
+            rss: expect.any(Number),
+            external: expect.any(Number),
+            arrayBuffers: expect.any(Number),
+        });
+        expect(memory.native.sqlite).toMatchObject({
+            connectionCount: expect.any(Number),
+            cacheUpperBoundBytes: expect.any(Number),
+            sqliteStatusApi: "unavailable",
+        });
+        expect(memory.native.tokenizer.loaded).toBeTypeOf("boolean");
+        expect(memory.native.localEmbedding.loaded).toBeTypeOf("boolean");
+        expect(memory.native.quickJs.loaded).toBeTypeOf("boolean");
+        expect(memory.holders.lkgSlots.totalBytes).toBeTypeOf("number");
+        expect(memory.holders.messageIndexQueue.activeBufferBytes).toBeTypeOf("number");
+    });
+
+    test("does not register heap diagnostics when the flag is off by default", () => {
+        const previous = process.env.MAGIC_CONTEXT_DEBUG_RPC;
+        delete process.env.MAGIC_CONTEXT_DEBUG_RPC;
+        try {
+            const handlers = registeredRpcMethods(false);
+            expect(handlers.has("debug.memoryUsage")).toBe(false);
+            expect(handlers.has("debug.heapSnapshot")).toBe(false);
+        } finally {
+            if (previous === undefined) delete process.env.MAGIC_CONTEXT_DEBUG_RPC;
+            else process.env.MAGIC_CONTEXT_DEBUG_RPC = previous;
+        }
+    });
+
+    test("registers diagnostics only for an explicit config or environment opt-in", () => {
+        const previous = process.env.MAGIC_CONTEXT_DEBUG_RPC;
+        delete process.env.MAGIC_CONTEXT_DEBUG_RPC;
+        try {
+            expect(isDebugRpcEnabled({ debug_rpc: true }, {})).toBe(true);
+            expect(isDebugRpcEnabled({ debug_rpc: false }, { MAGIC_CONTEXT_DEBUG_RPC: "1" })).toBe(
+                true,
+            );
+            expect(isDebugRpcEnabled({ debug_rpc: false }, {})).toBe(false);
+            expect(registeredRpcMethods(true).has("debug.heapSnapshot")).toBe(true);
+        } finally {
+            if (previous === undefined) delete process.env.MAGIC_CONTEXT_DEBUG_RPC;
+            else process.env.MAGIC_CONTEXT_DEBUG_RPC = previous;
+        }
+    });
 });
 
 describe("Rust maintenance RPC routing", () => {
@@ -135,6 +212,37 @@ describe("buildStatusDetail — active profile", () => {
     });
 });
 
+describe("buildStatusDetail — protected-token floor", () => {
+    test("uses the durable first-observed floor for pre-snapshot sessions after restart", () => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-status-pre-snapshot-floor";
+            const insertTag = db.prepare(
+                `INSERT INTO tags (
+                    session_id, message_id, type, status, byte_size, tag_number,
+                    token_count, input_token_count, reasoning_token_count
+                ) VALUES (?, ?, 'tool', 'active', 1, ?, 2000, 0, 0)`,
+            );
+            for (let tagNumber = 1; tagNumber <= 10; tagNumber += 1) {
+                insertTag.run(sessionId, `message-${tagNumber}`, tagNumber);
+            }
+
+            const defer = resolveEpochFloorForPass(db, sessionId, {
+                usableSoft: 100_000,
+                isCacheBustingPass: false,
+            });
+            expect(defer.floor).toBe(8_000);
+            resetEpochFloorRegistryForTest();
+
+            const detail = buildStatusDetail(db, sessionId, process.cwd());
+            expect(detail.protectedTagCount).toBe(4);
+        } finally {
+            closeQuietly(db);
+            resetEpochFloorRegistryForTest();
+        }
+    });
+});
+
 describe("buildStatusDetail — storage version probe", () => {
     test("reports the upstream lane when fork rows share context.db", () => {
         const db = createTestDb();
@@ -223,6 +331,7 @@ describe("buildSidebarSnapshot — persisted tail hygiene", () => {
                 generationInvalidated: false,
                 baselineGeneration: 0,
                 computedAt: 0,
+                reclaimableToolOutputCount: 0,
             });
         } finally {
             closeQuietly(db);
@@ -260,6 +369,7 @@ describe("buildSidebarSnapshot — persisted tail hygiene", () => {
                 generationInvalidated: false,
                 baselineGeneration: 7,
                 computedAt: 123,
+                reclaimableToolOutputCount: 0,
             });
         } finally {
             closeQuietly(db);

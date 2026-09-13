@@ -74,6 +74,7 @@ export interface PiRunnerOptions {
   magicContextConfig?: Record<string, unknown>;
   piSettingsExtra?: Record<string, unknown>;
   modelContextLimit?: number;
+  extensionsBeforeMagicContext?: string[];
   /** Compatibility option from the old spawn-per-turn runner. RPC sessions persist naturally. */
   continueSession?: boolean;
 }
@@ -167,7 +168,6 @@ export function writeConfigs(env: PiIsolatedEnv, opts: PiRunnerOptions): void {
     embedding: { provider: "off" },
     historian: { model: "anthropic/claude-haiku-4-5" },
     dreamer: { disable: true },
-    sidekick: { disable: true },
     ...pinMockAgents(opts.magicContextConfig, "anthropic/claude-haiku-4-5", "pi"),
   };
   writeFileSync(join(env.agentDir, "magic-context.jsonc"), JSON.stringify(magicContext, null, 2));

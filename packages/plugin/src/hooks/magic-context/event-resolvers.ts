@@ -1,4 +1,4 @@
-import type { ContextDatabase } from "../../features/magic-context/storage";
+import { type ContextDatabase, updateSessionMeta } from "../../features/magic-context/storage";
 import {
     getOverflowState,
     loadPersistedUsage,
@@ -12,9 +12,70 @@ import {
     isSaneLimit,
 } from "../../shared/models-dev-cache";
 import { resolveModelConfigOrDefault } from "../../shared/prompt-surface";
+import { applyProvenInputFloor, hasTrustedAbsoluteWall } from "../../shared/window-geometry";
 
 export { escalationBands, MAX_EXECUTE_THRESHOLD };
 export const DEFAULT_CONTEXT_LIMIT = 200_000;
+
+function modelMatchedPersistedUsage(
+    db: ContextDatabase | undefined,
+    sessionID: string | undefined,
+    modelKey: string | undefined,
+): NonNullable<ReturnType<typeof loadPersistedUsage>> | undefined {
+    if (!db || !sessionID || !modelKey) return undefined;
+    try {
+        const persisted = loadPersistedUsage(db, sessionID);
+        if (
+            persisted !== null &&
+            piModelRefToCanonical(persisted.lastObservedModelKey ?? "") ===
+                piModelRefToCanonical(modelKey)
+        ) {
+            return persisted;
+        }
+    } catch {
+        // Persisted usage is best-effort; the normal resolver remains available.
+    }
+    return undefined;
+}
+
+function modelMatchedProvenContextLimit(
+    db: ContextDatabase | undefined,
+    sessionID: string | undefined,
+    modelKey: string | undefined,
+): number | undefined {
+    const persisted = modelMatchedPersistedUsage(db, sessionID, modelKey);
+    return isSaneLimit(persisted?.observedSafeInputTokens)
+        ? persisted.observedSafeInputTokens
+        : undefined;
+}
+
+function applySessionProvenFloor(
+    geometry: NonNullable<ReturnType<typeof getSdkWindowGeometry>>,
+    persisted: NonNullable<ReturnType<typeof modelMatchedPersistedUsage>> | undefined,
+    ctx?: { db?: ContextDatabase; sessionID?: string },
+) {
+    const provenLimit = isSaneLimit(persisted?.observedSafeInputTokens)
+        ? persisted.observedSafeInputTokens
+        : undefined;
+    const result = applyProvenInputFloor(geometry, provenLimit);
+    if (result.refused && ctx?.db && ctx.sessionID) {
+        const impossiblePressure = persisted?.usage.inputTokens
+            ? persisted.usage.inputTokens > result.refused.absoluteWall
+            : false;
+        updateSessionMeta(ctx.db, ctx.sessionID, {
+            observedSafeInputTokens: 0,
+            cacheAlertSent: false,
+            lastUsageContextLimit: geometry.usableSoft,
+            lastInputTokens: impossiblePressure ? 0 : persisted?.usage.inputTokens,
+            lastContextPercentage: impossiblePressure ? 0 : persisted?.usage.percentage,
+        });
+        sessionLog(
+            ctx.sessionID,
+            `persisted proven floor ${result.refused.reading} exceeds trusted absolute wall ${result.refused.absoluteWall}; cleared and re-resolved to ${geometry.usableSoft}`,
+        );
+    }
+    return result.geometry;
+}
 
 export function resolveContextWindowGeometry(
     providerID: string | undefined,
@@ -36,10 +97,16 @@ export function resolveContextWindowGeometry(
             // Geometry resolution remains best-effort when session metadata is unavailable.
         }
     }
-    return getSdkWindowGeometry(providerID, modelID, detected, {
+    const geometry = getSdkWindowGeometry(providerID, modelID, detected, {
         detectedLimitProvenance,
         harness: "opencode",
     });
+    if (!geometry || detected !== undefined) return geometry;
+    return applySessionProvenFloor(
+        geometry,
+        modelMatchedPersistedUsage(ctx?.db, ctx?.sessionID, modelKey),
+        ctx,
+    );
 }
 
 type CacheTtlConfig = string | Record<string, string>;
@@ -83,7 +150,20 @@ export function resolveContextLimit(
                   detectedLimitProvenance,
               })
             : undefined;
-    return fromModelsDev ?? detected ?? DEFAULT_CONTEXT_LIMIT;
+    const resolved = fromModelsDev ?? detected ?? DEFAULT_CONTEXT_LIMIT;
+    if (detected !== undefined) return resolved;
+    const provenLimit = modelMatchedProvenContextLimit(ctx?.db, ctx?.sessionID, modelKey);
+    if (!isSaneLimit(provenLimit)) return resolved;
+    const geometry = resolveContextWindowGeometry(providerID, modelID, ctx);
+    if (ctx?.reservation !== "none" && geometry) return geometry.usableSoft;
+    if (
+        geometry &&
+        hasTrustedAbsoluteWall(geometry) &&
+        provenLimit > geometry.derivation.absoluteWall
+    ) {
+        return resolved;
+    }
+    return Math.max(resolved, provenLimit);
 }
 
 /**
@@ -134,28 +214,24 @@ export function resolveTrustedContextLimit(
                   detectedLimitProvenance,
               })
             : undefined;
-    if (typeof fromModelsDev === "number" && fromModelsDev > 0) return fromModelsDev;
-    if (detected !== undefined) return detected;
-
-    // Usage reports are trusted only for the model that produced them. A
-    // session-scoped limit from a previous model must not leak across a switch.
-    if (modelKey && ctx?.db && ctx.sessionID) {
-        try {
-            const persisted = loadPersistedUsage(ctx.db, ctx.sessionID);
-            if (
-                persisted !== null &&
-                piModelRefToCanonical(persisted.lastObservedModelKey ?? "") ===
-                    piModelRefToCanonical(modelKey) &&
-                isSaneLimit(persisted.lastUsageContextLimit)
-            ) {
-                return persisted.lastUsageContextLimit;
-            }
-        } catch {
-            // best-effort; ignore
-        }
+    if (detected !== undefined) {
+        return typeof fromModelsDev === "number" && fromModelsDev > 0 ? fromModelsDev : detected;
     }
 
-    return undefined;
+    // A successful request is a lower bound on the usable window. Keep that
+    // model-scoped proof when a later catalog response regresses below it.
+    const provenLimit = modelMatchedProvenContextLimit(ctx?.db, ctx?.sessionID, modelKey);
+    if (typeof fromModelsDev === "number" && fromModelsDev > 0) {
+        return isSaneLimit(provenLimit) ? Math.max(fromModelsDev, provenLimit) : fromModelsDev;
+    }
+    if (isSaneLimit(provenLimit)) return provenLimit;
+
+    // Unknown models still need the prior usage-derived denominator for token
+    // thresholds even when no successful high-water mark has been recorded.
+    const persisted = modelMatchedPersistedUsage(ctx?.db, ctx?.sessionID, modelKey);
+    return isSaneLimit(persisted?.lastUsageContextLimit)
+        ? persisted.lastUsageContextLimit
+        : undefined;
 }
 
 export function resolveCacheTtl(cacheTtl: CacheTtlConfig, modelKey: string | undefined): string {

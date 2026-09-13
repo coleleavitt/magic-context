@@ -1,5 +1,13 @@
 import { getHarness } from "../../shared/harness";
 import type { Database } from "../../shared/sqlite";
+import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import { decodePiContentDecision, encodePiContentDecision } from "./pi-content-decisions";
+import { getNativeReplayState } from "./storage-native-replay";
+import {
+    type ReplayDocument,
+    readReplayDocument,
+    serializeReplayDocument,
+} from "./storage-replay-document";
 
 export interface CloneCompartmentRow {
     sequence: number;
@@ -90,6 +98,7 @@ type RawSessionMetaRow = {
     stripped_placeholder_ids: string | null;
     stale_reduce_stripped_ids: string | null;
     processed_image_stripped_ids: string | null;
+    merged_reasoning_stripped_ids: string | null;
     pending_pi_compaction_marker_state: string | null;
     last_todo_state: string | null;
     todo_synthetic_call_id: string | null;
@@ -97,13 +106,37 @@ type RawSessionMetaRow = {
     todo_synthetic_state_json: string | null;
 };
 
+function clonePiContentDecisions(
+    raw: string | null,
+    filter: CloneSessionStateFilter,
+): string | null {
+    if (!raw) return null;
+    const entries: unknown = JSON.parse(raw);
+    if (!Array.isArray(entries)) return null;
+    const copied: string[] = [];
+    for (const entry of entries) {
+        if (typeof entry !== "string") continue;
+        const decision = decodePiContentDecision(entry);
+        if (!decision) continue;
+        const [kind, id] = decision;
+        const root = kind === "reminder-strip" ? id.replace(/:p\d+$/, "") : id;
+        if (!filter.includeMessageId(root)) continue;
+        copied.push(
+            encodePiContentDecision(kind, `${mapMessageId(filter, root)}${id.slice(root.length)}`),
+        );
+    }
+    return copied.length ? JSON.stringify(copied) : null;
+}
+
 function runImmediate<T>(db: Database, body: () => T): T {
+    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
     let committed = false;
     try {
         const result = body();
         db.exec("COMMIT");
         committed = true;
+        logSlowWriteTransaction("storage_clone_copy", transactionStartedAt);
         return result;
     } finally {
         if (!committed) {
@@ -220,6 +253,70 @@ function filterIdBlob(raw: string | null, filter: CloneSessionStateFilter): stri
     }
 }
 
+function filterNativeToolInputs(
+    inputs: ReadonlyMap<string, string>,
+    copiedToolCallIds: ReadonlySet<string>,
+    filter: CloneSessionStateFilter,
+): Record<string, string> {
+    const filtered = new Map<string, string>();
+    for (const [sourceId, serializedInput] of inputs) {
+        if (!copiedToolCallIds.has(sourceId)) continue;
+        const destinationId = mapMessageId(filter, sourceId);
+        if (destinationId === null) continue;
+        const existing = filtered.get(destinationId);
+        if (existing !== undefined && existing !== serializedInput) {
+            throw new Error(`native tool input clone collision for ${destinationId}`);
+        }
+        filtered.set(destinationId, serializedInput);
+    }
+    return Object.fromEntries(filtered);
+}
+
+function filterNativeReasoningIds(
+    ids: ReadonlySet<string>,
+    filter: CloneSessionStateFilter,
+): string[] {
+    const filtered = new Set<string>();
+    for (const sourceId of ids) {
+        if (!filter.includeMessageId(sourceId)) continue;
+        const destinationId = mapMessageId(filter, sourceId);
+        if (destinationId !== null) filtered.add(destinationId);
+    }
+    return [...filtered];
+}
+
+function cloneReplayDocument(
+    db: Database,
+    sourceSessionId: string,
+    copiedToolCallIds: ReadonlySet<string>,
+    filter: CloneSessionStateFilter,
+): ReplayDocument {
+    const document = readReplayDocument(db, sourceSessionId);
+    const trailingBlank = new Map<string, ReplayDocument["trailingBlank"][string]>();
+    for (const [sourceId, decision] of Object.entries(document.trailingBlank)) {
+        if (!filter.includeMessageId(sourceId)) continue;
+        const destinationId = mapMessageId(filter, sourceId);
+        if (destinationId === null) continue;
+        const existing = trailingBlank.get(destinationId);
+        if (existing !== undefined && existing !== decision) {
+            throw new Error(`trailing blank clone collision for ${destinationId}`);
+        }
+        trailingBlank.set(destinationId, decision);
+    }
+    document.trailingBlank = Object.fromEntries(trailingBlank);
+    if (document.version === 1 || document.piNative === undefined) return document;
+
+    const nativeReplay = getNativeReplayState(db, sourceSessionId);
+    return {
+        ...document,
+        piNative: {
+            ...(document.piNative as Record<string, unknown>),
+            toolInputs: filterNativeToolInputs(nativeReplay.toolInputs, copiedToolCallIds, filter),
+            reasoningIds: filterNativeReasoningIds(nativeReplay.reasoningIds, filter),
+        },
+    };
+}
+
 function clampWatermark(value: number | null, maxCopiedTag: number): number {
     if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
     return Math.min(Math.floor(value), maxCopiedTag);
@@ -323,6 +420,7 @@ export function copySessionStateForClone(
         );
         const copiedTagNumbers: number[] = [];
         const copiedTagIds = new Map<number, number>();
+        const copiedToolCallIds = new Set<string>();
         for (const row of sourceTags) {
             if (
                 !filter.includeTag({
@@ -363,6 +461,7 @@ export function copySessionStateForClone(
                 : sourceTagId;
             copiedTagIds.set(sourceTagId, destinationTagId);
             copiedTagNumbers.push(row.tag_number);
+            if (row.type === "tool") copiedToolCallIds.add(row.message_id);
         }
 
         if (copiedTagNumbers.length > 0) {
@@ -432,7 +531,7 @@ export function copySessionStateForClone(
             .prepare(
                 `SELECT cleared_reasoning_through_tag, tool_reclaim_watermark,
                         pi_stable_id_scheme, stripped_placeholder_ids,
-                        stale_reduce_stripped_ids, processed_image_stripped_ids,
+                        stale_reduce_stripped_ids, processed_image_stripped_ids, merged_reasoning_stripped_ids,
                         pending_pi_compaction_marker_state, last_todo_state,
                         todo_synthetic_call_id, todo_synthetic_anchor_message_id,
                         todo_synthetic_state_json
@@ -451,11 +550,11 @@ export function copySessionStateForClone(
             `INSERT INTO session_meta
                 (session_id, harness, counter, cleared_reasoning_through_tag,
                  tool_reclaim_watermark, pi_stable_id_scheme, stripped_placeholder_ids,
-                 stale_reduce_stripped_ids, processed_image_stripped_ids,
+                 stale_reduce_stripped_ids, processed_image_stripped_ids, merged_reasoning_stripped_ids,
                  pending_pi_compaction_marker_state, last_todo_state,
                  todo_synthetic_call_id, todo_synthetic_anchor_message_id,
                  todo_synthetic_state_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(session_id) DO UPDATE SET
                 harness = excluded.harness,
                 counter = excluded.counter,
@@ -464,7 +563,8 @@ export function copySessionStateForClone(
                 pi_stable_id_scheme = excluded.pi_stable_id_scheme,
                 stripped_placeholder_ids = excluded.stripped_placeholder_ids,
                 stale_reduce_stripped_ids = excluded.stale_reduce_stripped_ids,
-                processed_image_stripped_ids = excluded.processed_image_stripped_ids,
+                 processed_image_stripped_ids = excluded.processed_image_stripped_ids,
+                 merged_reasoning_stripped_ids = excluded.merged_reasoning_stripped_ids,
                 pending_pi_compaction_marker_state = excluded.pending_pi_compaction_marker_state,
                 last_todo_state = excluded.last_todo_state,
                 todo_synthetic_call_id = excluded.todo_synthetic_call_id,
@@ -485,12 +585,30 @@ export function copySessionStateForClone(
             filterIdBlob(meta?.stripped_placeholder_ids ?? null, filter),
             filterIdBlob(meta?.stale_reduce_stripped_ids ?? null, filter),
             filterIdBlob(meta?.processed_image_stripped_ids ?? null, filter),
+            clonePiContentDecisions(meta?.merged_reasoning_stripped_ids ?? null, filter),
             pendingMarker,
             migrateTodo ? (meta?.last_todo_state ?? "") : "",
             migrateTodo ? (meta?.todo_synthetic_call_id ?? "") : "",
             migrateTodo ? (mapMessageId(filter, todoAnchor) ?? "") : "",
             migrateTodo ? (meta?.todo_synthetic_state_json ?? "") : "",
         );
+        // Clone owns the whole replay document so its filtered native state
+        // cannot be overwritten by the CLI's later generic metadata copy.
+        const metaColumnRows = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{
+            name: string;
+        }>;
+        const metaColumns = new Set(metaColumnRows.map((column) => column.name));
+        if (metaColumns.has("trailing_blank_decisions")) {
+            const replayDocument = cloneReplayDocument(
+                db,
+                sourceSessionId,
+                copiedToolCallIds,
+                filter,
+            );
+            db.prepare(
+                "UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?",
+            ).run(serializeReplayDocument(replayDocument), destinationSessionId);
+        }
 
         const pendingOpsRow = db
             .prepare("SELECT COUNT(*) AS count FROM pending_ops WHERE session_id = ?")

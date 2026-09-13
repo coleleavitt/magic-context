@@ -2,22 +2,20 @@ import {
     isCompactionEnabled,
     isDreamerRunnable,
     isHistorianRunnable,
-    isSidekickRunnable,
 } from "../../config/agent-disable";
+import type { ProtectedTokensTierOverrides } from "../../config/project-security";
 import {
     DEFAULT_HISTORIAN_TIMEOUT_MS,
     type DreamerConfig,
     type HistorianConfig,
     type MagicContextConfig,
-    type SidekickConfig,
 } from "../../config/schema/magic-context";
 import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import {
     applyMirroredNoteCompileFields,
-    applyMirrorPage,
+    drainMirrorPages,
     ensureContextStoreUuid,
-    getMirrorCursor,
     getModuleNoteEvaluationBridge,
     registerModuleNoteEvaluationBridge,
 } from "../../features/magic-context/context-authority";
@@ -81,6 +79,7 @@ import {
     resolveHistorianContextLimit,
     resolveKnownHistorianContextLimit,
 } from "./derive-budgets";
+import { createDroppedInputToolExecuteBeforeHook } from "./dropped-input-guard";
 import {
     autoEmbedAttemptedBySession,
     clearEmbedSessionState,
@@ -124,7 +123,11 @@ import {
     getLiveNotificationParams,
 } from "./hook-handlers";
 import type { LiveSessionState } from "./live-session-state";
-import { type NotificationParams, sendIgnoredMessage } from "./send-session-notification";
+import {
+    type NotificationParams,
+    sendIgnoredMessage,
+    sendStatusNotification,
+} from "./send-session-notification";
 import { createSystemPromptHashHandler } from "./system-prompt-hash";
 import { maybeSendUpgradeReminder } from "./upgrade-reminder";
 
@@ -141,7 +144,8 @@ export interface MagicContextDeps {
     compactionHandler: ReturnType<typeof createCompactionHandler>;
     liveSessionState?: LiveSessionState;
     config: {
-        protected_tags: number;
+        protected_tokens?: number;
+        protectedTokenTierOverrides?: ProtectedTokensTierOverrides;
         /** User-level setting that lets a session started exactly in the canonical home directory use it as the project. */
         allow_home_project?: boolean;
         language?: string;
@@ -174,7 +178,6 @@ export interface MagicContextDeps {
         embedding?: {
             provider?: "local" | "openai-compatible" | "off" | "synapse";
         };
-        sidekick?: SidekickConfig;
         dreamer?: DreamerConfig;
         smart_notes?: { retina_handoff?: boolean };
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
@@ -483,7 +486,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             agentBySession,
             deps.config.toast_duration_ms,
         );
-        void sendIgnoredMessage(deps.client, sessionId, warning, notificationParams).catch(
+        void sendStatusNotification(deps.client, sessionId, warning, notificationParams).catch(
             (error) => {
                 log(
                     `[magic-context] failed to send project identity warning for ${directory}: ${getErrorMessage(error)}`,
@@ -771,29 +774,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 // "busy"/zero-work each pass, reset its own latch, and re-announced
                 // the same count forever. Retries belong to the passive backfill;
                 // progress lives in /ctx-embed status and the sidebar.
-                const embeddedBefore = coverage.session.embedded;
                 await executeEmbedHistory(sessionId, { silent: true });
                 drainReachedTerminal = true;
-                const completedCoverage = getEmbeddingCoverageStatus(
-                    db,
-                    sessionProjectIdentity,
-                    sessionId,
-                );
-                const embeddedNow = completedCoverage.session.embedded - embeddedBefore;
-                if (embeddedNow > 0 && !isTuiConnected(sessionId)) {
-                    const notifyParams = getLiveNotificationParams(
-                        sessionId,
-                        liveModelBySession,
-                        variantBySession,
-                        agentBySession,
-                    );
-                    await sendIgnoredMessage(
-                        deps.client,
-                        sessionId,
-                        `Embedded ${embeddedNow} compartment${embeddedNow === 1 ? "" : "s"} of history for semantic search.`,
-                        { ...notifyParams },
-                    );
-                }
             } catch (error) {
                 log("[magic-context] auto-embed drain failed:", error);
             } finally {
@@ -802,8 +784,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         })();
     };
 
-    const sidekickRunnable = isSidekickRunnable(deps.config);
-    const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
     const rustMemorySyncRequestedSessions = new Set<string>();
     // Build the same subc-backed client for the TS recovery arm. Constructing the
     // transport is inert; it connects only if a marker actually needs draining.
@@ -875,16 +855,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
     const syncModuleDomain = async (domain: "memories" | "notes"): Promise<void> => {
         if (!rustModeModuleClient?.mirrorPull) return;
-        for (;;) {
-            const cursor = getMirrorCursor(db, domain);
-            const response = await rustModeModuleClient.mirrorPull({
-                domain,
-                cursor,
-                limit: 1000,
-            });
-            const next = applyMirrorPage({ db, page: response.page });
-            if (!response.page.has_more || next === cursor) break;
-        }
+        await drainMirrorPages({
+            db,
+            module: rustModeModuleClient,
+            domain,
+            limit: 1000,
+        });
     };
     const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
     const syncModuleMemories = (): Promise<void> => syncModuleDomain("memories");
@@ -1126,7 +1102,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         db,
         channel1StateBySession,
         channel2DirectiveTextBySession,
-        protectedTags: deps.config.protected_tags,
+        protectedTokens: deps.config.protected_tokens,
+        protectedTokenTierOverrides: deps.config.protectedTokenTierOverrides,
         smartDrops: deps.config.smart_drops === true,
         clearReasoningAge: deps.config.clear_reasoning_age ?? 50,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
@@ -1354,7 +1331,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const commandHandler = createMagicContextCommandHandler({
         db,
-        protectedTags: deps.config.protected_tags,
         compactionOff,
         toastDurationMs: deps.config.toast_duration_ms,
         executeThresholdPercentage: deps.config.execute_threshold_percentage ?? 65,
@@ -1441,15 +1417,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 ...params,
             });
         },
-        sidekick: sidekickConfig
-            ? {
-                  config: sidekickConfig,
-                  projectPath,
-                  sessionDirectory: deps.directory,
-                  client: deps.client,
-                  language: deps.config.language,
-              }
-            : undefined,
         dreamer: dreamerConfig
             ? {
                   config: dreamerConfig,
@@ -1507,7 +1474,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const systemPromptHash = createSystemPromptHashHandler({
         db,
-        protectedTags: deps.config.protected_tags,
         dreamerEnabled: dreamerRunnable,
         // Gates ctx_memory guidance out of the prompt when memory is off (the
         // ctx_memory TOOL is gated in tool-registry.ts on the same flag).
@@ -1557,7 +1523,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         lastHeuristicsTurnId,
         commitSeenLastPass,
         client: deps.client,
-        protectedTags: deps.config.protected_tags,
     });
 
     const hooks = {
@@ -1583,7 +1548,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                           {
                               client: deps.client,
                               db,
-                              sendIgnoredMessage,
+                              sendStatusNotification,
                               getNotificationParams: (sid) =>
                                   getLiveNotificationParams(
                                       sid,
@@ -1618,6 +1583,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             }
         },
         "command.execute.before": createCommandExecuteBeforeHook(commandHandler),
+        "tool.execute.before": createDroppedInputToolExecuteBeforeHook(),
         "tool.execute.after": createToolExecuteAfterHook({
             db,
             channel1StateBySession,
@@ -1643,10 +1609,29 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     };
     const hooksWithBackends = hooks as typeof hooks & {
         rustToolBackends?: RustToolBackends;
+        getDebugMemoryHolders?: () => {
+            taggerCache: ReturnType<NonNullable<Tagger["getHeapStats"]>>;
+            wireCache: ReturnType<typeof transform.getRustWireCacheHeapStats>;
+        };
     };
-    Object.defineProperty(hooksWithBackends, "rustToolBackends", {
-        value: rustToolBackends,
-        enumerable: false,
+    Object.defineProperties(hooksWithBackends, {
+        rustToolBackends: {
+            value: rustToolBackends,
+            enumerable: false,
+        },
+        getDebugMemoryHolders: {
+            value: () => ({
+                taggerCache: deps.tagger.getHeapStats?.() ?? {
+                    sessionCount: 0,
+                    assignmentEntries: 0,
+                    toolAccountingEntries: 0,
+                    loadSignatureEntries: 0,
+                    sessions: [],
+                },
+                wireCache: transform.getRustWireCacheHeapStats(),
+            }),
+            enumerable: false,
+        },
     });
     return hooksWithBackends;
 }

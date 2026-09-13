@@ -3,122 +3,10 @@
 import { describe, expect, it } from "bun:test";
 import { findFirstKeptEntryId } from "./pi-historian-runner";
 import {
+	convertEntriesToRawMessagePage,
 	convertEntriesToRawMessages,
 	findLastModelKeyFromBranch,
-	isMidTurnPi,
 } from "./read-session-pi";
-
-describe("isMidTurnPi", () => {
-	it("is mid-turn when the latest assistant stopReason is toolUse", () => {
-		expect(
-			isMidTurnPi(
-				{
-					messages: [{ role: "assistant", stopReason: "toolUse", content: [] }],
-				},
-				"session-1",
-			),
-		).toBe(true);
-	});
-
-	it("is not mid-turn when a newer branch-backed user message ends a stale toolUse tail", () => {
-		const assistant = { role: "assistant", stopReason: "toolUse", content: [] };
-		const user = { role: "user", content: "new turn" };
-		expect(
-			isMidTurnPi({ messages: [assistant, user] }, "session-1", [
-				{ type: "message", id: "assistant-1", message: assistant },
-				{ type: "message", id: "user-1", message: user },
-			]),
-		).toBe(false);
-	});
-
-	it("does not release mid-turn for synthetic user-shaped model messages", () => {
-		const assistant = { role: "assistant", stopReason: "toolUse", content: [] };
-		const syntheticUser = { role: "user", content: "steer content" };
-		expect(
-			isMidTurnPi({ messages: [assistant, syntheticUser] }, "session-1", [
-				{ type: "message", id: "assistant-1", message: assistant },
-				{
-					type: "custom_message",
-					id: "steer-1",
-					customType: "ctx-nudge",
-					message: syntheticUser,
-				},
-			]),
-		).toBe(true);
-	});
-
-	it("does not release mid-turn for custom-role nudges after a stale toolUse tail", () => {
-		expect(
-			isMidTurnPi(
-				{
-					messages: [
-						{ role: "assistant", stopReason: "toolUse", content: [] },
-						{ role: "custom", content: "agent nudge" },
-					],
-				},
-				"session-1",
-			),
-		).toBe(true);
-	});
-
-	it("is mid-turn when the latest assistant has an unpaired toolCall", () => {
-		expect(
-			isMidTurnPi(
-				{
-					messages: [
-						{
-							role: "assistant",
-							content: [{ type: "toolCall", id: "call-1", name: "bash" }],
-						},
-					],
-				},
-				"session-1",
-			),
-		).toBe(true);
-	});
-
-	it("is not mid-turn when a newer branch-backed user ends an unpaired toolCall tail", () => {
-		const assistant = {
-			role: "assistant",
-			content: [{ type: "toolCall", id: "call-1", name: "bash" }],
-		};
-		const user = { role: "user", content: "new turn" };
-		expect(
-			isMidTurnPi({ messages: [assistant, user] }, "session-1", [
-				{ type: "message", id: "assistant-1", message: assistant },
-				{ type: "message", id: "user-1", message: user },
-			]),
-		).toBe(false);
-	});
-
-	it("is not mid-turn when toolCall content is paired or absent", () => {
-		expect(
-			isMidTurnPi(
-				{
-					messages: [
-						{
-							role: "assistant",
-							content: [{ type: "toolCall", id: "call-1", name: "bash" }],
-						},
-						{ role: "toolResult", toolCallId: "call-1", content: [] },
-					],
-				},
-				"session-1",
-			),
-		).toBe(false);
-
-		expect(
-			isMidTurnPi(
-				{
-					messages: [
-						{ role: "assistant", content: [{ type: "text", text: "done" }] },
-					],
-				},
-				"session-1",
-			),
-		).toBe(false);
-	});
-});
 
 describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () => {
 	// Regression coverage for the cortexkit/magic-context X1+X2 production
@@ -487,5 +375,41 @@ describe("findLastModelKeyFromBranch", () => {
 		expect(findLastModelKeyFromBranch([])).toBeUndefined();
 		expect(findLastModelKeyFromBranch(null)).toBeUndefined();
 		expect(findLastModelKeyFromBranch(undefined)).toBeUndefined();
+	});
+});
+
+describe("convertEntriesToRawMessagePage", () => {
+	it("matches full conversion when tool results fold across page boundaries", () => {
+		const entry = (id: string, message: Record<string, unknown>) => ({
+			type: "message",
+			id,
+			message,
+		});
+		const entries = [
+			entry("user-1", { role: "user", content: "start" }),
+			entry("asst-1", {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call-1", name: "read" }],
+			}),
+			entry("result-1", {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "read",
+				content: [{ type: "text", text: "result" }],
+			}),
+			entry("asst-2", {
+				role: "assistant",
+				content: [{ type: "text", text: "continue" }],
+			}),
+			entry("user-2", { role: "user", content: "finish" }),
+		];
+		const full = convertEntriesToRawMessages(entries);
+		const paged = [
+			...convertEntriesToRawMessagePage(entries, 0, 2, full.length),
+			...convertEntriesToRawMessagePage(entries, 2, 2, full.length),
+			...convertEntriesToRawMessagePage(entries, 4, 2, full.length),
+		];
+
+		expect(paged).toEqual(full);
 	});
 });

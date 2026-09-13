@@ -1,13 +1,14 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { MagicContextPluginConfig } from "../config";
 import { isCompactionEnabled, isDreamerRunnable } from "../config/agent-disable";
-import { DEFAULT_PROTECTED_TAGS } from "../features/magic-context/defaults";
 import { resolveProjectIdentityForSession } from "../features/magic-context/memory/project-identity";
+import { getProtectionWindowForSession } from "../features/magic-context/protection-window";
 import {
     getDatabasePersistenceError,
     isDatabasePersisted,
     openDatabase,
 } from "../features/magic-context/storage";
+import { getObservedEpochFloor } from "../features/magic-context/storage-meta-persisted";
 import { setCtxReduceRegisteredGlobally } from "../hooks/magic-context/ctx-reduce-availability";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
@@ -135,7 +136,12 @@ export function createToolRegistry(args: {
             ? {}
             : createCtxReduceTools({
                   db,
-                  protectedTags: pluginConfig.protected_tags ?? DEFAULT_PROTECTED_TAGS,
+                  getProtectionWindow: (sessionId) =>
+                      getProtectionWindowForSession(
+                          db,
+                          sessionId,
+                          getObservedEpochFloor(db, sessionId),
+                      ),
                   rustToolBackends,
               })),
         ...createCtxExpandTools({ db }),

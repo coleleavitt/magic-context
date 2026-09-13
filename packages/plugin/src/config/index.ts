@@ -25,12 +25,14 @@ import { migrateDreamerV2 } from "./migrate-dreamer-v2";
 import { migrateLegacyExperimental } from "./migrate-experimental";
 import { resolveConfigProfile } from "./profiles";
 import {
+    attachProtectedTokensTierOverrides,
     constrainProjectThresholdOverrides,
     dropInheritedEmbeddingKeyOnRedirect,
     stripUnsafeProjectConfigFields,
 } from "./project-security";
 import { pruneNestedConfigLeaf } from "./prune-config-leaf";
 import { loadRawConfigFile } from "./raw-loader";
+import { stripRemovedAgentConfig } from "./removed-agent-config";
 import { type MagicContextConfig, MagicContextConfigSchema } from "./schema/magic-context";
 import { resolveTransformMode } from "./transform-mode";
 import { substituteConfigVariables } from "./variable";
@@ -319,14 +321,39 @@ function redactConfigValue(value: unknown): string {
     return typeof value;
 }
 
-function parsePluginConfig(
+let warnedProtectedTagsDeprecation = false;
+
+export function resetProtectedTagsDeprecationWarningForTest(): void {
+    warnedProtectedTagsDeprecation = false;
+}
+
+export function warnProtectedTagsDeprecationOnce(): void {
+    if (!warnedProtectedTagsDeprecation) {
+        warnedProtectedTagsDeprecation = true;
+        console.warn(
+            "[magic-context] protected_tags is deprecated and ignored; use protected_tokens instead.",
+        );
+    }
+}
+
+export function parsePluginConfig(
     rawConfig: Record<string, unknown>,
     recoveredTopLevelKeys: string[] = [],
 ): MagicContextPluginConfig & { configWarnings?: string[] } {
     // Pre-Zod shim: reshape legacy experimental.* graduated keys so the user's
     // opt-in/out state survives upgrades even when they never run `doctor`.
     const preMigrationWarnings: string[] = [];
-    const migratedExperimental = migrateLegacyExperimental(rawConfig, preMigrationWarnings);
+    const configWithoutRemovedAgent = stripRemovedAgentConfig(rawConfig, preMigrationWarnings);
+    if (Object.hasOwn(rawConfig, "protected_tags")) {
+        warnProtectedTagsDeprecationOnce();
+        preMigrationWarnings.push(
+            "protected_tags is deprecated and ignored; use protected_tokens instead.",
+        );
+    }
+    const migratedExperimental = migrateLegacyExperimental(
+        configWithoutRemovedAgent,
+        preMigrationWarnings,
+    );
     // Dreamer v2: convert the legacy v1 dreamer shape (window schedule, tasks
     // array, user_memories/pin_key_files blocks) into the per-task `tasks` record.
     // Runs AFTER migrate-experimental so experimental.user_memories (already
@@ -397,7 +424,7 @@ function parsePluginConfig(
     const patched: Record<string, unknown> = { ...rawConfig };
     for (const key of errorPaths) {
         recoveredTopLevelKeys.push(key);
-        const isAgentConfig = key === "historian" || key === "dreamer" || key === "sidekick";
+        const isAgentConfig = key === "historian" || key === "dreamer";
 
         // For object-valued keys (including agent harness blocks), prune only invalid
         // nested leaves and keep valid siblings, so one bad field does not remove
@@ -610,6 +637,8 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
               : null;
 
     const allWarnings: string[] = [];
+    const removedConfigWarnings: string[] = [];
+    const userRaw = stripRemovedAgentConfig(userLoaded?.config ?? {}, removedConfigWarnings);
 
     if (userLegacyFallback.source) {
         allWarnings.push(
@@ -638,18 +667,20 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
     let projectRaw: Record<string, unknown> = {};
     if (projectLoaded) {
         allWarnings.push(...projectLoaded.warnings.map((w) => `[project config] ${w}`));
-        projectRaw = { ...projectLoaded.config };
+        projectRaw = stripRemovedAgentConfig(projectLoaded.config, removedConfigWarnings);
         for (const warning of stripUnsafeProjectConfigFields(projectRaw)) {
             allWarnings.push(`[project config] ${warning}`);
         }
     }
+
+    allWarnings.push(...removedConfigWarnings.map((warning) => `[config] ${warning}`));
 
     // Resolve profiles at the single user→project merge choke point. The profile
     // definition is parsed from the trusted user tier, then its validated model
     // overlay is merged before the untrusted project config. The raw selector is
     // consumed here; only the resolved name remains as status metadata.
     const profileResolution = resolveConfigProfile({
-        userRaw: userLoaded?.config ?? {},
+        userRaw,
         projectRaw,
     });
     allWarnings.push(...profileResolution.warnings.map((warning) => `[config] ${warning}`));
@@ -684,6 +715,10 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
     const recoveredTopLevelKeys: string[] = [];
     const cacheTtlConfigured = Object.hasOwn(mergedRaw, "cache_ttl");
     const config = parsePluginConfig(mergedRaw, recoveredTopLevelKeys);
+    attachProtectedTokensTierOverrides(config, {
+        trustedUser: trustedBaseConfig.protected_tokens,
+        project: projectLoaded ? profileResolution.projectBase.protected_tokens : undefined,
+    });
     if (profileResolution.activeProfile) config.profile = profileResolution.activeProfile;
     setOutputReserveConfig(config.output_reserve);
     setWindowOverlayPath(config.models?.window_overlay_path);
@@ -700,7 +735,7 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
 
     const resolvedTransformMode = resolveTransformMode({
         configured: config.transform_mode,
-        userTierHasSubc: hasUserTierSubcConfig(userLoaded?.config),
+        userTierHasSubc: hasUserTierSubcConfig(userRaw),
         compactionEnabled: isCompactionEnabled(config),
     });
     config.transform_mode = resolvedTransformMode.mode;

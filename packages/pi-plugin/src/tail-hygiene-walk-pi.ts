@@ -25,12 +25,11 @@ const FNV1A_32_PRIME = 0x01000193;
 export interface PiTailHygieneWalkInput {
 	messages: readonly unknown[];
 	tags: readonly TagEntry[];
-	protectedTags?: number;
 	/**
-	 * Canonical protection window tag numbers (Coordinate space: tag-number).
-	 * Empty-window behaviour: empty set.
+	 * Canonical protection-window membership derived from persisted row mass and the
+	 * snapshotted floor. Coordinate space: tag-number. An empty set is an empty window.
 	 */
-	protectedTagNumbers?: ReadonlySet<number>;
+	protectedTagNumbers: ReadonlySet<number>;
 	/** Active tags whose drop is queued but has not yet changed the rendered Pi entries. */
 	pendingDropTagNumbers?: ReadonlySet<number>;
 	stableId?: (message: unknown, index: number) => string | undefined;
@@ -436,25 +435,15 @@ function excludedDraft(key: string, value: unknown): DraftPart {
 
 function finalizeParts(
 	drafts: readonly DraftPart[],
-	protectedTags: number,
 	pendingDropTagNumbers: ReadonlySet<number>,
-	protectedTagNumbers?: ReadonlySet<number>,
+	protectedTagNumbers: ReadonlySet<number>,
 ): TailHygieneMeasurement {
 	const visibleTags = new Map<number, TagEntry>();
 	for (const part of drafts) {
 		if (part.kind !== "excluded" && part.tag)
 			visibleTags.set(part.tag.tagNumber, part.tag);
 	}
-	// Coordinate space: tag-number
-	// Empty-window behaviour: empty set
-	const protectedNumbers =
-		protectedTagNumbers !== undefined
-			? new Set(protectedTagNumbers)
-			: new Set(
-					[...visibleTags.keys()]
-						.sort((left, right) => right - left)
-						.slice(0, Math.max(0, protectedTags)),
-				);
+	const protectedNumbers = new Set(protectedTagNumbers);
 	const exemplarNumbers = [...visibleTags.values()]
 		.filter((tag) => tag.type === "tool" && tag.toolName === "ctx_reduce")
 		.sort((left, right) => right.tagNumber - left.tagNumber)
@@ -473,7 +462,10 @@ function finalizeParts(
 			? pendingDropTagNumbers.has(draft.tag.tagNumber)
 			: false;
 		const uTokens =
-			draft.tag && !protectedPart && !queuedForDrop && draft.kind !== "excluded"
+			draft.tag?.status === "active" &&
+			!protectedPart &&
+			!queuedForDrop &&
+			draft.kind !== "excluded"
 				? tokens
 				: 0;
 		t += tokens;
@@ -485,9 +477,7 @@ function finalizeParts(
 			tokens,
 			uTokens,
 			tagNumber: draft.tag?.tagNumber ?? null,
-			// Pi derives liveness from rendered sentinels. A visible attributed part is
-			// active for baseline/delta purposes regardless of the durable row's status.
-			tagStatus: draft.tag ? "active" : null,
+			tagStatus: draft.tag?.status ?? null,
 			protected: protectedPart,
 			queuedForDrop,
 		};
@@ -579,7 +569,7 @@ export function measurePiTailHygiene(
 					const arc = arcByPart.get(part);
 					const content = stripChannel1ReminderSpans(part.text);
 					const tag = parseVisibleTag(content, tagsByNumber) ?? arc?.tag;
-					if (arc?.sentinel || !content || isDropSentinel(content)) {
+					if (!content) {
 						drafts.push(excludedDraft(`${key}\0toolOutput`, content));
 					} else {
 						drafts.push({
@@ -587,7 +577,7 @@ export function measurePiTailHygiene(
 							kind: "toolOutput",
 							content,
 							tokens: memoizedTokens("toolOutput", content),
-							tag,
+							tag: arc?.sentinel ? undefined : tag,
 						});
 					}
 					continue;
@@ -633,8 +623,7 @@ export function measurePiTailHygiene(
 				const callId = typeof part.id === "string" ? part.id : "";
 				if (
 					part.syntheticTodoMarker === true ||
-					callId.startsWith(SYNTHETIC_TODO_PREFIX) ||
-					arc?.sentinel
+					callId.startsWith(SYNTHETIC_TODO_PREFIX)
 				) {
 					drafts.push(excludedDraft(`${key}\0toolInput`, part));
 					continue;
@@ -648,7 +637,7 @@ export function measurePiTailHygiene(
 						kind: "toolInput",
 						content,
 						tokens: memoizedTokens("toolInput", content),
-						tag: arc?.tag,
+						tag: arc?.sentinel ? undefined : arc?.tag,
 					});
 				}
 				continue;
@@ -658,7 +647,6 @@ export function measurePiTailHygiene(
 	}
 	return finalizeParts(
 		drafts,
-		input.protectedTags ?? 20,
 		input.pendingDropTagNumbers ?? new Set<number>(),
 		input.protectedTagNumbers,
 	);

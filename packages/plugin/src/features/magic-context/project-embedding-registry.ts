@@ -2,8 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../config/schema/magic-context";
+import { setBootQuietPeriodForTests } from "../../plugin/boot-quiet";
 import { log } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import {
     buildCanonicalChunkTextFromFts,
     buildCompartmentSummaryFallbackText,
@@ -14,6 +16,7 @@ import {
     countUnembeddedSessionCompartments,
     loadUnembeddedCompartmentChunkCandidatesPolite,
     loadUnembeddedSessionChunkCandidates,
+    loadUnembeddedShadowChunkCandidates,
     normalizeCompartmentChunkMaxInputTokens,
     replaceCompartmentChunkEmbeddings,
     type SaveCompartmentChunkEmbeddingInput,
@@ -37,9 +40,10 @@ import { OpenAICompatibleEmbeddingProvider } from "./memory/embedding-openai";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import {
     getSynapseBatchRequestKey,
+    isSynapseEmbeddingTruncated,
     SYNAPSE_DEFAULT_MODEL,
-    SYNAPSE_MAX_INPUT_TOKENS,
     SynapseEmbeddingProvider,
+    type SynapseLaneDescriptor,
 } from "./memory/embedding-synapse";
 import {
     getMemoryEmbedCoverage,
@@ -50,10 +54,29 @@ import {
     repairMisScopedCompartmentChunkEmbeddingsForProject,
 } from "./session-project-storage";
 import {
+    describeShadowBackfillWriteRefusal,
+    listShadowBackfillStalls,
+    type PersistedShadowBackfillState,
+    parsePersistedShadowBackfillState,
+    type ShadowBackfillStall,
+    type ShadowBackfillStopReason,
+    type ShadowBackfillWriteRefusalReason,
+    type ShadowScope,
+} from "./shadow-backfill-state";
+import {
     beginSynapseBatchLedger,
     finishSynapseBatchLedger,
     pruneSynapseBatchLedgerForProject,
 } from "./storage-embedding-measurements";
+
+export {
+    describeShadowBackfillWriteRefusal,
+    formatShadowBackfillStall,
+    listShadowBackfillStalls,
+    type ShadowBackfillStall,
+    type ShadowBackfillStopReason,
+    type ShadowBackfillWriteRefusalReason,
+} from "./shadow-backfill-state";
 
 const OFF_PROVIDER_IDENTITY = "embedding-provider:off";
 const SWEEP_MAX_WALL_CLOCK_MS = 10 * 60 * 1000;
@@ -125,6 +148,8 @@ export interface ProjectEmbeddingRegistrationSnapshot {
     model: string;
     /** Configured provider kind (e.g. "openai-compatible", "local", "ollama"). */
     provider: string;
+    /** Live Synapse lane capabilities, when this registration uses Synapse. */
+    synapseDescriptor?: SynapseLaneDescriptor;
 }
 
 interface ProjectEmbeddingRegistration {
@@ -166,7 +191,6 @@ interface ShadowEmbeddingRegistration {
     generation: number;
 }
 
-type ShadowScope = "memory" | "commit" | "chunk";
 interface ShadowQueueItem {
     projectIdentity: string;
     scope: ShadowScope;
@@ -179,6 +203,8 @@ let shadowWorker: Promise<void> | null = null;
 const SHADOW_MAX_ITEMS_PER_TICK = 64;
 const SHADOW_MAX_BYTES_PER_TICK = 512 * 1024;
 const SHADOW_MAX_WALL_CLOCK_MS = 2_000;
+const SHADOW_RESUBMIT_WINDOW_MS = 60 * 60 * 1000;
+const SHADOW_BACKFILL_PROVENANCE_KEY = "_magicContextShadowBackfill";
 
 /**
  * Shadow scopes that still owe a historical backfill for a project. A Synapse
@@ -199,7 +225,13 @@ const pendingShadowBackfills = new Map<string, Set<ShadowScope>>();
 const shadowBackfillLastIds = new Map<string, string>();
 /** Why a (project:scope) backfill stopped: "drained" or "stalled_no_progress". */
 const shadowBackfillStopReasons = new Map<string, ShadowBackfillStopReason>();
-export type ShadowBackfillStopReason = "drained" | "stalled_no_progress";
+const shadowBackfillLastWriteOutcomes = new Map<string, ShadowBackfillWriteOutcome>();
+let shadowBackfillNow = (): number => Date.now();
+
+interface ShadowBackfillWriteOutcome {
+    writes: number;
+    refusalReason?: ShadowBackfillWriteRefusalReason;
+}
 
 /** Stop reason for a scope's last backfill retirement, for status surfaces. */
 export function getShadowBackfillStopReason(
@@ -248,14 +280,51 @@ export class TestProviderFactoryRequiredError extends Error {
     }
 }
 
+function synapseDescriptorFromConfig(config: EmbeddingConfig): SynapseLaneDescriptor | undefined {
+    const raw = config as unknown as Record<string, unknown>;
+    const candidate = raw.synapse_descriptor;
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
+    const descriptor = candidate as Partial<SynapseLaneDescriptor>;
+    if (
+        typeof descriptor.lane !== "string" ||
+        descriptor.lane.length === 0 ||
+        typeof descriptor.max_tokens !== "number" ||
+        !Number.isInteger(descriptor.max_tokens) ||
+        descriptor.max_tokens <= 0 ||
+        (descriptor.max_tokens_source !== "runtime_bucket" &&
+            descriptor.max_tokens_source !== "worker_bucket" &&
+            descriptor.max_tokens_source !== "catalog" &&
+            descriptor.max_tokens_source !== "catalog_unloaded") ||
+        typeof descriptor.warm !== "boolean"
+    ) {
+        return undefined;
+    }
+    return descriptor as SynapseLaneDescriptor;
+}
+
 function synapseConfigFields(config: EmbeddingConfig): {
     model?: string;
     fingerprint?: string;
     tableEpoch?: number;
     dims?: number;
     provenance?: unknown;
+    descriptor?: SynapseLaneDescriptor;
 } {
     const raw = config as unknown as Record<string, unknown>;
+    const descriptor = synapseDescriptorFromConfig(config);
+    const rawProvenance = raw.synapse_provenance;
+    const provenance = descriptor
+        ? {
+              ...(rawProvenance &&
+              typeof rawProvenance === "object" &&
+              !Array.isArray(rawProvenance)
+                  ? (rawProvenance as Record<string, unknown>)
+                  : rawProvenance === undefined
+                    ? {}
+                    : { synapse_provenance: rawProvenance }),
+              capability_descriptor: descriptor,
+          }
+        : rawProvenance;
     return {
         ...(typeof raw.model === "string" ? { model: raw.model } : {}),
         ...(typeof raw.synapse_fingerprint === "string"
@@ -265,8 +334,95 @@ function synapseConfigFields(config: EmbeddingConfig): {
             ? { tableEpoch: raw.synapse_table_epoch }
             : {}),
         ...(typeof raw.synapse_dims === "number" ? { dims: raw.synapse_dims } : {}),
-        ...(raw.synapse_provenance !== undefined ? { provenance: raw.synapse_provenance } : {}),
+        ...(provenance !== undefined ? { provenance } : {}),
+        ...(descriptor ? { descriptor } : {}),
     };
+}
+
+function parseJsonRecord(value: string): Record<string, unknown> {
+    try {
+        const parsed = JSON.parse(value) as unknown;
+        return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : { synapse_provenance: parsed };
+    } catch {
+        return {};
+    }
+}
+
+function hasShadowEmbeddingRegistrationsTable(db: Database): boolean {
+    return Boolean(
+        db
+            .prepare(
+                "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'shadow_embedding_registrations'",
+            )
+            .get(),
+    );
+}
+
+function getPersistedShadowBackfillState(
+    db: Database,
+    projectIdentity: string,
+    scope: ShadowScope,
+    modelId: string,
+): PersistedShadowBackfillState | undefined {
+    if (!hasShadowEmbeddingRegistrationsTable(db)) return undefined;
+    const row = db
+        .prepare(
+            `SELECT provenance_json AS provenanceJson
+             FROM shadow_embedding_registrations
+             WHERE project_path = ? AND scope = ? AND model_id = ?`,
+        )
+        .get(projectIdentity, scope, modelId) as { provenanceJson?: string } | undefined;
+    return typeof row?.provenanceJson === "string"
+        ? parsePersistedShadowBackfillState(row.provenanceJson)
+        : undefined;
+}
+
+function updatePersistedShadowBackfillState(
+    db: Database,
+    projectIdentity: string,
+    scope: ShadowScope,
+    modelId: string,
+    update: (state: PersistedShadowBackfillState) => PersistedShadowBackfillState,
+): void {
+    if (!hasShadowEmbeddingRegistrationsTable(db)) return;
+    const row = db
+        .prepare(
+            `SELECT provenance_json AS provenanceJson
+             FROM shadow_embedding_registrations
+             WHERE project_path = ? AND scope = ? AND model_id = ?`,
+        )
+        .get(projectIdentity, scope, modelId) as { provenanceJson?: string } | undefined;
+    if (typeof row?.provenanceJson !== "string") return;
+    const provenance = parseJsonRecord(row.provenanceJson);
+    const current = parsePersistedShadowBackfillState(row.provenanceJson) ?? { version: 1 };
+    provenance[SHADOW_BACKFILL_PROVENANCE_KEY] = update(current);
+    db.prepare(
+        `UPDATE shadow_embedding_registrations
+         SET provenance_json = ?
+         WHERE project_path = ? AND scope = ? AND model_id = ?`,
+    ).run(JSON.stringify(provenance), projectIdentity, scope, modelId);
+}
+
+function shadowDescriptorProvenanceJson(
+    db: Database,
+    projectIdentity: string,
+    scope: ShadowScope,
+    modelId: string,
+    synapseProvenance: unknown,
+): string {
+    const provenance: Record<string, unknown> =
+        typeof synapseProvenance === "object" &&
+        synapseProvenance !== null &&
+        !Array.isArray(synapseProvenance)
+            ? { ...(synapseProvenance as Record<string, unknown>) }
+            : synapseProvenance === undefined
+              ? {}
+              : { synapse_provenance: synapseProvenance };
+    const existing = getPersistedShadowBackfillState(db, projectIdentity, scope, modelId);
+    if (existing) provenance[SHADOW_BACKFILL_PROVENANCE_KEY] = existing;
+    return JSON.stringify(provenance);
 }
 
 function persistPrimaryDescriptor(db: Database, registration: ProjectEmbeddingRegistration): void {
@@ -333,7 +489,13 @@ function persistShadowDescriptor(db: Database, registration: ShadowEmbeddingRegi
         fields.fingerprint ?? "",
         fields.tableEpoch ?? 0,
         fields.dims ?? 0,
-        JSON.stringify(fields.provenance ?? {}),
+        shadowDescriptorProvenanceJson(
+            db,
+            registration.projectIdentity,
+            "memory",
+            registration.modelId,
+            fields.provenance,
+        ),
         now,
     );
     db.prepare(
@@ -355,7 +517,13 @@ function persistShadowDescriptor(db: Database, registration: ShadowEmbeddingRegi
         fields.fingerprint ?? "",
         fields.tableEpoch ?? 0,
         fields.dims ?? 0,
-        JSON.stringify(fields.provenance ?? {}),
+        shadowDescriptorProvenanceJson(
+            db,
+            registration.projectIdentity,
+            "commit",
+            registration.modelId,
+            fields.provenance,
+        ),
         now,
     );
     db.prepare(
@@ -377,7 +545,13 @@ function persistShadowDescriptor(db: Database, registration: ShadowEmbeddingRegi
         fields.fingerprint ?? "",
         fields.tableEpoch ?? 0,
         fields.dims ?? 0,
-        JSON.stringify(fields.provenance ?? {}),
+        shadowDescriptorProvenanceJson(
+            db,
+            registration.projectIdentity,
+            "chunk",
+            registration.chunkModelId,
+            fields.provenance,
+        ),
         now,
     );
 }
@@ -421,6 +595,12 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
             // intentionally omitted from identity (stored vectors use passage).
             ...(inputType ? { input_type: inputType } : {}),
             ...(queryInputType ? { query_input_type: queryInputType } : {}),
+            ...(config.query_instruction !== undefined
+                ? { query_instruction: config.query_instruction }
+                : {}),
+            ...(config.document_prefix !== undefined
+                ? { document_prefix: config.document_prefix }
+                : {}),
             ...(truncate ? { truncate } : {}),
             ...(config.max_input_tokens
                 ? {
@@ -439,17 +619,23 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
     if (config.provider === "synapse") {
         const synapse = config as EmbeddingConfig & {
             model?: string;
+            max_input_tokens?: number;
             synapse_connection_file?: string;
             synapse_fingerprint?: string;
             synapse_table_epoch?: number;
             synapse_dims?: number;
             synapse_recommended_batch?: number;
+            synapse_recommended_token_budget?: number;
+            synapse_descriptor?: SynapseLaneDescriptor;
             synapse_provenance?: unknown;
         };
+        const descriptor = synapseDescriptorFromConfig(config);
         return {
             provider: "synapse",
             model: synapse.model?.trim() || "gte-modernbert-base-f16",
-            max_input_tokens: SYNAPSE_MAX_INPUT_TOKENS,
+            max_input_tokens: normalizeCompartmentChunkMaxInputTokens(
+                descriptor?.max_tokens ?? synapse.max_input_tokens,
+            ),
             ...(synapse.synapse_connection_file
                 ? { synapse_connection_file: synapse.synapse_connection_file }
                 : {}),
@@ -465,6 +651,12 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
             ...(typeof synapse.synapse_recommended_batch === "number"
                 ? { synapse_recommended_batch: synapse.synapse_recommended_batch }
                 : {}),
+            ...(typeof synapse.synapse_recommended_token_budget === "number"
+                ? {
+                      synapse_recommended_token_budget: synapse.synapse_recommended_token_budget,
+                  }
+                : {}),
+            ...(descriptor ? { synapse_descriptor: descriptor } : {}),
             ...(synapse.synapse_provenance !== undefined
                 ? { synapse_provenance: synapse.synapse_provenance }
                 : {}),
@@ -501,6 +693,8 @@ function createProvider(
             apiKey: config.api_key,
             inputType: config.input_type,
             queryInputType: config.query_input_type,
+            queryInstruction: config.query_instruction,
+            documentPrefix: config.document_prefix,
             truncate: config.truncate,
             maxInputTokens: config.max_input_tokens,
         });
@@ -518,11 +712,14 @@ function createProvider(
     if (config.provider === "synapse") {
         const synapse = config as EmbeddingConfig & {
             model?: string;
+            max_input_tokens?: number;
             synapse_connection_file?: string;
             synapse_fingerprint?: string;
             synapse_table_epoch?: number;
             synapse_dims?: number;
             synapse_recommended_batch?: number;
+            synapse_recommended_token_budget?: number;
+            synapse_descriptor?: SynapseLaneDescriptor;
             synapse_provenance?: unknown;
         };
         return new SynapseEmbeddingProvider({
@@ -534,6 +731,8 @@ function createProvider(
             tableEpoch: synapse.synapse_table_epoch,
             dims: synapse.synapse_dims,
             recommendedBatch: synapse.synapse_recommended_batch,
+            recommendedTokenBudget: synapse.synapse_recommended_token_budget,
+            descriptor: synapse.synapse_descriptor,
             provenance: synapse.synapse_provenance,
         });
     }
@@ -605,6 +804,10 @@ function snapshotFor(
         "model" in registration.config && typeof registration.config.model === "string"
             ? registration.config.model.trim()
             : "";
+    const synapseDescriptor =
+        !registration.observationMode && registration.config.provider === "synapse"
+            ? synapseDescriptorFromConfig(registration.config)
+            : undefined;
     return {
         projectIdentity: registration.projectIdentity,
         sourceDirectory: registration.sourceDirectory,
@@ -627,6 +830,7 @@ function snapshotFor(
             registration.observationMode || !providerIsOn
                 ? "off"
                 : (registration.config.provider ?? "local"),
+        ...(synapseDescriptor ? { synapseDescriptor } : {}),
     };
 }
 
@@ -717,6 +921,7 @@ function recordActiveEmbeddingIdentity(
     }
 
     const now = Date.now();
+    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
     try {
         if (features.memoryEnabled) {
@@ -732,6 +937,7 @@ function recordActiveEmbeddingIdentity(
             recordScopeActiveIdentity(db, projectIdentity, "chunk", currentChunkIdentity, now);
         }
         db.exec("COMMIT");
+        logSlowWriteTransaction("embedding_identity_record", transactionStartedAt);
     } catch (error) {
         try {
             db.exec("ROLLBACK");
@@ -943,6 +1149,7 @@ export function sweepStaleEmbeddingIdentitiesForProject(
     // identity marker until its final vector is gone makes later timer ticks
     // resume safely without holding a writer lock across the whole backlog.
     let remainingBudget = STALE_EMBEDDING_GC_BATCH_SIZE;
+    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
     try {
         for (const { scope, enabled, currentModelId } of scopes) {
@@ -981,6 +1188,7 @@ export function sweepStaleEmbeddingIdentitiesForProject(
             }
         }
         db.exec("COMMIT");
+        logSlowWriteTransaction("embedding_stale_gc", transactionStartedAt);
     } catch (error) {
         try {
             db.exec("ROLLBACK");
@@ -1055,6 +1263,7 @@ export function registerProjectShadowEmbedding(
     projectIdentity: string,
     config: EmbeddingConfig,
     sourceDirectory: string,
+    options: { manualBackfill?: boolean } = {},
 ): ProjectEmbeddingRegistrationSnapshot | null {
     const resolvedConfig = resolveEmbeddingConfig(config);
     if (resolvedConfig.provider !== "synapse") {
@@ -1075,7 +1284,9 @@ export function registerProjectShadowEmbedding(
         const backfillAlreadyArmed =
             hasPendingShadowBackfill(projectIdentity) ||
             shadowQueue.some((item) => item.projectIdentity === projectIdentity);
-        if (!backfillAlreadyArmed) maybeArmShadowBackfill(db, projectIdentity, prior);
+        if (!backfillAlreadyArmed || options.manualBackfill === true) {
+            maybeArmShadowBackfill(db, projectIdentity, prior, options.manualBackfill === true);
+        }
         return {
             ...snapshotFor({
                 projectIdentity,
@@ -1106,7 +1317,15 @@ export function registerProjectShadowEmbedding(
     };
     shadowRegistrations.set(projectIdentity, registration);
     dbForShadowQueue.set(projectIdentity, db);
-    if (prior) disposeProvider(prior.provider);
+    if (prior) {
+        disposeProvider(prior.provider);
+        for (const scope of ["memory", "commit", "chunk"] as const) {
+            const scopeKey = `${projectIdentity}:${scope}`;
+            shadowBackfillLastIds.delete(scopeKey);
+            shadowBackfillStopReasons.delete(scopeKey);
+            shadowBackfillLastWriteOutcomes.delete(scopeKey);
+        }
+    }
     db.transaction(() => {
         const now = Date.now();
         recordScopeActiveIdentity(db, projectIdentity, "memory", registration.modelId, now);
@@ -1119,7 +1338,7 @@ export function registerProjectShadowEmbedding(
     // corpus under it so the measurement cohort keeps its coverage; the old
     // identity's rows age out through the 14-day GC. No-op when nothing is
     // missing (fresh project / identity unchanged path returned above).
-    maybeArmShadowBackfill(db, projectIdentity, registration);
+    maybeArmShadowBackfill(db, projectIdentity, registration, options.manualBackfill === true);
     return {
         projectIdentity,
         sourceDirectory,
@@ -1136,6 +1355,9 @@ export function registerProjectShadowEmbedding(
                 ? resolvedConfig.model
                 : registration.modelId,
         provider: "synapse",
+        ...(synapseDescriptorFromConfig(resolvedConfig)
+            ? { synapseDescriptor: synapseDescriptorFromConfig(resolvedConfig) }
+            : {}),
     };
 }
 
@@ -1193,7 +1415,8 @@ export async function embedShadowTextForProject(
     const registration = shadowRegistrations.get(projectIdentity);
     if (!registration) return null;
     try {
-        return await registration.provider.embed(text, signal, "query");
+        const vector = await registration.provider.embed(text, signal, "query");
+        return vector && !isSynapseEmbeddingTruncated(vector) ? vector : null;
     } catch (error) {
         log("[magic-context] Synapse shadow query failed:", error);
         return null;
@@ -1210,16 +1433,8 @@ export function enqueueShadowEmbeddingItems(
     startShadowWorker();
 }
 
-/**
- * Base key/hash-incomplete query for one shadow scope. Memory content updates
- * invalidate all model rows and commit SHAs are content identities, so their
- * current-content predicate reduces to row existence. Chunk coverage is stricter:
- * every primary `(compartment_id, window_index, chunk_hash)` must have an exact
- * row under the current shadow identity. A same-key row with an old hash remains
- * a candidate and is replaced by the bounded drain.
- */
 function shadowBackfillMissingBase(
-    scope: ShadowScope,
+    scope: Exclude<ShadowScope, "chunk">,
     primaryModelId: string,
     shadowModelId: string,
     projectIdentity: string,
@@ -1235,37 +1450,14 @@ function shadowBackfillMissingBase(
             orderBy: " ORDER BY m.id",
         };
     }
-    if (scope === "commit") {
-        return {
-            sql: `SELECT gc.sha AS id
-                  FROM git_commits gc
-                  JOIN git_commit_embeddings gp ON gp.sha = gc.sha AND gp.model_id = ?
-                  LEFT JOIN git_commit_embeddings gs ON gs.sha = gc.sha AND gs.model_id = ?
-                  WHERE gc.project_path = ? AND gs.sha IS NULL`,
-            params: [primaryModelId, shadowModelId, projectIdentity],
-            orderBy: " ORDER BY gc.committed_at DESC, gc.sha",
-        };
-    }
     return {
-        sql: `SELECT cp.compartment_id AS id,
-                     MIN(CASE WHEN NOT EXISTS (
-                         SELECT 1 FROM compartment_chunk_embeddings same_key
-                         WHERE same_key.compartment_id = cp.compartment_id
-                           AND same_key.window_index = cp.window_index
-                           AND same_key.model_id = ?
-                     ) THEN 0 ELSE 1 END) AS defect_order
-              FROM compartment_chunk_embeddings cp
-              WHERE cp.project_path = ? AND cp.model_id = ?
-                AND NOT EXISTS (
-                    SELECT 1 FROM compartment_chunk_embeddings current
-                    WHERE current.compartment_id = cp.compartment_id
-                      AND current.window_index = cp.window_index
-                      AND current.chunk_hash = cp.chunk_hash
-                      AND current.model_id = ?
-                )
-              GROUP BY cp.compartment_id`,
-        params: [shadowModelId, projectIdentity, primaryModelId, shadowModelId],
-        orderBy: " ORDER BY defect_order ASC, cp.compartment_id ASC",
+        sql: `SELECT gc.sha AS id
+              FROM git_commits gc
+              JOIN git_commit_embeddings gp ON gp.sha = gc.sha AND gp.model_id = ?
+              LEFT JOIN git_commit_embeddings gs ON gs.sha = gc.sha AND gs.model_id = ?
+              WHERE gc.project_path = ? AND gs.sha IS NULL`,
+        params: [primaryModelId, shadowModelId, projectIdentity],
+        orderBy: " ORDER BY gc.committed_at DESC, gc.sha",
     };
 }
 
@@ -1277,7 +1469,18 @@ function shadowBackfillMissingIds(
     primaryModelId: string,
     shadowModelId: string,
     limit: number,
+    shadowMaxInputTokens: number,
 ): string[] {
+    if (scope === "chunk") {
+        return loadUnembeddedShadowChunkCandidates(
+            db,
+            projectIdentity,
+            primaryModelId,
+            shadowModelId,
+            limit,
+            shadowMaxInputTokens,
+        ).map((candidate) => String(candidate.id));
+    }
     const { sql, params, orderBy } = shadowBackfillMissingBase(
         scope,
         primaryModelId,
@@ -1297,7 +1500,18 @@ function countShadowBackfillMissing(
     scope: ShadowScope,
     primaryModelId: string,
     shadowModelId: string,
+    shadowMaxInputTokens: number,
 ): number {
+    if (scope === "chunk") {
+        return loadUnembeddedShadowChunkCandidates(
+            db,
+            projectIdentity,
+            primaryModelId,
+            shadowModelId,
+            Number.MAX_SAFE_INTEGER,
+            shadowMaxInputTokens,
+        ).length;
+    }
     const { sql, params } = shadowBackfillMissingBase(
         scope,
         primaryModelId,
@@ -1316,20 +1530,91 @@ function shadowModelIdForScope(
     return scope === "chunk" ? registration.chunkModelId : registration.modelId;
 }
 
+function shadowMaxInputTokensFor(registration: ShadowEmbeddingRegistration): number {
+    return normalizeCompartmentChunkMaxInputTokens(
+        "max_input_tokens" in registration.config
+            ? registration.config.max_input_tokens
+            : undefined,
+    );
+}
+
+function shadowBackfillCohortFingerprint(
+    db: Database,
+    projectIdentity: string,
+    scope: ShadowScope,
+    primaryModelId: string,
+): unknown {
+    if (scope === "memory") {
+        return db
+            .prepare(
+                `SELECT COUNT(*) AS rowCount, MAX(m.id) AS maxId, MAX(m.updated_at) AS maxUpdatedAt
+                 FROM memories m
+                 JOIN memory_embeddings me ON me.memory_id = m.id AND me.model_id = ?
+                 WHERE m.project_path = ? AND m.status = 'active'`,
+            )
+            .get(primaryModelId, projectIdentity);
+    }
+    if (scope === "commit") {
+        return db
+            .prepare(
+                `SELECT COUNT(*) AS rowCount, MAX(gc.sha) AS maxId, MAX(gc.committed_at) AS maxUpdatedAt
+                 FROM git_commits gc
+                 JOIN git_commit_embeddings gce ON gce.sha = gc.sha AND gce.model_id = ?
+                 WHERE gc.project_path = ?`,
+            )
+            .get(primaryModelId, projectIdentity);
+    }
+    return db
+        .prepare(
+            `SELECT COUNT(*) AS rowCount,
+                    COUNT(DISTINCT compartment_id) AS compartmentCount,
+                    MAX(compartment_id) AS maxId,
+                    MAX(created_at) AS maxUpdatedAt
+             FROM compartment_chunk_embeddings
+             WHERE project_path = ? AND model_id = ?`,
+        )
+        .get(projectIdentity, primaryModelId);
+}
+
+function shadowBackfillCandidateBatch(
+    db: Database,
+    projectIdentity: string,
+    scope: ShadowScope,
+    primaryModelId: string,
+    shadow: ShadowEmbeddingRegistration,
+    limit: number,
+): { ids: string[]; signature: string } {
+    const shadowModelId = shadowModelIdForScope(shadow, scope);
+    const ids = shadowBackfillMissingIds(
+        db,
+        projectIdentity,
+        scope,
+        primaryModelId,
+        shadowModelId,
+        limit,
+        shadowMaxInputTokensFor(shadow),
+    );
+    return {
+        ids,
+        signature: sha256Prefix(
+            stableStringify({
+                scope,
+                primaryModelId,
+                shadowModelId,
+                ids,
+                cohort: shadowBackfillCohortFingerprint(db, projectIdentity, scope, primaryModelId),
+            }),
+            32,
+        ),
+    };
+}
+
 function hasPendingShadowBackfill(projectIdentity?: string): boolean {
     if (projectIdentity === undefined) return pendingShadowBackfills.size > 0;
     const scopes = pendingShadowBackfills.get(projectIdentity);
     return scopes !== undefined && scopes.size > 0;
 }
 
-/**
- * Refill the shadow queue from pending historical backfills. Called by the
- * worker whenever the live queue runs dry: for each pending (project, scope) it
- * enqueues one bounded chunk of the missing set. A scope is retired when its
- * missing set is empty, or when the same id set comes back twice in a row (no
- * write landed — see shadowBackfillLastIds), so a failing provider can never
- * spin the worker forever.
- */
 function pumpShadowBackfill(): void {
     for (const [projectIdentity, scopes] of pendingShadowBackfills) {
         const db = dbForShadowQueue.get(projectIdentity);
@@ -1346,79 +1631,142 @@ function pumpShadowBackfill(): void {
             if (primaryModelId === "off" || shadowModelId === "off") {
                 scopes.delete(scope);
                 shadowBackfillLastIds.delete(stallKey);
+                shadowBackfillLastWriteOutcomes.delete(stallKey);
                 continue;
             }
-            const ids = shadowBackfillMissingIds(
+            const batch = shadowBackfillCandidateBatch(
                 db,
                 projectIdentity,
                 scope,
                 primaryModelId,
-                shadowModelId,
+                shadow,
                 SHADOW_MAX_ITEMS_PER_TICK,
             );
-            if (ids.length === 0) {
+            if (batch.ids.length === 0) {
                 shadowBackfillStopReasons.set(stallKey, "drained");
                 scopes.delete(scope);
                 shadowBackfillLastIds.delete(stallKey);
+                shadowBackfillLastWriteOutcomes.delete(stallKey);
+                updatePersistedShadowBackfillState(
+                    db,
+                    projectIdentity,
+                    scope,
+                    shadowModelId,
+                    (state) => ({
+                        ...state,
+                        stopReason: "drained",
+                        candidateSignature: undefined,
+                        writeRefusalReason: undefined,
+                        stoppedAt: shadowBackfillNow(),
+                    }),
+                );
                 continue;
             }
-            const signature = ids.join(",");
-            if (shadowBackfillLastIds.get(stallKey) === signature) {
-                // No progress since the last pump for this scope; stop retrying.
-                // Record WHY so status surfaces can distinguish "honest backlog,
-                // provider was failing" from "nothing left" — a bare remaining
-                // count after a silent stop reads as an unembeddable-item bug and
-                // costs a diagnosis cycle (2026-07-24: 437 chunks, transient
-                // provider timeouts under load, zero recorded reason).
+            if (shadowBackfillLastIds.get(stallKey) === batch.signature) {
+                const lastOutcome = shadowBackfillLastWriteOutcomes.get(stallKey);
+                const writeRefusalReason =
+                    lastOutcome?.refusalReason ??
+                    (lastOutcome && lastOutcome.writes > 0
+                        ? "chunk_window_contract_mismatch"
+                        : "unknown_write_rejection");
                 shadowBackfillStopReasons.set(stallKey, "stalled_no_progress");
+                updatePersistedShadowBackfillState(
+                    db,
+                    projectIdentity,
+                    scope,
+                    shadowModelId,
+                    (state) => ({
+                        ...state,
+                        stopReason: "stalled_no_progress",
+                        candidateSignature: batch.signature,
+                        writeRefusalReason,
+                        stoppedAt: shadowBackfillNow(),
+                    }),
+                );
                 log(
                     `[shadow] backfill scope ${scope} for ${projectIdentity} retired without progress — ` +
-                        `the last batch produced no writes (provider failure or timeout is the usual cause); ` +
-                        `${ids.length}+ items remain and retry on the next registration or manual --shadow run`,
+                        `${describeShadowBackfillWriteRefusal(writeRefusalReason)}; ` +
+                        `${batch.ids.length}+ items remain and automatic registration will not retry unchanged candidates`,
                 );
                 scopes.delete(scope);
                 shadowBackfillLastIds.delete(stallKey);
+                shadowBackfillLastWriteOutcomes.delete(stallKey);
                 continue;
             }
-            shadowBackfillLastIds.set(stallKey, signature);
-            shadowQueue.push({ projectIdentity, scope, ids });
+            shadowBackfillLastIds.set(stallKey, batch.signature);
+            shadowQueue.push({ projectIdentity, scope, ids: batch.ids });
         }
         if (scopes.size === 0) pendingShadowBackfills.delete(projectIdentity);
     }
 }
 
-/**
- * Detect whether a freshly registered shadow identity owes a historical
- * backfill and arm it. Runs whenever a NEW shadow identity lands — either a
- * rotation (prior identity differed) or a first/again registration whose corpus
- * already has primary rows but no shadow rows under the current identity (the
- * rotation-while-down case). Cheap: a LIMIT-1 probe per scope; the actual
- * embedding happens asynchronously in the bounded shadow worker, so this never
- * blocks registration. Gated on the untrusted-config latch so a degraded load
- * can never enqueue shadow work off a config we don't trust.
- */
 function maybeArmShadowBackfill(
     db: Database,
     projectIdentity: string,
     shadow: ShadowEmbeddingRegistration,
+    manualBackfill = false,
 ): void {
     if (untrustedLoadProjects.has(projectIdentity)) return;
     const primary = projectRegistrations.get(projectIdentity);
-    if (!primary) return; // No primary cohort to mirror yet.
+    if (!primary) return;
     const pending = new Set<ShadowScope>();
     for (const scope of ["memory", "commit", "chunk"] as const) {
         const primaryModelId = shadowModelIdForScope(primary, scope);
         const shadowModelId = shadowModelIdForScope(shadow, scope);
+        const stallKey = `${projectIdentity}:${scope}`;
         if (primaryModelId === "off" || shadowModelId === "off") continue;
-        const probe = shadowBackfillMissingIds(
+        const batch = shadowBackfillCandidateBatch(
             db,
             projectIdentity,
             scope,
             primaryModelId,
-            shadowModelId,
-            1,
+            shadow,
+            SHADOW_MAX_ITEMS_PER_TICK,
         );
-        if (probe.length > 0) pending.add(scope);
+        const persisted = getPersistedShadowBackfillState(
+            db,
+            projectIdentity,
+            scope,
+            shadowModelId,
+        );
+        if (batch.ids.length === 0) {
+            if (persisted?.stopReason === "stalled_no_progress") {
+                shadowBackfillStopReasons.set(stallKey, "drained");
+                updatePersistedShadowBackfillState(
+                    db,
+                    projectIdentity,
+                    scope,
+                    shadowModelId,
+                    (state) => ({
+                        ...state,
+                        stopReason: "drained",
+                        candidateSignature: undefined,
+                        writeRefusalReason: undefined,
+                        stoppedAt: shadowBackfillNow(),
+                    }),
+                );
+            }
+            continue;
+        }
+        if (
+            !manualBackfill &&
+            persisted?.stopReason === "stalled_no_progress" &&
+            persisted.candidateSignature === batch.signature
+        ) {
+            shadowBackfillStopReasons.set(stallKey, "stalled_no_progress");
+            continue;
+        }
+        shadowBackfillStopReasons.delete(stallKey);
+        shadowBackfillLastIds.delete(stallKey);
+        shadowBackfillLastWriteOutcomes.delete(stallKey);
+        updatePersistedShadowBackfillState(db, projectIdentity, scope, shadowModelId, (state) => ({
+            ...state,
+            stopReason: undefined,
+            candidateSignature: undefined,
+            writeRefusalReason: undefined,
+            stoppedAt: undefined,
+        }));
+        pending.add(scope);
     }
     if (pending.size === 0) return;
     pendingShadowBackfills.set(projectIdentity, pending);
@@ -1445,6 +1793,7 @@ export function getShadowBackfillRemaining(
             scope,
             primaryModelId,
             shadowModelId,
+            shadowMaxInputTokensFor(shadow),
         );
     }
     return remaining;
@@ -1484,7 +1833,10 @@ async function embedShadowItems(
     items: readonly { id: string; text: string; contentSha256: string }[],
     db: Database,
     scope: ShadowScope,
-): Promise<Map<string, Float32Array>> {
+): Promise<{
+    vectors: Map<string, Float32Array>;
+    refusalReason?: ShadowBackfillWriteRefusalReason;
+}> {
     const raw = registration.config as unknown as Record<string, unknown>;
     const fingerprint = typeof raw.synapse_fingerprint === "string" ? raw.synapse_fingerprint : "";
     const tableEpoch = typeof raw.synapse_table_epoch === "number" ? raw.synapse_table_epoch : 0;
@@ -1494,56 +1846,119 @@ async function embedShadowItems(
         tableEpoch,
         items,
     });
-    beginSynapseBatchLedger(db, {
-        sessionId: `shadow:${registration.projectIdentity}`,
-        projectPath: registration.projectIdentity,
-        scope,
-        manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
-        requestKey,
-    });
+    const sessionId = `shadow:${registration.projectIdentity}`;
+    const now = shadowBackfillNow();
+    const prior = db
+        .prepare(
+            `SELECT updated_at AS updatedAt
+             FROM synapse_batch_ledger
+             WHERE session_id = ? AND request_key = ?`,
+        )
+        .get(sessionId, requestKey) as { updatedAt?: number } | undefined;
+    if (
+        typeof prior?.updatedAt === "number" &&
+        now - prior.updatedAt >= 0 &&
+        now - prior.updatedAt < SHADOW_RESUBMIT_WINDOW_MS
+    ) {
+        const modelId = shadowModelIdForScope(registration, scope);
+        const state = getPersistedShadowBackfillState(
+            db,
+            registration.projectIdentity,
+            scope,
+            modelId,
+        );
+        if (
+            state?.budgetLogRequestKey !== requestKey ||
+            typeof state.budgetLoggedAt !== "number" ||
+            now - state.budgetLoggedAt >= SHADOW_RESUBMIT_WINDOW_MS
+        ) {
+            log(
+                `[shadow] skipped duplicate ${scope} batch for ${registration.projectIdentity}; ` +
+                    "the same content was submitted within the one-hour provider budget",
+            );
+            updatePersistedShadowBackfillState(
+                db,
+                registration.projectIdentity,
+                scope,
+                modelId,
+                (current) => ({
+                    ...current,
+                    budgetLogRequestKey: requestKey,
+                    budgetLoggedAt: now,
+                }),
+            );
+        }
+        return {
+            vectors: new Map(),
+            refusalReason: "duplicate_submission_budget",
+        };
+    }
+    beginSynapseBatchLedger(
+        db,
+        {
+            sessionId,
+            projectPath: registration.projectIdentity,
+            scope,
+            manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+            requestKey,
+        },
+        now,
+    );
     try {
         if (registration.provider.embedItems) {
-            const vectors = await registration.provider.embedItems(items);
+            const returned = await registration.provider.embedItems(items);
+            const vectors = new Map(
+                [...returned].filter(([, vector]) => !isSynapseEmbeddingTruncated(vector)),
+            );
             finishSynapseBatchLedger(
                 db,
-                `shadow:${registration.projectIdentity}`,
+                sessionId,
                 requestKey,
                 vectors.size === items.length ? "complete" : "partial",
+                shadowBackfillNow(),
             );
-            return vectors;
+            return {
+                vectors,
+                ...(vectors.size === 0
+                    ? ({ refusalReason: "provider_returned_no_vectors" } as const)
+                    : {}),
+            };
         }
         const positional = await registration.provider.embedBatch(items.map((item) => item.text));
         const vectors = new Map(
             items.flatMap((item, index) => {
                 const vector = positional[index];
-                return vector ? [[item.id, vector] as const] : [];
+                return vector && !isSynapseEmbeddingTruncated(vector)
+                    ? [[item.id, vector] as const]
+                    : [];
             }),
         );
         finishSynapseBatchLedger(
             db,
-            `shadow:${registration.projectIdentity}`,
+            sessionId,
             requestKey,
             vectors.size === items.length ? "complete" : "partial",
+            shadowBackfillNow(),
         );
-        return vectors;
+        return {
+            vectors,
+            ...(vectors.size === 0
+                ? ({ refusalReason: "provider_returned_no_vectors" } as const)
+                : {}),
+        };
     } catch (error) {
-        finishSynapseBatchLedger(
-            db,
-            `shadow:${registration.projectIdentity}`,
-            requestKey,
-            "failed",
-        );
+        finishSynapseBatchLedger(db, sessionId, requestKey, "failed", shadowBackfillNow());
         throw error;
     }
 }
 
-async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
+async function processShadowQueueItem(item: ShadowQueueItem): Promise<ShadowBackfillWriteOutcome> {
     const registration = shadowRegistrations.get(item.projectIdentity);
-    if (!registration) return;
+    if (!registration) return { writes: 0, refusalReason: "candidate_rows_changed" };
     const boundedIds = item.ids.slice(0, SHADOW_MAX_ITEMS_PER_TICK);
     if (item.scope === "memory") {
         const db = dbForShadowQueue.get(item.projectIdentity);
-        if (!db) return;
+        if (!db) return { writes: 0, refusalReason: "candidate_rows_changed" };
         const placeholders = boundedIds.map(() => "?").join(",");
         const rows = db
             .prepare(
@@ -1555,7 +1970,8 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             content: string;
             normalized_hash: string;
         }>;
-        const vectors = await embedShadowItems(
+        if (rows.length === 0) return { writes: 0, refusalReason: "candidate_rows_changed" };
+        const embedded = await embedShadowItems(
             registration,
             rows.map((row) => ({
                 id: `memory:${row.id}`,
@@ -1565,31 +1981,51 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             db,
             "memory",
         );
+        let writes = 0;
+        let hashGuardRejected = false;
         db.transaction(() => {
             for (const row of rows) {
-                const vector = vectors.get(`memory:${row.id}`);
-                if (vector)
+                const vector = embedded.vectors.get(`memory:${row.id}`);
+                if (!vector) continue;
+                if (
                     saveEmbeddingIfHashMatches(
                         db,
                         row.id,
                         vector,
                         registration.modelId,
                         row.normalized_hash,
-                    );
+                    )
+                ) {
+                    writes += 1;
+                } else {
+                    hashGuardRejected = true;
+                }
             }
         })();
-        return;
+        return {
+            writes,
+            ...(writes === 0
+                ? {
+                      refusalReason:
+                          embedded.refusalReason ??
+                          (hashGuardRejected
+                              ? "memory_hash_guard_rejected"
+                              : "provider_returned_no_vectors"),
+                  }
+                : {}),
+        };
     }
     if (item.scope === "commit") {
         const db = dbForShadowQueue.get(item.projectIdentity);
-        if (!db) return;
+        if (!db) return { writes: 0, refusalReason: "candidate_rows_changed" };
         const placeholders = boundedIds.map(() => "?").join(",");
         const rows = db
             .prepare(
                 `SELECT sha, message FROM git_commits WHERE project_path = ? AND sha IN (${placeholders})`,
             )
             .all(item.projectIdentity, ...boundedIds) as Array<{ sha: string; message: string }>;
-        const vectors = await embedShadowItems(
+        if (rows.length === 0) return { writes: 0, refusalReason: "candidate_rows_changed" };
+        const embedded = await embedShadowItems(
             registration,
             rows.map((row) => ({
                 id: `commit:${row.sha}`,
@@ -1599,22 +2035,30 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             db,
             "commit",
         );
+        let writes = 0;
         db.transaction(() => {
             for (const row of rows) {
-                const vector = vectors.get(`commit:${row.sha}`);
-                if (vector) saveCommitEmbedding(db, row.sha, vector, registration.modelId);
+                const vector = embedded.vectors.get(`commit:${row.sha}`);
+                if (!vector) continue;
+                saveCommitEmbedding(db, row.sha, vector, registration.modelId);
+                writes += 1;
             }
         })();
-        return;
+        return {
+            writes,
+            ...(writes === 0
+                ? { refusalReason: embedded.refusalReason ?? "provider_returned_no_vectors" }
+                : {}),
+        };
     }
 
     const db = dbForShadowQueue.get(item.projectIdentity);
-    if (!db) return;
+    if (!db) return { writes: 0, refusalReason: "candidate_rows_changed" };
     const placeholders = boundedIds.map(() => "?").join(",");
     const candidates = db
         .prepare(
             `SELECT id, session_id, start_message, end_message
-         FROM compartments WHERE id IN (${placeholders})`,
+             FROM compartments WHERE id IN (${placeholders})`,
         )
         .all(...boundedIds.map((id) => Number(id))) as Array<{
         id: number;
@@ -1622,10 +2066,15 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
         start_message: number;
         end_message: number;
     }>;
+    if (candidates.length === 0) {
+        return { writes: 0, refusalReason: "candidate_rows_changed" };
+    }
     const prepared: Array<{
         candidate: (typeof candidates)[number];
         windows: ReturnType<typeof chunkCanonicalText>;
     }> = [];
+    let ftsMappingIncomplete = false;
+    let emptyCanonicalText = false;
     for (const candidate of candidates) {
         const mappedText = buildCanonicalChunkTextFromFts(
             db,
@@ -1633,17 +2082,28 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             candidate.start_message,
             candidate.end_message,
         );
-        if (mappedText !== null) {
+        if (mappedText === null) {
+            ftsMappingIncomplete = true;
+        } else {
             const text = mappedText || buildCompartmentSummaryFallbackText(db, candidate.id);
             const windows = chunkCanonicalText(
                 text,
                 candidate.start_message,
                 candidate.end_message,
-                SYNAPSE_MAX_INPUT_TOKENS,
+                shadowMaxInputTokensFor(registration),
             );
             if (windows.length > 0) prepared.push({ candidate, windows });
+            else emptyCanonicalText = true;
         }
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    if (prepared.length === 0) {
+        return {
+            writes: 0,
+            refusalReason: ftsMappingIncomplete
+                ? "chunk_fts_mapping_incomplete"
+                : "chunk_empty_canonical_text",
+        };
     }
     const items = prepared.flatMap((item) =>
         item.windows.map((window) => ({
@@ -1652,10 +2112,12 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             contentSha256: contentSha256(window.text),
         })),
     );
-    const vectors = await embedShadowItems(registration, items, db, "chunk");
+    const embedded = await embedShadowItems(registration, items, db, "chunk");
+    let writes = 0;
+    let partialVectorSet = false;
     for (const item of prepared) {
         const rows: SaveCompartmentChunkEmbeddingInput[] = item.windows.flatMap((window) => {
-            const vector = vectors.get(`chunk:${item.candidate.id}:${window.windowIndex}`);
+            const vector = embedded.vectors.get(`chunk:${item.candidate.id}:${window.windowIndex}`);
             return vector
                 ? [
                       {
@@ -1669,8 +2131,29 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
                   ]
                 : [];
         });
-        if (rows.length === item.windows.length) replaceCompartmentChunkEmbeddings(db, rows);
+        if (rows.length === item.windows.length) {
+            replaceCompartmentChunkEmbeddings(db, rows);
+            writes += 1;
+        } else {
+            partialVectorSet = true;
+        }
     }
+    return {
+        writes,
+        ...(writes === 0
+            ? {
+                  refusalReason:
+                      embedded.refusalReason ??
+                      (partialVectorSet
+                          ? "chunk_partial_vector_set"
+                          : ftsMappingIncomplete
+                            ? "chunk_fts_mapping_incomplete"
+                            : emptyCanonicalText
+                              ? "chunk_empty_canonical_text"
+                              : "unknown_write_rejection"),
+              }
+            : {}),
+    };
 }
 
 const dbForShadowQueue = new Map<string, Database>();
@@ -1700,8 +2183,13 @@ async function runShadowWorker(): Promise<void> {
             break;
         }
         try {
-            await processShadowQueueItem(item);
+            const outcome = await processShadowQueueItem(item);
+            shadowBackfillLastWriteOutcomes.set(`${item.projectIdentity}:${item.scope}`, outcome);
         } catch (error) {
+            shadowBackfillLastWriteOutcomes.set(`${item.projectIdentity}:${item.scope}`, {
+                writes: 0,
+                refusalReason: "provider_returned_no_vectors",
+            });
             log("[magic-context] Synapse shadow write failed:", error);
         }
         processed += item.ids.length;
@@ -1815,7 +2303,7 @@ export async function embedTextForProject(
     if (!provider) return null;
 
     const vector = await provider.embed(text, signal, purpose);
-    if (!vector) return null;
+    if (!vector || isSynapseEmbeddingTruncated(vector)) return null;
 
     const current = projectRegistrations.get(projectIdentity);
     if (
@@ -1849,7 +2337,9 @@ export async function embedBatchForProject(
     const provider = getOrCreateProjectProvider(registration);
     if (!provider) return null;
 
-    const vectors = await provider.embedBatch(texts, signal, purpose);
+    const vectors = (await provider.embedBatch(texts, signal, purpose)).map((vector) =>
+        vector && !isSynapseEmbeddingTruncated(vector) ? vector : null,
+    );
     const current = projectRegistrations.get(projectIdentity);
     if (
         !current ||
@@ -1909,7 +2399,10 @@ export async function embedItemsForProject(
     let vectors: Map<string, Float32Array>;
     try {
         if (provider.embedItems) {
-            vectors = await provider.embedItems(items, signal);
+            const returned = await provider.embedItems(items, signal);
+            vectors = new Map(
+                [...returned].filter(([, vector]) => !isSynapseEmbeddingTruncated(vector)),
+            );
         } else {
             const positional = await provider.embedBatch(
                 items.map((item) => item.text),
@@ -1919,7 +2412,9 @@ export async function embedItemsForProject(
             vectors = new Map(
                 items.flatMap((item, index) => {
                     const vector = positional[index];
-                    return vector ? [[item.id, vector] as const] : [];
+                    return vector && !isSynapseEmbeddingTruncated(vector)
+                        ? [[item.id, vector] as const]
+                        : [];
                 }),
             );
         }
@@ -2179,6 +2674,7 @@ async function embedCompartmentChunkBatch(
         snapshot.chunkModelId,
         batchSize,
         getProjectEmbeddingMaxInputTokens(projectIdentity),
+        true,
     );
     if (candidates.length === 0) return 0;
     // Passive sweep ignores `failed`/`noWork` — it's bounded per tick and re-runs
@@ -2512,7 +3008,6 @@ export async function embedSessionCompartmentChunks(
         snapshot.chunkModelId,
         maxInputTokens,
     );
-    if (total === 0) return { status: "nothing", embedded: 0, total: 0 };
 
     const holderId = `session-embed-${randomUUID()}`;
     const lease = acquireGitSweepLease(db, projectIdentity, holderId, { ignoreCooldown: true });
@@ -2573,6 +3068,7 @@ export async function embedSessionCompartmentChunks(
                 batchSize,
                 [...skipIds, ...failedIds],
                 maxInputTokens,
+                true,
             );
             if (candidates.length === 0) break;
             const {
@@ -2633,6 +3129,7 @@ export async function embedSessionCompartmentChunks(
             log("[magic-context] embed drain: lease release failed (will TTL-expire):", error);
         }
     }
+    if (total === 0) return { status: "nothing", embedded: 0, total: 0 };
     if (aborted) return { status: "aborted", embedded, total, failed: failedIds.length };
     // Either the provider went down (circuit broke) or some compartments failed
     // their retries but the rest drained. Count what's genuinely still embeddable
@@ -2670,12 +3167,16 @@ export interface EmbeddingCoverageStatus {
     model: string;
     /** Configured provider kind ("local" / "openai-compatible" / "ollama" / "off"). */
     provider: string;
+    /** Live Synapse lane capabilities, when Synapse is active. */
+    synapseDescriptor?: SynapseLaneDescriptor;
     /** This session's compartment-chunk coverage. */
     session: { embedded: number; total: number };
     /** Project-wide active-memory coverage. */
     memories: { embedded: number; total: number };
     /** Project-wide git-commit coverage (only meaningful when gitEnabled). */
     commits: { embedded: number; total: number; gitEnabled: boolean };
+    /** Durable write-side reasons for current shadow scopes that stopped without progress. */
+    shadowBackfillStalls: ShadowBackfillStall[];
 }
 
 /**
@@ -2694,9 +3195,13 @@ export function getEmbeddingCoverageStatus(
             enabled: false,
             model: snapshot?.model ?? "off",
             provider: snapshot?.provider ?? "off",
+            ...(snapshot?.synapseDescriptor
+                ? { synapseDescriptor: snapshot.synapseDescriptor }
+                : {}),
             session: { embedded: 0, total: 0 },
             memories: { embedded: 0, total: 0 },
             commits: { embedded: 0, total: 0, gitEnabled: false },
+            shadowBackfillStalls: listShadowBackfillStalls(db, projectIdentity),
         };
     }
     const session = countSessionCompartmentEmbedCoverage(
@@ -2719,9 +3224,11 @@ export function getEmbeddingCoverageStatus(
         enabled: true,
         model: snapshot.model,
         provider: snapshot.provider,
+        ...(snapshot.synapseDescriptor ? { synapseDescriptor: snapshot.synapseDescriptor } : {}),
         session,
         memories,
         commits,
+        shadowBackfillStalls: listShadowBackfillStalls(db, projectIdentity),
     };
 }
 
@@ -2806,6 +3313,10 @@ export function _setTestProviderFactoryForProject(
     testProviderFactory = factory;
 }
 
+export function _setShadowBackfillNowForTests(now: (() => number) | null): void {
+    shadowBackfillNow = now ?? (() => Date.now());
+}
+
 export function _resetProjectEmbeddingRegistryForTests(): void {
     for (const registration of projectRegistrations.values()) {
         disposeProvider(registration.provider);
@@ -2818,9 +3329,13 @@ export function _resetProjectEmbeddingRegistryForTests(): void {
     shadowQueue.length = 0;
     pendingShadowBackfills.clear();
     shadowBackfillLastIds.clear();
+    shadowBackfillStopReasons.clear();
+    shadowBackfillLastWriteOutcomes.clear();
     dbForShadowQueue.clear();
     untrustedLoadProjects.clear();
     globalRegistrationGeneration = 0;
     projectSweepInProgress = false;
     testProviderFactory = null;
+    shadowBackfillNow = () => Date.now();
+    setBootQuietPeriodForTests(null);
 }

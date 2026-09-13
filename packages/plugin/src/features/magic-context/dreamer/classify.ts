@@ -10,13 +10,14 @@ import {
     extractLatestAssistantText,
     hasLengthCappedOutput,
 } from "../../../shared/assistant-message-extractor";
+import { teardownChildSession } from "../../../shared/child-session-teardown";
 import { describeError, getErrorMessage } from "../../../shared/error-message";
-import { shouldKeepSubagents } from "../../../shared/keep-subagents";
 import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import { hasShareabilitySensitiveText } from "../../../shared/redaction";
 import { modelBodyField, toModelEntry } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
+import { renderCapabilityRefusal } from "../../../shared/user-facing-codes";
 import {
     getMemoriesByProject,
     getUnclassifiedMemoryIds,
@@ -331,6 +332,7 @@ async function classifyOneChunk(
     signal: AbortSignal,
 ): Promise<{ classified: number; changed: number }> {
     let agentSessionId: string | null = null;
+    let promptSettled = false;
     const startedAt = Date.now();
     const moduleRoute = isModuleRoute(args);
     try {
@@ -411,6 +413,7 @@ async function classifyOneChunk(
                 },
             },
         );
+        promptSettled = true;
 
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
         return applyClassifications(
@@ -439,19 +442,15 @@ async function classifyOneChunk(
             throw failure;
         return { classified: 0, changed: 0 };
     } finally {
-        // Delete on success AND failure (the failed child still holds the
-        // memory-pool snapshot from the prompt). keep_subagents still honored —
-        // memory-pool text, not raw user transcripts.
-        if (agentSessionId && !shouldKeepSubagents()) {
-            await args.client.session
-                .delete({
-                    path: { id: agentSessionId },
-                    query: { directory: args.sessionDirectory },
-                })
-                .catch((e: unknown) => {
-                    log(`[dreamer] classify session cleanup failed: ${getErrorMessage(e)}`);
-                });
-        }
+        await teardownChildSession({
+            client: args.client,
+            sessionId: agentSessionId,
+            sessionDirectory: args.sessionDirectory,
+            promptSettled,
+            privacySensitive: true,
+            context: "[dreamer] classify",
+            log,
+        });
     }
 }
 
@@ -553,12 +552,12 @@ async function runClassifyThroughModule(
         });
     } catch (error) {
         if (isRustAuthorityDrainingError(error)) {
-            throw new Error("Rust memory authority is not ready; TypeScript fallback is disabled.");
+            throw new Error(renderCapabilityRefusal("memory_write"));
         }
         throw error;
     }
     if (isRustAuthorityDrainingError(applied)) {
-        throw new Error("Rust memory authority is not ready; TypeScript fallback is disabled.");
+        throw new Error(renderCapabilityRefusal("memory_write"));
     }
     const applyResult = (applied as { result?: unknown } | null)?.result ?? applied;
     if (!applyResult || typeof applyResult !== "object") {

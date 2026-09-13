@@ -24,7 +24,7 @@ import {
     resolveOpenCodeProtectedTailBoundary,
 } from "./protected-tail-boundary";
 import { primeTailRawMessageCache, withRawSessionMessageCache } from "./read-session-chunk";
-import { sendIgnoredMessage } from "./send-session-notification";
+import { sendStatusNotification } from "./send-session-notification";
 import type { MessageLike } from "./transform-operations";
 
 interface RunCompartmentPhaseArgs {
@@ -150,10 +150,16 @@ export function runCompartmentPhase(
 
     return withRawSessionMessageCache(() => {
         try {
+            const preResolved = args.preResolvedBoundarySnapshot;
+            const hasPreResolvedAnchor = preResolved?.lastCompartmentEndMessageId !== undefined;
             primeTailRawMessageCache({
                 sessionId: args.resolvedSessionId,
-                lastCompartmentEnd: getLastCompartmentEndMessage(args.db, args.resolvedSessionId),
-                anchorMessageId: getLastCompartmentEndMessageId(args.db, args.resolvedSessionId),
+                lastCompartmentEnd: hasPreResolvedAnchor
+                    ? preResolved.offset - 1
+                    : getLastCompartmentEndMessage(args.db, args.resolvedSessionId),
+                anchorMessageId: hasPreResolvedAnchor
+                    ? (preResolved.lastCompartmentEndMessageId ?? null)
+                    : getLastCompartmentEndMessageId(args.db, args.resolvedSessionId),
             });
         } catch (error) {
             // Priming is a pure optimization — on any failure the phase falls
@@ -201,8 +207,18 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             rebuiltHistoryThisPass,
         };
     }
-    let rawEligibility: ReturnType<typeof getRawHistoryEligibility> | null = null;
-    let lastObservedCompartmentEnd = -1;
+    let rawEligibility: ReturnType<typeof getRawHistoryEligibility> | null =
+        args.preResolvedBoundarySnapshot
+            ? {
+                  lastCompartmentEnd: args.preResolvedBoundarySnapshot.offset - 1,
+                  offset: args.preResolvedBoundarySnapshot.offset,
+                  rawMessageCount: args.preResolvedBoundarySnapshot.rawMessageCountAtTrigger,
+                  hasRawBeyondLastCompartment:
+                      args.preResolvedBoundarySnapshot.rawMessageCountAtTrigger >=
+                      args.preResolvedBoundarySnapshot.offset,
+              }
+            : null;
+    let lastObservedCompartmentEnd = rawEligibility?.lastCompartmentEnd ?? -1;
     let cachedBoundarySnapshot: ProtectedTailBoundarySnapshot | null = null;
 
     function hasNewRawHistoryForCompartment(): boolean {
@@ -417,7 +433,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             if (args.client && !activeRun.notificationSent) {
                 activeRun.notificationSent = true;
                 const notifParams = args.getNotificationParams?.() ?? {};
-                void sendIgnoredMessage(
+                void sendStatusNotification(
                     args.client,
                     args.sessionId,
                     `⏳ Context at ${args.contextUsage.percentage.toFixed(0)}% — Magic Context is comparting history before continuing. This may take up to 2 minutes.`,

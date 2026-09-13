@@ -36,6 +36,7 @@ import {
     CHANNEL1_SENTINEL,
     type Channel1State,
     decideChannel1,
+    formatChannel1Evaluation,
     reclaimableToolOutputCount,
     toolOutputTokens,
 } from "./ctx-reduce-nudge";
@@ -53,7 +54,11 @@ import {
     resetNoteNudgeCooldownOnly,
 } from "./note-nudger";
 import { readRawSessionMessageById, readRawSessionMessages } from "./read-session-chunk";
-import { clearIgnoredMessages, flushIgnoredMessages } from "./send-session-notification";
+import {
+    clearIgnoredMessages,
+    flushIgnoredMessages,
+    observeIgnoredNotificationEvent,
+} from "./send-session-notification";
 import { variantChangeBustsProviderCache } from "./sentinel";
 import { matchStrippedMagicContextCommand } from "./stripped-command";
 import { normalizeTodoStateJson } from "./todo-view";
@@ -331,13 +336,15 @@ export function createEventHook(args: {
     deferredMaterializationSessions: DeferredMaterializationSessions;
     lastHeuristicsTurnId: LastHeuristicsTurnId;
     commitSeenLastPass?: Map<string, boolean>;
+    /** Optional source override for the settled raw-message read. */
+    readIncrementalMessage?: typeof readRawSessionMessageById;
     client: PluginContext["client"];
-    protectedTags: number;
 }) {
     const latestAssistantMessageIdBySession =
         args.latestAssistantMessageIdBySession ?? new Map<string, string>();
 
     return async (input: { event: { type: string; properties?: unknown } }) => {
+        observeIgnoredNotificationEvent(input.event);
         await args.eventHandler(input);
 
         if (input.event.type === "message.updated") {
@@ -353,7 +360,7 @@ export function createEventHook(args: {
                         args.db,
                         messageInfo.sessionID,
                         messageInfo.messageID,
-                        readRawSessionMessageById,
+                        args.readIncrementalMessage ?? readRawSessionMessageById,
                     );
                 }
             }
@@ -470,9 +477,8 @@ export function createEventHook(args: {
             clearSessionTracking(sessionId);
         }
 
-        // Terminal message.updated/session events are the other existing idle
-        // boundary. `flushIgnoredMessages` checks the same DB signal again, so
-        // streaming deltas cannot accidentally release the queue mid-turn.
+        // The harness idle signal, not finish=stop, authorizes notice delivery.
+        // Other events may safely attempt a flush but cannot release the queue.
         if (input.event.type !== "session.deleted") {
             await flushIgnoredMessages(sessionId);
         }
@@ -547,8 +553,6 @@ function maybeInjectChannel1Nudge(
     // inside the recency reserve, so it grows T but not U.
     state.turnDeltaT += toolOutputTokens(out.output);
 
-    if (state.reducedSinceRefresh || state.agentDropsAppliedThisPass) return;
-
     const nudgeState = getChannel1NudgeState(args.db, sessionId);
     const decision = decideChannel1({
         baselineU: state.baselineU,
@@ -559,13 +563,15 @@ function maybeInjectChannel1Nudge(
         lastNudgeLevel: nudgeState.level,
         lastFireOrdinal: nudgeState.ordinal,
         currentRealUserTurnCount: state.realUserTurnCount,
-        hasRecentReduce: false,
+        hasRecentReduce: state.reducedSinceRefresh,
+        agentDropsAppliedThisPass: state.agentDropsAppliedThisPass,
         postReduceGracePending: nudgeState.postReduceGracePending,
         postReduceGraceBaselineU: nudgeState.postReduceGraceBaselineU,
         postReduceGracePreLevel: nudgeState.postReduceGracePreLevel,
         evaluable: state.evaluable,
         generationInvalidated: state.generationInvalidated,
     });
+    sessionLog(sessionId, formatChannel1Evaluation(decision));
 
     // Store the cadence level and dampening ordinal together so one persisted state stays in sync.
     setLastNudgeUndropped(args.db, sessionId, decision.nextLastNudge);

@@ -4,6 +4,7 @@ import { estimateTokens } from "../../hooks/magic-context/read-session-formattin
 import { getHarness } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { isSynapseEmbeddingTruncated } from "./memory/embedding-synapse";
 import { messageFtsOrdinalRangeIsMapped } from "./message-fts-rowid-map";
 import { recursiveCharacterSplit } from "./recursive-text-splitter";
 
@@ -123,10 +124,12 @@ const existingHashStatements = new WeakMap<Database, PreparedStatement>();
 const existingHashByProjectStatements = new WeakMap<Database, PreparedStatement>();
 const deleteByCompartmentStatements = new WeakMap<Database, PreparedStatement>();
 const insertEmbeddingStatements = new WeakMap<Database, PreparedStatement>();
+const renumberEmbeddingWindowStatements = new WeakMap<Database, PreparedStatement>();
 const searchRowsStatements = new WeakMap<Database, PreparedStatement>();
 const searchRowsByModelStatements = new WeakMap<Database, PreparedStatement>();
 const searchPoolProbeStatements = new WeakMap<Database, PreparedStatement>();
 const backfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
+const shadowBackfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
 
 const DECODED_SEARCH_POOL_CACHE_MAX_BYTES = 256 * 1024 * 1024;
 const decodedSearchPools = new WeakMap<Database, Map<string, DecodedSearchPoolEntry>>();
@@ -180,6 +183,22 @@ function getInsertEmbeddingStatement(db: Database): PreparedStatement {
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         );
         insertEmbeddingStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getRenumberEmbeddingWindowStatement(db: Database): PreparedStatement {
+    let stmt = renumberEmbeddingWindowStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            `UPDATE compartment_chunk_embeddings
+             SET window_index = ?
+             WHERE compartment_id = ?
+               AND model_id = ?
+               AND project_path = ?
+               AND window_index = ?`,
+        );
+        renumberEmbeddingWindowStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -248,6 +267,36 @@ function getBackfillCandidateStatement(db: Database): PreparedStatement {
              ORDER BY c.created_at DESC, c.id DESC`,
         );
         backfillCandidateStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getShadowBackfillCandidateStatement(db: Database): PreparedStatement {
+    let stmt = shadowBackfillCandidateStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            `SELECT c.id AS id,
+                    c.session_id AS sessionId,
+                    c.start_message AS startMessage,
+                    c.end_message AS endMessage,
+                    c.title AS title
+             FROM compartments c
+             JOIN session_projects sp
+               ON sp.session_id = c.session_id
+              AND sp.harness = c.harness
+              AND sp.project_path = ?
+             WHERE c.start_message IS NOT NULL
+               AND c.end_message IS NOT NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM compartment_chunk_embeddings primary_chunks
+                   WHERE primary_chunks.compartment_id = c.id
+                     AND primary_chunks.project_path = ?
+                     AND primary_chunks.model_id = ?
+               )
+             ORDER BY c.created_at DESC, c.id DESC`,
+        );
+        shadowBackfillCandidateStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -385,6 +434,19 @@ function parseCanonicalLineRange(line: string): { start: number; end: number } |
     const end = match[2] ? Number.parseInt(match[2], 10) : start;
     if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
     return { start, end };
+}
+
+function assertOrdinalRangeWithinCompartment(
+    rangeStart: number,
+    rangeEnd: number,
+    compartmentStart: number,
+    compartmentEnd: number,
+): void {
+    if (rangeStart < compartmentStart || rangeEnd > compartmentEnd || rangeEnd < rangeStart) {
+        throw new RangeError(
+            `Canonical chunk range ${rangeStart}-${rangeEnd} lies outside compartment ${compartmentStart}-${compartmentEnd}`,
+        );
+    }
 }
 
 function hashChunkText(text: string): string {
@@ -528,6 +590,17 @@ export function canonicalizeInMemoryChunkTextForEmbedding(
             continue;
         }
 
+        const clipsRequestedRange =
+            (startOrdinal != null && lineStart < startOrdinal) ||
+            (endOrdinal != null && lineEnd > endOrdinal);
+        if (clipsRequestedRange) {
+            // Merged historian blocks can include filtered ordinals, while a single
+            // message can itself contain " / ". Without one part per ordinal there
+            // is no faithful way to clip the text. Reject the in-memory chunk so the
+            // publish path reconstructs this compartment's exact span from FTS.
+            return "";
+        }
+
         const parts = rawParts.filter((part) => !part.startsWith("TC:"));
         if (parts.length === 0) continue;
         lines.push(`${match[1]} ${parts.join(" / ")}`);
@@ -546,6 +619,13 @@ export function chunkCanonicalText(
         .map((line) => line.trim())
         .filter((line) => line.length > 0);
     if (lines.length === 0 || endOrdinal < startOrdinal) return [];
+
+    for (const line of lines) {
+        const range = parseCanonicalLineRange(line);
+        if (range) {
+            assertOrdinalRangeWithinCompartment(range.start, range.end, startOrdinal, endOrdinal);
+        }
+    }
 
     const normalizedMax = normalizeCompartmentChunkMaxInputTokens(maxInputTokens);
     // Window against a safety-margined budget, not the raw ceiling, so estimator
@@ -573,8 +653,9 @@ export function chunkCanonicalText(
     const flush = (): void => {
         if (currentLines.length === 0 || currentStart === null || currentEnd === null) return;
         const text = currentLines.join("\n");
+        assertOrdinalRangeWithinCompartment(currentStart, currentEnd, startOrdinal, endOrdinal);
         windows.push({
-            windowIndex: windows.length + 1,
+            windowIndex: windows.length,
             startOrdinal: currentStart,
             endOrdinal: currentEnd,
             text,
@@ -602,8 +683,9 @@ export function chunkCanonicalText(
         if (lineTokens > effectiveMax) {
             flush();
             for (const slice of splitOversizedLine(line, effectiveMax)) {
+                assertOrdinalRangeWithinCompartment(lineStart, lineEnd, startOrdinal, endOrdinal);
                 windows.push({
-                    windowIndex: windows.length + 1,
+                    windowIndex: windows.length,
                     startOrdinal: lineStart,
                     endOrdinal: lineEnd,
                     text: slice,
@@ -625,10 +707,6 @@ export function chunkCanonicalText(
     }
     flush();
 
-    // windowIndex is assigned contiguously as 1-based at push time (both the
-    // flush path and the oversized-line split use `windows.length + 1`), so it is
-    // already gap-free and stable — preserve it (chunk identity = compartmentId +
-    // windowIndex + hash; renumbering would orphan every stored chunk row).
     return windows;
 }
 
@@ -764,7 +842,7 @@ export function replaceCompartmentChunkEmbeddings(
     db: Database,
     rows: readonly SaveCompartmentChunkEmbeddingInput[],
 ): void {
-    if (rows.length === 0) return;
+    if (rows.length === 0 || rows.some((row) => isSynapseEmbeddingTruncated(row.vector))) return;
     const compartmentId = rows[0].compartmentId;
     const modelId = rows[0].modelId;
     const now = Date.now();
@@ -877,20 +955,53 @@ export function loadUnembeddedCompartmentChunkCandidates(
     );
 }
 
-/** Auto-drain selector that gives the host a turn after every mapped span read. */
+/**
+ * Select hash-incomplete rows under the shadow window contract, restricted to
+ * compartments already represented in the primary cohort. Primary and shadow
+ * providers may use different token ceilings, so primary window keys and hashes
+ * cannot be used as the shadow completeness predicate.
+ */
+export function loadUnembeddedShadowChunkCandidates(
+    db: Database,
+    projectPath: string,
+    primaryModelId: string,
+    shadowModelId: string,
+    limit: number,
+    shadowMaxInputTokens: number,
+): CompartmentChunkBackfillCandidate[] {
+    const rows = getShadowBackfillCandidateStatement(db).all(
+        projectPath,
+        projectPath,
+        primaryModelId,
+    ) as unknown[];
+    return selectHashIncompleteChunkCandidates(
+        db,
+        projectPath,
+        shadowModelId,
+        mapBackfillCandidateRows(rows),
+        Math.max(1, limit),
+        shadowMaxInputTokens,
+    );
+}
+
+/**
+ * Auto-drain selector that gives the host a turn after every mapped span read.
+ * `leaseHeldRenumber` is reserved for callers holding the project's write lease.
+ */
 export async function loadUnembeddedCompartmentChunkCandidatesPolite(
     db: Database,
     projectPath: string,
     modelId: string,
     limit: number,
     maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
+    leaseHeldRenumber = false,
 ): Promise<CompartmentChunkBackfillCandidate[]> {
     const rows = getBackfillCandidateStatement(db).all(projectPath) as unknown[];
     const candidates = mapBackfillCandidateRows(rows);
     const missing: CompartmentChunkBackfillCandidate[] = [];
     const stale: CompartmentChunkBackfillCandidate[] = [];
     for (const candidate of candidates) {
-        const defect = classifyChunkCoverageDefect(
+        const { defect, windows } = classifyChunkCoverageDefect(
             db,
             projectPath,
             modelId,
@@ -899,6 +1010,9 @@ export async function loadUnembeddedCompartmentChunkCandidatesPolite(
         );
         if (defect === "missing") missing.push(candidate);
         else if (defect === "stale") stale.push(candidate);
+        else if (defect === "renumber" && leaseHeldRenumber) {
+            renumberOneBasedChunkWindows(db, candidate, projectPath, modelId, windows);
+        }
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
     }
     return [...missing, ...stale].slice(0, Math.max(1, limit));
@@ -926,7 +1040,47 @@ function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCand
         }));
 }
 
-type ChunkCoverageDefect = "missing" | "stale" | "deferred" | null;
+type ChunkCoverageDefect = "missing" | "stale" | "renumber" | "deferred" | null;
+
+interface ChunkCoverageClassification {
+    defect: ChunkCoverageDefect;
+    windows: CompartmentChunkWindow[];
+}
+
+function renumberOneBasedChunkWindows(
+    db: Database,
+    candidate: CompartmentChunkBackfillCandidate,
+    projectPath: string,
+    modelId: string,
+    windows: readonly CompartmentChunkWindow[],
+): void {
+    const update = getRenumberEmbeddingWindowStatement(db);
+    db.transaction(() => {
+        // Move lowest to highest so each old key is vacant before the next row
+        // moves into it, preserving the unique compartment/model/window key.
+        for (const window of windows) {
+            const result = update.run(
+                window.windowIndex,
+                candidate.id,
+                modelId,
+                projectPath,
+                window.windowIndex + 1,
+            );
+            if (result.changes !== 1) {
+                throw new Error(
+                    `Failed to renumber compartment ${candidate.id} window ${window.windowIndex + 1}`,
+                );
+            }
+        }
+    })();
+    invalidateDecodedSearchPools(
+        db,
+        ([sessionId, cachedProjectPath, cachedModelId]) =>
+            sessionId === candidate.sessionId &&
+            cachedProjectPath === projectPath &&
+            cachedModelId === modelId,
+    );
+}
 
 /** Classify one compartment against the transcript bytes the current model would embed. */
 function classifyChunkCoverageDefect(
@@ -935,14 +1089,14 @@ function classifyChunkCoverageDefect(
     modelId: string,
     candidate: CompartmentChunkBackfillCandidate,
     maxInputTokens: number,
-): ChunkCoverageDefect {
+): ChunkCoverageClassification {
     const mappedText = buildCanonicalChunkTextFromFts(
         db,
         candidate.sessionId,
         candidate.startMessage,
         candidate.endMessage,
     );
-    if (mappedText === null) return "deferred";
+    if (mappedText === null) return { defect: "deferred", windows: [] };
     const canonicalText = mappedText || buildCompartmentSummaryFallbackText(db, candidate.id);
     const windows = chunkCanonicalText(
         canonicalText,
@@ -952,14 +1106,26 @@ function classifyChunkCoverageDefect(
     );
     const existing = getExistingChunkHashes(db, candidate.id, modelId, projectPath);
 
-    if (windows.some((window) => !existing.has(window.windowIndex))) return "missing";
+    const isMatchingOneBasedSet =
+        windows.length > 0 &&
+        existing.size === windows.length &&
+        windows.every((window) => existing.get(window.windowIndex + 1) === window.chunkHash);
+    if (isMatchingOneBasedSet) return { defect: "renumber", windows };
+
+    const expectedWindowIndexes = new Set(windows.map((window) => window.windowIndex));
+    if ([...existing.keys()].some((windowIndex) => !expectedWindowIndexes.has(windowIndex))) {
+        return { defect: "stale", windows };
+    }
+    if (windows.some((window) => !existing.has(window.windowIndex))) {
+        return { defect: "missing", windows };
+    }
     if (
         existing.size !== windows.length ||
         windows.some((window) => existing.get(window.windowIndex) !== window.chunkHash)
     ) {
-        return "stale";
+        return { defect: "stale", windows };
     }
-    return null;
+    return { defect: null, windows };
 }
 
 /**
@@ -974,11 +1140,12 @@ function selectHashIncompleteChunkCandidates(
     candidates: readonly CompartmentChunkBackfillCandidate[],
     limit: number,
     maxInputTokens: number,
+    leaseHeldRenumber = false,
 ): CompartmentChunkBackfillCandidate[] {
     const missing: CompartmentChunkBackfillCandidate[] = [];
     const stale: CompartmentChunkBackfillCandidate[] = [];
     for (const candidate of candidates) {
-        const defect = classifyChunkCoverageDefect(
+        const { defect, windows } = classifyChunkCoverageDefect(
             db,
             projectPath,
             modelId,
@@ -987,6 +1154,9 @@ function selectHashIncompleteChunkCandidates(
         );
         if (defect === "missing") missing.push(candidate);
         else if (defect === "stale") stale.push(candidate);
+        else if (defect === "renumber" && leaseHeldRenumber) {
+            renumberOneBasedChunkWindows(db, candidate, projectPath, modelId, windows);
+        }
     }
     return [...missing, ...stale].slice(0, limit);
 }
@@ -999,7 +1169,8 @@ const sessionBackfillCandidateStatements = new WeakMap<Database, PreparedStateme
  *  each defect class remains oldest-first so progress is deterministic.
  *
  *  `excludeIds` lets the drain loop advance past compartments that produced no
- *  embeddable work or provider failures this run. */
+ *  embeddable work or provider failures this run. `leaseHeldRenumber` is reserved
+ *  for callers holding the project's write lease. */
 export function loadUnembeddedSessionChunkCandidates(
     db: Database,
     projectPath: string,
@@ -1008,6 +1179,7 @@ export function loadUnembeddedSessionChunkCandidates(
     limit: number,
     excludeIds?: readonly number[],
     maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
+    leaseHeldRenumber = false,
 ): CompartmentChunkBackfillCandidate[] {
     const exclusions = excludeIds && excludeIds.length > 0 ? excludeIds : [];
     const exclusionSql =
@@ -1062,6 +1234,7 @@ export function loadUnembeddedSessionChunkCandidates(
         mapBackfillCandidateRows(rows),
         Math.max(1, limit),
         maxInputTokens,
+        leaseHeldRenumber,
     );
 }
 
@@ -1116,12 +1289,14 @@ export function countSessionCompartmentEmbedCoverage(
     const candidates = mapBackfillCandidateRows(rows);
     let embedded = 0;
     for (const candidate of candidates) {
-        if (
-            classifyChunkCoverageDefect(db, projectPath, modelId, candidate, maxInputTokens) ===
-            null
-        ) {
-            embedded += 1;
-        }
+        const { defect } = classifyChunkCoverageDefect(
+            db,
+            projectPath,
+            modelId,
+            candidate,
+            maxInputTokens,
+        );
+        if (defect === null || defect === "renumber") embedded += 1;
     }
     return { embedded, total: candidates.length };
 }

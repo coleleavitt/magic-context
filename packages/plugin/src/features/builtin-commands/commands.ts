@@ -14,7 +14,7 @@ export function getMagicContextBuiltinCommands(compactionEnabled = true) {
         "ctx-recomp": {
             template: "ctx-recomp",
             description: compactionEnabled
-                ? "Rebuild compartments and facts from raw history (full or <start>-<end> range)"
+                ? "Rebuild compressed history from raw history (full or <start>-<end> range); memories are not changed"
                 : unavailableInCompactionOff("ctx-recomp"),
         },
         "ctx-wrapup": {
@@ -33,10 +33,6 @@ export function getMagicContextBuiltinCommands(compactionEnabled = true) {
             description: compactionEnabled
                 ? "Force-process all pending magic context operations immediately"
                 : unavailableInCompactionOff("ctx-flush"),
-        },
-        "ctx-aug": {
-            template: "ctx-aug",
-            description: "Augment your prompt with project memory context via sidekick agent",
         },
         "ctx-dream": {
             template: "ctx-dream",

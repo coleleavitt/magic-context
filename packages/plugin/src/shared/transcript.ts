@@ -167,6 +167,12 @@ export interface TranscriptPart {
      */
     replaceWithSentinel(sentinelText: string): boolean;
 
+    /** Remove one half of a complete tool arc. Callers must remove both halves together. */
+    remove?(): boolean;
+    /** Refuse structural deletion when the adapter cannot match provider-native identity safely. */
+    /** A deferred durable decision vetoes the whole drop, including sentinel fallback. */
+    canRemove?(): boolean | "defer";
+
     /**
      * Optional: serialized byte size of the part's REAL payload, including
      * non-text content (images, structured data) that `getText()` can't
@@ -187,6 +193,8 @@ export interface TranscriptPart {
  * use `info.id` for cross-pass correlation, never the message reference.
  */
 export interface TranscriptMessage {
+    /** Override when the receiving protocol does not merge adjacent assistant reasoning turns. */
+    requiresToolArcSkeleton?: boolean;
     /**
      * Lightweight metadata exposed for tagging, sentinel persistence, and
      * cross-pass correlation. Adapters fill these from harness-native

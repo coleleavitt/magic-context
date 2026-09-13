@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
@@ -7,9 +10,11 @@ import { recordDetectedContextLimit } from "../../features/magic-context/storage
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { clearWindowOverlayCacheForTest, setWindowOverlayPath } from "../../shared/window-geometry";
 import {
     resolveCacheTtl,
     resolveContextLimit,
+    resolveContextWindowGeometry,
     resolveExecuteThreshold,
     resolveExecuteThresholdDetail,
     resolveModelKey,
@@ -47,6 +52,137 @@ describe("event-resolvers", () => {
 
             //#then
             expect(limit).toBe(200_000);
+        });
+
+        it("keeps a model-scoped successful request as a floor after a catalog regression", async () => {
+            const db = new Database(":memory:");
+            initializeDatabase(db);
+            runMigrations(db);
+            const sessionId = "ses-proven-context-floor";
+            try {
+                clearModelsDevCache();
+                await refreshModelLimitsFromApi({
+                    config: {
+                        providers: async () => ({
+                            data: {
+                                providers: [
+                                    {
+                                        id: "custom",
+                                        models: {
+                                            model: { limit: { context: 30_000 } },
+                                        },
+                                    },
+                                ],
+                            },
+                        }),
+                    },
+                });
+                updateSessionMeta(db, sessionId, {
+                    lastContextPercentage: 100,
+                    lastInputTokens: 90_000,
+                    lastUsageContextLimit: 90_000,
+                    lastObservedModelKey: "custom/model",
+                    observedSafeInputTokens: 90_000,
+                });
+
+                const context = { db, sessionID: sessionId };
+                expect(resolveContextLimit("custom", "model", context)).toBe(90_000);
+                expect(resolveTrustedContextLimit("custom", "model", context)).toBe(90_000);
+                expect(resolveContextWindowGeometry("custom", "model", context)?.usableSoft).toBe(
+                    90_000,
+                );
+            } finally {
+                clearModelsDevCache();
+                closeQuietly(db);
+            }
+        });
+
+        it("clears a persisted floor above an overlay-backed absolute wall", async () => {
+            const db = new Database(":memory:");
+            initializeDatabase(db);
+            runMigrations(db);
+            const sessionId = "ses-poisoned-overlay-floor";
+            const dir = mkdtempSync(join(tmpdir(), "mc-floor-overlay-"));
+            const overlayPath = join(dir, "window-overlay.json");
+            try {
+                writeFileSync(
+                    overlayPath,
+                    JSON.stringify({
+                        schema: "fusiform-window-overlay/v1",
+                        generated_at: "2026-09-11T00:00:00Z",
+                        minted_provider_ids: [],
+                        cells: [
+                            {
+                                provider_id: "test-provider",
+                                model_id: "test-model",
+                                facts: {
+                                    "window.enforced": {
+                                        value: { kind: "stated", value: 272_000 },
+                                        grade: "measured",
+                                        units: "provider",
+                                        boundary: "Observed",
+                                        source_ref: "session regression fixture",
+                                        observed_at: "2026-09-11T00:00:00Z",
+                                    },
+                                },
+                            },
+                        ],
+                    }),
+                );
+                setWindowOverlayPath(overlayPath);
+                await refreshModelLimitsFromApi({
+                    config: {
+                        providers: async () => ({
+                            data: {
+                                providers: [
+                                    {
+                                        id: "test-provider",
+                                        models: {
+                                            "test-model": {
+                                                limit: { context: 272_000, output: 128_000 },
+                                            },
+                                        },
+                                    },
+                                ],
+                            },
+                        }),
+                    },
+                });
+                updateSessionMeta(db, sessionId, {
+                    lastContextPercentage: 48.1,
+                    lastInputTokens: 285_310,
+                    lastUsageContextLimit: 593_717,
+                    lastObservedModelKey: "test-provider/test-model",
+                    observedSafeInputTokens: 593_717,
+                    cacheAlertSent: true,
+                });
+
+                const geometry = resolveContextWindowGeometry("test-provider", "test-model", {
+                    db,
+                    sessionID: sessionId,
+                });
+                expect(geometry?.usableSoft).toBe(240_000);
+                expect(geometry?.usableHard).toBe(240_000);
+                expect(geometry?.derivation.absoluteWall).toBe(272_000);
+                const meta = db
+                    .prepare(
+                        "SELECT observed_safe_input_tokens, last_usage_context_limit, last_input_tokens, last_context_percentage, cache_alert_sent FROM session_meta WHERE session_id = ?",
+                    )
+                    .get(sessionId) as Record<string, number>;
+                expect(meta).toMatchObject({
+                    observed_safe_input_tokens: 0,
+                    last_usage_context_limit: 240_000,
+                    last_input_tokens: 0,
+                    last_context_percentage: 0,
+                    cache_alert_sent: 0,
+                });
+            } finally {
+                setWindowOverlayPath(undefined);
+                clearWindowOverlayCacheForTest();
+                clearModelsDevCache();
+                closeQuietly(db);
+                rmSync(dir, { recursive: true, force: true });
+            }
         });
 
         it("does not reserve output twice from a detected prompt-only ceiling", async () => {

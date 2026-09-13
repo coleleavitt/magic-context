@@ -7,6 +7,7 @@ import {
 } from "../../features/magic-context/overflow-detection";
 import {
     armThinkingBindingRecovery,
+    clearDetectedContextLimit,
     clearHistorianFailureState,
     clearPendingCompactionMarkerStateIf,
     clearSession,
@@ -41,14 +42,17 @@ import type { ContextUsage, SessionMeta } from "../../features/magic-context/typ
 import { captureWindowReport } from "../../features/magic-context/window-report-ledger";
 import { log, sessionLog } from "../../shared/logger";
 import {
+    getSdkContextLimit,
     refreshModelLimitsAfterAuthOnce,
     refreshModelLimitsFromApi,
 } from "../../shared/models-dev-cache";
+import { hasTrustedAbsoluteWall } from "../../shared/window-geometry";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
 import { removeCompactionMarkerForSession } from "./compaction-marker-manager";
 import {
     getMessageRemovedInfo,
     getMessageUpdatedAssistantInfo,
+    getMessageUpdatedInfo,
     getSessionCreatedInfo,
     getSessionErrorInfo,
     getSessionProperties,
@@ -56,19 +60,25 @@ import {
 import {
     resolveCacheTtl,
     resolveContextLimit,
+    resolveContextWindowGeometry,
     resolveModelKey,
     resolveSessionId,
 } from "./event-resolvers";
 import { dropSlot } from "./lkg-slot";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
 import { readRawSessionMessages } from "./read-session-chunk";
-import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
+import {
+    clearTrackedOpenCodeSession,
+    findLastAssistantModelFromOpenCodeDb,
+    observeOpenCodeTurnEvent,
+} from "./read-session-db";
 import { invalidateTrueRawTokenCache } from "./read-session-true-raw-tokens";
-import { type NotificationParams, sendIgnoredMessage } from "./send-session-notification";
+import { type NotificationParams, sendStatusNotification } from "./send-session-notification";
 import { clearMessageTokensCache } from "./transform";
 import { resetDegradedCacheCount } from "./transform-postprocess-phase";
 
 const CONTEXT_USAGE_TTL_MS = 60 * 60 * 1000;
+const usageRefusalLogSeen = new Set<string>();
 
 type CacheTtlConfig = string | Record<string, string>;
 
@@ -100,7 +110,6 @@ export interface EventHandlerDeps {
     onSessionDeleted?: (sessionId: string) => Promise<void> | void;
     rustSessionCleanup?: boolean;
     config: {
-        protected_tags: number;
         clear_reasoning_age?: number;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
         execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
@@ -261,6 +270,7 @@ function cleanupRemovedMessageState(
 export function createEventHandler(deps: EventHandlerDeps) {
     return async (input: { event: { type: string; properties?: unknown } }): Promise<void> => {
         evictExpiredUsageEntries(deps.contextUsageMap);
+        observeOpenCodeTurnEvent(input.event.type, input.event.properties);
 
         const properties = getSessionProperties(input.event.properties);
 
@@ -270,8 +280,8 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
 
-            // Flag our own hidden children (historian/dreamer/sidekick/
-            // memory-migration) by their `magic-context-` title prefix so the
+            // Flag our own hidden children (historian/dreamer/memory-migration)
+            // by their `magic-context-` title prefix so the
             // transform + system-prompt hooks can fully exempt them. In-memory
             // only — these sessions never span a restart.
             if (
@@ -331,6 +341,8 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 captureWindowReport({
                     db: deps.db,
                     sessionID: errInfo.sessionID,
+                    providerID: errInfo.providerID,
+                    modelID: errInfo.modelID,
                     matchedPattern: detection.matchedPattern,
                     reportedLimit: detection.reportedLimit,
                     reportedLimitProvenance: detection.reportedLimitProvenance,
@@ -346,6 +358,10 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 // still propagates to OpenCode / the parent agent through the
                 // normal event pipeline; that's the right recovery surface.
                 const sessionMeta = getOrCreateSessionMeta(deps.db, errInfo.sessionID);
+                const overflowModelKey =
+                    resolveModelKey(errInfo.providerID, errInfo.modelID) ??
+                    sessionMeta.lastObservedModelKey ??
+                    undefined;
                 if (sessionMeta.isSubagent) {
                     // Subagents can't run historian, so we skip the recovery
                     // flag — but the reported limit is still useful data for
@@ -359,7 +375,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                             deps.db,
                             errInfo.sessionID,
                             detection.reportedLimit,
-                            undefined,
+                            overflowModelKey,
                             detection.reportedLimitProvenance,
                         );
                     }
@@ -385,7 +401,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                             deps.db,
                             errInfo.sessionID,
                             detection.reportedLimit,
-                            undefined,
+                            overflowModelKey,
                             detection.reportedLimitProvenance,
                         );
                     }
@@ -400,7 +416,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     deps.db,
                     errInfo.sessionID,
                     detection.reportedLimit,
-                    undefined,
+                    overflowModelKey,
                     "provider_overflow",
                     detection.reportedLimitProvenance,
                 );
@@ -418,6 +434,8 @@ export function createEventHandler(deps: EventHandlerDeps) {
         if (input.event.type === "message.updated") {
             const info = getMessageUpdatedAssistantInfo(input.event.properties);
             if (!info) {
+                const genericInfo = getMessageUpdatedInfo(input.event.properties);
+                if (genericInfo?.role === "user") return;
                 const sessionId = properties ? resolveSessionId(properties) : null;
                 if (sessionId) {
                     sessionLog(
@@ -628,6 +646,28 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         (info.tokens?.input ?? 0) +
                         (info.tokens?.cache?.read ?? 0) +
                         (info.tokens?.cache?.write ?? 0);
+                    const baseGeometry = resolveContextWindowGeometry(
+                        info.providerID,
+                        info.modelID,
+                    );
+                    const trustedAbsoluteWall =
+                        baseGeometry && hasTrustedAbsoluteWall(baseGeometry)
+                            ? baseGeometry.derivation.absoluteWall
+                            : undefined;
+                    const usageReadingValid =
+                        trustedAbsoluteWall === undefined ||
+                        totalInputTokens <= trustedAbsoluteWall;
+                    if (!usageReadingValid && trustedAbsoluteWall !== undefined) {
+                        const refusalKey = `${info.sessionID}|${modelKey ?? "unknown"}`;
+                        if (!usageRefusalLogSeen.has(refusalKey)) {
+                            usageRefusalLogSeen.add(refusalKey);
+                            sessionLog(
+                                info.sessionID,
+                                `usage accounting refused reading ${totalInputTokens} above trusted absolute wall ${trustedAbsoluteWall}; sample ignored`,
+                            );
+                        }
+                    }
+                    const pressureInputTokens = usageReadingValid ? totalInputTokens : 0;
                     // Auth is provably live now (a request returned usage), so
                     // re-warm the model-limit cache once per process to overwrite
                     // any stale pre-auth limit (e.g. gpt-5.5 cached at the raw
@@ -638,63 +678,103 @@ export function createEventHandler(deps: EventHandlerDeps) {
                             deps.client as Parameters<typeof refreshModelLimitsAfterAuthOnce>[0],
                         );
                     }
+                    const requestSucceeded = !messageHadOverflowError;
+                    const successfulUsageProof = requestSucceeded && usageReadingValid;
+                    if (successfulUsageProof) {
+                        const rawOverflow = getOverflowState(deps.db, info.sessionID);
+                        const detectedLimitMatchesModel =
+                            rawOverflow.detectedContextLimitModelKey === null ||
+                            (modelKey !== undefined &&
+                                rawOverflow.detectedContextLimitModelKey === modelKey);
+                        if (
+                            rawOverflow.detectedContextLimit > 0 &&
+                            detectedLimitMatchesModel &&
+                            pressureInputTokens > rawOverflow.detectedContextLimit
+                        ) {
+                            clearDetectedContextLimit(deps.db, info.sessionID);
+                            sessionLog(
+                                info.sessionID,
+                                `detected limit ${rawOverflow.detectedContextLimit} invalidated by a successful ${pressureInputTokens}-token request; using catalog/default`,
+                            );
+                            deps.onSessionCacheInvalidated?.(info.sessionID);
+                        }
+                    }
+
                     let contextLimit = resolveContextLimit(info.providerID, info.modelID, {
                         db: deps.db,
                         sessionID: info.sessionID,
                     });
-                    let percentage = contextLimit > 0 ? (totalInputTokens / contextLimit) * 100 : 0;
-
-                    sessionLog(
-                        info.sessionID,
-                        `event message.updated: totalInputTokens=${totalInputTokens} contextLimit=${contextLimit} percentage=${percentage.toFixed(1)}%`,
-                    );
-
                     const sessionMeta = getOrCreateSessionMeta(deps.db, info.sessionID);
                     const observedSafeInputTokens = sessionMeta.observedSafeInputTokens ?? 0;
+                    const provenSafeInputTokens = successfulUsageProof
+                        ? Math.max(observedSafeInputTokens, pressureInputTokens)
+                        : observedSafeInputTokens;
+                    let catalogLimit =
+                        info.providerID && info.modelID
+                            ? getSdkContextLimit(info.providerID, info.modelID)
+                            : undefined;
+
                     if (
-                        percentage > 100 &&
-                        observedSafeInputTokens > 0 &&
-                        totalInputTokens <= observedSafeInputTokens * 2
+                        successfulUsageProof &&
+                        catalogLimit !== undefined &&
+                        catalogLimit < provenSafeInputTokens
                     ) {
-                        const oldLimit = contextLimit;
+                        const oldLimit = catalogLimit;
                         if (deps.client) {
                             await refreshModelLimitsFromApi(
                                 deps.client as Parameters<typeof refreshModelLimitsFromApi>[0],
                             );
+                            catalogLimit =
+                                info.providerID && info.modelID
+                                    ? getSdkContextLimit(info.providerID, info.modelID)
+                                    : undefined;
                             contextLimit = resolveContextLimit(info.providerID, info.modelID, {
                                 db: deps.db,
                                 sessionID: info.sessionID,
                             });
-                            if (contextLimit >= totalInputTokens) {
-                                percentage = (totalInputTokens / contextLimit) * 100;
+                            if (
+                                catalogLimit !== undefined &&
+                                catalogLimit >= provenSafeInputTokens
+                            ) {
                                 sessionLog(
                                     info.sessionID,
-                                    `models-dev-cache: regression recovered for ${info.providerID}/${info.modelID} via refresh (was=${oldLimit}, now=${contextLimit})`,
+                                    `models-dev-cache: regression recovered for ${info.providerID}/${info.modelID} via refresh (was=${oldLimit}, now=${catalogLimit})`,
                                 );
                             }
                         }
 
-                        if (contextLimit < totalInputTokens && !sessionMeta.cacheAlertSent) {
-                            const safeTokens = Math.max(observedSafeInputTokens, totalInputTokens);
-                            const delivery = await sendIgnoredMessage(
+                        if (
+                            catalogLimit !== undefined &&
+                            catalogLimit < provenSafeInputTokens &&
+                            !sessionMeta.cacheAlertSent
+                        ) {
+                            const delivery = await sendStatusNotification(
                                 deps.client,
                                 info.sessionID,
-                                `⚠️ Magic Context: OpenCode reports a context limit of ${formatTokens(contextLimit)} tokens for ${info.providerID}/${info.modelID} but you've successfully sent ${formatTokens(safeTokens)} tokens in this session — the cached limit looks wrong. Restart OpenCode if you suspect this is incorrect.`,
+                                `⚠️ Magic Context: OpenCode's catalog reports a context limit of ${formatTokens(catalogLimit)} tokens for ${info.providerID}/${info.modelID}, but this session has sent ${formatTokens(provenSafeInputTokens)} tokens successfully. Magic Context will keep using the larger proven value for its pressure math. If the catalog is wrong for your provider, set provider.<provider-id>.models.<model-id>.limit.context in opencode.json.`,
                                 deps.getNotificationParams?.(info.sessionID) ?? {},
                             );
-                            // The title guard can skip ignored-message posts until a
-                            // session is safely titled; keep the flag unset unless
-                            // the notification actually reached a user-visible surface.
+                            // Retry only if the RPC notification could not be enqueued.
                             if (delivery === "sent") {
                                 updates.cacheAlertSent = true;
                             }
                         }
                     }
 
+                    if (successfulUsageProof) {
+                        contextLimit = Math.max(contextLimit, provenSafeInputTokens);
+                    }
+                    const percentage =
+                        contextLimit > 0 ? (pressureInputTokens / contextLimit) * 100 : 0;
+                    sessionLog(
+                        info.sessionID,
+                        `event message.updated: totalInputTokens=${pressureInputTokens} contextLimit=${contextLimit} percentage=${percentage.toFixed(1)}%`,
+                    );
+
                     deps.contextUsageMap.set(info.sessionID, {
                         usage: {
                             percentage,
-                            inputTokens: totalInputTokens,
+                            inputTokens: pressureInputTokens,
                         },
                         updatedAt: now,
                         lastResponseTime: now,
@@ -702,14 +782,11 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     });
 
                     updates.lastContextPercentage = percentage;
-                    updates.lastInputTokens = totalInputTokens;
+                    updates.lastInputTokens = pressureInputTokens;
                     updates.lastUsageContextLimit = contextLimit;
                     updates.lastObservedModelKey = modelKey ?? null;
-                    if (!messageHadOverflowError) {
-                        updates.observedSafeInputTokens = Math.max(
-                            observedSafeInputTokens,
-                            totalInputTokens,
-                        );
+                    if (successfulUsageProof) {
+                        updates.observedSafeInputTokens = provenSafeInputTokens;
                     }
 
                     const historianFailureState = getHistorianFailureState(deps.db, info.sessionID);
@@ -885,6 +962,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             dropSlot(sessionId, "session.deleted");
+            clearTrackedOpenCodeSession(sessionId);
             try {
                 // Commit the retry marker before any deletion work. clearSession removes
                 // it in the same transaction as the session data, so a BUSY/rollback

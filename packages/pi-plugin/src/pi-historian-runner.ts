@@ -95,6 +95,7 @@ import {
 } from "@magic-context/core/hooks/magic-context/compartment-runner-validation";
 import { renderMemoryBlock } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
+import { persistFilteredNoise } from "@magic-context/core/hooks/magic-context/persist-filtered-noise";
 import { producerWindowFailureReason } from "@magic-context/core/hooks/magic-context/producer-window-guard";
 import {
 	createDefaultBoundarySnapshotForTests,
@@ -106,6 +107,7 @@ import {
 	validateBoundarySnapshot,
 } from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
 import {
+	getRawSessionTagKeysThrough,
 	type RawMessageProvider,
 	readSessionChunk,
 	withRawMessageProvider,
@@ -126,6 +128,7 @@ import type {
 	SubagentRunResult,
 } from "@magic-context/core/shared/subagent-runner";
 import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
+import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";
 
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
@@ -738,9 +741,17 @@ async function runPiHistorianTraced(
 			const forceKeepLastCompartmentForChunk =
 				forceKeepLastCompartment === true && !chunk.hasMore;
 			if (!chunk.text || chunk.messageCount === 0) {
+				if (persistFilteredNoise(db, sessionId, chunk, eligibleEndOrdinal)) {
+					telemetry.status = "noop";
+					telemetry.failureReason = "filtered noise skipped";
+					telemetry.chunkStartOrdinal = offset;
+					telemetry.chunkEndOrdinal = eligibleEndOrdinal - 1;
+					rollbackDrainReservation();
+					return;
+				}
 				sessionLog(
 					sessionId,
-					`historian no-op: chunk empty after filtering (messageCount=${chunk.messageCount}, textLen=${chunk.text?.length ?? 0}) range=${offset}-${protectedTailStart - 1}`,
+					`historian no-op: chunk empty after filtering (messageCount=${chunk.messageCount}, textLen=${chunk.text?.length ?? 0}) range=${offset}-${eligibleEndOrdinal - 1}`,
 				);
 				if (boundarySnapshot.usagePercentage < 80) {
 					if (!isWrapupInProgress(db, sessionId))
@@ -1286,7 +1297,20 @@ async function runPiHistorianTraced(
 					return false;
 				return true;
 			});
+			const unanchoredPromotionSkipReason = discardedLast
+				? "discarded_last"
+				: weakLookaheadFinalCompartment
+					? "weak_lookahead_final_compartment"
+					: null;
+			if (unanchoredPromotionSkipReason) {
+				sessionLog(
+					sessionId,
+					`historian unanchored promotion skipped: reason=${unanchoredPromotionSkipReason} facts=${validatedPass.facts?.length ?? 0} user_observations=${validatedPass.userObservations?.length ?? 0} primers=${validatedPass.primerCandidates?.length ?? 0} events_publishable=${publishableEvents.length}/${validatedPass.events?.length ?? 0}`,
+				);
+			}
 			let promotedFactRefs: Array<{ memoryId: number; content: string }> = [];
+			let promotedFactCount = 0;
+			let publishedEventCount = 0;
 			let persistedIds: number[] = [];
 
 			// Atomic publication: append + durable facts/events/drop queue + clear failure state.
@@ -1302,6 +1326,11 @@ async function runPiHistorianTraced(
 				rollbackDrainReservation();
 				return;
 			}
+			const compartmentTagKeys = await getRawSessionTagKeysThrough(
+				sessionId,
+				lastNewEnd,
+				{ db },
+			);
 			let published = false;
 			const publishOutcome = await tracedSpan(
 				"historian.publish",
@@ -1311,108 +1340,112 @@ async function runPiHistorianTraced(
 					"historian.events": publishableEvents.length,
 				},
 				async (publishSpan): Promise<"published" | "lease-lost"> => {
-					db.exec("BEGIN IMMEDIATE");
-					try {
-						if (
-							!isCompartmentLeaseHeld(db, sessionId, compartmentLeaseHolderId)
-						) {
-							db.exec("ROLLBACK");
-							sessionLog(
-								sessionId,
-								"historian publish skipped: compartment lease no longer held",
-							);
-							rollbackDrainReservation();
-							publishSpan.setAttributes({
-								"historian.published": false,
-								"historian.error": "compartment lease no longer held",
-							});
-							publishSpan.recordError("compartment lease no longer held");
-							return "lease-lost";
-						}
-						appendCompartments(db, sessionId, newCompartments);
-						// Resolve durable ids for the just-appended compartments (last N rows by
-						// sequence — appendCompartments inserts at the tail). Used for events
-						// anchoring + post-commit embeddings.
-						persistedIds = getCompartments(db, sessionId)
-							.slice(-newCompartments.length)
-							.map((c) => c.id);
-						// v2 faithful fact lifecycle (E6 parity): facts are no longer a
-						// REPLACE-the-whole-list store. The historian emits only THIS
-						// chunk's facts (deduped against <project-memory> in the prompt);
-						// they flow to project memory via in-transaction durable promotion.
-						// No replaceSessionFacts — promoted facts reach the agent through the
-						// renderer's m[1] new-memories watermark. Promotion is in the SAME
-						// transaction as the boundary floor below, so both commit or both roll back.
-						if (promotionActive && !skipUnanchoredPromotion) {
-							promotedFactRefs = promoteSessionFactsDurable(
+				const transactionStartedAt = performance.now();
+				db.exec("BEGIN IMMEDIATE");
+				try {
+					if (!isCompartmentLeaseHeld(db, sessionId, compartmentLeaseHolderId)) {
+						db.exec("ROLLBACK");
+						sessionLog(
+							sessionId,
+							"historian publish skipped: compartment lease no longer held",
+						);
+						rollbackDrainReservation();
+						return "lease-lost";
+					}
+					appendCompartments(db, sessionId, newCompartments);
+					// Resolve durable ids for the just-appended compartments (last N rows by
+					// sequence — appendCompartments inserts at the tail). Used for events
+					// anchoring + post-commit embeddings.
+					persistedIds = getCompartments(db, sessionId)
+						.slice(-newCompartments.length)
+						.map((c) => c.id);
+					// v2 faithful fact lifecycle (E6 parity): facts are no longer a
+					// REPLACE-the-whole-list store. The historian emits only THIS
+					// chunk's facts (deduped against <project-memory> in the prompt);
+					// they flow to project memory via in-transaction durable promotion.
+					// No replaceSessionFacts — promoted facts reach the agent through the
+					// renderer's m[1] new-memories watermark. Promotion is in the SAME
+					// transaction as the boundary floor below, so both commit or both roll back.
+					if (promotionActive && !skipUnanchoredPromotion) {
+						const promotion = promoteSessionFactsDurable(
+							db,
+							sessionId,
+							projectPath,
+							validatedPass.facts ?? [],
+						);
+						promotedFactRefs = promotion.newMemoryRefs;
+						promotedFactCount = promotion.factsPromoted;
+					}
+
+					if (publishableEvents.length > 0) {
+						try {
+							insertCompartmentEvents(
 								db,
 								sessionId,
-								projectPath,
-								validatedPass.facts ?? [],
+								publishableEvents,
+								persistedIds,
 							);
-						}
-
-						if (publishableEvents.length > 0) {
-							try {
-								insertCompartmentEvents(
-									db,
-									sessionId,
-									publishableEvents,
-									persistedIds,
-								);
-								sessionLog(
-									sessionId,
-									`stored ${publishableEvents.length} compartment event(s)`,
-								);
-							} catch (error) {
-								sessionLog(
-									sessionId,
-									"failed to store compartment events:",
-									error,
-								);
-							}
-						}
-
-						queueDropsForCompartmentalizedMessages(db, sessionId, lastNewEnd);
-
-						clearHistorianFailureState(db, sessionId);
-						// Healthy historian progress clears the drain-failure backoff. Normal
-						// runs also clear overflow recovery; wrapup keeps it armed until the loop
-						// reaches the keep watermark.
-						clearHistorianDrainFailure(db, sessionId);
-						recordProtectedTailPublicationFloor(db, sessionId, lastNewEnd + 1);
-						if (!isWrapupInProgress(db, sessionId))
-							clearEmergencyRecovery(db, sessionId);
-						// userObservations are inserted POST-COMMIT
-						// (best-effort, below), not inside this publish transaction. An
-						// auxiliary user_memory_candidates failure must never roll back
-						// compartment publication. Mirrors OpenCode.
-						if (lastNewEndMessageId) {
-							setPendingPiCompactionMarkerState(db, sessionId, {
-								firstKeptEntryId,
-								endMessageId: lastNewEndMessageId,
-								ordinal: lastNewEnd,
-								tokensBefore: chunk.tokenEstimate,
-								summary: markerSummary,
-								publishedAt: Date.now(),
-							});
-						}
-						db.exec("COMMIT");
-						published = true;
-						publishSpan.setAttributes({
-							"historian.published": true,
-							"historian.promoted_facts": promotedFactRefs.length,
-						});
-						return "published";
-					} finally {
-						if (!published) {
-							try {
-								db.exec("ROLLBACK");
-							} catch {
-								// Transaction may already be closed by an early rollback.
-							}
+							publishedEventCount = publishableEvents.length;
+							sessionLog(
+								sessionId,
+								`stored ${publishableEvents.length} compartment event(s)`,
+							);
+						} catch (error) {
+							sessionLog(sessionId, "failed to store compartment events:", error);
 						}
 					}
+
+					queueDropsForCompartmentalizedMessages(
+						db,
+						sessionId,
+						lastNewEnd,
+						compartmentTagKeys,
+					);
+
+					clearHistorianFailureState(db, sessionId);
+					// Healthy historian progress clears the drain-failure backoff. Normal
+					// runs also clear overflow recovery; wrapup keeps it armed until the loop
+					// reaches the keep watermark.
+					clearHistorianDrainFailure(db, sessionId);
+					recordProtectedTailPublicationFloor(db, sessionId, lastNewEnd + 1);
+					if (!isWrapupInProgress(db, sessionId))
+						clearEmergencyRecovery(db, sessionId);
+					// userObservations are inserted POST-COMMIT
+					// (best-effort, below), not inside this publish transaction. An
+					// auxiliary user_memory_candidates failure must never roll back
+					// compartment publication. Mirrors OpenCode.
+					if (lastNewEndMessageId) {
+						setPendingPiCompactionMarkerState(db, sessionId, {
+							firstKeptEntryId,
+							endMessageId: lastNewEndMessageId,
+							ordinal: lastNewEnd,
+							tokensBefore: chunk.tokenEstimate,
+							summary: markerSummary,
+							publishedAt: Date.now(),
+						});
+					}
+					db.exec("COMMIT");
+					published = true;
+					logSlowWriteTransaction("pi_historian_publish", transactionStartedAt);
+				} finally {
+					if (!published) {
+						try {
+							db.exec("ROLLBACK");
+						} catch {
+							// Transaction may already be closed by an early rollback.
+						}
+					}
+				}
+					if (!published) {
+						publishSpan.setAttributes({ "historian.published": false });
+						publishSpan.recordError("compartment lease no longer held");
+						return "lease-lost";
+					}
+					publishSpan.setAttributes({
+						"historian.published": true,
+						"historian.promoted_facts": promotedFactCount,
+					});
+					return "published";
 				},
 			);
 			if (publishOutcome !== "published") return;
@@ -1608,7 +1641,9 @@ async function runPiHistorianTraced(
 				telemetry.factsEmitted = facts.length;
 				telemetry.factsByCategory =
 					facts.length > 0 ? tallyFactsByCategory(facts) : null;
-				telemetry.eventsEmitted = publishableEvents.length;
+				telemetry.factsPromoted = promotedFactCount;
+				telemetry.eventsEmitted = (validatedPass.events ?? []).length;
+				telemetry.eventsPublished = publishedEventCount;
 				telemetry.importanceMin = imp.min;
 				telemetry.importanceMax = imp.max;
 				telemetry.importanceAvg = imp.avg;
@@ -1683,7 +1718,9 @@ async function runPiHistorianTraced(
 				compartmentIdMax: telemetry.compartmentIdMax ?? null,
 				factsEmitted: telemetry.factsEmitted ?? 0,
 				factsByCategory: telemetry.factsByCategory ?? null,
+				factsPromoted: telemetry.factsPromoted ?? 0,
 				eventsEmitted: telemetry.eventsEmitted ?? 0,
+				eventsPublished: telemetry.eventsPublished ?? 0,
 				importanceMin: telemetry.importanceMin ?? null,
 				importanceMax: telemetry.importanceMax ?? null,
 				importanceAvg: telemetry.importanceAvg ?? null,

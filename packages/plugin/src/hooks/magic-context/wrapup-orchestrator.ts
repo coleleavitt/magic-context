@@ -34,7 +34,7 @@ import {
 } from "./protected-tail-boundary";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import { setRecompStarting, setRecompTerminal } from "./recomp-orchestrator";
-import { sendIgnoredMessage } from "./send-session-notification";
+import { sendStatusNotification } from "./send-session-notification";
 
 export interface ManagedWrapupContext extends ManagedRecompContext {
     contextLimit: number;
@@ -243,9 +243,11 @@ async function runOneWrapupIteration(args: {
         preserveInjectionCacheUntilConsumed: true,
         compartmentLeaseHolderId: leaseHolderId,
         forceDrainQuota: true,
-        // Wrapup wants coverage on the actual final chunk. The runner downgrades
-        // this hint whenever readSessionChunk reports more raw history remains.
-        forceKeepLastCompartment: true,
+        // The boundary resolver caps each run's window, so chunk.hasMore cannot see
+        // beyond that window. Only request weak-lookahead preservation when this
+        // window reaches the wrapup's full drain target; the runner still downgrades
+        // the hint if its own chunk reader stops early within the window.
+        forceKeepLastCompartment: plan.snapshot.eligibleEndOrdinal >= plan.targetEligibleEndOrdinal,
         refreshBoundarySnapshot: () =>
             buildPlan(ctx, sessionId, messagesToKeep, anchorRawMessageCount).snapshot,
         onCompartmentStatePublished: (sid) => {
@@ -370,13 +372,12 @@ export async function runManagedWrapup(
         // The command blocks until the drain finishes and fires no message events,
         // so nothing would indicate the run until completion. Two best-effort
         // surfaces, neither may affect the drain:
-        //  - sendIgnoredMessage: TUI gets a toast; Desktop/headless gets a
-        //    persisted ignored chat message (its only progress surface).
+        //  - sendStatusNotification: RPC toast, with no user-role chat row.
         //  - wrapup-progress-kick: starts the TUI sidebar's fast progress poll
         //    (the toast above cannot do that).
         if (!stoppedForFailure) {
             try {
-                void sendIgnoredMessage(
+                void sendStatusNotification(
                     ctx.client,
                     sessionId,
                     `Magic Wrapup started — compacting about ${plural(expectedChunks, "chunk")} of history. This can take a few minutes; the result posts here when done.`,
@@ -432,6 +433,11 @@ export async function runManagedWrapup(
                 if (lastEnd + 1 >= plan.targetEligibleEndOrdinal) break;
 
                 chunkIndex += 1;
+                // Boundary diagnostics belong in the log; the progress note stays a plain sentence.
+                sessionLog(
+                    sessionId,
+                    `wrapup chunk ${chunkIndex}: ${describeBoundaryDiagnostics(plan.snapshot)}`,
+                );
                 emitWrapupProgress(ctx, sessionId, {
                     processedMessages: Math.max(0, lastEnd),
                     totalMessages: Math.max(0, plan.targetEligibleEndOrdinal - 1),
@@ -440,7 +446,7 @@ export async function runManagedWrapup(
                         0,
                         getCompartments(ctx.db, sessionId).length - startCompartmentCount,
                     ),
-                    note: `Chunk ${chunkIndex}/${expectedChunks}: messages ${plan.snapshot.offset}-${plan.snapshot.eligibleEndOrdinal - 1}… ${describeBoundaryDiagnostics(plan.snapshot)}`,
+                    note: `Chunk ${chunkIndex}/${expectedChunks}: messages ${plan.snapshot.offset}-${plan.snapshot.eligibleEndOrdinal - 1}…`,
                 });
                 if (
                     !renewWrapupMarker({

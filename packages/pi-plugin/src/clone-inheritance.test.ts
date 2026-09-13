@@ -5,12 +5,31 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	decodePiContentDecision,
+	encodePiContentDecision,
+	freezePiContentDecision,
+	getPiContentDecisions,
+	PI_CONTENT_DECISION_LIMIT,
+} from "@magic-context/core/features/magic-context/pi-content-decisions";
+import {
 	type CloneSessionStateFilter,
+	clearSession,
 	copySessionStateForClone,
 	getOrCreateSessionMeta,
 	getSourceContents,
 	getTagsBySession,
 } from "@magic-context/core/features/magic-context/storage";
+import {
+	addTrailingBlankDecisions,
+	getTrailingBlankDecisions,
+	thinkingBindingRecoveryFrozenId,
+} from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import {
+	addNativeReasoningIds,
+	getNativeReasoningIds,
+	getNativeToolInputs,
+	saveNativeToolInputs,
+} from "@magic-context/core/features/magic-context/storage-native-replay";
 import { replayCavemanCompression } from "@magic-context/core/hooks/magic-context/caveman-cleanup";
 import type { TagTarget } from "@magic-context/core/hooks/magic-context/tag-messages";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -202,6 +221,39 @@ function pending(
 }
 
 describe("Pi clone state inheritance", () => {
+	it("does not inherit Rust reasoning decisions across fork or branch filters", () => {
+		for (const branch of [
+			[user("kept")],
+			[user("kept"), assistant("branch-new")],
+		]) {
+			const database = db();
+			seedTag(database, { tagNumber: 1, messageId: "kept" });
+			seedTag(database, { tagNumber: 2, messageId: "removed" });
+			// Rust state normally lives in a separate store. Even if both stores are
+			// colocated, the Pi clone's explicit table list must not copy its units.
+			database.exec(
+				"CREATE TABLE mc_cache_state (session_id TEXT PRIMARY KEY, core_state TEXT, meta TEXT)",
+			);
+			database.prepare("INSERT INTO mc_cache_state VALUES (?, ?, ?)").run(
+				"source",
+				JSON.stringify({
+					frozen_units: [
+						{ key: "strip:reasoning_clear:kept", frozen_payload: "" },
+					],
+				}),
+				JSON.stringify({
+					reasoning_replay_evidence: { source_hash: "source-only" },
+				}),
+			);
+			const result = copyWithEntries(database, branch);
+			expect(result.kind).toBe("migrated");
+			expect(
+				getTagsBySession(database, "clone").map((tag) => tag.messageId),
+			).toEqual(["kept"]);
+			expect(count(database, "mc_cache_state", "source")).toBe(1);
+			expect(count(database, "mc_cache_state", "clone")).toBe(0);
+		}
+	});
 	it("filters prefix clones, including compartments that span the fork point", () => {
 		const database = db();
 		seedCompartment(database, { sequence: 1, startId: "u1", endId: "a1" });
@@ -628,6 +680,96 @@ describe("Pi clone state inheritance", () => {
 		});
 	});
 
+	it("copies only retained Pi content decisions into a clone", () => {
+		const database = db();
+		seedMeta(database, {
+			merged_reasoning_stripped_ids: JSON.stringify([
+				encodePiContentDecision("reminder-strip", "u1:p0"),
+				encodePiContentDecision("seam-temporal-strip", "u1"),
+				encodePiContentDecision("reminder-strip", "u3:p0"),
+			]),
+		});
+		copyWithEntries(database, [user("u1")]);
+		expect([...getPiContentDecisions(database, "clone")]).toEqual([
+			encodePiContentDecision("reminder-strip", "u1:p0"),
+			encodePiContentDecision("seam-temporal-strip", "u1"),
+		]);
+	});
+
+	it("retains nonzero text parts during pruning and remaps their message roots on clone", () => {
+		const database = db();
+		seedTag(database, { tagNumber: 1, messageId: "u1:p1" });
+		seedMeta(database, {
+			merged_reasoning_stripped_ids: JSON.stringify([
+				encodePiContentDecision("seam-temporal-strip", "u1"),
+			]),
+		});
+		expect(
+			freezePiContentDecision(database, "source", "reminder-strip", "u1:p1"),
+		).toBe(true);
+		expect(getPiContentDecisions(database, "source").size).toBe(2);
+		copySessionStateForClone(database, "source", "clone", {
+			...__test.createCloneFilter([user("u1")]),
+			mapMessageId: (id) => `mapped-${id}`,
+		});
+		expect([...getPiContentDecisions(database, "clone")]).toEqual([
+			encodePiContentDecision("seam-temporal-strip", "mapped-u1"),
+			encodePiContentDecision("reminder-strip", "mapped-u1:p1"),
+		]);
+	});
+
+	it("preserves legacy replay entries while bounding content decisions and pruning deleted messages", () => {
+		const database = db();
+		const legacy = [
+			"bare-id",
+			thinkingBindingRecoveryFrozenId("entry"),
+			'__merged_reasoning_parts_v1__:["assistant",["part-id",2]]',
+		];
+		const entries = [...legacy];
+		for (let i = 0; i < PI_CONTENT_DECISION_LIMIT; i++) {
+			seedTag(database, { tagNumber: i + 1, messageId: `u${i}:p0` });
+			entries.push(encodePiContentDecision("reminder-strip", `u${i}:p0`));
+		}
+		seedMeta(database, {
+			merged_reasoning_stripped_ids: JSON.stringify(entries),
+		});
+		expect(legacy.map(decodePiContentDecision)).toEqual([null, null, null]);
+		expect(
+			freezePiContentDecision(database, "source", "reminder-strip", "new:p0"),
+		).toBe(false);
+		database
+			.prepare("DELETE FROM tags WHERE session_id = ? AND message_id = ?")
+			.run("source", "u0:p0");
+		expect(
+			freezePiContentDecision(database, "source", "reminder-strip", "new:p0"),
+		).toBe(true);
+		const row = database
+			.prepare(
+				"SELECT merged_reasoning_stripped_ids AS value FROM session_meta WHERE session_id = ?",
+			)
+			.get("source") as { value: string };
+		expect(JSON.parse(row.value).slice(0, 3)).toEqual(legacy);
+		expect(getPiContentDecisions(database, "source").size).toBe(
+			PI_CONTENT_DECISION_LIMIT,
+		);
+		expect(
+			getPiContentDecisions(database, "source").has(
+				encodePiContentDecision("reminder-strip", "u0:p0"),
+			),
+		).toBe(false);
+	});
+
+	it("clears Pi content decisions with session deletion", () => {
+		const database = db();
+		seedMeta(database, {
+			merged_reasoning_stripped_ids: JSON.stringify([
+				encodePiContentDecision("reminder-strip", "u:p0"),
+			]),
+		});
+		clearSession(database, "source");
+		expect(getPiContentDecisions(database, "source").size).toBe(0);
+	});
+
 	it("inherits frozen ids that remain on the clone path", () => {
 		const database = db();
 		seedMeta(database, {
@@ -646,6 +788,125 @@ describe("Pi clone state inheritance", () => {
 			.get("clone") as { placeholders: string; images: string };
 		expect(JSON.parse(row.placeholders)).toEqual(["a1"]);
 		expect(JSON.parse(row.images)).toEqual(["u1"]);
+	});
+
+	it("carries only retained native tool and reasoning decisions into a remapped clone", () => {
+		const database = db();
+		const retainedInput =
+			'{"path":"src/retained.ts","range":{"start":10,"end":40},"marker":"[truncated]"}';
+		seedTag(database, {
+			tagNumber: 1,
+			messageId: "call-retained",
+			type: "tool",
+			ownerId: "assistant-retained",
+		});
+		seedTag(database, {
+			tagNumber: 2,
+			messageId: "call-outside",
+			type: "tool",
+			ownerId: "assistant-outside",
+		});
+		addTrailingBlankDecisions(database, "source", [
+			["assistant-retained", "strip"],
+			["assistant-outside", "keep:2"],
+		]);
+		saveNativeToolInputs(
+			database,
+			"source",
+			new Map([
+				["call-retained", retainedInput],
+				["call-outside", '{"path":"src/outside.ts"}'],
+			]),
+		);
+		addNativeReasoningIds(database, "source", [
+			"assistant-retained",
+			"assistant-outside",
+		]);
+
+		const filter: CloneSessionStateFilter = {
+			resolveBoundaryOrdinal: () => undefined,
+			includeTag: (tag) =>
+				tag.type === "tool" && tag.toolOwnerMessageId === "assistant-retained",
+			includeMessageId: (id) => id === "assistant-retained",
+			mapMessageId: (id) =>
+				id === "assistant-retained"
+					? "clone-assistant-retained"
+					: id === "call-retained"
+						? "clone-call-retained"
+						: id,
+			selectPendingPiMarker: () => null,
+		};
+
+		const result = copySessionStateForClone(
+			database,
+			"source",
+			"clone",
+			filter,
+		);
+
+		expect(result.tagsCopied).toBe(1);
+		expect(getNativeToolInputs(database, "clone")).toEqual(
+			new Map([["clone-call-retained", retainedInput]]),
+		);
+		expect(getNativeReasoningIds(database, "clone")).toEqual(
+			new Set(["clone-assistant-retained"]),
+		);
+		expect(getTrailingBlankDecisions(database, "clone")).toEqual(
+			new Map([["clone-assistant-retained", "strip"]]),
+		);
+	});
+
+	it("filters and remaps legacy flat trailing decisions without adding native state", () => {
+		const database = db();
+		addTrailingBlankDecisions(database, "source", [
+			["assistant-retained", "strip"],
+			["assistant-outside", "keep:2"],
+		]);
+		copySessionStateForClone(database, "source", "clone", {
+			...__test.createCloneFilter([assistant("assistant-retained")]),
+			mapMessageId: (id) => `clone-${id}`,
+		});
+		expect(getTrailingBlankDecisions(database, "clone")).toEqual(
+			new Map([["clone-assistant-retained", "strip"]]),
+		);
+		expect(getTrailingBlankDecisions(database, "source")).toEqual(
+			new Map([
+				["assistant-retained", "strip"],
+				["assistant-outside", "keep:2"],
+			]),
+		);
+		expect(getNativeToolInputs(database, "clone")).toEqual(new Map());
+		expect(getNativeReasoningIds(database, "clone")).toEqual(new Set());
+	});
+
+	it("fails closed and rolls back a clone with malformed native replay", () => {
+		const database = db();
+		seedTag(database, {
+			tagNumber: 1,
+			messageId: "call-retained",
+			type: "tool",
+			ownerId: "assistant-retained",
+		});
+		const malformedReplayDocument = JSON.stringify({
+			version: 2,
+			trailingBlank: {},
+			piNative: "not-a-native-state",
+		});
+		seedMeta(database, {
+			trailing_blank_decisions: malformedReplayDocument,
+		});
+
+		expect(() =>
+			copyWithEntries(database, [assistant("assistant-retained")]),
+		).toThrow();
+		expect(count(database, "tags")).toBe(0);
+		expect(count(database, "session_meta")).toBe(0);
+		const sourceMeta = database
+			.prepare(
+				"SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?",
+			)
+			.get("source") as { trailing_blank_decisions: string };
+		expect(sourceMeta.trailing_blank_decisions).toBe(malformedReplayDocument);
 	});
 
 	it("leaves every m0/m1 cache field fresh so the first pass hard-materializes", () => {

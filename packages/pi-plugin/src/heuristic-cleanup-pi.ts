@@ -26,26 +26,21 @@
  * force-materialization gating as OpenCode (gating is the caller's
  * responsibility — this function unconditionally executes when called).
  *
- * Cache safety: every mutation persists to the DB (`tags.status`,
- * `tags.drop_mode`, `source_contents`, `tags.caveman_depth`). Subsequent
- * defer passes read these durable signals via `applyFlushedStatuses` +
- * `replayCavemanCompression` so the visible message bytes stay stable
- * across passes.
+ * Cache safety: mutations persist as tag drop/compression state or namespaced
+ * Pi content decisions in session_meta. The context handler replays reminder
+ * strips after caveman restores its source, including on defer passes. Original
+ * source_contents remain intact for expansion.
  */
 
-import { getProtectionWindowForSession } from "@magic-context/core/features/magic-context/protection-window";
+import { freezePiContentDecision } from "@magic-context/core/features/magic-context/pi-content-decisions";
 import {
 	type ContextDatabase,
 	getActiveTagsBySession,
 	getMaxTagNumberBySession,
-	replaceSourceContent,
 	updateTagDropMode,
 	updateTagStatus,
 } from "@magic-context/core/features/magic-context/storage";
-import {
-	getEmergencyInputSample,
-	setEmergencyDropSample,
-} from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { getEmergencyInputSample } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import type { TagEntry } from "@magic-context/core/features/magic-context/types";
 import {
 	applyCavemanCleanup,
@@ -82,10 +77,9 @@ const DEDUP_SAFE_TOOLS = new Set([
 ]);
 
 export interface PiHeuristicCleanupConfig {
-	protectedTags?: number;
-	cutoff?: number | null;
-	floor?: number;
-	protectedTokens?: number;
+	protectedTags: number;
+	/** Token-window cutoff; null means no tool-backed protection window exists. */
+	protectedCutoff?: number | null;
 	/** Run age-sensitive cleanup; emergency selection remains independent. */
 	routine?: boolean;
 	/**
@@ -327,23 +321,10 @@ export function applyPiHeuristicCleanup(
 	// regardless of status. `getMaxTagNumberBySession` resolves with a
 	// single backward index seek (O(log N)).
 	const maxTag = getMaxTagNumberBySession(db, sessionId);
-	const windowResult = getProtectionWindowForSession(db, sessionId);
-	// Coordinate space: tag-number
-	// Empty-window behaviour: absent cutoff branch (cutoff is null)
-	const resolvedCutoff =
-		config.cutoff !== undefined
-			? config.cutoff
-			: typeof config.protectedTags === "number"
-				? null
-				: windowResult.ordinalCutoff.cutoff;
 	const protectedCutoff =
-		resolvedCutoff !== null
-			? resolvedCutoff - 1
-			: typeof config.protectedTags === "number"
-				? maxTag - config.protectedTags
-				: windowResult.ordinalCutoff.cutoff !== null
-					? windowResult.ordinalCutoff.cutoff - 1
-					: maxTag;
+		config.protectedCutoff === null
+			? maxTag + 1
+			: (config.protectedCutoff ?? maxTag - config.protectedTags);
 	const routine = config.routine !== false;
 	// Stale ctx_reduce removal uses the protected-tail window after first retaining
 	// the newest housekeeping exemplars; only older calls can become stale.
@@ -358,8 +339,8 @@ export function applyPiHeuristicCleanup(
 	// ── Pass 1: tiered target-headroom emergency drop ─────────────────
 	// Replaces the old need-blind aged-drop + dropAllTools nuke. Runs only when
 	// the caller supplies `emergency` (derived force-band cache-busting pass). Selection is
-	// pure (`planEmergencyDrop`); we apply it and advance the persisted watermark
-	// so each tag drops once. Mirrors OpenCode `applyHeuristicCleanup`.
+	// pure (`planEmergencyDrop`); we persist the tag mutations and return their count.
+	// The context handler consumes the shared episode after all reclaim lanes finish.
 	if (config.emergency) {
 		const emergency = config.emergency;
 		const priorInputSample = getEmergencyInputSample(db, sessionId);
@@ -376,14 +357,15 @@ export function applyPiHeuristicCleanup(
 		// narrowing it to the droppable subset folds real conversation/
 		// reasoning tail into the "irreducible prefix" and under-evicts.
 		const activeTags = tags.filter((t) => t.status === "active");
+		sessionLog(
+			sessionId,
+			`emergency candidates: loaded=${tags.length} active=${activeTags.length} activeTools=${activeTags.filter((tag) => tag.type === "tool").length} visibleCompleteTools=${droppableTags.length} windowYields=${(emergency.usagePercentage ?? 0) >= 95} cutoff=${protectedCutoff}`,
+		);
 		const plan = planEmergencyDrop({
 			tags: droppableTags as readonly EmergencyDropTag[],
 			floorTags: activeTags as readonly EmergencyDropTag[],
 			maxTag,
-			protectedTags:
-				resolvedCutoff !== null
-					? Math.max(0, maxTag - (resolvedCutoff - 1))
-					: (config.protectedTags ?? 0),
+			protectedCutoff,
 			currentTotalInputTokens: emergency.currentTotalInputTokens,
 			ceilingTokens: emergency.ceilingTokens,
 			usagePercentage: emergency.usagePercentage,
@@ -429,14 +411,10 @@ export function applyPiHeuristicCleanup(
 						emergencyDroppedTools++;
 					}
 				}
-			})();
+			}).immediate();
 			sessionLog(sessionId, `emergency tiered drop: ${plan.reason}`);
 		} else {
 			sessionLog(sessionId, `emergency tiered drop skipped: ${plan.reason}`);
-		}
-		// A no-op spent no cache rewrite and must not consume the episode's batch.
-		if (emergencyDroppedTools > 0) {
-			setEmergencyDropSample(db, sessionId, emergency.currentTotalInputTokens);
 		}
 	}
 
@@ -480,7 +458,7 @@ export function applyPiHeuristicCleanup(
 					droppedStaleReduceCalls++;
 				}
 			}
-		})();
+		}).immediate();
 	}
 
 	// ── Pass 2: strip system injections from message tags ─────────────
@@ -508,21 +486,25 @@ export function applyPiHeuristicCleanup(
 							? target.setContent(`[dropped §${tag.tagNumber}§]`)
 							: false;
 					if (dropResult === "removed" || dropResult === "absent") {
-						replaceSourceContent(db, sessionId, tag.tagNumber, "");
 						updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
 						if (dropResult === "removed" || didReplace) {
 							droppedInjections++;
 						}
 					}
 				} else {
-					const didSet = target.setContent(stripped);
-					if (didSet) {
-						replaceSourceContent(db, sessionId, tag.tagNumber, strippedSource);
-						droppedInjections++;
+					if (
+						freezePiContentDecision(
+							db,
+							sessionId,
+							"reminder-strip",
+							tag.messageId,
+						)
+					) {
+						if (target.setContent(stripped)) droppedInjections++;
 					}
 				}
 			}
-		})();
+		}).immediate();
 	}
 
 	// ── Pass 3: tool dedup (Pi-shape fingerprinter) ───────────────────
@@ -567,7 +549,7 @@ export function applyPiHeuristicCleanup(
 					}
 				}
 			}
-		})();
+		}).immediate();
 	}
 
 	if (
@@ -589,7 +571,7 @@ export function applyPiHeuristicCleanup(
 		const cavemanResult = applyCavemanCleanup(sessionId, db, targets, tags, {
 			enabled: true,
 			minChars: config.caveman.minChars,
-			protectedTags: config.protectedTags ?? 20,
+			protectedCutoff,
 		});
 		compressedTextTags =
 			cavemanResult.compressedToLite +

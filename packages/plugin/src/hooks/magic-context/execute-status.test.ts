@@ -2,6 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { CONFIG_WARNING_CLASS, type ConfigParseFailure } from "../../shared/config-diagnostics";
+import {
+    formatOpenCodeDbMissingStatusLine,
+    resetOpenCodeDbPathStateForTesting,
+    resolveOpenCodeDbPath,
+} from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { executeStatus } from "./execute-status";
 import { estimateTokens } from "./read-session-formatting";
@@ -17,7 +22,7 @@ describe("executeStatus", () => {
             "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
         ).run(SESSION_ID, 1, 12, 34, "m12", "m34", "Status arc", "status body", Date.now());
 
-        const status = executeStatus(db, SESSION_ID, 20);
+        const status = executeStatus(db, SESSION_ID);
         const expected = estimateTokens("## 12-34 · Status arc\nstatus body\n");
 
         expect(status).toContain(`- History block: ~${expected.toLocaleString()} tokens`);
@@ -35,7 +40,6 @@ describe("executeStatus", () => {
         const status = executeStatus(
             db,
             SESSION_ID,
-            20,
             65,
             "some/model",
             undefined,
@@ -57,7 +61,6 @@ describe("executeStatus", () => {
         const status = executeStatus(
             db,
             SESSION_ID,
-            20,
             65,
             "some/model",
             undefined,
@@ -79,7 +82,6 @@ describe("executeStatus", () => {
         const status = executeStatus(
             db,
             SESSION_ID,
-            20,
             undefined,
             undefined,
             undefined,
@@ -113,7 +115,7 @@ describe("executeStatus", () => {
             SESSION_ID,
         );
 
-        const status = executeStatus(db, SESSION_ID, 20);
+        const status = executeStatus(db, SESSION_ID);
 
         expect(status).toContain("- Cache TTL: never (session)");
         expect(status).toContain(
@@ -124,7 +126,10 @@ describe("executeStatus", () => {
         db.close();
     });
 
-    test("puts parse failure first and shows configured TTL without mutating the session row", () => {
+    test("puts the missing OpenCode store before parse failures and keeps configured TTL read-only", () => {
+        const originalOpenCodeDb = process.env.OPENCODE_DB;
+        process.env.OPENCODE_DB = ":memory:";
+        resetOpenCodeDbPathStateForTesting();
         const db = new Database(":memory:");
         initializeDatabase(db);
         getOrCreateSessionMeta(db, SESSION_ID);
@@ -142,7 +147,6 @@ describe("executeStatus", () => {
         const status = executeStatus(
             db,
             SESSION_ID,
-            20,
             undefined,
             "anthropic/claude-opus-5",
             undefined,
@@ -162,11 +166,17 @@ describe("executeStatus", () => {
         );
 
         expect(status.split("\n")[0]).toBe(
+            formatOpenCodeDbMissingStatusLine(resolveOpenCodeDbPath()),
+        );
+        expect(status).toContain(
             "Config: PARSE FAILED (/tmp/magic-context.jsonc:1:1) — recovered values applied; fix the file",
         );
         expect(status).toContain("Cache TTL: 1h (config for anthropic/claude-opus-5)");
         expect(getOrCreateSessionMeta(db, SESSION_ID).cacheTtl).toBe("5m");
         db.close();
+        if (originalOpenCodeDb === undefined) delete process.env.OPENCODE_DB;
+        else process.env.OPENCODE_DB = originalOpenCodeDb;
+        resetOpenCodeDbPathStateForTesting();
     });
 
     test("shows module-routed host paths only in Rust mode", () => {
@@ -174,11 +184,10 @@ describe("executeStatus", () => {
         initializeDatabase(db);
         getOrCreateSessionMeta(db, SESSION_ID);
 
-        const tsStatus = executeStatus(db, SESSION_ID, 20);
+        const tsStatus = executeStatus(db, SESSION_ID);
         const rustStatus = executeStatus(
             db,
             SESSION_ID,
-            20,
             undefined,
             undefined,
             undefined,

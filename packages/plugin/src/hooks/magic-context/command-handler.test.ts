@@ -276,7 +276,6 @@ describe("createMagicContextCommandHandler", () => {
         const sendNotification = mock(async () => {});
         const handler = createMagicContextCommandHandler({
             db,
-            protectedTags: 3,
             sendNotification,
         });
 
@@ -296,7 +295,6 @@ describe("createMagicContextCommandHandler", () => {
         const executeWrapup = mock(async () => "should not run");
         const handler = createMagicContextCommandHandler({
             db,
-            protectedTags: 3,
             sendNotification,
             executeWrapup,
         });
@@ -328,7 +326,6 @@ describe("createMagicContextCommandHandler", () => {
             const onFlush = mock(() => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 compactionOff: true,
                 executeWrapup,
                 executeRecomp,
@@ -363,7 +360,6 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 compactionOff: false,
                 executeWrapup: async () => "wrapup ran",
                 executeRecomp: async () => "recomp ran",
@@ -391,14 +387,17 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 compactionOff: true,
                 sendNotification,
             });
 
             await expectSentinel(
                 handler["command.execute.before"](
-                    { command: "ctx-status", sessionID: "ses-status-off", arguments: "" },
+                    {
+                        command: "ctx-status",
+                        sessionID: "ses-status-off",
+                        arguments: "diagnostics",
+                    },
                     makeOutput(""),
                     {},
                 ),
@@ -418,7 +417,6 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 compactionOff: true,
                 getEmbedStatusText: () => "embedding is ready",
                 sendNotification,
@@ -450,7 +448,6 @@ describe("createMagicContextCommandHandler", () => {
             }));
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 compactionOff: true,
                 sendNotification,
                 dreamer: { config: {} as never, projectPath: "/repo", runManual },
@@ -467,49 +464,6 @@ describe("createMagicContextCommandHandler", () => {
 
             expect(runManual).toHaveBeenCalledWith(undefined);
         });
-
-        it("keeps /ctx-aug functional", async () => {
-            const sendNotification = mock(async () => {});
-            const client = {
-                session: {
-                    create: mock(async () => ({ data: { id: "sidekick-child" } })),
-                    promptAsync: mock(async () => undefined),
-                    messages: mock(async () => ({
-                        data: [
-                            {
-                                info: { role: "assistant", time: { created: Date.now() } },
-                                parts: [{ type: "text", text: "Use Bun" }],
-                            },
-                        ],
-                    })),
-                    delete: mock(async () => ({ data: undefined })),
-                },
-            };
-            const handler = createMagicContextCommandHandler({
-                db,
-                protectedTags: 3,
-                compactionOff: true,
-                sendNotification,
-                sidekick: {
-                    config: { timeout_ms: 5_000 },
-                    projectPath: "/repo",
-                    sessionDirectory: "/repo",
-                    client: client as never,
-                },
-            });
-
-            await expectSentinel(
-                handler["command.execute.before"](
-                    { command: "ctx-aug", sessionID: "ses-aug-off", arguments: "Check this" },
-                    makeOutput(""),
-                    {},
-                ),
-                "__CONTEXT_MANAGEMENT_CTX-AUG_HANDLED__",
-            );
-
-            expect(client.session.create).toHaveBeenCalledTimes(1);
-            expect(client.session.promptAsync).toHaveBeenCalledTimes(1);
-        });
     });
 
     describe("ctx-flush", () => {
@@ -517,7 +471,6 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 sendNotification,
             });
 
@@ -545,7 +498,6 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 sendNotification,
             });
 
@@ -574,7 +526,6 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 sendNotification,
                 onFlush,
             });
@@ -610,7 +561,6 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 5,
                 sendNotification,
             });
 
@@ -627,14 +577,13 @@ describe("createMagicContextCommandHandler", () => {
                 [string, string, unknown]
             >;
             const [, text] = calls[0]!;
-            expect(text).toContain("## Magic Status");
-            expect(text).toContain("### Tags");
-            expect(text).toContain("### Pending Queue");
-            expect(text).toContain("### Cache TTL");
-            expect(text).toContain("- Active: 2");
-            expect(text).toContain("- Dropped: 1");
-            expect(text).toContain("- Drops: 1");
-            expect(text).toContain("**Protected tags:** 5");
+            expect(text).toContain("## Magic Context Status");
+            expect(text).toContain("**Context:**");
+            expect(text).toContain("**History compression:**");
+            expect(text).toContain("**Memory:**");
+            expect(text).toContain("**Search indexing:**");
+            expect(text).not.toContain("### Tags");
+            expect(text).not.toContain("Protected tool tags");
             expect(text).not.toContain("Host backends → MODULE");
         });
 
@@ -644,13 +593,16 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 sendNotification,
             });
 
             await expectSentinel(
                 handler["command.execute.before"](
-                    { command: "ctx-status", sessionID: "ses-status-ops", arguments: "" },
+                    {
+                        command: "ctx-status",
+                        sessionID: "ses-status-ops",
+                        arguments: "diagnostics",
+                    },
                     makeOutput(""),
                     {},
                 ),
@@ -670,7 +622,6 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 2,
                 sendNotification,
             });
 
@@ -687,10 +638,10 @@ describe("createMagicContextCommandHandler", () => {
                 [string, string, unknown]
             >;
             const [, text] = calls[0]!;
-            expect(text).toContain("- Active: 0");
-            expect(text).toContain("- Dropped: 0");
-            expect(text).toContain("- Total queued: 0");
-            expect(text).toContain("**Protected tags:** 2");
+            expect(text).toContain("## Magic Context Status");
+            expect(text).toContain("0 memories · 0 notes");
+            expect(text).not.toContain("Total queued");
+            expect(text).not.toContain("Protected tool tags");
         });
     });
 
@@ -722,10 +673,10 @@ describe("createMagicContextCommandHandler", () => {
 
         it("renders shared status markdown through the normal response path without a live TUI sink", async () => {
             const sendNotification = mock(async () => {});
+            const getStatusDetail = mock(statusDetail);
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
-                getStatusDetail: statusDetail,
+                getStatusDetail,
                 sendNotification,
             });
 
@@ -740,9 +691,12 @@ describe("createMagicContextCommandHandler", () => {
 
             expect(sendNotification).toHaveBeenCalledWith(
                 "ses-sinkless",
-                expect.stringContaining("**Usage:** 75.0% (96,000 / 128,000 usable tokens)"),
+                expect.stringContaining(
+                    "**Context:** 75.0% of usable context (96,000 / 128,000 tokens)",
+                ),
                 {},
             );
+            expect(getStatusDetail).toHaveBeenCalledTimes(1);
             expect(drainNotifications()).toEqual([]);
         });
 
@@ -757,7 +711,6 @@ describe("createMagicContextCommandHandler", () => {
             const getStatusDetail = mock(statusDetail);
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 getStatusDetail,
                 sendNotification,
             });
@@ -772,7 +725,7 @@ describe("createMagicContextCommandHandler", () => {
                     "__CONTEXT_MANAGEMENT_CTX-STATUS_HANDLED__",
                 );
 
-                expect(received).toEqual([{ action: "show-status-dialog" }]);
+                expect(received).toEqual([{ action: "show-status-dialog", diagnostics: false }]);
                 expect(getStatusDetail).not.toHaveBeenCalled();
                 expect(sendNotification).not.toHaveBeenCalled();
             } finally {
@@ -784,7 +737,6 @@ describe("createMagicContextCommandHandler", () => {
             const sinklessNotification = mock(async () => {});
             const sinklessHandler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 executeRecomp: async () => "should not run",
                 sendNotification: sinklessNotification,
             });
@@ -813,7 +765,6 @@ describe("createMagicContextCommandHandler", () => {
             const liveNotification = mock(async () => {});
             const liveHandler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 executeRecomp: async () => "should not run",
                 sendNotification: liveNotification,
             });
@@ -842,7 +793,6 @@ describe("createMagicContextCommandHandler", () => {
             const executeRecomp = mock(async () => "## Magic Recomp\n\nRebuilt state.");
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 executeRecomp,
                 sendNotification,
             });
@@ -882,7 +832,7 @@ describe("createMagicContextCommandHandler", () => {
             expect(sendNotification).toHaveBeenNthCalledWith(
                 1,
                 "ses-recomp",
-                expect.stringContaining("Historian recomp started"),
+                expect.stringContaining("Recomp started"),
                 {},
             );
             expect(sendNotification).toHaveBeenNthCalledWith(
@@ -898,7 +848,6 @@ describe("createMagicContextCommandHandler", () => {
             const executeRecomp = mock(async () => "## Magic Recomp\n\nRebuilt state.");
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 executeRecomp,
                 sendNotification,
             });
@@ -930,7 +879,6 @@ describe("createMagicContextCommandHandler", () => {
             const executeRecomp = mock(async () => "## Magic Recomp\n\nRebuilt state.");
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 executeRecomp,
                 sendNotification,
             });
@@ -967,7 +915,6 @@ describe("createMagicContextCommandHandler", () => {
             });
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 transformMode: "rust",
                 rustModeModuleClient: {
                     call: async () => {
@@ -994,7 +941,7 @@ describe("createMagicContextCommandHandler", () => {
             expect(getStatusDetail).not.toHaveBeenCalled();
             expect(sendNotification).toHaveBeenCalledWith(
                 "ses-rust-status-unavailable",
-                expect.stringContaining("Rust module status could not be read"),
+                expect.stringContaining("(MC-S01)"),
                 {},
             );
             const text = String(sendNotification.mock.calls[0]?.[1]);
@@ -1006,7 +953,6 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 transformMode: "rust",
                 rustModeModuleClient: {
                     call: async (request) => {
@@ -1059,7 +1005,6 @@ describe("createMagicContextCommandHandler", () => {
             );
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 transformMode: "rust",
                 rustModeModuleClient: { call: moduleCall },
                 sendNotification,
@@ -1106,7 +1051,6 @@ describe("createMagicContextCommandHandler", () => {
             const runUpgrade = mock(async () => "TS upgrade ran");
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 transformMode: "rust",
                 rustModeModuleClient: { call: moduleCall },
                 runUpgrade,
@@ -1143,8 +1087,12 @@ describe("createMagicContextCommandHandler", () => {
             const text = (sendNotification.mock.calls as unknown as Array<[string, string]>)
                 .map(([, notification]) => notification)
                 .join("\n");
-            expect(text).toContain("module supports only a full-session recomp");
-            expect(text).toContain("switch authority through the documented drain flow");
+            expect(text).toContain("(MC-C06)");
+            expect(text).toContain("Run /ctx-recomp instead. (MC-C07)");
+            expect(text).not.toContain("standard mode");
+            for (const forbidden of ["authority", "MODULE", "drain", "facade", "changefeed"]) {
+                expect(text).not.toContain(forbidden);
+            }
         });
 
         it("maps every shared wrapup state cell to the TypeScript outcome contract", async () => {
@@ -1189,7 +1137,6 @@ describe("createMagicContextCommandHandler", () => {
                 }));
                 const handler = createMagicContextCommandHandler({
                     db,
-                    protectedTags: 3,
                     transformMode: "rust",
                     rustModeModuleClient: { call: moduleCall },
                     sendNotification,
@@ -1210,13 +1157,13 @@ describe("createMagicContextCommandHandler", () => {
                     .map(([, notification]) => notification)
                     .join("\n");
                 expect(text, row.cell).toContain(row.expectedHeading);
-                if (row.disposition !== "already_in_progress") {
+                if (row.disposition !== "already_in_progress" && row.disposition !== "retryable") {
                     expect(text, row.cell).toContain(`matrix:${row.cell}`);
                 }
                 if (row.forbiddenHeading)
                     expect(text, row.cell).not.toContain(row.forbiddenHeading);
                 if (row.disposition === "retryable") {
-                    expect(text, row.cell).toContain("Run /ctx-wrapup again to continue.");
+                    expect(text, row.cell).toContain("Retry in a moment. (MC-C09)");
                     expect(text, row.cell).not.toContain("— Failed");
                 }
             }
@@ -1233,7 +1180,6 @@ describe("createMagicContextCommandHandler", () => {
             }));
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 transformMode: "rust",
                 rustModeModuleClient: { call: moduleCall },
                 sendNotification,
@@ -1253,7 +1199,7 @@ describe("createMagicContextCommandHandler", () => {
                 .map(([, text]) => text)
                 .join("\n");
             expect(texts).toContain("## Magic Wrapup — Partial");
-            expect(texts).toContain("Run /ctx-wrapup again to continue.");
+            expect(texts).toContain("Retry in a moment. (MC-C09)");
             expect(texts).not.toContain("— Failed");
         });
 
@@ -1264,7 +1210,6 @@ describe("createMagicContextCommandHandler", () => {
             });
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 transformMode: "rust",
                 rustModeModuleClient: { call: moduleCall },
                 getEmbedStatusText: () => "embedding is ready",
@@ -1291,7 +1236,6 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 transformMode: "rust",
                 rustModeModuleClient: {
                     call: async () => ({
@@ -1310,7 +1254,11 @@ describe("createMagicContextCommandHandler", () => {
 
             await expectSentinel(
                 handler["command.execute.before"](
-                    { command: "ctx-status", sessionID: "ses-rust-status", arguments: "" },
+                    {
+                        command: "ctx-status",
+                        sessionID: "ses-rust-status",
+                        arguments: "diagnostics",
+                    },
                     makeOutput(""),
                     {},
                 ),
@@ -1331,7 +1279,6 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 transformMode: "rust",
                 rustModeModuleClient: {
                     call: async (request) => {
@@ -1377,7 +1324,7 @@ describe("createMagicContextCommandHandler", () => {
             );
             expect(sendNotification).toHaveBeenCalledWith(
                 "ses-rust-ops",
-                expect.stringContaining("Historian recomp started"),
+                expect.stringContaining("Recomp started"),
                 {},
             );
         });
@@ -1386,7 +1333,6 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 transformMode: "rust",
                 getEmbedStatusText: () => "Embedding is ready.",
                 sendNotification,
@@ -1421,7 +1367,6 @@ describe("createMagicContextCommandHandler", () => {
             );
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 runUpgrade,
                 sendNotification,
             });
@@ -1452,7 +1397,6 @@ describe("createMagicContextCommandHandler", () => {
             const executeRecomp = mock(async () => "rebuilt");
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 executeRecomp,
                 sendNotification,
             });
@@ -1484,13 +1428,13 @@ describe("createMagicContextCommandHandler", () => {
             const sendNotification = mock(async () => {});
             const runManual = mock(async () => ({
                 ran: ["verify"],
+                details: ["curate: 8 memory operations applied"],
                 skippedNoWork: [],
                 deferredBusy: [],
                 failed: [],
             }));
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 sendNotification,
                 dreamer: {
                     // command handler only reads `config` for presence; runManual is the entry.
@@ -1519,6 +1463,9 @@ describe("createMagicContextCommandHandler", () => {
                 expect.stringContaining("Ran: verify"),
                 { toastDurationMs: 5000 },
             );
+            expect(sendNotification.mock.calls[1]?.[1]).toContain(
+                "curate: 8 memory operations applied",
+            );
         });
 
         it("force-runs a single named task when given an argument", async () => {
@@ -1531,7 +1478,6 @@ describe("createMagicContextCommandHandler", () => {
             }));
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 sendNotification,
                 dreamer: {
                     config: {} as never,
@@ -1564,7 +1510,6 @@ describe("createMagicContextCommandHandler", () => {
             }));
             const handler = createMagicContextCommandHandler({
                 db,
-                protectedTags: 3,
                 sendNotification,
                 dreamer: {
                     config: {} as never,
@@ -1591,96 +1536,6 @@ describe("createMagicContextCommandHandler", () => {
         });
     });
 
-    describe("ctx-aug", () => {
-        it("runs sidekick in a child session and sends the augmented prompt", async () => {
-            const sendNotification = mock(async () => {});
-            const client = {
-                session: {
-                    create: mock(async () => ({ data: { id: "sidekick-child" } })),
-                    prompt: mock(async () => undefined),
-                    promptAsync: mock(async () => undefined),
-                    messages: mock(async () => ({
-                        data: [
-                            {
-                                info: { role: "assistant", time: { created: Date.now() } },
-                                parts: [{ type: "text", text: "Use Bun for commands" }],
-                            },
-                        ],
-                    })),
-                    delete: mock(async () => ({ data: undefined })),
-                },
-            };
-            const handler = createMagicContextCommandHandler({
-                db,
-                protectedTags: 3,
-                sendNotification,
-                sidekick: {
-                    config: {
-                        timeout_ms: 5_000,
-                    },
-                    projectPath: "/repo/project",
-                    sessionDirectory: "/repo/project",
-                    client: client as never,
-                },
-            });
-
-            await expectSentinel(
-                handler["command.execute.before"](
-                    {
-                        command: "ctx-aug",
-                        sessionID: "ses-aug",
-                        arguments: "Implement sidekick migration",
-                    },
-                    makeOutput(""),
-                    {},
-                ),
-                "__CONTEXT_MANAGEMENT_CTX-AUG_HANDLED__",
-            );
-
-            expect(sendNotification).toHaveBeenCalledWith(
-                "ses-aug",
-                "🔍 Preparing augmentation… this may take 2-10s depending on your sidekick provider.",
-                {},
-            );
-            expect(client.session.create).toHaveBeenCalledTimes(1);
-            expect(client.session.promptAsync).toHaveBeenCalledWith({
-                path: { id: "ses-aug" },
-                body: {
-                    parts: [
-                        {
-                            type: "text",
-                            text: "Implement sidekick migration\n\n<sidekick-augmentation>\nUse Bun for commands\n</sidekick-augmentation>",
-                        },
-                    ],
-                },
-            });
-        });
-
-        it("reports when sidekick is not configured", async () => {
-            const sendNotification = mock(async () => {});
-            const handler = createMagicContextCommandHandler({
-                db,
-                protectedTags: 3,
-                sendNotification,
-            });
-
-            await expectSentinel(
-                handler["command.execute.before"](
-                    { command: "ctx-aug", sessionID: "ses-aug-missing", arguments: "Help" },
-                    makeOutput(""),
-                    {},
-                ),
-                "__CONTEXT_MANAGEMENT_CTX-AUG_HANDLED__",
-            );
-
-            expect(sendNotification).toHaveBeenCalledWith(
-                "ses-aug-missing",
-                expect.stringContaining("Sidekick is not configured"),
-                {},
-            );
-        });
-    });
-
     it("handles flush and status as independent commands", async () => {
         insertTag(db, "ses-both", 1, 200);
         insertPendingOp(db, "ses-both", 1);
@@ -1688,12 +1543,10 @@ describe("createMagicContextCommandHandler", () => {
         const sendNotificationStatus = mock(async () => {});
         const handlerFlush = createMagicContextCommandHandler({
             db,
-            protectedTags: 4,
             sendNotification: sendNotificationFlush,
         });
         const handlerStatus = createMagicContextCommandHandler({
             db,
-            protectedTags: 4,
             sendNotification: sendNotificationStatus,
         });
 
@@ -1724,14 +1577,13 @@ describe("createMagicContextCommandHandler", () => {
         const [, flushText] = flushCalls[0]!;
         const [, statusText] = statusCalls[0]!;
         expect(flushText).toContain("1 dropped");
-        expect(statusText).toContain("## Magic Status");
+        expect(statusText).toContain("## Magic Context Status");
     });
 
     it("delivers notification text before throwing the sentinel", async () => {
         const sendNotification = mock(async () => {});
         const handler = createMagicContextCommandHandler({
             db,
-            protectedTags: 3,
             sendNotification,
         });
 
@@ -1756,7 +1608,6 @@ describe("createMagicContextCommandHandler", () => {
         const sendNotification = mock(async () => {});
         const handler = createMagicContextCommandHandler({
             db,
-            protectedTags: 3,
             sendNotification,
         });
 
@@ -1776,7 +1627,7 @@ describe("createMagicContextCommandHandler", () => {
 
         expect(sendNotification).toHaveBeenCalledWith(
             "ses-stable-model",
-            expect.stringContaining("## Magic Status"),
+            expect.stringContaining("## Magic Context Status"),
             {},
         );
     });

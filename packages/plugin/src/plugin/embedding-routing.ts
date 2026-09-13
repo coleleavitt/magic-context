@@ -8,14 +8,16 @@ import {
     getSynapseLaneIdentity,
     SYNAPSE_DEFAULT_MODEL,
     SynapseEmbeddingProvider,
+    type SynapseLaneDescriptor,
     type SynapseLaneMetadata,
+    toSynapseLaneDescriptor,
 } from "../features/magic-context/memory/embedding-synapse";
 import { log } from "../shared/logger";
 
 export interface ResolvedSynapseEmbeddingConfig {
     provider: "synapse";
     model: string;
-    max_input_tokens: 8192;
+    max_input_tokens: number;
     synapse_connection_file: string;
     synapse_fingerprint: string;
     synapse_table_epoch: number;
@@ -23,6 +25,8 @@ export interface ResolvedSynapseEmbeddingConfig {
     // treats a missing value as adopt-on-first-write.
     synapse_dims?: number;
     synapse_recommended_batch?: number;
+    synapse_recommended_token_budget?: number;
+    synapse_descriptor: SynapseLaneDescriptor;
     synapse_provenance?: unknown;
 }
 
@@ -52,6 +56,12 @@ function fallbackConfig(
     const inputType = typeof raw.input_type === "string" ? raw.input_type.trim() : "";
     const queryInputType =
         typeof raw.query_input_type === "string" ? raw.query_input_type.trim() : "";
+    const queryInstruction =
+        typeof raw.query_instruction === "string" || raw.query_instruction === false
+            ? raw.query_instruction
+            : undefined;
+    const documentPrefix =
+        typeof raw.document_prefix === "string" ? raw.document_prefix : undefined;
     const truncate = typeof raw.truncate === "string" ? raw.truncate.trim() : "";
     const maxInputTokens =
         typeof raw.max_input_tokens === "number" ? raw.max_input_tokens : undefined;
@@ -65,6 +75,8 @@ function fallbackConfig(
             ...(apiKey ? { api_key: apiKey } : {}),
             ...(inputType ? { input_type: inputType } : {}),
             ...(queryInputType ? { query_input_type: queryInputType } : {}),
+            ...(queryInstruction !== undefined ? { query_instruction: queryInstruction } : {}),
+            ...(documentPrefix !== undefined ? { document_prefix: documentPrefix } : {}),
             ...(truncate ? { truncate } : {}),
             ...(maxInputTokens !== undefined ? { max_input_tokens: maxInputTokens } : {}),
         };
@@ -97,11 +109,7 @@ function synapseOptions(
             SYNAPSE_DEFAULT_MODEL,
         ...(metadata
             ? {
-                  fingerprint: metadata.fingerprint,
-                  tableEpoch: metadata.table_epoch,
-                  dims: metadata.dims,
-                  recommendedBatch: metadata.recommended_batch,
-                  provenance: metadata.provenance,
+                  metadata,
               }
             : {}),
     };
@@ -141,7 +149,7 @@ function resolvedSynapseConfig(
     return {
         provider: "synapse",
         model: metadata.model,
-        max_input_tokens: 8192,
+        max_input_tokens: metadata.max_tokens,
         synapse_connection_file: subc.connection_file,
         synapse_fingerprint: metadata.fingerprint,
         synapse_table_epoch: metadata.table_epoch,
@@ -149,6 +157,10 @@ function resolvedSynapseConfig(
         ...(metadata.recommended_batch
             ? { synapse_recommended_batch: metadata.recommended_batch }
             : {}),
+        ...(metadata.recommended_token_budget
+            ? { synapse_recommended_token_budget: metadata.recommended_token_budget }
+            : {}),
+        synapse_descriptor: toSynapseLaneDescriptor(metadata),
         ...(metadata.provenance !== undefined ? { synapse_provenance: metadata.provenance } : {}),
     };
 }

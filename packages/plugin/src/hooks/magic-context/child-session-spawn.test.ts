@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { runMigrations } from "../../features/magic-context/migrations";
 import {
     __resetChildSpawnFenceProbeForTests,
@@ -21,6 +21,10 @@ import {
     STALE_PLUGIN_RESTART_NOTICE,
 } from "./child-session-spawn";
 
+import { __ignoredNotificationTest } from "./send-session-notification";
+
+// Schema-warning delivery is exercised with an idle parent, not an active model loop.
+beforeEach(() => __ignoredNotificationTest.setHoldDetector(() => false));
 const dbs: Database[] = [];
 
 function staleDatabase(): Database {
@@ -35,6 +39,7 @@ function staleDatabase(): Database {
 }
 
 afterEach(() => {
+    __ignoredNotificationTest.reset();
     __resetChildSpawnFenceProbeForTests();
     __resetNotificationStateForTests();
     for (const db of dbs.splice(0)) db.close();
@@ -49,7 +54,7 @@ describe("createChildSessionWithFence", () => {
             client,
             db: staleDatabase(),
             parentSessionId: "ses_parent",
-            title: "magic-context-sidekick",
+            title: "magic-context-dreamer",
             directory: "/project",
             onFenceLatched: (failure: ChildSpawnFenceFailure) => latchedFailures.push(failure),
         };
@@ -79,7 +84,7 @@ describe("createChildSessionWithFence", () => {
             client,
             db,
             parentSessionId: "ses_parent",
-            title: "magic-context-sidekick",
+            title: "magic-context-dreamer",
             directory: "/project",
         };
 
@@ -93,10 +98,10 @@ describe("createChildSessionWithFence", () => {
                 payload: expect.objectContaining({ message: SCHEMA_PROBE_FAILURE_NOTICE }),
             }),
         );
-        expect(prompt).toHaveBeenCalledTimes(1);
+        expect(prompt).not.toHaveBeenCalled();
     });
 
-    it("surfaces the latched failure through the TUI toast and parent warning paths", async () => {
+    it("surfaces the latched failure through RPC and persisted sidebar state without a parent chat row", async () => {
         const db = staleDatabase();
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses_parent");
         const create = mock(async () => ({ id: "child" }));
@@ -106,7 +111,7 @@ describe("createChildSessionWithFence", () => {
             client,
             db,
             parentSessionId: "ses_parent",
-            title: "magic-context-sidekick",
+            title: "magic-context-dreamer",
             directory: "/project",
         };
 
@@ -126,7 +131,7 @@ describe("createChildSessionWithFence", () => {
         expect(notifications).toContainEqual(
             expect.objectContaining({ type: "action", payload: { action: "refresh-sidebar" } }),
         );
-        expect(prompt).toHaveBeenCalledTimes(1);
+        expect(prompt).not.toHaveBeenCalled();
         expect(
             db
                 .prepare("SELECT last_transform_error FROM session_meta WHERE session_id = ?")

@@ -15,6 +15,16 @@ import {
     type EmbeddingProbeOutcome,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
+import {
+    formatSynapseLaneDescriptor,
+    SYNAPSE_DEFAULT_MODEL,
+    SynapseEmbeddingProvider,
+    toSynapseLaneDescriptor,
+} from "@magic-context/core/features/magic-context/memory/embedding-synapse";
+import {
+    formatShadowBackfillStall,
+    listShadowBackfillStalls,
+} from "@magic-context/core/features/magic-context/shadow-backfill-state";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
 import {
@@ -528,7 +538,7 @@ async function runHealthChecks(options: {
             add(
                 results,
                 "fail",
-                `Pi ${version} is older than required ${MIN_PI_VERSION}. Subagents (historian/dreamer/sidekick) use the long-form \`--extension\` flag introduced in Pi 0.71.0; older versions hard-fail with "Unknown option". Run \`pi update\` (or \`npm install -g @earendil-works/pi-coding-agent@latest\`).`,
+                `Pi ${version} is older than required ${MIN_PI_VERSION}. Subagents (historian/dreamer) use the long-form \`--extension\` flag introduced in Pi 0.71.0; older versions hard-fail with "Unknown option". Run \`pi update\` (or \`npm install -g @earendil-works/pi-coding-agent@latest\`).`,
             );
         } else if (version) {
             add(results, "pass", `Pi version meets minimum ${MIN_PI_VERSION} requirement`);
@@ -700,6 +710,9 @@ async function runHealthChecks(options: {
                     (table) => `${table}=${countTable(db as ContextDatabase, table) ?? "n/a"}`,
                 ).join(", ");
                 add(results, "info", `Shared DB row counts: ${counts}`);
+                for (const stall of listShadowBackfillStalls(db)) {
+                    add(results, "warn", formatShadowBackfillStall(stall));
+                }
             }
         } catch (error) {
             if (error instanceof UnsupportedSchemaVersionError) {
@@ -758,7 +771,40 @@ async function runHealthChecks(options: {
             userRaw ?? undefined,
         );
     }
-    if (mergedEmbedding.provider === "openai-compatible") {
+    if (mergedEmbedding.provider === "synapse") {
+        const subc = loadedConfig.config.subc;
+        const model =
+            typeof mergedEmbedding.model === "string" && mergedEmbedding.model.trim().length > 0
+                ? mergedEmbedding.model.trim()
+                : SYNAPSE_DEFAULT_MODEL;
+        if (!subc) {
+            add(results, "fail", "Embedding provider is synapse but the subc block is missing");
+        } else {
+            try {
+                const metadata = await SynapseEmbeddingProvider.discover({
+                    connectionFile: subc.connection_file,
+                    projectRoot: options.cwd,
+                    session: "doctor:pi",
+                    model,
+                });
+                add(
+                    results,
+                    "pass",
+                    `Embedding provider: synapse — ${sanitizeDiagnosticText(
+                        formatSynapseLaneDescriptor(toSynapseLaneDescriptor(metadata)),
+                    )}`,
+                );
+            } catch (error) {
+                add(
+                    results,
+                    "fail",
+                    `Synapse embedding lane unavailable: ${sanitizeDiagnosticText(
+                        error instanceof Error ? error.message : String(error),
+                    )}`,
+                );
+            }
+        }
+    } else if (mergedEmbedding.provider === "openai-compatible") {
         const endpoint =
             typeof mergedEmbedding.endpoint === "string" ? mergedEmbedding.endpoint.trim() : "";
         const model = typeof mergedEmbedding.model === "string" ? mergedEmbedding.model.trim() : "";

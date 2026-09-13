@@ -184,17 +184,14 @@ pub struct SelectionContext {
     pub current_total_input_tokens: f64,
     /// ceiling = contextLimit × executeThreshold%.
     pub ceiling_tokens: f64,
-    /// The protected-recent window: items with `ordinal > protected_cutoff_ordinal`
-    /// are never emergency-evicted (0 = protect nothing).
-    pub protected_cutoff_ordinal: u64,
     /// The frozen two-pass watermark: tool items with `ordinal <= last_execute_ordinal`
     /// may join the next riding/force batch (0 = none). It advances only after that
     /// batch is applied, so execute-band residency cannot age in one new arc per pass.
     pub last_execute_ordinal: u64,
     /// True only for a scheduler execute caused by a context-pressure threshold crossing.
     pub scheduler_pressure_execute: bool,
-    /// Emergency idempotence latch: the input-token reading at the prior emergency
-    /// drop (0 if never), and whether any emergency drop has happened.
+    /// Shared force-episode latch. The sample is diagnostic, not an equality gate:
+    /// changing usage cannot grant another batch before exit or an independent bust.
     pub prior_input_sample: f64,
     pub has_prior_drop: bool,
     /// Agent-marked drop ids (the ctx_reduce §N§ signal), a caller-owned side input.
@@ -212,7 +209,9 @@ pub struct SelectionContext {
     /// True when supersession can ride concrete work already scheduled for this pass.
     /// Unlike `pass_already_busting`, a held emergency latch alone does not set this.
     pub supersession_ride_available: bool,
-    /// Dynamic newest-tag protection expressed as exact block ids.
+    /// At the scheduler's >=95% backstop, the token window and tier reserve yield.
+    pub emergency_window_yields: bool,
+    /// Persisted token-window protection expressed as exact block ids.
     pub tag_window_protected_block_ids: HashSet<String>,
     /// Whole-message protection for mutation-exempt and lineage-anchor messages.
     pub exempt_message_protected_block_ids: HashSet<String>,
@@ -220,7 +219,7 @@ pub struct SelectionContext {
 
 impl SelectionContext {
     fn block_is_protected(&self, block_id: &str) -> bool {
-        self.tag_window_protected_block_ids.contains(block_id)
+        (!self.emergency_window_yields && self.tag_window_protected_block_ids.contains(block_id))
             || self.exempt_message_protected_block_ids.contains(block_id)
     }
 }
@@ -343,7 +342,8 @@ fn group_arcs(items: &[SelItem], frozen: &HashSet<String>) -> Vec<ToolArc> {
                     .saturating_add(token_count),
             );
         }
-        if frozen.contains(&item.id) {
+        // Legacy call-only reductions must not strand a still-live result.
+        if matches!(item.kind, SelKind::ToolResult { .. }) && frozen.contains(&item.id) {
             entry.reduced = true;
         }
         match &item.kind {
@@ -560,14 +560,6 @@ pub(crate) fn filter_reasoning_ineligible_decisions(
 /// reference when the target already has a minted visible tag number.
 const DROPPED_PLACEHOLDER: &str = "[dropped]";
 
-fn safe_prefix(s: &str, max_len: usize) -> &str {
-    let mut end = max_len.min(s.len());
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 /// Clamp a diff value to a region hint (edit_marker): first `EDIT_REGION_HINT_LEN`
 /// UTF-16 units + the sentinel. Idempotent (already-hinted values pass through). Pure.
 fn region_hint(value: &str) -> String {
@@ -688,50 +680,19 @@ enum ArcShape {
     EditMarker,
 }
 
-/// Clamp ToolCall input values exactly like the TypeScript drop target: inputs at or
-/// below 500 JSON bytes remain intact; larger object values keep short strings while
-/// arrays and nested objects become compact summaries. The result is frozen at selection.
-fn skeleton_payload(input: &serde_json::Value) -> String {
-    const INPUT_CLAMP_BYTES: usize = 500;
-    const SKELETON_ARG_LEN: usize = 5;
-    let serialized_len = serde_json::to_string(input)
-        .map(|value| value.len())
-        .unwrap_or(0);
-    if serialized_len <= INPUT_CLAMP_BYTES {
-        return canonical_json(input);
-    }
-    let clamp_object = |object: &serde_json::Map<String, serde_json::Value>| {
-        let mut output = object.clone();
-        for value in output.values_mut() {
-            match value {
-                serde_json::Value::String(s) if s.chars().count() > SKELETON_ARG_LEN => {
-                    let byte_len = s
-                        .char_indices()
-                        .nth(SKELETON_ARG_LEN)
-                        .map(|(i, _)| i)
-                        .unwrap_or(s.len());
-                    *value = serde_json::Value::String(format!(
-                        "{}{}",
-                        safe_prefix(s, byte_len),
-                        TRUNCATION_SENTINEL
-                    ));
-                }
-                serde_json::Value::Array(items) => {
-                    *value = serde_json::Value::String(format!("[{} items]", items.len()));
-                }
-                serde_json::Value::Object(_) => {
-                    *value = serde_json::Value::String("[object]".to_string());
-                }
-                _ => {}
-            }
-        }
-        canonical_json(&serde_json::Value::Object(output))
-    };
-    match input {
-        serde_json::Value::Object(object) => clamp_object(object),
-        serde_json::Value::Array(items) => format!("[{} items]", items.len()),
-        _ => canonical_json(input),
-    }
+/// Build the only model-visible input for a dropped ToolCall shell. The tagged
+/// form is a pure function of the durable tag id; selection freezes the untagged
+/// form and the renderer fills in the tag from its durable overlay.
+pub(crate) fn dropped_input_payload(tag_id: Option<i64>) -> String {
+    let sentinel = tag_id.map_or_else(
+        || DROPPED_PLACEHOLDER.to_string(),
+        |tag_id| format!("[dropped §{tag_id}§]"),
+    );
+    canonical_json(&serde_json::json!({ "dropped": sentinel }))
+}
+
+fn skeleton_payload(_input: &serde_json::Value) -> String {
+    dropped_input_payload(None)
 }
 
 /// Expand a reduced arc into its per-block [`ReductionDecision`]s: the ToolCall block
@@ -919,7 +880,6 @@ fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<Strin
                 .iter()
                 .any(|(id, _)| ctx.block_is_protected(id))
             || arc.result_ids.iter().any(|id| ctx.block_is_protected(id))
-            || (ctx.protected_cutoff_ordinal > 0 && arc.ordinal > ctx.protected_cutoff_ordinal)
         {
             continue;
         }
@@ -964,9 +924,14 @@ fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<Strin
         .collect()
 }
 
+fn reclaim_ride_available(ctx: &SelectionContext) -> bool {
+    ctx.pass_already_busting
+        || ctx.supersession_ride_available
+        || (ctx.pass_class == PassClass::EmergencyForce && !ctx.has_prior_drop)
+}
+
 fn two_pass_batch_can_apply(ctx: &SelectionContext) -> bool {
-    ctx.scheduler_pressure_execute
-        && (ctx.pass_already_busting || ctx.pass_class == PassClass::EmergencyForce)
+    reclaim_ride_available(ctx)
 }
 
 /// 1.4 Age-based two-pass: tool arcs whose age (ToolCall ordinal) is at/under the
@@ -1097,6 +1062,7 @@ fn select_emergency(
     arcs: &[&ToolArc],
     ctx: &SelectionContext,
     all_active_floor_tokens: f64,
+    assessment: &mut Option<mc_store::EmergencyDropAssessment>,
 ) -> HashSet<String> {
     // Guards mirror the TS planner: unknown ceiling/usage → no-op; idempotence latch.
     if !ctx.ceiling_tokens.is_finite() || ctx.ceiling_tokens <= 0.0 {
@@ -1105,7 +1071,7 @@ fn select_emergency(
     if !ctx.current_total_input_tokens.is_finite() || ctx.current_total_input_tokens <= 0.0 {
         return HashSet::new();
     }
-    if ctx.has_prior_drop && ctx.current_total_input_tokens == ctx.prior_input_sample {
+    if ctx.has_prior_drop && !ctx.pass_already_busting && !ctx.emergency_window_yields {
         return HashSet::new();
     }
 
@@ -1136,7 +1102,11 @@ fn select_emergency(
                     .cmp(&a.ordinal)
                     .then_with(|| b.arc_id.cmp(&a.arc_id))
             });
-            let reserve_count = (TIER_RECENCY_RESERVE * nums.len() as f64).ceil() as usize;
+            let reserve_count = if ctx.emergency_window_yields {
+                0
+            } else {
+                (TIER_RECENCY_RESERVE * nums.len() as f64).ceil() as usize
+            };
             for arc in nums.iter().take(reserve_count) {
                 reserved.insert(arc.arc_id.clone());
             }
@@ -1148,11 +1118,16 @@ fn select_emergency(
     // neither the floor nor target (panel-verified emergency interaction).
     let protected_ctx_reduce_arcs = newest_ctx_reduce_arc_ids(arcs);
 
-    // Build candidates per tier (protected tail + reserve excluded).
+    // Build candidates per tier (persisted protected identities + reserve excluded).
     let mut by_tier: HashMap<u8, Vec<&&ToolArc>> = HashMap::new();
     for arc in arcs {
-        if arc.ordinal > ctx.protected_cutoff_ordinal && ctx.protected_cutoff_ordinal > 0 {
-            continue; // global protected tail
+        if arc
+            .call_inputs
+            .iter()
+            .any(|(id, _)| ctx.block_is_protected(id))
+            || arc.result_ids.iter().any(|id| ctx.block_is_protected(id))
+        {
+            continue;
         }
         if protected_ctx_reduce_arcs.contains(&arc.arc_id) {
             continue;
@@ -1164,6 +1139,11 @@ fn select_emergency(
         by_tier.entry(tier).or_default().push(arc);
     }
 
+    let candidate_tokens = by_tier
+        .values()
+        .flatten()
+        .map(|arc| bytes_to_tokens(arc.reclaim_bytes()))
+        .sum::<f64>();
     // Walk T3 → T2 → T1, oldest-first within tier, until reclaim met.
     let mut selected: HashSet<String> = HashSet::new();
     let mut reclaimed = 0.0f64;
@@ -1183,12 +1163,21 @@ fn select_emergency(
             }
         }
     }
+    *assessment = Some(mc_store::EmergencyDropAssessment {
+        fixed_floor_tokens: fixed_floor,
+        target_tokens: target,
+        required_reclaim_tokens: reclaim_tokens,
+        selected_reclaim_tokens: reclaimed,
+        candidate_tokens,
+        target_unreachable: reclaimed < reclaim_tokens,
+    });
     selected
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct SelectionOutcome {
     pub decisions: Vec<ReductionDecision>,
+    pub emergency_drop_assessment: Option<mc_store::EmergencyDropAssessment>,
     /// The pressure pass was already busting, or was in the force band, so the age
     /// batch had an application opportunity. Empty opportunities still advance the
     /// watermark so future arcs can age into a later batch.
@@ -1227,7 +1216,6 @@ pub(crate) fn select_reductions_with_outcome(
         return SelectionOutcome::default();
     }
 
-    let two_pass_batch_can_apply = two_pass_batch_can_apply(ctx);
     let live_ids: HashSet<String> = items
         .iter()
         .filter(|item| {
@@ -1250,6 +1238,25 @@ pub(crate) fn select_reductions_with_outcome(
         .map(|arc| arc.arc_id.as_str())
         .collect::<HashSet<_>>();
     let reasoning_ineligible_arcs = reasoning_ineligible_arc_ids(items);
+    let arc_by_block_id: HashMap<&str, &str> = items
+        .iter()
+        .filter_map(|item| Some((item.id.as_str(), item.arc_id.as_deref()?)))
+        .collect();
+    let arc_allows_reduction = |id: &str| {
+        arc_by_block_id.get(id).is_none_or(|arc_id| {
+            !incomplete_arc_ids.contains(*arc_id) && !reasoning_ineligible_arcs.contains(*arc_id)
+        })
+    };
+    // Only agent drops that survive the same arc guards as final emission price
+    // automatic cleanup. An open or reasoning-exempt arc cannot supply a ride.
+    let mut agent_decisions = Vec::new();
+    select_agent_drops(ctx, &live_ids, frozen_keys, &mut agent_decisions);
+    agent_decisions.retain(|decision| arc_allows_reduction(&decision.target_id));
+    let mut ride_context = ctx.clone();
+    ride_context.supersession_ride_available |= !agent_decisions.is_empty();
+    ride_context.pass_already_busting |= !agent_decisions.is_empty();
+    let ctx = &ride_context;
+    let two_pass_batch_can_apply = two_pass_batch_can_apply(ctx);
     let reasoning_adjacency_collapse_arcs = reasoning_adjacency_collapse_arc_ids(items);
     // A running call has no completed/errored result and is never reclaimable. This
     // matches the TypeScript targets' completion guard and prevents a selector from
@@ -1272,7 +1279,11 @@ pub(crate) fn select_reductions_with_outcome(
     let mut arc_shapes: HashMap<String, ArcShape> = HashMap::new();
     // Dedup precedes age selection, as in the TS heuristic pass. An older duplicate
     // removed here must not also enter the two-pass age batch.
-    let dedup_arc_ids = select_tool_dedup(&active_arcs, ctx);
+    let dedup_arc_ids = if reclaim_ride_available(ctx) {
+        select_tool_dedup(&active_arcs, ctx)
+    } else {
+        HashSet::new()
+    };
     let arcs_after_dedup: Vec<&ToolArc> = active_arcs
         .iter()
         .copied()
@@ -1280,6 +1291,7 @@ pub(crate) fn select_reductions_with_outcome(
         .collect();
     let two_pass_arc_ids = select_two_pass(&arcs_after_dedup, ctx);
     let mut eligible_supersession_arc_ids = None;
+    let mut emergency_drop_assessment = None;
 
     match ctx.pass_class {
         PassClass::EmergencyForce => {
@@ -1290,8 +1302,16 @@ pub(crate) fn select_reductions_with_outcome(
             // text, media, reasoning, and non-droppable tools; system-prefix and opaque metadata
             // remain outside that population. Only active client tool arcs can be selected below.
             let all_active_floor_tokens = active_floor_tokens(items, frozen_keys);
-            let emergency_arc_ids = select_emergency(&active_arcs, ctx, all_active_floor_tokens);
-            if !emergency_arc_ids.is_empty() || !two_pass_arc_ids.is_empty() {
+            let emergency_arc_ids = select_emergency(
+                &active_arcs,
+                ctx,
+                all_active_floor_tokens,
+                &mut emergency_drop_assessment,
+            );
+            if ctx.pass_already_busting
+                || !emergency_arc_ids.is_empty()
+                || !two_pass_arc_ids.is_empty()
+            {
                 for arc_id in &dedup_arc_ids {
                     arc_shapes.insert(arc_id.clone(), ArcShape::DedupFullDrop);
                 }
@@ -1308,11 +1328,13 @@ pub(crate) fn select_reductions_with_outcome(
                     .entry(arc_id.clone())
                     .or_insert(ArcShape::FullDrop);
             }
-            // Apply supersession only when this pass selected concrete reclaim work: an
-            // emergency eviction or a two-pass reclaim batch. If emergency mode has met
-            // its headroom target but selected nothing, defer supersession so it cannot
-            // create a cache bust by itself.
-            if cfg.smart_drops && (!emergency_arc_ids.is_empty() || !two_pass_arc_ids.is_empty()) {
+            // Supersession joins a priced batch, including the shared force-episode
+            // opportunity. A held latch without independent work grants no new ride.
+            if cfg.smart_drops
+                && (ctx.pass_already_busting
+                    || !emergency_arc_ids.is_empty()
+                    || !two_pass_arc_ids.is_empty())
+            {
                 // A superseded arc remains eligible while the ride gate is shut, so the count
                 // observed when it next opens summarizes everything accumulated between rides.
                 let intents = select_supersession(&active_arcs, &supersession_recent_message_ids);
@@ -1343,8 +1365,7 @@ pub(crate) fn select_reductions_with_outcome(
             // Supersession is deferred work: ordinary execute-band pressure and a held
             // emergency latch cannot authorize a rewrite. Concrete scheduled work or an
             // admitted two-pass batch lets the whole pending set ride the same bust.
-            if cfg.smart_drops && (ctx.supersession_ride_available || !two_pass_arc_ids.is_empty())
-            {
+            if cfg.smart_drops && reclaim_ride_available(ctx) {
                 // Count the exact selector output before overlap precedence removes members.
                 let intents = select_supersession(&active_arcs, &supersession_recent_message_ids);
                 eligible_supersession_arc_ids =
@@ -1367,9 +1388,8 @@ pub(crate) fn select_reductions_with_outcome(
         PassClass::Defer => unreachable!("defer returned early"),
     }
 
-    // Supersession's recency floor follows the newest ACTIVE tag window rather than a second
-    // owner-message K=20 window. If either half has a protected active tag, retain the whole arc;
-    // otherwise filtering only the tagged result would leave a partially superseded pair.
+    // The persisted token window supplements the structural newest-20 owner floor. Protect the
+    // whole arc when either half is a member, avoiding partially superseded call/result pairs.
     let protected_supersession_arcs = |protected_block_ids: &HashSet<String>| {
         eligible_supersession_arc_ids.as_ref().map(|eligible| {
             eligible
@@ -1389,8 +1409,13 @@ pub(crate) fn select_reductions_with_outcome(
                 .collect::<HashSet<_>>()
         })
     };
+    let yielded_window = HashSet::new();
     let supersession_arcs_with_tag_window_protection =
-        protected_supersession_arcs(&ctx.tag_window_protected_block_ids);
+        protected_supersession_arcs(if ctx.emergency_window_yields {
+            &yielded_window
+        } else {
+            &ctx.tag_window_protected_block_ids
+        });
     let supersession_arcs_with_exempt_message_protection =
         protected_supersession_arcs(&ctx.exempt_message_protected_block_ids);
 
@@ -1448,22 +1473,21 @@ pub(crate) fn select_reductions_with_outcome(
 
     // Agent-directed ids can name either half of a tool arc, so apply the same whole-message
     // guard after their block-granular decisions have been added.
-    let arc_by_block_id: HashMap<&str, &str> = items
+    out.retain(|decision| arc_allows_reduction(&decision.target_id));
+
+    // Withhold the whole arc when either half is protected. Freezing only its call
+    // would leave a live result paired with a reduced invocation on later passes.
+    let protected_arcs: HashSet<&str> = items
         .iter()
-        .filter_map(|item| Some((item.id.as_str(), item.arc_id.as_deref()?)))
+        .filter(|item| ctx.block_is_protected(&item.id))
+        .filter_map(|item| item.arc_id.as_deref())
         .collect();
     out.retain(|decision| {
-        arc_by_block_id
-            .get(decision.target_id.as_str())
-            .is_none_or(|arc_id| {
-                !incomplete_arc_ids.contains(*arc_id)
-                    && !reasoning_ineligible_arcs.contains(*arc_id)
-            })
+        !ctx.block_is_protected(&decision.target_id)
+            && !arc_by_block_id
+                .get(decision.target_id.as_str())
+                .is_some_and(|arc_id| protected_arcs.contains(arc_id))
     });
-
-    // Protection is block-specific, not an ordinal cutoff: remove protected targets from
-    // both automatic arc decisions and agent-directed decisions before the stable merge.
-    out.retain(|decision| !ctx.block_is_protected(&decision.target_id));
 
     // Deterministic merge: exactly one decision per target (drop > edit_marker >
     // skeleton), stable output order (by target_id).
@@ -1484,6 +1508,7 @@ pub(crate) fn select_reductions_with_outcome(
     };
     SelectionOutcome {
         decisions,
+        emergency_drop_assessment,
         two_pass_batch_can_apply,
         eligible_supersession_count: eligible_supersession_arc_ids.as_ref().map(HashSet::len),
         supersession_withheld_by_tag_window_count: withheld_count(
@@ -1661,12 +1686,100 @@ mod tests {
         }
     }
 
+    #[test]
+    fn contract_consumed_episode_emergency95_parity_golden() {
+        let items = vec![
+            tool_call("protected", 1, "bash", serde_json::json!({}), 100),
+            tool_result("protected", 2, "bash", 20_000),
+        ];
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 90_000.0;
+        ctx.ceiling_tokens = 65_000.0;
+        ctx.has_prior_drop = true;
+        ctx.prior_input_sample = 85_000.0;
+        ctx.tag_window_protected_block_ids
+            .insert(result_block_id("protected"));
+        assert!(
+            select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default())
+                .is_empty()
+        );
+        ctx.current_total_input_tokens = 96_000.0;
+        ctx.emergency_window_yields = true;
+        let decisions =
+            select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|d| d.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["protected#0", "protected#1"]
+        );
+    }
+
+    #[test]
+    fn contract_legacy_call_only_reduction_does_not_strand_result() {
+        let items = vec![
+            tool_call("legacy", 1, "bash", serde_json::json!({}), 100),
+            tool_result("legacy", 2, "bash", 20_000),
+        ];
+        let frozen = HashSet::from([call_block_id("legacy")]);
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 96_000.0;
+        ctx.ceiling_tokens = 65_000.0;
+        ctx.emergency_window_yields = true;
+        let outcome = select_reductions(&items, &frozen, &ctx, &SelectionConfig::default());
+        assert!(outcome
+            .iter()
+            .any(|d| d.target_id == result_block_id("legacy")));
+        assert!(!outcome
+            .iter()
+            .any(|d| d.target_id == call_block_id("legacy")));
+    }
+
+    #[test]
+    fn emergency_floor_walk_exhausts_candidates_or_reaches_target() {
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 142_021.0;
+        ctx.ceiling_tokens = 116_900.0;
+        let mut items = vec![text_with_id("text", 1, 240_000)];
+        for n in 0..10 {
+            let mid = format!("tool-{n}");
+            items.push(tool_call(&mid, n + 2, "bash", serde_json::json!({}), 0));
+            items.push(tool_result(&mid, n + 2, "bash", 8_000));
+        }
+        let arcs = group_arcs(&items, &HashSet::new());
+        let arcs = arcs.iter().collect::<Vec<_>>();
+        let mut assessment = None;
+        let selected = select_emergency(&arcs, &ctx, 80_000.0, &mut assessment);
+        let report = assessment.as_ref().unwrap();
+        assert_eq!(selected.len(), 10);
+        assert_eq!(report.fixed_floor_tokens, 62_021.0);
+        assert!((report.target_tokens - 78_484.7).abs() < 0.01);
+        assert_eq!(report.required_reclaim_tokens, 63_536.0);
+        assert_eq!(report.selected_reclaim_tokens, 20_000.0);
+        assert!(report.target_unreachable);
+        ctx.tag_window_protected_block_ids
+            .extend((1..10).map(|n| result_block_id(&format!("tool-{n}"))));
+        let selected = select_emergency(&arcs, &ctx, 80_000.0, &mut assessment);
+        let report = assessment.as_ref().unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(report.candidate_tokens, 2_000.0);
+        assert!(report.target_unreachable);
+        ctx.emergency_window_yields = true;
+        ctx.current_total_input_tokens = 20_000.0;
+        ctx.ceiling_tokens = 20_000.0;
+        let selected = select_emergency(&arcs, &ctx, 20_000.0, &mut assessment);
+        let report = assessment.as_ref().unwrap();
+        assert_eq!(selected.len(), 7);
+        assert_eq!(report.selected_reclaim_tokens, 14_000.0);
+        assert!(!report.target_unreachable);
+    }
+
     fn base_ctx(pass: PassClass) -> SelectionContext {
         SelectionContext {
             pass_class: pass,
             current_total_input_tokens: 0.0,
             ceiling_tokens: 0.0,
-            protected_cutoff_ordinal: 0,
             last_execute_ordinal: 0,
             scheduler_pressure_execute: pass == PassClass::Execute,
             prior_input_sample: 0.0,
@@ -1676,6 +1789,7 @@ mod tests {
             first_applied_agent_drop_ids: HashSet::new(),
             pass_already_busting: false,
             supersession_ride_available: false,
+            emergency_window_yields: false,
             tag_window_protected_block_ids: HashSet::new(),
             exempt_message_protected_block_ids: HashSet::new(),
         }
@@ -1840,6 +1954,20 @@ mod tests {
         SelKind::Opaque
     }
 
+    fn golden_ordinal_threshold_to_row_identities(
+        items: &[SelItem],
+        ordinal_threshold: u64,
+    ) -> HashSet<String> {
+        if ordinal_threshold == 0 {
+            return HashSet::new();
+        }
+        items
+            .iter()
+            .filter(|item| item.ordinal > ordinal_threshold)
+            .map(|item| item.id.clone())
+            .collect()
+    }
+
     #[test]
     fn selection_golden_matches_ts_selectors() {
         let raw = include_str!("../testdata/selection-golden.json");
@@ -1927,7 +2055,6 @@ mod tests {
                 pass_class: pass,
                 current_total_input_tokens: case.ctx.current_total_input_tokens,
                 ceiling_tokens: case.ctx.ceiling_tokens,
-                protected_cutoff_ordinal: case.ctx.protected_cutoff_ordinal,
                 last_execute_ordinal: case.ctx.last_execute_ordinal,
                 scheduler_pressure_execute: case.ctx.scheduler_pressure_execute,
                 prior_input_sample: case.ctx.prior_input_sample,
@@ -1937,7 +2064,11 @@ mod tests {
                 first_applied_agent_drop_ids: HashSet::new(),
                 pass_already_busting: case.smart_drops || case.ctx.pass_already_busting,
                 supersession_ride_available: case.smart_drops || case.ctx.pass_already_busting,
-                tag_window_protected_block_ids: HashSet::new(),
+                emergency_window_yields: false,
+                tag_window_protected_block_ids: golden_ordinal_threshold_to_row_identities(
+                    &items,
+                    case.ctx.protected_cutoff_ordinal,
+                ),
                 exempt_message_protected_block_ids: HashSet::new(),
             };
             let cfg = SelectionConfig {
@@ -1965,6 +2096,39 @@ mod tests {
     }
 
     // --- CK-model unit tests (no TS equivalent) ---
+
+    #[derive(Deserialize)]
+    struct DroppedInputMarkerGoldenCase {
+        label: String,
+        tag_id: i64,
+        input: serde_json::Value,
+        expected_frozen: serde_json::Value,
+        expected_tagged: serde_json::Value,
+    }
+
+    #[test]
+    fn dropped_input_marker_matches_typescript_golden() {
+        let cases: Vec<DroppedInputMarkerGoldenCase> =
+            serde_json::from_str(include_str!("../testdata/dropped-input-marker-golden.json"))
+                .expect("parse dropped-input-marker-golden.json");
+        assert!(!cases.is_empty(), "empty dropped-input marker golden");
+        for case in cases {
+            let frozen = skeleton_payload(&case.input);
+            let tagged = dropped_input_payload(Some(case.tag_id));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&frozen).unwrap(),
+                case.expected_frozen,
+                "{} frozen",
+                case.label
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&tagged).unwrap(),
+                case.expected_tagged,
+                "{} tagged",
+                case.label
+            );
+        }
+    }
 
     #[derive(Deserialize)]
     struct EditMarkerGoldenCase {
@@ -1996,7 +2160,27 @@ mod tests {
     }
 
     #[test]
-    fn age_reclaim_requires_both_scheduler_pressure_and_a_ride() {
+    fn rejected_agent_drop_on_open_arc_cannot_price_automatic_age_reclaim() {
+        let items = vec![
+            tool_call("old", 1, "bash", serde_json::json!({}), 100),
+            tool_result("old", 1, "bash", 4000),
+            tool_call("open", 3, "bash", serde_json::json!({}), 100),
+        ];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.last_execute_ordinal = 1;
+        ctx.agent_drop_ids = vec![call_block_id("open")];
+        let result = select_reductions_with_outcome(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig::default(),
+        );
+        assert!(result.decisions.is_empty());
+        assert!(!result.two_pass_batch_can_apply);
+    }
+
+    #[test]
+    fn age_reclaim_requires_a_ride_not_scheduler_pressure() {
         let mut result = tool_result("c1", 1, "bash", 2_000);
         result.token_count = Some(300);
         let items = vec![
@@ -2023,8 +2207,8 @@ mod tests {
             &ctx,
             &SelectionConfig::default(),
         );
-        assert!(ride_only.decisions.is_empty());
-        assert!(!ride_only.two_pass_batch_can_apply);
+        assert_eq!(ride_only.decisions.len(), 2);
+        assert!(ride_only.two_pass_batch_can_apply);
 
         ctx.scheduler_pressure_execute = true;
         let admitted = select_reductions_with_outcome(
@@ -2460,7 +2644,7 @@ mod tests {
         let mut emergency_ctx = base_ctx(PassClass::EmergencyForce);
         emergency_ctx.current_total_input_tokens = 90_000.0;
         emergency_ctx.ceiling_tokens = 100_000.0;
-        emergency_ctx.pass_already_busting = true;
+        emergency_ctx.has_prior_drop = true;
         let emergency = select_reductions(&items, &HashSet::new(), &emergency_ctx, &cfg);
 
         assert!(
@@ -2516,7 +2700,7 @@ mod tests {
             let mut ctx = base_ctx(PassClass::EmergencyForce);
             ctx.current_total_input_tokens = 90_000.0;
             ctx.ceiling_tokens = 100_000.0;
-            ctx.pass_already_busting = true;
+            ctx.has_prior_drop = true;
             if !select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty() {
                 self_caused_busts += 1;
             }
@@ -2603,7 +2787,7 @@ mod tests {
             let mut ctx = base_ctx(PassClass::EmergencyForce);
             ctx.current_total_input_tokens = 70_000.0;
             ctx.ceiling_tokens = 100_000.0;
-            ctx.pass_already_busting = true;
+            ctx.has_prior_drop = true;
             let reductions = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
             applied_reclaims += usize::from(!reductions.is_empty());
             let served = served_block_bytes(&items, &reductions);
@@ -2668,6 +2852,50 @@ mod tests {
 
         assert_eq!(admitted, expected);
         assert_eq!(decisions.len(), expected.len() * 2);
+    }
+
+    #[test]
+    fn emergency_95_yields_window_and_reserve_but_retains_open_arcs_and_exemplars() {
+        let mut items = Vec::new();
+        for n in 1..=4 {
+            let id = format!("c{n}");
+            items.push(tool_call(&id, n, "read", serde_json::json!({}), 40_000));
+            items.push(tool_result(&id, n, "read", 40_000));
+        }
+        items.push(tool_call("open", 5, "read", serde_json::json!({}), 40_000));
+        for n in 6..=8 {
+            let id = format!("c{n}");
+            items.push(tool_call(
+                &id,
+                n,
+                "ctx_reduce",
+                serde_json::json!({}),
+                40_000,
+            ));
+            items.push(tool_result(&id, n, "ctx_reduce", 40_000));
+        }
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 190_000.0;
+        ctx.ceiling_tokens = 130_000.0;
+        ctx.tag_window_protected_block_ids = items.iter().map(|item| item.id.clone()).collect();
+        let cfg = SelectionConfig { smart_drops: false };
+        assert!(select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty());
+        ctx.emergency_window_yields = true;
+        let decisions = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
+        let targets = decisions
+            .iter()
+            .map(|d| d.target_id.clone())
+            .collect::<HashSet<_>>();
+        for n in 1..=4 {
+            assert!(
+                targets.contains(&result_block_id(&format!("c{n}"))),
+                "completed arc {n}, including newest reserve, must yield"
+            );
+        }
+        assert!(!targets.contains(&call_block_id("open")));
+        for n in 6..=8 {
+            assert!(!targets.contains(&result_block_id(&format!("c{n}"))));
+        }
     }
 
     #[test]
@@ -3120,7 +3348,6 @@ mod tests {
             agent_drop_ids: vec![result_block_id("c9")],
             current_total_input_tokens: 123_456.0,
             ceiling_tokens: 200_000.0,
-            protected_cutoff_ordinal: 2,
             prior_input_sample: 99_000.0,
             has_prior_drop: true,
             pass_already_busting: true,
@@ -3375,7 +3602,10 @@ mod tests {
         ];
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.supersession_ride_available = true;
-        ctx.protected_cutoff_ordinal = 1;
+        ctx.tag_window_protected_block_ids = HashSet::from([
+            "protected-owner#1".to_string(),
+            "protected-new-result#0".to_string(),
+        ]);
         assert!(
             select_reductions(
                 &protected_items,
@@ -3405,7 +3635,7 @@ mod tests {
                 50,
             ),
         ];
-        ctx.protected_cutoff_ordinal = 0;
+        ctx.tag_window_protected_block_ids.clear();
         assert!(
             select_reductions(
                 &open_items,
@@ -3419,7 +3649,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_safe_tools_run_on_execute_but_not_defer_passes() {
+    fn duplicate_safe_tools_require_an_independent_bust() {
         let items = vec![
             tool_call_with_ids(
                 "owner#0",
@@ -3440,7 +3670,15 @@ mod tests {
             ),
             tool_result_with_ids("newer-result#0", "owner#1", 3, "mcp_read", 300),
         ];
-        let execute = base_ctx(PassClass::Execute);
+        let mut execute = base_ctx(PassClass::Execute);
+        assert!(select_reductions(
+            &items,
+            &HashSet::new(),
+            &execute,
+            &SelectionConfig::default()
+        )
+        .is_empty());
+        execute.pass_already_busting = true;
         let selected = select_reductions(
             &items,
             &HashSet::new(),

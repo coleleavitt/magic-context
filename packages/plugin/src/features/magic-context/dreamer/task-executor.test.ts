@@ -2,6 +2,7 @@
 
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createDreamTimerModuleClient } from "../../../plugin/dream-timer-module-client";
+import * as logger from "../../../shared/logger";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { applyMirrorPage, ensureContextStoreUuid } from "../context-authority";
@@ -19,6 +20,10 @@ import { recordCurateSafetyRefusal } from "./curate-memory-safety";
 import { acquireLease, acquireLeaseWithAcquisition, releaseLease } from "./lease";
 import { MAP_BATCH_FLOOR_MS } from "./map-memories";
 import { applyRetrospectiveLearnings } from "./retrospective-learnings";
+import {
+    PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES,
+    sweepOrphanedRetrospectiveChildren,
+} from "./retrospective-orphan-sweep";
 import { getDreamRuns } from "./storage-dream-runs";
 import {
     getTaskScheduleState,
@@ -52,6 +57,35 @@ function assistantMessages(text: string) {
     ];
 }
 
+function curateToolMessages(
+    calls: Array<{
+        action: string;
+        status: "completed" | "pending" | "error";
+    }>,
+    text?: string,
+    finish = "stop",
+) {
+    return [
+        {
+            info: { role: "assistant", time: { created: Date.now() }, finish },
+            parts: [
+                ...calls.map((call, index) => ({
+                    type: "tool",
+                    callID: `curate-call-${index}`,
+                    tool: "ctx_memory",
+                    state: {
+                        status: call.status,
+                        input: { action: call.action },
+                        ...(call.status === "completed" ? { output: "memory updated" } : {}),
+                        ...(call.status === "error" ? { error: "tool failed" } : {}),
+                    },
+                })),
+                ...(text ? [{ type: "text", text }] : []),
+            ],
+        },
+    ];
+}
+
 function providerFailureMessages(text: string) {
     return [
         {
@@ -74,6 +108,130 @@ arguments:
 {"action":"archive","reason":"与全局用户画像重复","ids":[6]}`;
 
 describe("createDreamTaskExecutor — curate", () => {
+    test("archives an unsettled child through a detached final-part write, then the age gate sweeps it", async () => {
+        db = freshDb();
+        const project = "/repo/detached-writer";
+        insertMemory(db, {
+            projectPath: project,
+            category: "PROJECT_RULES",
+            content: "Keep internal child sessions until detached writers have drained.",
+        });
+
+        const opencodeDb = new Database(":memory:");
+        opencodeDb.exec(`
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                directory TEXT,
+                time_created INTEGER
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES session(id)
+            );
+        `);
+        let resolveWriter: (() => void) | undefined;
+        const writerSettled = new Promise<void>((resolve) => {
+            resolveWriter = resolve;
+        });
+        let writerError: unknown;
+        const deleted: string[] = [];
+        const archived: unknown[] = [];
+        const logSpy = spyOn(logger, "log").mockImplementation(() => {});
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => {
+                    opencodeDb
+                        .prepare(
+                            "INSERT INTO session (id, title, directory, time_created) VALUES (?, ?, ?, ?)",
+                        )
+                        .run("delayed-child", "magic-context-dream-curate", project, 1);
+                    return { data: { id: "delayed-child" } };
+                }),
+                prompt: mock(async () => {
+                    setTimeout(() => {
+                        try {
+                            opencodeDb
+                                .prepare("INSERT INTO part (id, session_id) VALUES (?, ?)")
+                                .run("final-part", "delayed-child");
+                        } catch (error) {
+                            writerError = error;
+                        } finally {
+                            resolveWriter?.();
+                        }
+                    }, 200);
+                    throw new Error("prompt timed out after 1200000ms");
+                }),
+                abort: mock(async () => ({})),
+                update: mock(async (input: unknown) => {
+                    archived.push(input);
+                    return {};
+                }),
+                messages: mock(async () => ({ data: assistantMessages("curation complete") })),
+                delete: mock(async ({ path }: { path: { id: string } }) => {
+                    deleted.push(path.id);
+                    opencodeDb.prepare("DELETE FROM part WHERE session_id = ?").run(path.id);
+                    opencodeDb.prepare("DELETE FROM session WHERE id = ?").run(path.id);
+                    return {};
+                }),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => opencodeDb,
+        });
+
+        try {
+            const result = await executor(
+                { task: "curate", schedule: "0 4 * * 0", timeoutMinutes: 20 },
+                {
+                    db,
+                    projectIdentity: project,
+                    holderId: "holder-delayed-writer",
+                    leaseKey: leaseKeyFor("curate", project),
+                },
+            );
+            await writerSettled;
+
+            expect(result).toMatchObject({ status: "failed" });
+            expect(writerError).toBeUndefined();
+            expect(
+                opencodeDb.prepare("SELECT id FROM part WHERE id = ?").get("final-part"),
+            ).toEqual({ id: "final-part" });
+            expect(deleted).toEqual([]);
+            expect(archived).toEqual([
+                {
+                    path: { id: "delayed-child" },
+                    query: { directory: project },
+                    body: { time: { archived: expect.any(Number) } },
+                },
+            ]);
+            expect(
+                logSpy.mock.calls.some(
+                    ([message]) =>
+                        message ===
+                        "[dreamer] curate: prompt unsettled — session delayed-child left to the age-gated sweep",
+                ),
+            ).toBe(true);
+
+            const swept = await sweepOrphanedRetrospectiveChildren({
+                opencodeDb,
+                client: client as never,
+                sessionDirectory: project,
+                staleMs: 60_000,
+                titleMatches: PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES,
+                now: 60_002,
+            });
+            expect(swept).toBe(1);
+            expect(deleted).toEqual(["delayed-child"]);
+        } finally {
+            closeQuietly(opencodeDb);
+        }
+    });
+
     test("runs whole-pool curation without verification gate or watermark patch", async () => {
         db = freshDb();
         const project = "/repo/project";
@@ -132,6 +290,172 @@ describe("createDreamTaskExecutor — curate", () => {
         expect(capturedPrompt).not.toContain("verified_files");
     });
 
+    test("archives expired active memories before curation without expiring permanent rows", async () => {
+        db = freshDb();
+        const project = "/repo/expired-curate";
+        const now = Date.now();
+        const expired = insertMemory(db, {
+            projectPath: project,
+            category: "KNOWN_ISSUES",
+            content: "This legacy issue has reached its TTL.",
+            expiresAt: now - 1,
+        });
+        const permanent = insertMemory(db, {
+            projectPath: project,
+            category: "PROJECT_RULES",
+            content: "Permanent memories are never expired.",
+            expiresAt: now - 1,
+        });
+        db.prepare("UPDATE memories SET status = 'permanent' WHERE id = ?").run(permanent.id);
+        const create = mock(async () => ({ data: { id: "must-not-create" } }));
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create,
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+
+        const result = await executor(
+            { task: "curate", schedule: "0 4 * * 0", timeoutMinutes: 20 },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-expired-curate",
+                leaseKey: leaseKeyFor("curate", project),
+            },
+        );
+
+        expect(result).toMatchObject({
+            status: "completed",
+            detail: "curate: archived 1 expired memory",
+        });
+        expect(create).not.toHaveBeenCalled();
+        expect(
+            db.prepare("SELECT status, metadata_json FROM memories WHERE id = ?").get(expired.id),
+        ).toEqual({
+            status: "archived",
+            metadata_json: JSON.stringify({ archive_reason: "expired" }),
+        });
+        expect(db.prepare("SELECT status FROM memories WHERE id = ?").get(permanent.id)).toEqual({
+            status: "permanent",
+        });
+        expect(
+            db
+                .prepare(
+                    "SELECT mutation_type, target_memory_id FROM memory_mutation_log WHERE project_path = ?",
+                )
+                .all(project),
+        ).toEqual([{ mutation_type: "archive", target_memory_id: expired.id }]);
+        expect(
+            JSON.parse(getDreamRuns(db, project)[0]?.memory_changes_json ?? "null"),
+        ).toMatchObject({
+            archived: 1,
+            archivedIds: [expired.id],
+        });
+    });
+
+    test("accepts tool-only curate output after completed ctx_memory operations", async () => {
+        db = freshDb();
+        const project = "/repo/curate-tool-only";
+        insertMemory(db, {
+            projectPath: project,
+            category: "PROJECT_RULES",
+            content: "Keep the memory pool concise.",
+        });
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "dream-child-tool-only" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: curateToolMessages([
+                        { action: "merge", status: "completed" },
+                        { action: "archive", status: "completed" },
+                    ]),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+
+        const result = await executor(
+            { task: "curate", schedule: "0 4 * * 0", timeoutMinutes: 20 },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-curate-tool-only",
+                leaseKey: leaseKeyFor("curate", project),
+            },
+        );
+
+        expect(result).toMatchObject({
+            status: "completed",
+            detail: expect.stringContaining("curate: 2 memory operations applied"),
+        });
+        const task = JSON.parse(getDreamRuns(db, project)[0]?.tasks_json ?? "[]")[0] as {
+            progress?: string;
+        };
+        expect(task.progress).toContain("curate: 2 memory operations applied");
+        expect(task.progress).toContain("merge");
+        expect(task.progress).toContain("archive");
+    });
+
+    test("rejects curate output when its ctx_memory call never completed", async () => {
+        db = freshDb();
+        const project = "/repo/curate-pending-tool";
+        insertMemory(db, {
+            projectPath: project,
+            category: "PROJECT_RULES",
+            content: "Keep the memory pool concise.",
+        });
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "dream-child-pending-tool" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: curateToolMessages(
+                        [{ action: "archive", status: "pending" }],
+                        undefined,
+                        "aborted",
+                    ),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+
+        const result = await executor(
+            { task: "curate", schedule: "0 4 * * 0", timeoutMinutes: 20 },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-curate-pending-tool",
+                leaseKey: leaseKeyFor("curate", project),
+            },
+        );
+
+        expect(result.status).toBe("failed");
+        expect(result.failureDetail).toContain("(MC-D03)");
+        const task = JSON.parse(getDreamRuns(db, project)[0]?.tasks_json ?? "[]")[0] as {
+            failure?: { failure_class?: string };
+        };
+        expect(task.failure?.failure_class).toBe("empty_completion");
+    });
+
     test("reports host-side curate refusal progress without failing the task", async () => {
         db = freshDb();
         const project = "/repo/curate-refusal-progress";
@@ -176,7 +500,10 @@ describe("createDreamTaskExecutor — curate", () => {
             },
         );
 
-        expect(result).toEqual({ status: "completed", schedulePatch: undefined });
+        expect(result).toEqual({
+            status: "completed",
+            detail: "curate: refused 1 unsafe mutation(s)",
+        });
         expect(progress).toContainEqual(
             expect.objectContaining({ task: "curate", processed: 1, refused: 1 }),
         );
@@ -205,7 +532,8 @@ describe("createDreamTaskExecutor — curate", () => {
                     return {};
                 }),
                 messages: mock(async () => ({
-                    data: assistantMessages(
+                    data: curateToolMessages(
+                        [{ action: "archive", status: "completed" }],
                         promptCalls === 1 ? CURATE_PSEUDO_TOOL_CALL : "curation complete",
                     ),
                 })),
@@ -234,7 +562,10 @@ describe("createDreamTaskExecutor — curate", () => {
         );
 
         expect(promptCalls).toBe(2);
-        expect(result).toEqual({ status: "completed", schedulePatch: undefined });
+        expect(result).toEqual({
+            status: "completed",
+            detail: "curate: 1 memory operation applied (archive)",
+        });
     });
 
     test("adds the content language directive to curated prose tasks", async () => {
@@ -391,9 +722,9 @@ describe("createDreamTaskExecutor — structured failure telemetry", () => {
             provider_error: null,
             child_session_id: empty.childId,
         });
-        expect(provider.result.failureDetail).toContain("provider_error");
-        expect(timeout.result.failureDetail).toContain("provider_timeout");
-        expect(empty.result.failureDetail).toContain("empty_completion");
+        expect(provider.result.failureDetail).toContain("(MC-D02)");
+        expect(timeout.result.failureDetail).toContain("(MC-D01)");
+        expect(empty.result.failureDetail).toContain("(MC-D03)");
         expect(empty.task.error).toContain("Dreamer returned no assistant output.");
     });
 });
@@ -1405,7 +1736,7 @@ describe("createDreamTaskExecutor — retrospective", () => {
         expect(getProjectState(db, project)?.projectMemoryEpoch).toBe(epochBefore);
     });
 
-    test("gate returns 'n' → one gate turn, child created+deleted, watermark advances, no deepen", async () => {
+    test("gate returns 'n' → one settled gate turn deletes inline, advances the watermark, and does not deepen", async () => {
         db = freshDb();
         const project = "/repo/project";
         const provider = {
@@ -1463,7 +1794,11 @@ describe("createDreamTaskExecutor — retrospective", () => {
         });
         expect(client.session.create).toHaveBeenCalled();
         expect(prompts).toBe(1); // gate only — no deepen turn
-        expect(client.session.delete).toHaveBeenCalled(); // child always cleaned up
+        const { delete: deleteSession } = client.session;
+        expect(deleteSession).toHaveBeenCalledWith({
+            path: { id: "retro-child" },
+            query: { directory: project },
+        });
         expect(getMemoriesByProject(db, project)).toHaveLength(0);
     });
 

@@ -25,9 +25,7 @@ use crate::injection::{
     advance_injection_from_meta, capture_todo_state_on_bust, injection_pending_after_capture,
     is_synthetic_todo_id, InjectionOutcome,
 };
-use crate::m0_compose::{
-    compose_m0_from_store, trim_memories_to_budget, trim_user_profile_to_budget,
-};
+use crate::m0_compose::{trim_memories_to_budget, trim_user_profile_to_budget};
 use crate::m1_compose::{
     claim_and_render_notes, compose_m1_from_store, m1_revision_signal_parts_for_pass_timed,
     M1RevisionReadTimings, M1RevisionSignal,
@@ -35,14 +33,19 @@ use crate::m1_compose::{
 use crate::memory_render::{render_m0, workspace_source_names, M0Inputs, M1_PLACEHOLDER};
 use crate::project_docs::read_project_docs_canonical;
 use crate::prompt_surface::{PromptSurfacePreset, PromptSurfaceSelection};
+use crate::protection_window::{
+    resolve_floor_snapshot, FloorPass, ProtectionWindow, TagNumberCutoffProjection,
+};
+#[cfg(test)]
+use crate::protection_window::{CoordinateSpace, TagNumber};
 use crate::scheduler::{
     self, BoundaryBypass, ContextUsage, DeferredExecute, ExecuteThresholdConfig, LatchState,
     SchedulerConfig, SchedulerInputs, SessionMeta, TailState,
 };
 use crate::selection::{
-    filter_reasoning_ineligible_decisions, is_reclaim_hint_excluded_tool, resolve_tool_tier,
-    select_reductions_with_outcome, PassClass, SelItem, SelKind, SelMessageRole, SelectionConfig,
-    SelectionContext, SelectionOutcome, AGE_RECLAIM_MIN_TOKENS,
+    dropped_input_payload, filter_reasoning_ineligible_decisions, is_reclaim_hint_excluded_tool,
+    resolve_tool_tier, select_reductions_with_outcome, PassClass, SelItem, SelKind, SelMessageRole,
+    SelectionConfig, SelectionContext, SelectionOutcome, AGE_RECLAIM_MIN_TOKENS,
 };
 use crate::tail_hygiene::{
     channel1_refire_tokens, effective_tail_hygiene, hygiene_band,
@@ -578,6 +581,9 @@ pub struct ProducerContext<'a> {
     /// Execute threshold resolved by the host for this request, or the route-bind fallback for
     /// older hosts that omit `effective_execute_threshold`.
     pub execute_threshold_percentage: f64,
+    /// Hostless protected-token floor resolved from module config and this pass's usable geometry.
+    pub protected_tokens_floor: u64,
+    pub protected_tokens_provenance: &'static str,
     /// Whether the full compaction pipeline is enabled. When false, the module emits only
     /// additive m0/m1 memory and project-doc blocks ahead of the unchanged live array.
     pub compaction_enabled: bool,
@@ -623,6 +629,8 @@ pub struct DeclaredTrim {
 pub struct TransformGeometry {
     pub usable_soft: u64,
     pub usable_hard: u64,
+    #[serde(default)]
+    pub absolute_wall: u64,
     pub derivation: String,
 }
 
@@ -674,9 +682,15 @@ pub struct TransformRequest {
     /// Primary sessions compose the cache prefix; subagents retain only reduction plumbing.
     #[serde(default)]
     pub is_subagent: bool,
-    /// Number of newest active tag rows protected from emergency reduction.
+    /// Deprecated count retained for older senders. It is parsed for compatibility and ignored.
     #[serde(default = "default_protected_tags")]
     pub protected_tags: usize,
+    /// Whether the deprecated field was present on the incoming wire object.
+    #[serde(skip_serializing)]
+    pub protected_tags_present: bool,
+    /// Host-resolved token floor. Older and hostless senders omit it and use module resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_tokens_effective: Option<u64>,
     /// Canonical provider id used by the native serializer gate. Empty sentinels are
     /// safe only for the OpenCode Anthropic adapter, matching TS `modelAcceptsEmptyContent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -897,6 +911,33 @@ fn default_protected_tags() -> usize {
     20
 }
 
+fn claim_protected_tags_deprecation(req: &TransformRequest) -> bool {
+    if !req.protected_tags_present {
+        return false;
+    }
+    static WARNED_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    WARNED_SESSIONS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("protected_tags warning mutex")
+        .insert(req.session_id.clone())
+}
+
+fn emit_protected_tags_deprecation_once(req: &TransformRequest) {
+    if claim_protected_tags_deprecation(req) {
+        eprintln!(
+            "mc-module: deprecated protected_tags is ignored for session {}; use protected_tokens",
+            req.session_id
+        );
+    }
+}
+
+fn present_deprecated_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
 #[derive(Deserialize)]
 struct TransformRequestWire {
     #[serde(default)]
@@ -913,8 +954,10 @@ struct TransformRequestWire {
     upgrade_state: String,
     #[serde(default)]
     is_subagent: bool,
-    #[serde(default = "default_protected_tags")]
-    protected_tags: usize,
+    #[serde(default, deserialize_with = "present_deprecated_value")]
+    protected_tags: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protected_tokens_effective: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1022,6 +1065,13 @@ impl<'de> Deserialize<'de> for TransformRequest {
         } else {
             wire.messages
         };
+        let protected_tags_present = wire.protected_tags.is_some();
+        let protected_tags = wire
+            .protected_tags
+            .as_ref()
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or_else(default_protected_tags);
         Ok(Self {
             kind: wire.kind,
             v: wire.v,
@@ -1031,7 +1081,9 @@ impl<'de> Deserialize<'de> for TransformRequest {
             system_prompt_hash: wire.system_prompt_hash,
             upgrade_state: wire.upgrade_state,
             is_subagent: wire.is_subagent,
-            protected_tags: wire.protected_tags,
+            protected_tags,
+            protected_tags_present,
+            protected_tokens_effective: wire.protected_tokens_effective,
             provider_id: wire.provider_id,
             model_key: wire.model_key,
             clear_reasoning_age: wire.clear_reasoning_age,
@@ -1244,6 +1296,8 @@ pub struct TransformTimings {
     #[serde(default)]
     pub compose_m0m1: f64,
     #[serde(default)]
+    pub compose: crate::m0_compose::ComposeTimings,
+    #[serde(default)]
     pub selection: f64,
     #[serde(default)]
     pub transition_detection: f64,
@@ -1360,7 +1414,7 @@ pub fn format_pass_timing_line(
          planning={:.1} state_evolution={:.1} finalize={:.1} \
          tag_overlay={:.1} unit_mint={:.1} temporal={:.1} caveman={:.1} \
          tag_mint_candidates={} tag_mint_new={} tag_mint_tokenized_bytes={} \
-         decide={:.1} seed_or_sync={:.1} compose_m0m1={:.1} selection={:.1} \
+         decide={:.1} seed_or_sync={:.1} compose_m0m1={:.1} decay_render_ms={:.3} tier_tokenize_ms={:.3} memory_render_ms={:.3} mural_ms={:.3} user_profile_ms={:.3} retry_attempts={} selection={:.1} \
          transition_detection={:.3} emergency_reasoning_exclusions={} todo={:.1} \
          blocks_by_mid={:.1} build_frozen_unit_index={:.1} full_drop_tool_ids={:.1} \
          build_output={:.1} build_identity={:.1} build_identity_max={:.1} build_frozen_unit_scan={:.1} \
@@ -1420,6 +1474,12 @@ pub fn format_pass_timing_line(
         timings.decide,
         timings.seed_or_sync,
         timings.compose_m0m1,
+        timings.compose.decay_render_ms,
+        timings.compose.tier_tokenize_ms,
+        timings.compose.memory_render_ms,
+        timings.compose.mural_ms,
+        timings.compose.user_profile_ms,
+        timings.compose.retry_attempts,
         timings.selection,
         timings.transition_detection,
         timings.emergency_reasoning_exclusions,
@@ -1695,9 +1755,15 @@ pub(crate) struct ProjectionCacheInput {
 pub struct TransformWithProjection {
     pub response: TransformResponse,
     pub projection: FlatProjection,
+    /// Historian preflight consumes the exact tag snapshot validated by this transform. The
+    /// snapshot is absent only on paths that return before normal tag hydration.
+    pub(crate) historian_tags: Option<Arc<Vec<McTagRow>>>,
     /// Native attachment uses the same validated tag baseline as the transform, avoiding a
     /// second numbers-only table scan after the response has been built.
     pub tag_numbers: BTreeMap<String, u64>,
+    /// Publication floor from the state accepted by this transform. Emergency follow-up uses it
+    /// as the pre-wait comparison point, then performs one fresh read after asynchronous work.
+    pub(crate) publication_floor_ordinal: Option<u64>,
     pub scheduler_pass: scheduler::PassDecision,
     pub scheduler_defer_reason: Option<scheduler::SchedulerDeferReason>,
     pub scheduler_drain_latch_active: bool,
@@ -1705,6 +1771,9 @@ pub struct TransformWithProjection {
     pub trim_mismatch: Option<TrimMismatch>,
     pub revert_epoch: u64,
     pub reasoning_watermark: u64,
+    /// Committed reasoning-clear units that let native finalization replay the same
+    /// decisions as CK rendering without reconsidering age or newest-assistant status.
+    pub reasoning_clear_units: Vec<FrozenUnit>,
     /// Whether unmatched native tool shells may use the transition coalescer. The durable marker
     /// records that the compatibility salt already triggered the required cache-invalidating HARD,
     /// so all later replays use the same encoding.
@@ -1838,7 +1907,7 @@ struct Channel1NudgeInputs<'a, 'ctx> {
     baseline: Option<&'a TailHygieneBaseline>,
     channel1_appends: &'a [Channel1AppendRow],
     mutation_exempt_mid: Option<&'a str>,
-    protected_tags: usize,
+    protection_cutoff: &'a TagNumberCutoffProjection,
     pending_drop_target_ids: &'a HashSet<String>,
     agent_drops_applied_this_pass: bool,
 }
@@ -2000,7 +2069,15 @@ pub fn transform_with_projection(
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
 ) -> Result<TransformWithProjection, TransformError> {
-    let result = apply_once_with_estimator(store, req, ctx, mc_tokenizer::estimate_tokens, None);
+    let result = apply_once_with_estimator_and_projection(
+        store,
+        req,
+        ctx,
+        mc_tokenizer::estimate_tokens,
+        None,
+        None,
+        true,
+    );
     record_stable_pass_trace(store, req, ctx, &result);
     result
 }
@@ -2019,6 +2096,7 @@ pub(crate) fn transform_with_projection_cached(
         mc_tokenizer::estimate_tokens,
         Some(output_cache),
         projection_cache,
+        true,
     );
     record_stable_pass_trace(store, req, ctx, &result);
     result
@@ -2072,6 +2150,7 @@ fn pass_scheduler_observation(
 /// The retry wrapper around [`apply_once`], parameterized by the token estimator so tests
 /// can inject a panicking/counting one to prove the estimator is HARD-only (never called
 /// on SOFT/defer). Production always passes [`mc_tokenizer::estimate_tokens`].
+#[cfg(test)]
 fn apply_once_with_estimator(
     store: &McStore,
     req: &TransformRequest,
@@ -2079,7 +2158,15 @@ fn apply_once_with_estimator(
     estimate_tokens: impl Fn(&str) -> usize + Copy,
     output_cache: Option<&Mutex<SerializedOutputCache>>,
 ) -> Result<TransformWithProjection, TransformError> {
-    apply_once_with_estimator_and_projection(store, req, ctx, estimate_tokens, output_cache, None)
+    apply_once_with_estimator_and_projection(
+        store,
+        req,
+        ctx,
+        estimate_tokens,
+        output_cache,
+        None,
+        false,
+    )
 }
 
 /// Convert MC's assumed cache lifetime into a provider-expressible Claude Code marker TTL.
@@ -2166,7 +2253,9 @@ fn apply_once_with_estimator_and_projection(
     estimate_tokens: impl Fn(&str) -> usize + Copy,
     output_cache: Option<&Mutex<SerializedOutputCache>>,
     projection_cache: Option<&ProjectionCacheInput>,
+    incremental_history: bool,
 ) -> Result<TransformWithProjection, TransformError> {
+    emit_protected_tags_deprecation_once(req);
     let mut attempt = 0;
     let mut boundary_divergence_retry = false;
     loop {
@@ -2180,6 +2269,7 @@ fn apply_once_with_estimator_and_projection(
             projection_cache,
             boundary_divergence_retry,
             &mut boundary_divergence_detected,
+            incremental_history,
         ) {
             Err(TransformError::Store(McStoreError::CasConflict { .. }))
                 if attempt < MAX_CAS_RETRIES =>
@@ -2503,7 +2593,9 @@ fn lineage_protocol_passthrough(
     projection: FlatProjection,
 ) -> TransformWithProjection {
     TransformWithProjection {
+        historian_tags: None,
         tag_numbers: BTreeMap::new(),
+        publication_floor_ordinal: None,
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
         scheduler_defer_reason: Some(scheduler::SchedulerDeferReason::SchedulerDefer),
@@ -2512,6 +2604,7 @@ fn lineage_protocol_passthrough(
         trim_mismatch: None,
         revert_epoch: 0,
         reasoning_watermark: 0,
+        reasoning_clear_units: Vec::new(),
         transition_consumed: false,
         mutation_exempt_mid: None,
         lineage_anchor_mid: None,
@@ -2765,6 +2858,7 @@ fn apply_additive_only(
         || external_revision_changed
         || project_memory_epoch_hard_due;
     let ordinary_historian_veto = ctx.historian_active
+        && m1_signal.revision == loaded.meta.m1_revision
         && scheduler_outcome.pass == scheduler::PassDecision::Execute
         && !hard_fold_requested
         && !loaded.meta.soft_refresh_pending
@@ -3088,7 +3182,9 @@ fn apply_additive_only(
         PassPlan::Defer | PassPlan::Reject(_) => None,
     };
     Ok(TransformWithProjection {
+        historian_tags: None,
         tag_numbers: BTreeMap::new(),
+        publication_floor_ordinal: meta.publication_floor_ordinal,
         projection,
         scheduler_pass: scheduler_outcome.pass,
         scheduler_defer_reason: scheduler_outcome.defer_reason,
@@ -3099,6 +3195,7 @@ fn apply_additive_only(
         reasoning_watermark: meta
             .reasoning_cleared_through_tag
             .max(meta.reasoning_cleared_through_ordinal),
+        reasoning_clear_units: Vec::new(),
         transition_consumed: transition_consumed(&core),
         mutation_exempt_mid: None,
         lineage_anchor_mid: None,
@@ -3157,6 +3254,7 @@ fn apply_once(
     projection_cache: Option<&ProjectionCacheInput>,
     boundary_divergence_retry: bool,
     boundary_divergence_detected: &mut bool,
+    incremental_history: bool,
 ) -> Result<TransformWithProjection, TransformError> {
     *boundary_divergence_detected = false;
     if !ctx.compaction_enabled {
@@ -3552,6 +3650,7 @@ fn apply_once(
                 .map(|value| serde_json::to_string(value).expect("divergence is serializable"));
             let mut next_meta = loaded.meta.clone();
             next_meta.served_output_fingerprint = served_fingerprints;
+            next_meta.served_output_generation = Some(reasoning_generation(&next_meta));
             let fingerprint_changed = next_meta != loaded.meta;
             let row_version = if fingerprint_changed {
                 #[cfg(test)]
@@ -3596,6 +3695,7 @@ fn apply_once(
                 );
             }
             return Ok(pending_passthrough_result(PendingPassthroughArgs {
+                historian_tags: Arc::clone(&tag_rows),
                 projection,
                 tag_numbers,
                 req,
@@ -3606,6 +3706,7 @@ fn apply_once(
                 reasoning_watermark: next_meta
                     .reasoning_cleared_through_tag
                     .max(next_meta.reasoning_cleared_through_ordinal),
+                publication_floor_ordinal: next_meta.publication_floor_ordinal,
                 transition_consumed: transition_consumed(&loaded.core),
                 committed: fingerprint_changed,
                 trim_mismatch,
@@ -3665,6 +3766,7 @@ fn apply_once(
             .as_ref()
             .map(|value| serde_json::to_string(value).expect("divergence is serializable"));
         meta.served_output_fingerprint = served_fingerprints;
+        meta.served_output_generation = Some(reasoning_generation(&meta));
         #[cfg(test)]
         run_transform_attempt_hook(&req.session_id);
         let row_version = store.commit_transform(
@@ -3708,6 +3810,7 @@ fn apply_once(
             req.session_id, fingerprint, ambiguous
         );
         return Ok(pending_passthrough_result(PendingPassthroughArgs {
+            historian_tags: Arc::clone(&tag_rows),
             projection,
             tag_numbers,
             req,
@@ -3718,6 +3821,7 @@ fn apply_once(
             reasoning_watermark: meta
                 .reasoning_cleared_through_tag
                 .max(meta.reasoning_cleared_through_ordinal),
+            publication_floor_ordinal: meta.publication_floor_ordinal,
             transition_consumed: transition_consumed(&loaded.core),
             committed: true,
             trim_mismatch,
@@ -4048,22 +4152,45 @@ fn apply_once(
     } else {
         false
     };
-    let hard_fold_requested = first_fold_due
+    let pre_snapshot_inputs_changed = req.protected_tokens_effective.is_none()
+        && loaded.meta.protected_tokens_effective.is_none()
+        && crate::protection_window::pre_snapshot_inputs_changed(
+            store.tag_cache_namespace(),
+            &req.session_id,
+            ctx.protected_tokens_floor,
+            req.geometry
+                .as_ref()
+                .map(|geometry| geometry.usable_soft)
+                .or_else(|| req.usage.as_ref().map(|usage| usage.context_limit_tokens))
+                .unwrap_or(200_000),
+        );
+    let reasoning_exemption_repair = !req.is_subagent
+        && (reasoning_clear_exemption_changed(&loaded.core, req, lineage_anchor_mid)
+            || legacy_reasoning_exemption_changed(
+                &loaded.core,
+                &loaded.meta,
+                req,
+                &projection,
+                lineage_anchor_mid,
+            ));
+    let hard_fold_requested = reasoning_exemption_repair
+        || pre_snapshot_inputs_changed
+        || first_fold_due
         || boundary_divergence_recut.is_some()
         || scheduler_outcome.idle_ttl_fired
         || system_absorb_hard_due
         || external_revision_changed
         || project_memory_epoch_hard_due;
-    // Bust-opportunity table (the deferred-work invariant): bootstrap/legacy/reconcile/shape
-    // repair, render-config or epoch HARD, requested HARD, TTL/system HARD, refresh/flush,
-    // Force/Emergency drives, first reduction application, and every ordinary Execute are
-    // opportunities. An active historian vetoes only the ordinary-pass arms so publication
-    // can be coalesced into the next materializing pass.
+    // Prefix work, explicit refresh, and force/emergency drives supply opportunities.
+    // Historian activity only vetoes ordinary executes without published work or
+    // pending agent drops; unpublished in-flight work remains pending.
     let emergency_arm_engaged = matches!(
         scheduler_outcome.pass,
         scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
     ) || scheduler_outcome.drain_latch.is_active();
     let ordinary_historian_veto = ctx.historian_active
+        && current_m1_digest == loaded.meta.m1_revision
+        && pending_drop_target_ids.is_empty()
         && scheduler_outcome.pass == scheduler::PassDecision::Execute
         && !hard_fold_requested
         && !emergency_arm_engaged
@@ -4071,17 +4198,25 @@ fn apply_once(
         && !render_config_changed
         && !reconcile_hard_due
         && loaded.meta.initialized;
-    let supersession_ride_available = !loaded.meta.initialized
-        || render_config_changed
-        || hard_fold_requested
-        || reconcile_hard_due
-        || matches!(
-            scheduler_outcome.pass,
-            scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
-        )
+    // Subagents execute a reductions-only branch, not the prefix plan. Inherited
+    // HARD/reconcile advisories cannot price automatic reductions without a fold.
+    let prefix_materialization_enabled = !req.is_subagent;
+    let force_band_active = usage_percentage
+        >= scheduler::escalation_bands(ctx.execute_threshold_percentage)
+            .force_materialize_percentage;
+    let force_episode_available = force_band_active && !loaded.meta.has_prior_emergency_drop;
+    let supersession_ride_available = (prefix_materialization_enabled
+        && (!loaded.meta.initialized
+            || render_config_changed
+            || hard_fold_requested
+            || reconcile_hard_due
+            || lineage_state.force_hard
+            || (scheduler_outcome.pass != scheduler::PassDecision::Defer
+                && current_m1_digest != loaded.meta.m1_revision)))
+        || force_episode_available
+        || scheduler_outcome.pass == scheduler::PassDecision::Emergency95
         || loaded.meta.soft_refresh_pending;
-    let pass_already_busting =
-        supersession_ride_available || scheduler_outcome.drain_latch.is_active();
+    let pass_already_busting = supersession_ride_available;
     // Tail reclaim gates purely on the serializer profile. Every shipping profile is a
     // full-array consumer (healing::tail_reclaim is true for all of them), so the request
     // array round-trips both prefix and tail mutations on every pass. The U1-era layering
@@ -4099,8 +4234,9 @@ fn apply_once(
                 || hard_fold_requested
                 || cached_m1_missing_due,
         );
-    // Hard advisory requests use the normal Execute path so queued work can be processed
-    // during the fold, but only context pressure reported by the scheduler enables age reclaim.
+    // Keep selection deferred when the producer gate or historian veto blocks it.
+    // An execute selection class still needs the separate ride permission above
+    // before it can choose automatic reductions.
     let selection_class = if producer_gate && !ordinary_historian_veto {
         selection_pass_class(scheduler_outcome.pass)
     } else {
@@ -4128,26 +4264,27 @@ fn apply_once(
             loaded.meta.synthetic_todo.as_ref(),
             todo_synthesis_verdict(req),
         );
-    let tag_window_protected_block_ids = if tagging_surface_requested {
-        // Same-pass bootstrap mints have never been provider-visible and must not protect a block
-        // from reduction before its first render. Hydrated rows retain their normal protection;
-        // the newly minted suffix becomes eligible on the next pass after this atomic commit.
-        let protection_tags = if suppress_bootstrap_reduction_tag_overlay {
-            &tag_rows[..hydrated_tag_count]
+    let floor_resolution = resolve_floor_snapshot(
+        req.protected_tokens_effective,
+        loaded.meta.protected_tokens_effective,
+        ctx.protected_tokens_floor,
+        if pass_already_busting
+            || (scheduler_outcome.pass == scheduler::PassDecision::Execute
+                && !ordinary_historian_veto)
+        {
+            FloorPass::CacheBust
         } else {
-            tag_rows.as_slice()
-        };
-        newest_active_tag_block_ids(
-            &loaded.core,
-            &loaded.meta,
-            &projection,
-            protection_tags,
-            mutation_exempt_mid,
-            req.protected_tags,
-        )
-    } else {
-        HashSet::new()
-    };
+            FloorPass::Defer
+        },
+    );
+    let protected_tokens_floor = floor_resolution.effective;
+    // Pending same-pass mints are not persisted rows yet. Every consumer view below is projected
+    // from this one walk over the hydrated mc_tags baseline, independent of the served array.
+    let protection_window = ProtectionWindow::from_persisted_rows(
+        &tag_rows[..hydrated_tag_count],
+        protected_tokens_floor,
+    );
+    let tag_window_protected_block_ids = protection_window.row_identities.block_ids.clone();
     let exempt_message_protected_block_ids = [mutation_exempt_mid, lineage_anchor_mid]
         .into_iter()
         .flatten()
@@ -4204,10 +4341,6 @@ fn apply_once(
                 ceiling_tokens: context_limit_tokens
                     * ctx.execute_threshold_percentage.clamp(1.0, 100.0)
                     / 100.0,
-                protected_cutoff_ordinal: protected_tail_cutoff_ordinal(
-                    &projection,
-                    &protected_block_ids,
-                ),
                 last_execute_ordinal: if loaded.core.reconcile_pending {
                     0
                 } else {
@@ -4215,13 +4348,15 @@ fn apply_once(
                 },
                 scheduler_pressure_execute: scheduler_outcome.pressure_execute,
                 prior_input_sample: loaded.meta.last_emergency_input_sample,
-                has_prior_drop: loaded.meta.has_prior_emergency_drop,
+                has_prior_drop: loaded.meta.has_prior_emergency_drop && !pass_already_busting,
                 agent_drop_ids,
                 agent_drop_command_ids,
                 first_applied_agent_drop_ids,
                 pass_already_busting,
                 supersession_ride_available,
-                tag_window_protected_block_ids,
+                emergency_window_yields: scheduler_outcome.pass
+                    == scheduler::PassDecision::Emergency95,
+                tag_window_protected_block_ids: tag_window_protected_block_ids.clone(),
                 exempt_message_protected_block_ids,
             },
             &SelectionConfig {
@@ -4266,11 +4401,48 @@ fn apply_once(
     // The drain latch can remain active after pressure falls below the force threshold.
     // It does not mean this request is already rewriting the cached prefix: pending m1
     // publications still need Execute or an independently authorized repair/force/flush.
-    let independent_bust_opportunity =
-        (matches!(scheduler_outcome.pass, scheduler::PassDecision::Execute)
-            && !ordinary_historian_veto)
-            || supersession_ride_available;
+    let independent_bust_opportunity = supersession_ride_available;
     let bust_opportunity = independent_bust_opportunity || reductions_pending_now;
+    // Discover non-tool lanes before classification: a force batch containing only
+    // text compression or strip work must not need a tool drop to open its own gate.
+    let non_tool_bust_opportunity = bust_opportunity
+        || cached_m1_missing_due
+        || is_legacy_baseline(&loaded.core)
+        || loaded.meta.bootstrap_seed_fold_pending;
+    let planned_age_basis = tag_rows
+        .iter()
+        .filter_map(|row| u64::try_from(row.tag_number).ok())
+        .max()
+        .unwrap_or(0);
+    let planned_caveman_units = new_caveman_units(
+        &loaded.core,
+        req,
+        CavemanTagState {
+            rows: &tag_rows,
+            protection_cutoff: &protection_window.cutoff,
+        },
+        &live,
+        loaded.meta.coverage_ordinal,
+        non_tool_bust_opportunity,
+        planned_age_basis,
+    );
+    let planned_reasoning_cutoff = reasoning_clear_cutoff_with_tags(
+        req,
+        serializer_profile,
+        non_tool_bust_opportunity,
+        &tag_numbers,
+    );
+    let planned_strip_units = new_frozen_strip_units(
+        &loaded.core,
+        req,
+        &tag_numbers,
+        planned_reasoning_cutoff,
+        non_tool_bust_opportunity,
+        lineage_anchor_mid,
+    );
+    let reclaim_pending_now = reductions_pending_now
+        || !planned_caveman_units.is_empty()
+        || !planned_strip_units.is_empty();
     let mut plan = classify(&ClassifierInput {
         initialized: loaded.meta.initialized && !loaded.meta.bootstrap_seed_fold_pending,
         is_legacy_baseline: is_legacy_baseline(&loaded.core),
@@ -4283,10 +4455,9 @@ fn apply_once(
         m1_revision_changed: current_m1_digest != loaded.meta.m1_revision
             || loaded.meta.soft_refresh_pending
             || todo_injection_pending,
-        reductions_pending: reductions_pending_now,
-        // Scheduler Execute is a genuine deferred-work consumption opportunity even when
-        // no reduction was selected. An active historian is the one ordinary-pass veto;
-        // hard/force/emergency arms bypass it.
+        reductions_pending: reclaim_pending_now,
+        // Todo state is deferred work, not an independent bust. It may join
+        // published prefix work, an explicit flush, force, or actual reductions.
         bust_opportunity,
     });
     // A todo-only delta does not need a coverage anchor: it inserts a frozen pair between the
@@ -4295,7 +4466,7 @@ fn apply_once(
     // defer result when an independent bust opportunity already exists. Reconcile defers remain
     // untouched because they must clear or rebuild the boundary state first.
     if todo_injection_pending
-        && independent_bust_opportunity
+        && bust_opportunity
         && !loaded.core.reconcile_pending
         && matches!(plan, PassPlan::Defer)
     {
@@ -4326,7 +4497,7 @@ fn apply_once(
         coverage_delta: compartment_seq_changed_since_meta,
         m1_delta: current_m1_digest != loaded.meta.m1_revision,
         explicit_flush: loaded.meta.soft_refresh_pending,
-        reductions_pending: reductions_pending_now,
+        reductions_pending: reclaim_pending_now,
     });
     if todo_injection_pending && matches!(plan, PassPlan::Soft) && materialize_reason.is_none() {
         materialize_reason = Some("synthetic_todo".to_string());
@@ -4339,6 +4510,12 @@ fn apply_once(
     }
     if transition_due {
         materialize_reason = Some("renderer_transition".to_string());
+    }
+    if pre_snapshot_inputs_changed {
+        materialize_reason = Some("protected_tokens_inputs_changed".to_string());
+    }
+    if reasoning_exemption_repair {
+        materialize_reason = Some("reasoning_exemption_repair".to_string());
     }
 
     timings.planning = elapsed_ms(planning_started_at);
@@ -4363,14 +4540,23 @@ fn apply_once(
         meta.last_upgrade_state = req.upgrade_state.clone();
         meta.last_render_config = effective_render_config.clone();
     }
-    if matches!(
-        scheduler_outcome.pass,
-        scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
-    ) {
-        // The emergency selector latches every acting input sample, including zero
-        // removals, so repeated pressure observations do not re-bust unchanged bytes.
-        meta.last_emergency_input_sample = usage_input_tokens;
-        meta.has_prior_emergency_drop = true;
+    // One shared opportunity admits all reclaim lanes. A changed usage sample is not
+    // a new episode; exit needs five percentage points of headroom below the band,
+    // so a small batch-induced dip cannot rearm it. Independent busts and the 95% arm
+    // bypass the latch above without granting subsequent passes another opportunity.
+    if !force_band_active
+        && usage_input_tokens > 0.0
+        && usage_percentage
+            < scheduler::escalation_bands(ctx.execute_threshold_percentage)
+                .force_materialize_percentage
+                - 5.0
+    {
+        meta.last_emergency_input_sample = 0.0;
+        meta.has_prior_emergency_drop = false;
+        meta.emergency_drop_assessment = None;
+    }
+    if let Some(assessment) = selection_outcome.emergency_drop_assessment {
+        meta.emergency_drop_assessment = Some(assessment);
     }
     let mut commit_expected = loaded.row_version;
     if clear_pending_rewrite_on_present {
@@ -4419,6 +4605,26 @@ fn apply_once(
         PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
     );
     let is_bust_pass = !req.is_subagent && is_provider_prefix_mutation_pass;
+    if !lineage_anchor_failure {
+        meta.protected_tokens_effective = floor_resolution.persisted;
+        if meta.protected_tokens_effective != loaded.meta.protected_tokens_effective {
+            eprintln!(
+                "mc-module: protected_tokens session={} floor={} provenance={} usable_soft={}",
+                req.session_id,
+                protected_tokens_floor,
+                if floor_resolution.source == "host" {
+                    "host"
+                } else {
+                    ctx.protected_tokens_provenance
+                },
+                req.geometry
+                    .as_ref()
+                    .map(|geometry| geometry.usable_soft)
+                    .or_else(|| req.usage.as_ref().map(|usage| usage.context_limit_tokens))
+                    .unwrap_or(200_000),
+            );
+        }
+    }
     let user_hint_started_at = Instant::now();
     if auto_search_active {
         if let Some(hint) = maybe_decide_live_user_hint(
@@ -4462,36 +4668,26 @@ fn apply_once(
         meta.reasoning_cleared_through_ordinal = meta.reasoning_cleared_through_ordinal.max(cutoff);
     }
     let unit_mint_started_at = Instant::now();
-    let new_strip_units = new_frozen_strip_units(
-        &loaded.core,
-        req,
-        &tag_numbers,
-        reasoning_clear_cutoff,
-        is_bust_pass,
-        lineage_anchor_mid,
-    );
+    let new_strip_units = if is_bust_pass {
+        planned_strip_units
+    } else {
+        Vec::new()
+    };
     timings.unit_mint = elapsed_ms(unit_mint_started_at);
     let caveman_started_at = Instant::now();
-    let caveman_age_basis_tag = if is_bust_pass && req.caveman_enabled {
+    if is_bust_pass && req.caveman_enabled {
         let basis = tag_rows
             .iter()
             .filter_map(|row| u64::try_from(row.tag_number).ok())
             .max()
             .unwrap_or(0);
         meta.caveman_age_basis_tag = basis;
-        basis
+    }
+    let new_caveman_units = if is_bust_pass {
+        planned_caveman_units
     } else {
-        loaded.meta.caveman_age_basis_tag
+        Vec::new()
     };
-    let new_caveman_units = new_caveman_units(
-        &loaded.core,
-        req,
-        &tag_rows,
-        &live,
-        loaded.meta.coverage_ordinal,
-        is_bust_pass,
-        caveman_age_basis_tag,
-    );
     timings.caveman = elapsed_ms(caveman_started_at);
     if loaded.meta.soft_refresh_pending && is_bust_pass {
         meta.soft_refresh_pending = false;
@@ -4554,7 +4750,7 @@ fn apply_once(
                     coverage_bounds.map(|(start, _)| start),
                     serializer_profile,
                 );
-                let mut comp = compose_m0_from_store(
+                let mut comp = crate::m0_compose::compose_m0_from_store_timed(
                     store,
                     &crate::m0_compose::M0ComposeInputs {
                         session_id: &req.session_id,
@@ -4571,6 +4767,8 @@ fn apply_once(
                         mural: m0_mural_input(req, serializer_profile),
                     },
                     estimate_tokens,
+                    incremental_history,
+                    &mut timings.compose,
                 )?;
 
                 // Live coverage guard: store-pure validation allows sparse coordinate
@@ -4655,7 +4853,7 @@ fn apply_once(
                                     recut_coverage_bounds.map(|(start, _)| start),
                                     serializer_profile,
                                 );
-                            comp = compose_m0_from_store(
+                            comp = crate::m0_compose::compose_m0_from_store_timed(
                                 store,
                                 &crate::m0_compose::M0ComposeInputs {
                                     session_id: &req.session_id,
@@ -4672,6 +4870,8 @@ fn apply_once(
                                     mural: m0_mural_input(req, serializer_profile),
                                 },
                                 estimate_tokens,
+                                incremental_history,
+                                &mut timings.compose,
                             )?;
                             meta.last_execute_ordinal = meta
                                 .last_execute_ordinal
@@ -4902,7 +5102,7 @@ fn apply_once(
                         coverage_bounds.map(|(start, _)| start),
                         serializer_profile,
                     );
-                    let comp = compose_m0_from_store(
+                    let comp = crate::m0_compose::compose_m0_from_store_timed(
                         store,
                         &crate::m0_compose::M0ComposeInputs {
                             session_id: &req.session_id,
@@ -4919,6 +5119,8 @@ fn apply_once(
                             mural: m0_mural_input(req, serializer_profile),
                         },
                         estimate_tokens,
+                        incremental_history,
+                        &mut timings.compose,
                     )?;
 
                     if let Some(stray) = first_uncovered_live_block(
@@ -5254,13 +5456,6 @@ fn apply_once(
             .unwrap_or(0)
             .max(meta.last_execute_ordinal);
     }
-    if is_bust_pass && selection_class == PassClass::EmergencyForce {
-        // An emergency selector pass consumes the current provider sample even when
-        // protection filtered every candidate; otherwise the same stale sample would
-        // repeatedly re-arm and re-bust the session.
-        meta.last_emergency_input_sample = usage_input_tokens;
-        meta.has_prior_emergency_drop = true;
-    }
 
     if tail_reclaim_enabled {
         let todo_started_at = Instant::now();
@@ -5309,7 +5504,7 @@ fn apply_once(
         &core,
         meta.coverage_ordinal,
         &hygiene_tag_rows,
-        req.protected_tags,
+        &protection_window.tag_numbers,
         &protected_block_ids,
         &pending_drop_target_ids,
     );
@@ -5371,7 +5566,7 @@ fn apply_once(
                 baseline: current_hygiene_baseline.as_ref(),
                 channel1_appends: &channel1_appends,
                 mutation_exempt_mid,
-                protected_tags: req.protected_tags,
+                protection_cutoff: &protection_window.cutoff,
                 pending_drop_target_ids: &pending_drop_target_ids,
                 agent_drops_applied_this_pass,
             },
@@ -5405,6 +5600,45 @@ fn apply_once(
         output_meta.coverage_ordinal = None;
         no_trim_meta = Some(output_meta);
     }
+    if is_bust_pass {
+        for unit in &mut core.frozen_units {
+            if unit.key.starts_with(SYSTEM_STRIP_BLOCK_PREFIX) {
+                unit.reset_rule.clear();
+            }
+        }
+    }
+    refresh_reasoning_clear_exemptions(&mut core, req, is_bust_pass, lineage_anchor_mid);
+    core.frozen_units.extend(new_reasoning_clear_units(
+        &core,
+        &meta,
+        req,
+        &tag_numbers,
+        is_bust_pass,
+        lineage_anchor_mid,
+        ReasoningClearSnapshot {
+            meta: &loaded.meta,
+            row_version: loaded.row_version,
+            projection: &projection,
+        },
+    ));
+    let legacy_adoption_complete =
+        legacy_reasoning_adoption_complete(&loaded.meta, &core.frozen_units);
+    if (is_bust_pass || legacy_adoption_complete)
+        && serializer_profile == Some(SerializerProfile::OpencodeAiSdk)
+        && req.serve_native
+    {
+        meta.reasoning_clear_initialized = true;
+        meta.reasoning_replay_evidence = None;
+    }
+    let cleared_mids = reasoning_clear_mids(&core.frozen_units)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    core.frozen_units.retain(|unit| {
+        unit.key
+            .strip_prefix("strip:native_reasoning_keep:")
+            .is_none_or(|mid| !cleared_mids.contains(mid))
+    });
     let output_meta = no_trim_meta.as_ref().unwrap_or(&meta);
     // OpenCode must replay the newest signed assistant's complete native vector. Its
     // demotion is not permission to apply previously withheld overlays on a defer.
@@ -5416,7 +5650,9 @@ fn apply_once(
     if serializer_profile == Some(SerializerProfile::OpencodeAiSdk) && req.serve_native {
         if let Some(mid) = latest_assistant_reasoning_mutation_exempt_mid(&req.messages) {
             if req.messages.iter().any(|message| {
-                message.mid == mid && message.ck.content.iter().any(is_reasoning_block)
+                message.mid == mid
+                    && !cleared_mids.contains(mid)
+                    && message.ck.content.iter().any(is_reasoning_block)
             }) {
                 let key = format!("strip:native_reasoning_keep:{mid}");
                 if !core.frozen_units.iter().any(|unit| unit.key == key) {
@@ -5447,6 +5683,75 @@ fn apply_once(
         output_cache_snapshot.as_ref(),
         is_bust_pass,
     )?;
+    if !is_bust_pass {
+        let candidates =
+            legacy_system_strip_candidates(&core, &loaded.meta, &built_output.messages);
+        if !candidates.is_empty() {
+            let mut unstripped_core = core.clone();
+            for unit in &mut unstripped_core.frozen_units {
+                if candidates.contains(&unit.key) {
+                    unit.reset_rule = SYSTEM_STRIP_PENDING.to_string();
+                }
+            }
+            let unstripped = build_output_with_tags(
+                &unstripped_core,
+                output_meta,
+                &projection,
+                req,
+                (tagging_active || auto_search_active).then_some(&tag_overlay),
+                tail_reclaim_enabled && !req.is_subagent,
+                mutation_exempt_mid,
+                &tag_numbers,
+                meta.reasoning_cleared_through_tag
+                    .max(meta.reasoning_cleared_through_ordinal),
+                transition_committed,
+                None,
+                false,
+            )?;
+            let original_hashes = served_output_fingerprints(&unstripped.messages)
+                .into_iter()
+                .map(|block| (block.block_id, block.content_hash))
+                .collect::<HashMap<_, _>>();
+            let previous = loaded
+                .meta
+                .served_output_fingerprint
+                .iter()
+                .map(|block| (block.block_id.as_str(), block.content_hash.as_str()))
+                .collect::<HashMap<_, _>>();
+            let mut changed = false;
+            for unit in &mut core.frozen_units {
+                if !candidates.contains(&unit.key) {
+                    continue;
+                }
+                let target = unit.key.strip_prefix(SYSTEM_STRIP_BLOCK_PREFIX).unwrap();
+                if previous.get(target).is_none_or(|hash| {
+                    original_hashes
+                        .get(target)
+                        .is_some_and(|original| original == hash)
+                }) {
+                    unit.reset_rule = SYSTEM_STRIP_PENDING.to_string();
+                    changed = true;
+                }
+            }
+            if changed {
+                built_output = build_output_with_tags(
+                    &core,
+                    output_meta,
+                    &projection,
+                    req,
+                    (tagging_active || auto_search_active).then_some(&tag_overlay),
+                    tail_reclaim_enabled && !req.is_subagent,
+                    mutation_exempt_mid,
+                    &tag_numbers,
+                    meta.reasoning_cleared_through_tag
+                        .max(meta.reasoning_cleared_through_ordinal),
+                    transition_committed,
+                    None,
+                    false,
+                )?;
+            }
+        }
+    }
     let new_merged_reasoning_units = new_merged_reasoning_strip_units(
         &core,
         req,
@@ -5557,6 +5862,25 @@ fn apply_once(
             .collect::<Vec<_>>();
         assert_eq!(cached_bytes, fresh_bytes, "serialized output cache drift");
     }
+    // Consume only applied reclaim, not a zero-yield evaluation or a prefix fold.
+    // Comparing frozen payloads also counts a deeper caveman rewrite of an existing unit.
+    if force_band_active
+        && core.frozen_units.iter().any(|unit| {
+            (unit.key.starts_with("red:")
+                || unit.key.starts_with(CAV_KEY_PREFIX)
+                || (unit.key.starts_with("strip:")
+                    && !unit.kind.ends_with("_keep")
+                    && unit.reset_rule != SYSTEM_STRIP_PENDING))
+                && !loaded.core.frozen_units.iter().any(|old| {
+                    old.key == unit.key
+                        && old.frozen_payload == unit.frozen_payload
+                        && old.reset_rule == unit.reset_rule
+                })
+        })
+    {
+        meta.last_emergency_input_sample = usage_input_tokens;
+        meta.has_prior_emergency_drop = true;
+    }
     let BuiltOutput {
         messages: ck_messages,
         cache_entries: output_cache_entries,
@@ -5617,6 +5941,7 @@ fn apply_once(
     // last-known-good representation while the mismatch remains.
     if !deferred_frozen_prefix_divergence {
         meta.served_output_fingerprint = served_fingerprints;
+        meta.served_output_generation = Some(reasoning_generation(&meta));
     }
 
     let channel2_output = channel2_directives(
@@ -5631,7 +5956,7 @@ fn apply_once(
             tag_rows: &hygiene_tag_rows,
             baseline: current_hygiene_baseline.as_ref(),
             mutation_exempt_mid,
-            protected_tags: req.protected_tags,
+            protection_cutoff: &protection_window.cutoff,
             pending_drop_target_ids: &pending_drop_target_ids,
         },
         &mut meta,
@@ -5653,6 +5978,17 @@ fn apply_once(
     let scheduler_applied_reductions = frozen_red_targets(&core)
         .iter()
         .any(|target| !frozen_reductions_before.contains(target));
+    let reasoning_clear_units = core
+        .frozen_units
+        .iter()
+        .filter(|unit| {
+            unit.key.starts_with("strip:reasoning_clear:")
+                || unit.key.starts_with(LEGACY_REASONING_CLEAR_PREFIX)
+        })
+        .cloned()
+        .collect();
+    core.frozen_units
+        .retain(|unit| !unit.key.starts_with(LEGACY_REASONING_CLEAR_PREFIX));
     let state_changed = core != loaded.core || meta != loaded.meta;
     if state_changed {
         meta.last_committed_pass_at_ms = ctx.now_ms;
@@ -5756,7 +6092,9 @@ fn apply_once(
     timings.finalize = elapsed_ms(finalize_started_at);
     timings.total = elapsed_ms(total_started_at);
     Ok(TransformWithProjection {
+        historian_tags: Some(tag_rows),
         tag_numbers,
+        publication_floor_ordinal: meta.publication_floor_ordinal,
         projection,
         scheduler_pass: scheduler_outcome.pass,
         scheduler_defer_reason: scheduler_outcome.defer_reason,
@@ -5767,6 +6105,7 @@ fn apply_once(
         reasoning_watermark: meta
             .reasoning_cleared_through_tag
             .max(meta.reasoning_cleared_through_ordinal),
+        reasoning_clear_units,
         transition_consumed: transition_consumed(&core),
         mutation_exempt_mid: mutation_exempt_mid.map(str::to_string),
         lineage_anchor_mid: lineage_anchor_mid.map(str::to_string),
@@ -6041,7 +6380,12 @@ fn effective_context_limit_tokens(
     usage: &ModuleUsage,
     geometry: Option<&TransformGeometry>,
 ) -> f64 {
-    if usage.context_limit_tokens >= crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT {
+    if usage.context_limit_tokens >= crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT
+        && geometry.is_none_or(|geometry| {
+            geometry.absolute_wall < crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT
+                || usage.context_limit_tokens <= geometry.absolute_wall
+        })
+    {
         return usage.context_limit_tokens as f64;
     }
     // Usage is unfilled on the first pass of a session (no observed pass yet),
@@ -6543,10 +6887,15 @@ fn caveman_target_depth(position: usize, total: usize) -> u8 {
 /// durably by the caller with the same commit as these units, so newly minted tags cannot change
 /// this cycle's eligible population. The original tag source is authoritative, so a later tier
 /// shift never compresses an already-compressed payload.
+struct CavemanTagState<'a> {
+    rows: &'a [McTagRow],
+    protection_cutoff: &'a TagNumberCutoffProjection,
+}
+
 fn new_caveman_units(
     core: &CoreState,
     req: &TransformRequest,
-    tag_rows: &[McTagRow],
+    tag_state: CavemanTagState<'_>,
     live: &[&FlatBlock],
     coverage: Option<u64>,
     is_bust_pass: bool,
@@ -6556,8 +6905,8 @@ fn new_caveman_units(
         return Vec::new();
     }
 
-    let protected_cutoff = age_basis_tag.saturating_sub(req.protected_tags as u64);
-    let tags_by_block = tag_rows
+    let tags_by_block = tag_state
+        .rows
         .iter()
         .filter(|row| row.kind == "message")
         .map(|row| (row.block_id.as_str(), row))
@@ -6576,7 +6925,12 @@ fn new_caveman_units(
             }
             let row = tags_by_block.get(block.id.as_str())?;
             let tag_number = u64::try_from(row.tag_number).ok()?;
-            if tag_number > protected_cutoff || row.source_bytes.len() < req.caveman_min_chars {
+            if tag_state
+                .protection_cutoff
+                .cutoff
+                .is_some_and(|cutoff| row.tag_number >= cutoff.0)
+                || row.source_bytes.len() < req.caveman_min_chars
+            {
                 return None;
             }
             let source = String::from_utf8(row.source_bytes.clone()).ok()?;
@@ -7696,6 +8050,7 @@ fn pending_rewrite_detail(session_id: &str, fingerprint: &str, ambiguous: bool) 
 }
 
 struct PendingPassthroughArgs<'a> {
+    historian_tags: Arc<Vec<McTagRow>>,
     projection: FlatProjection,
     tag_numbers: BTreeMap<String, u64>,
     req: &'a TransformRequest,
@@ -7704,6 +8059,7 @@ struct PendingPassthroughArgs<'a> {
     rendered_memory_ids: Vec<i64>,
     revert_epoch: u64,
     reasoning_watermark: u64,
+    publication_floor_ordinal: Option<u64>,
     transition_consumed: bool,
     committed: bool,
     trim_mismatch: Option<TrimMismatch>,
@@ -7751,6 +8107,7 @@ fn pending_passthrough_messages(
 
 fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWithProjection {
     let PendingPassthroughArgs {
+        historian_tags,
         projection,
         tag_numbers,
         req,
@@ -7759,6 +8116,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         rendered_memory_ids,
         revert_epoch,
         reasoning_watermark,
+        publication_floor_ordinal,
         transition_consumed,
         committed,
         trim_mismatch,
@@ -7781,7 +8139,9 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
     timings.total = elapsed_ms(total_started_at);
     response.timings = Some(timings);
     TransformWithProjection {
+        historian_tags: Some(historian_tags),
         tag_numbers,
+        publication_floor_ordinal,
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
         scheduler_defer_reason: Some(scheduler::SchedulerDeferReason::SchedulerDefer),
@@ -7790,6 +8150,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         trim_mismatch,
         revert_epoch,
         reasoning_watermark,
+        reasoning_clear_units: Vec::new(),
         transition_consumed,
         mutation_exempt_mid,
         lineage_anchor_mid: None,
@@ -8009,7 +8370,7 @@ fn tag_baseline_entry(
 /// Hydrate immutable tag rows from a cold baseline or an append-only tail. A post-read probe
 /// makes a concurrent mutation retry before its bytes reach the transform, and trigger-backed
 /// generations force a cold refill for replacement or deletion.
-fn load_cached_tags(
+pub(crate) fn load_cached_tags(
     store: &McStore,
     session_id: &str,
 ) -> Result<Arc<Vec<McTagRow>>, TransformError> {
@@ -8450,66 +8811,6 @@ fn taggable_source(block: &FlatBlock) -> Option<(TaggableKind, &str)> {
 
 fn taggable_kind(block: &FlatBlock) -> Option<TaggableKind> {
     taggable_source(block).map(|(kind, _)| kind)
-}
-
-/// Compute the newest protected tags as exact block ids over the current canonical tail.
-/// Stored provenance must still match the live carrier before a row can occupy a slot.
-fn newest_active_tag_block_ids(
-    core: &CoreState,
-    meta: &ModuleMeta,
-    projection: &FlatProjection,
-    tag_rows: &[McTagRow],
-    mutation_exempt_mid: Option<&str>,
-    protected_tags: usize,
-) -> HashSet<String> {
-    let block_by_id = projection
-        .blocks
-        .iter()
-        .map(|block| (block.id.as_str(), block))
-        .collect::<HashMap<_, _>>();
-    let frozen_targets = frozen_red_targets(core);
-    let mut active = tag_rows
-        .iter()
-        .filter(|row| {
-            let Some(block) = block_by_id.get(row.block_id.as_str()) else {
-                return false;
-            };
-            if !is_tail(block.ordinal, meta.coverage_ordinal)
-                || frozen_targets.contains(block.id())
-                || mutation_exempt_mid == Some(block.mid.as_str())
-            {
-                return false;
-            }
-            let Some((kind, source)) = taggable_source(block) else {
-                return false;
-            };
-            row.kind == kind.as_store_kind() && row.source_bytes == source.as_bytes()
-        })
-        .collect::<Vec<_>>();
-    active.sort_by(|left, right| {
-        right
-            .tag_number
-            .cmp(&left.tag_number)
-            .then_with(|| right.block_id.cmp(&left.block_id))
-    });
-    active
-        .into_iter()
-        .take(protected_tags)
-        .map(|row| row.block_id.clone())
-        .collect()
-}
-
-fn protected_tail_cutoff_ordinal(
-    projection: &FlatProjection,
-    protected_block_ids: &HashSet<String>,
-) -> u64 {
-    projection
-        .blocks
-        .iter()
-        .filter(|block| protected_block_ids.contains(&block.id))
-        .map(|block| block.ordinal)
-        .min()
-        .unwrap_or(0)
 }
 
 fn tag_overlay_state(
@@ -9521,13 +9822,9 @@ fn user_hint_message_text(message: &CkIngressMessage) -> String {
 }
 
 fn has_stacked_user_hint_augmentation(raw_prompt: &str) -> bool {
-    [
-        "<sidekick-augmentation>",
-        "<ctx-search-hint>",
-        "<ctx-search-auto>",
-    ]
-    .iter()
-    .any(|marker| raw_prompt.contains(marker))
+    ["<ctx-search-hint>", "<ctx-search-auto>"]
+        .iter()
+        .any(|marker| raw_prompt.contains(marker))
 }
 
 fn sanitize_user_hint_query(text: &str) -> String {
@@ -9806,7 +10103,7 @@ fn maybe_append_channel1_nudge(
         &existing_blocks,
         input.mutation_exempt_mid,
     )?;
-    let hint = oldest_reclaimable_hint(&active_tags, input.protected_tags, &queued_tag_numbers);
+    let hint = oldest_reclaimable_hint(&active_tags, input.protection_cutoff, &queued_tag_numbers);
     let reminder = build_channel1_reminder(
         decision.level,
         decision.reclaimable_tokens,
@@ -9908,7 +10205,10 @@ fn active_tags_for_nudge(
             && !frozen_targets.contains(block.id())
             && mutation_exempt_mid != Some(block.mid.as_str())
     }) {
-        if let Some(row) = tag_by_block.get(block.id.as_str()) {
+        if let Some(row) = tag_by_block
+            .get(block.id.as_str())
+            .filter(|row| crate::protection_window::is_tool_kind(&row.kind))
+        {
             out.push(ActiveTagForNudge {
                 tag_number: row.tag_number,
                 kind: row.kind.clone(),
@@ -9971,7 +10271,7 @@ struct Channel2DirectiveInput<'a> {
     tag_rows: &'a [McTagRow],
     baseline: Option<&'a TailHygieneBaseline>,
     mutation_exempt_mid: Option<&'a str>,
-    protected_tags: usize,
+    protection_cutoff: &'a TagNumberCutoffProjection,
     pending_drop_target_ids: &'a HashSet<String>,
 }
 
@@ -10050,7 +10350,7 @@ fn channel2_pressure(
             input.mutation_exempt_mid,
         );
         let queued_tag_numbers = queued_tag_numbers(input.tag_rows, input.pending_drop_target_ids);
-        oldest_channel2_hint(&active_tags, input.protected_tags, &queued_tag_numbers)
+        oldest_channel2_hint(&active_tags, input.protection_cutoff, &queued_tag_numbers)
     } else {
         Vec::new()
     };
@@ -10173,16 +10473,6 @@ fn channel2_directive_id(session_id: &str, arming_watermark: u64) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn protected_tag_cutoff(active_tags: &[ActiveTagForNudge], protected_tags: usize) -> Option<i64> {
-    if protected_tags == 0 {
-        return None;
-    }
-    active_tags
-        .get(active_tags.len().checked_sub(protected_tags)?)
-        .map(|tag| tag.tag_number)
-        .or(Some(i64::MIN))
-}
-
 fn channel2_token_aggregate(baseline: Option<&TailHygieneBaseline>) -> Option<(i64, i64)> {
     let baseline = baseline?;
     if !baseline.evaluable || baseline.generation_invalidated {
@@ -10195,15 +10485,18 @@ fn channel2_token_aggregate(baseline: Option<&TailHygieneBaseline>) -> Option<(i
 
 fn oldest_channel2_hint(
     active_tags: &[ActiveTagForNudge],
-    protected_tags: usize,
+    protection_cutoff: &TagNumberCutoffProjection,
     queued_tag_numbers: &HashSet<i64>,
 ) -> Vec<(i64, String)> {
-    let protected_cutoff = protected_tag_cutoff(active_tags, protected_tags);
     active_tags
         .iter()
         .filter(|tag| tag.kind == "tool_result")
         .filter(|tag| !queued_tag_numbers.contains(&tag.tag_number))
-        .filter(|tag| protected_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff))
+        .filter(|tag| {
+            protection_cutoff
+                .cutoff
+                .is_none_or(|cutoff| tag.tag_number < cutoff.0)
+        })
         .filter(|tag| tag.token_count >= 100)
         .take(4)
         .map(|tag| (tag.tag_number, "tool".to_string()))
@@ -10346,6 +10639,10 @@ fn decide_channel1(
 mod nudge_formula_tests {
     use super::*;
     use serde::Deserialize;
+
+    fn no_protection_cutoff() -> TagNumberCutoffProjection {
+        ProtectionWindow::from_persisted_rows(&[], 16_000).cutoff
+    }
 
     fn baseline(u: i64, t: i64) -> TailHygieneBaseline {
         TailHygieneBaseline {
@@ -10492,7 +10789,7 @@ mod nudge_formula_tests {
                 tag(6, "aft_search", 900),
                 tag(7, "read", 900),
             ],
-            0,
+            &no_protection_cutoff(),
             &HashSet::new(),
         );
 
@@ -10516,7 +10813,11 @@ mod nudge_formula_tests {
             tool_name: tool_name.to_string(),
         };
         let queued = HashSet::from([1]);
-        let hint = oldest_reclaimable_hint(&[tag(1, "bash"), tag(2, "read")], 0, &queued);
+        let hint = oldest_reclaimable_hint(
+            &[tag(1, "bash"), tag(2, "read")],
+            &no_protection_cutoff(),
+            &queued,
+        );
 
         assert_eq!(hint, vec![(2, "read".to_string())]);
     }
@@ -10544,7 +10845,7 @@ mod nudge_formula_tests {
                     tool_name: "bash_status".to_string(),
                 },
             ],
-            0,
+            &no_protection_cutoff(),
             &HashSet::new(),
         );
 
@@ -10747,7 +11048,7 @@ mod nudge_formula_tests {
                 tag_rows: &tags,
                 baseline: Some(&due_baseline),
                 mutation_exempt_mid: None,
-                protected_tags: 0,
+                protection_cutoff: &no_protection_cutoff(),
                 pending_drop_target_ids: &HashSet::new(),
             },
             &mut stale,
@@ -10767,7 +11068,7 @@ mod nudge_formula_tests {
                 tag_rows: &tags,
                 baseline: Some(&due_baseline),
                 mutation_exempt_mid: None,
-                protected_tags: 0,
+                protection_cutoff: &no_protection_cutoff(),
                 pending_drop_target_ids: &HashSet::new(),
             },
             &mut stale,
@@ -10823,10 +11124,9 @@ fn tool_result_can_carry_channel1(block: &CkWireBlock) -> bool {
 
 fn oldest_reclaimable_hint(
     active_tags: &[ActiveTagForNudge],
-    protected_tags: usize,
+    protection_cutoff: &TagNumberCutoffProjection,
     queued_tag_numbers: &HashSet<i64>,
 ) -> Vec<(i64, String)> {
-    let configured_cutoff = protected_tag_cutoff(active_tags, protected_tags);
     let mut candidates = active_tags
         .iter()
         .filter(|tag| {
@@ -10834,7 +11134,9 @@ fn oldest_reclaimable_hint(
                 && !queued_tag_numbers.contains(&tag.tag_number)
                 && tag.token_count >= AGE_RECLAIM_MIN_TOKENS as i64
                 && !is_reclaim_hint_excluded_tool(&tag.tool_name)
-                && configured_cutoff.is_none_or(|cutoff| tag.tag_number < cutoff)
+                && protection_cutoff
+                    .cutoff
+                    .is_none_or(|cutoff| tag.tag_number < cutoff.0)
         })
         .map(|tag| (tag.tag_number, tag.tool_name.clone()))
         .collect::<Vec<_>>();
@@ -10862,7 +11164,7 @@ fn should_use_sticky_channel1_reminder(
     last_level == level.as_str()
 }
 
-fn reclaimable_tool_output_count(baseline: Option<&TailHygieneBaseline>) -> usize {
+pub(crate) fn reclaimable_tool_output_count(baseline: Option<&TailHygieneBaseline>) -> usize {
     baseline
         .into_iter()
         .flat_map(|baseline| baseline.baseline_parts.iter())
@@ -10934,6 +11236,45 @@ fn strip_unit(kind: &str, mid: &str, payload: &str) -> FrozenUnit {
         durability_class: mc_core::DurabilityClass::Lineage,
         reset_rule: String::new(),
     }
+}
+
+const SYSTEM_STRIP_BLOCK_PREFIX: &str = "strip:system_injected_block:";
+const SYSTEM_STRIP_PENDING: &str = "await-priced-first-serve";
+
+// Older output-cache identities omitted block-level strips. A durable strip could
+// therefore coexist with last-served whole text. When rebuilding the original
+// block matches its last-served fingerprint, suspend the strip until a priced
+// pass. Already-served strips keep replaying; changed source bytes are not proof.
+fn legacy_system_strip_candidates(
+    core: &CoreState,
+    meta: &ModuleMeta,
+    rendered: &[ServedMessage],
+) -> HashSet<String> {
+    if !core
+        .frozen_units
+        .iter()
+        .any(|unit| unit.key.starts_with(SYSTEM_STRIP_BLOCK_PREFIX) && unit.reset_rule.is_empty())
+    {
+        return HashSet::new();
+    }
+    let current = served_output_fingerprints(rendered)
+        .into_iter()
+        .map(|block| (block.block_id, block.content_hash))
+        .collect::<HashMap<_, _>>();
+    let previous = meta
+        .served_output_fingerprint
+        .iter()
+        .map(|block| (block.block_id.as_str(), block.content_hash.as_str()))
+        .collect::<HashMap<_, _>>();
+    core.frozen_units
+        .iter()
+        .filter(|unit| unit.reset_rule.is_empty())
+        .filter_map(|unit| {
+            let target = unit.key.strip_prefix(SYSTEM_STRIP_BLOCK_PREFIX)?;
+            let hash = current.get(target)?;
+            (previous.get(target).copied() != Some(hash.as_str())).then(|| unit.key.clone())
+        })
+        .collect()
 }
 
 fn provider_sentinel_text(req: &TransformRequest) -> String {
@@ -11222,6 +11563,8 @@ fn tag_age_cutoff(req: &TransformRequest, tag_numbers: &BTreeMap<String, u64>) -
     Some(max_tag.saturating_sub(req.clear_reasoning_age))
 }
 
+include!("transform/reasoning_clear.rs");
+
 fn new_frozen_strip_units(
     core: &CoreState,
     req: &TransformRequest,
@@ -11239,10 +11582,11 @@ fn new_frozen_strip_units(
         .iter()
         .map(|unit| unit.key.as_str())
         .collect();
+    const STRUCTURAL_PROTECTED_MESSAGE_COUNT: usize = 40;
     let protected_start = req
         .messages
         .len()
-        .saturating_sub(req.protected_tags.saturating_mul(2));
+        .saturating_sub(STRUCTURAL_PROTECTED_MESSAGE_COUNT);
     let age_cutoff = tag_age_cutoff(req, tag_numbers);
     let reasoning_mutation_exempt_mid =
         latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
@@ -11421,6 +11765,7 @@ fn apply_surface_strips(
     tag_numbers: &BTreeMap<String, u64>,
     reasoning_policy: ReasoningMutationPolicy,
 ) {
+    replay_reasoning_clear(frozen_units, &message.mid, rebuilt);
     let sentinel = provider_sentinel_text(req);
     let whole_strip = (!reasoning_policy.exempt)
         .then(|| {
@@ -11450,6 +11795,7 @@ fn apply_surface_strips(
         if !reasoning_policy.exempt {
             if let Some(unit) =
                 output_message_strip_unit(frozen_units, "system_injected_block", block.id())
+                    .filter(|unit| unit.reset_rule != SYSTEM_STRIP_PENDING)
             {
                 rebuilt.content[index].kind = ck_wire::CkKind::Text {
                     text: unit.frozen_payload.clone(),
@@ -11459,20 +11805,7 @@ fn apply_surface_strips(
                 continue;
             }
         }
-        let clear_typed_reasoning = !reasoning_policy.exempt
-            && message.ck.role == "assistant"
-            && aged
-            && request_accepts_empty_content(req)
-            && matches!(&block.wire.kind, ck_wire::CkKind::Reasoning { .. });
-        if clear_typed_reasoning {
-            rebuilt.content[index].kind = ck_wire::CkKind::Reasoning {
-                text: String::new(),
-                signature: None,
-            };
-            rebuilt.content[index].mark_modified();
-            touched = true;
-            continue;
-        }
+
         let should_strip =
             (request_accepts_empty_content(req) && stale_reduce && is_reduce_block(&block.wire))
                 || ((image_seed
@@ -11498,6 +11831,9 @@ fn apply_surface_strips(
                 }
             }
         }
+    }
+    if touched {
+        rebuilt.mark_modified();
     }
     if stale_reduce && touched && !rebuilt.content.iter().any(has_meaningful_content) {
         rebuilt.content = vec![CkWireBlock::bare(ck_wire::CkKind::Text { text: sentinel })];
@@ -11526,7 +11862,9 @@ fn surviving_strip_units(core: &CoreState, req: &TransformRequest) -> Vec<Frozen
             // ids durable so their strip resumes deterministically if they return in a later
             // full-array request.
             unit.key.starts_with("strip:merged_reasoning:")
+                || unit.key.starts_with(SYSTEM_STRIP_BLOCK_PREFIX)
                 || unit.key.starts_with("strip:reasoning_age:")
+                || unit.key.starts_with("strip:reasoning_clear:")
                 || unit.key.starts_with("strip:trailing_blank_keep:")
                 || unit.key.starts_with("strip:trailing_blank_strip:")
                 || unit
@@ -12002,8 +12340,8 @@ impl<'a> FrozenUnitIndex<'a> {
                 .or_else(|| {
                     unit.key
                         .strip_prefix("strip:")
-                        .and_then(|rest| rest.rsplit_once(':'))
-                        .map(|(_, mid)| mid)
+                        .and_then(|rest| rest.split_once(':'))
+                        .map(|(_, target)| split_block_id(target).map_or(target, |(mid, _)| mid))
                 });
             if let Some(mid) = target_mid {
                 by_tail_mid.entry(mid).or_default().push(unit);
@@ -12058,7 +12396,10 @@ impl<'a> FrozenUnitLookup<'a> {
                             .unwrap_or_else(|| {
                                 unit.key
                                     .strip_prefix("strip:")
-                                    .is_some_and(|key| key.ends_with(&format!(":{mid}")))
+                                    .and_then(|key| key.split_once(':'))
+                                    .is_some_and(|(_, target)| {
+                                        split_block_id(target).map_or(target, |(mid, _)| mid) == mid
+                                    })
                             })
                     })
                     .collect(),
@@ -12170,6 +12511,7 @@ fn message_output_identity(
         digest_field(&mut hasher, unit.key.as_bytes());
         digest_field(&mut hasher, unit.kind.as_bytes());
         digest_field(&mut hasher, unit.frozen_payload.as_bytes());
+        digest_field(&mut hasher, unit.reset_rule.as_bytes());
     }
 
     *frozen_unit_scan_ms += elapsed_ms(frozen_unit_scan_started_at);
@@ -12447,6 +12789,7 @@ fn new_merged_reasoning_strip_units(
         .map(|unit| unit.key.as_str())
         .collect::<HashSet<_>>();
     let mutation_exempt_mid = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    let clear_lookup = FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units));
     let mut prev_assistant = false;
     let mut units = Vec::new();
     // Detect against the fully rendered message so earlier reductions and sentinel replacements
@@ -12456,7 +12799,9 @@ fn new_merged_reasoning_strip_units(
         let first_assistant_in_run = rendered.role == "assistant" && !prev_assistant;
         if let Some(mid) = rendered.meta.harness_id.as_deref() {
             let key = format!("strip:merged_reasoning:{mid}");
-            if !existing_keys.contains(key.as_str()) {
+            if !existing_keys.contains(key.as_str())
+                && active_reasoning_clear(&clear_lookup, mid).is_none()
+            {
                 let mut candidate = rendered.clone().into_message();
                 let mutation_exempt = mutation_exempt_mid == Some(mid);
                 if apply_serializer_residual_to_message(
@@ -13228,8 +13573,10 @@ fn build_output_with_tags_inner(
             .is_some_and(|(anchor_mid, _)| anchor_mid == msg.mid);
         let mutation_exempt =
             mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
-        let reasoning_mutation_exempt =
-            reasoning_mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
+        let reasoning_mutation_exempt = reasoning_mutation_exempt_mid == Some(msg.mid.as_str())
+            || lineage_anchor_exempt
+            || output_message_strip_unit(&frozen_units, "reasoning_clear", &msg.mid)
+                .is_some_and(|unit| unit.reset_rule == REASONING_CLEAR_SUSPENDED);
         let first_assistant_in_run = msg.ck.role == "assistant" && !prev_assistant;
         let blocks = blocks_by_mid
             .get(msg.mid.as_str())
@@ -13319,14 +13666,27 @@ fn build_output_with_tags_inner(
                     rebuilt.mark_modified();
                     for block in blocks {
                         if let Some(unit) = reduced.get(&block.block_index) {
-                            let display_payload = (unit.frozen_payload == "[dropped]"
-                                && unit.reset_rule != RED_SUPPRESS_TAG_OVERLAY_RULE)
-                                .then(|| {
-                                    tag_overlay
-                                        .and_then(|overlay| overlay.tag_by_block_id.get(&block.id))
-                                        .map(|tag_number| format!("[dropped §{tag_number}§]"))
-                                })
-                                .flatten();
+                            let display_payload = if unit.kind == "skeleton" {
+                                let tag_number = (unit.reset_rule != RED_SUPPRESS_TAG_OVERLAY_RULE)
+                                    .then(|| {
+                                        tag_overlay.and_then(|overlay| {
+                                            overlay.tag_by_block_id.get(&block.id).copied()
+                                        })
+                                    })
+                                    .flatten();
+                                Some(dropped_input_payload(tag_number))
+                            } else {
+                                (unit.frozen_payload == "[dropped]"
+                                    && unit.reset_rule != RED_SUPPRESS_TAG_OVERLAY_RULE)
+                                    .then(|| {
+                                        tag_overlay
+                                            .and_then(|overlay| {
+                                                overlay.tag_by_block_id.get(&block.id)
+                                            })
+                                            .map(|tag_number| format!("[dropped §{tag_number}§]"))
+                                    })
+                                    .flatten()
+                            };
                             rebuilt.content[block.block_index] = reduced_block(
                                 &block.wire,
                                 display_payload
@@ -13359,6 +13719,9 @@ fn build_output_with_tags_inner(
                         rebuilt.content[block.block_index].mark_modified();
                         rebuilt.mark_modified();
                     }
+                }
+                if mutation_exempt {
+                    replay_reasoning_clear(&frozen_units, &msg.mid, &mut rebuilt);
                 }
                 if !mutation_exempt {
                     apply_surface_strips(
@@ -13418,6 +13781,7 @@ fn build_output_with_tags_inner(
                 if let Some(profile) = serializer_profile {
                     if output_message_strip_unit(&frozen_units, "merged_reasoning", &msg.mid)
                         .is_some()
+                        && active_reasoning_clear(&frozen_units, &msg.mid).is_none()
                     {
                         apply_serializer_residual_to_message(
                             profile,
@@ -13717,7 +14081,7 @@ pub(crate) fn clear_served_native_reasoning(
     native_messages: &mut [Value],
     served_messages: &[CkWireMessage],
     ingress_messages: &[CkIngressMessage],
-    watermark: u64,
+    reasoning_clear_units: &[FrozenUnit],
     mid_turn: bool,
 ) -> usize {
     clear_served_native_reasoning_with_tags(
@@ -13726,14 +14090,15 @@ pub(crate) fn clear_served_native_reasoning(
         native_messages,
         served_messages,
         ingress_messages,
-        watermark,
+        reasoning_clear_units,
         mid_turn,
         &BTreeMap::new(),
     )
 }
 
-// Native encoding is deliberately last: it needs both the CK result and ingress/tag
-// ownership to prevent the codec's latest-assistant shortcut from restoring old reasoning.
+// Run native encoding last and replay the same committed clear units as CK rendering.
+// Codec-specific shortcuts must neither restore reasoning nor clear it for the first
+// time on a deferred pass that has no permission to change provider-visible bytes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn clear_served_native_reasoning_with_tags(
     profile: SerializerProfile,
@@ -13741,7 +14106,7 @@ pub(crate) fn clear_served_native_reasoning_with_tags(
     native_messages: &mut [Value],
     served_messages: &[CkWireMessage],
     ingress_messages: &[CkIngressMessage],
-    watermark: u64,
+    reasoning_clear_units: &[FrozenUnit],
     mid_turn: bool,
     tag_numbers: &BTreeMap<String, u64>,
 ) -> usize {
@@ -13751,7 +14116,7 @@ pub(crate) fn clear_served_native_reasoning_with_tags(
         native_messages,
         served_messages.iter(),
         ingress_messages,
-        watermark,
+        reasoning_clear_units,
         mid_turn,
         tag_numbers,
     )
@@ -13764,7 +14129,7 @@ pub(crate) fn clear_served_native_reasoning_from_served(
     native_messages: &mut [Value],
     served_messages: &[ServedMessage],
     ingress_messages: &[CkIngressMessage],
-    watermark: u64,
+    reasoning_clear_units: &[FrozenUnit],
     mid_turn: bool,
     tag_numbers: &BTreeMap<String, u64>,
 ) -> usize {
@@ -13774,7 +14139,7 @@ pub(crate) fn clear_served_native_reasoning_from_served(
         native_messages,
         served_messages.iter().map(Deref::deref),
         ingress_messages,
-        watermark,
+        reasoning_clear_units,
         mid_turn,
         tag_numbers,
     )
@@ -13786,14 +14151,14 @@ fn clear_served_native_reasoning_from_iter<'a>(
     provider_accepts_empty_content: bool,
     native_messages: &mut [Value],
     served_messages: impl IntoIterator<Item = &'a CkWireMessage>,
-    ingress_messages: &[CkIngressMessage],
-    watermark: u64,
+    _ingress_messages: &[CkIngressMessage],
+    reasoning_clear_units: &[FrozenUnit],
     _mid_turn: bool,
-    tag_numbers: &BTreeMap<String, u64>,
+    _tag_numbers: &BTreeMap<String, u64>,
 ) -> usize {
     if profile != SerializerProfile::OpencodeAiSdk
         || !provider_accepts_empty_content
-        || watermark == 0
+        || reasoning_clear_units.is_empty()
     {
         return 0;
     }
@@ -13807,22 +14172,7 @@ fn clear_served_native_reasoning_from_iter<'a>(
         return 0;
     }
 
-    let mut ordinal_by_mid = HashMap::new();
-    let mut newest_assistant_mid = None;
-    let mut newest_assistant_ordinal = 0;
-    for message in ingress_messages
-        .iter()
-        .filter(|message| !message.ck.meta.synthetic)
-    {
-        ordinal_by_mid.insert(message.mid.as_str(), message.ordinal);
-        if message.ck.role == "assistant"
-            && has_reasoning_replay_content(message)
-            && message.ordinal >= newest_assistant_ordinal
-        {
-            newest_assistant_ordinal = message.ordinal;
-            newest_assistant_mid = Some(message.mid.as_str());
-        }
-    }
+    let cleared_mids = reasoning_native_clear_mids(reasoning_clear_units);
 
     let mut cleared = 0;
     for raw_message in native_messages {
@@ -13839,11 +14189,7 @@ fn clear_served_native_reasoning_from_iter<'a>(
         {
             continue;
         }
-        let Some(&ordinal) = ordinal_by_mid.get(mid) else {
-            continue;
-        };
-        let age_number = tag_numbers.get(mid).copied().unwrap_or(ordinal);
-        if age_number > watermark || newest_assistant_mid == Some(mid) {
+        if !cleared_mids.contains(mid) {
             continue;
         }
 
@@ -14375,6 +14721,7 @@ pub(crate) mod tests {
         let geometry = TransformGeometry {
             usable_soft: 167_000,
             usable_hard: 200_000,
+            absolute_wall: 200_000,
             derivation: "claude-code/200000 window; soft = 167000".to_string(),
         };
         assert_eq!(
@@ -14397,6 +14744,7 @@ pub(crate) mod tests {
         let implausible = TransformGeometry {
             usable_soft: 12,
             usable_hard: 200_000,
+            absolute_wall: 200_000,
             derivation: String::new(),
         };
         assert_eq!(
@@ -14414,6 +14762,7 @@ pub(crate) mod tests {
                 Some(&TransformGeometry {
                     usable_soft: 1,
                     usable_hard: 168_000,
+                    absolute_wall: 168_000,
                     derivation: "s1-pre-carve/input=128000".to_string(),
                 }),
                 soft,
@@ -14433,6 +14782,7 @@ pub(crate) mod tests {
         let geometry = TransformGeometry {
             usable_soft: 128_000,
             usable_hard: 168_000,
+            absolute_wall: 168_000,
             derivation: "s1-pre-carve/input=128000".to_string(),
         };
         let mut current = req("geometry-wire", "cfg0", vec![]);
@@ -14506,6 +14856,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn compose_timing_line_preserves_each_measured_value() {
+        for scale in [1.0, 7.0] {
+            let timings = TransformTimings {
+                compose: crate::m0_compose::ComposeTimings {
+                    decay_render_ms: 1.25 * scale,
+                    tier_tokenize_ms: 2.5 * scale,
+                    memory_render_ms: 3.75 * scale,
+                    mural_ms: 4.25 * scale,
+                    user_profile_ms: 5.5 * scale,
+                    retry_attempts: scale as usize,
+                },
+                ..Default::default()
+            };
+            let line = format_pass_timing_line("fixture", &timings, 0.0);
+            let fields = line
+                .split_whitespace()
+                .skip(1)
+                .map(|s| s.split_once('=').unwrap())
+                .collect::<BTreeMap<_, _>>();
+            for (key, value) in [
+                ("decay_render_ms", 1.25),
+                ("tier_tokenize_ms", 2.5),
+                ("memory_render_ms", 3.75),
+                ("mural_ms", 4.25),
+                ("user_profile_ms", 5.5),
+            ] {
+                assert_eq!(fields[key], format!("{:.3}", value * scale), "{key}");
+            }
+            assert_eq!(fields["retry_attempts"], (scale as usize).to_string());
+        }
+    }
+
+    #[test]
     fn pass_timing_line_is_parseable_for_an_empty_session() {
         let line = format_pass_timing_line("", &TransformTimings::default(), 0.0);
         let fields = line
@@ -14569,6 +14952,128 @@ pub(crate) mod tests {
             "cache_dirty_skips",
         ] {
             assert_eq!(fields[key], "0", "{key} renders as an integer");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the private read-only store fixture; release performance gate"]
+    fn aft_store_compose_replay_parity() {
+        use sha2::{Digest, Sha256};
+        let root = std::path::PathBuf::from(
+            std::env::var("AFT_COMPOSE_STORE").expect("fixture directory"),
+        );
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+        let session = manifest["session"].as_str().unwrap();
+        let project = manifest["project"].as_str().unwrap();
+        let mut expected = Vec::new();
+        for optimized in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::copy(root.join("store.db"), dir.path().join("store.db")).unwrap();
+            let conn = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+            conn.execute("DELETE FROM mc_cache_state", []).unwrap();
+            conn.execute("UPDATE cortexkit_fence SET epoch=1", [])
+                .unwrap();
+            drop(conn);
+            let s = store(dir.path());
+            let compartments = s.load_compartments(session).unwrap();
+            assert_eq!(compartments.len(), 1627);
+            let last = compartments.last().unwrap();
+            let (mid, part) = last.end_message_id.rsplit_once('#').unwrap();
+            let part: usize = part.parse().unwrap();
+            let mut messages = vec![wire_item(
+                "user",
+                mid,
+                last.end_message as u64,
+                &vec!["covered"; part + 1],
+            )];
+            messages.extend((1..=776).map(|i| {
+                item(
+                    &format!("fixture-tail-{i}"),
+                    last.end_message as u64 + i,
+                    &format!("tail {i} {}", "payload ".repeat(64)),
+                )
+            }));
+            let mut request = req(session, "fixture", messages);
+            request.serializer_profile = "opencode".into();
+            let mural = s
+                .load_project_mural_artifact(project)
+                .unwrap()
+                .expect("live mural");
+            request.mural = Some(crate::m0_compose::M0MuralInput {
+                enabled: true,
+                supports_vision: true,
+                data_url: Some(String::from_utf8(mural.data_url).unwrap()),
+                content_hash: Some(mural.content_hash),
+            });
+            let mut context = pctx(project, dir.path().to_str().unwrap(), 1_789_124_333_840);
+            context.memory_budget_tokens = 15_000.0;
+            context.inject_docs = false;
+            let estimator: fn(&str) -> usize = if optimized {
+                mc_tokenizer::estimate_tokens
+            } else {
+                |s| mc_tokenizer::encode_ordinary(s).len()
+            };
+            for (index, phase) in ["cold", "SOFT+", "SOFT", "HARD"].iter().enumerate() {
+                if index == 2 {
+                    let mut loaded = s.load(session).unwrap();
+                    loaded.meta.soft_refresh_pending = true;
+                    s.commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+                        .unwrap();
+                }
+                if index == 3 {
+                    request.render_config = "fixture-hard".into();
+                }
+                let execute_start = Instant::now();
+                let mut output = apply_once_with_estimator_and_projection(
+                    &s, &request, &context, estimator, None, None, optimized,
+                )
+                .unwrap();
+                output.response.timings.as_mut().unwrap().transform_execute =
+                    elapsed_ms(execute_start);
+                assert_eq!(
+                    output.response.decision,
+                    if index == 0 || index == 3 {
+                        "HARD"
+                    } else {
+                        phase
+                    }
+                );
+                let loaded = s.load(session).unwrap();
+                let hashes = ["m0", "m1"].map(|key| {
+                    let unit = loaded
+                        .core
+                        .frozen_units
+                        .iter()
+                        .find(|u| u.key == key)
+                        .unwrap();
+                    format!("{:x}", Sha256::digest(unit.frozen_payload.as_bytes()))
+                });
+                if optimized {
+                    expected.push(hashes.clone());
+                } else {
+                    assert_eq!(hashes, expected[index], "{phase}");
+                }
+                let timings = output.response.timings.as_ref().unwrap();
+                eprintln!(
+                    "aft-store optimized={optimized} phase={phase} m0={} m1={} {}",
+                    hashes[0],
+                    hashes[1],
+                    format_pass_timing_line(session, timings, 0.0)
+                );
+                if optimized && !cfg!(debug_assertions) {
+                    assert!(
+                        timings.compose_m0m1 < 1000.0,
+                        "compose {}ms",
+                        timings.compose_m0m1
+                    );
+                    assert!(
+                        timings.total < 2000.0,
+                        "synthetic-tail full pass {}ms",
+                        timings.total
+                    );
+                }
+            }
         }
     }
 
@@ -15007,8 +15512,11 @@ pub(crate) mod tests {
             1,
             &["Keep this authored request.\n\n<system-reminder>hidden transport</system-reminder>"],
         );
-        let mut request = req("surgical-strip", "cfg0", vec![mixed]);
-        request.protected_tags = 0;
+        let mut messages = vec![mixed];
+        messages.extend(
+            (2..=41).map(|ordinal| item(&format!("tail-{ordinal}"), ordinal, "authored tail")),
+        );
+        let request = req("surgical-strip", "cfg0", messages);
 
         let bust = run(&store, &request, &spine());
         assert_eq!(bust.action, "HARD");
@@ -15277,6 +15785,13 @@ pub(crate) mod tests {
         }
     }
 
+    fn protection_cutoff(cutoff: Option<i64>) -> TagNumberCutoffProjection {
+        TagNumberCutoffProjection {
+            coordinate_space: CoordinateSpace::TagNumber,
+            cutoff: cutoff.map(TagNumber),
+        }
+    }
+
     fn req(session: &str, cfg: &str, messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
             cache_ttl: None,
@@ -15293,6 +15808,8 @@ pub(crate) mod tests {
             upgrade_state: String::new(),
             is_subagent: false,
             protected_tags: 20,
+            protected_tags_present: false,
+            protected_tokens_effective: None,
             provider_id: None,
             model_key: None,
             clear_reasoning_age: DEFAULT_CLEAR_REASONING_AGE,
@@ -15335,6 +15852,36 @@ pub(crate) mod tests {
             constituents: Vec::new(),
             compaction_observed: false,
         }
+    }
+
+    #[test]
+    fn deprecated_protected_tags_is_wire_inert_and_noticed_once_per_session() {
+        let base = req("deprecated-count-wire-once", "cfg", Vec::new());
+        let mut wire = serde_json::to_value(base).unwrap();
+        wire["protected_tags"] = json!({ "legacy": "arbitrary" });
+        wire["protected_tokens_effective"] = json!(24_000);
+        let parsed: TransformRequest = serde_json::from_value(wire).unwrap();
+
+        assert!(parsed.protected_tags_present);
+        assert_eq!(parsed.protected_tags, default_protected_tags());
+        assert_eq!(parsed.protected_tokens_effective, Some(24_000));
+        assert!(claim_protected_tags_deprecation(&parsed));
+        assert!(!claim_protected_tags_deprecation(&parsed));
+
+        let mut legacy_only_wire =
+            serde_json::to_value(req("deprecated-count-does-not-convert", "cfg", Vec::new()))
+                .unwrap();
+        legacy_only_wire["protected_tags"] = json!(999_999);
+        legacy_only_wire
+            .as_object_mut()
+            .unwrap()
+            .remove("protected_tokens_effective");
+        let legacy_only: TransformRequest = serde_json::from_value(legacy_only_wire).unwrap();
+        assert_eq!(legacy_only.protected_tokens_effective, None);
+
+        let absent = req("deprecated-count-wire-absent", "cfg", Vec::new());
+        assert!(!absent.protected_tags_present);
+        assert!(!claim_protected_tags_deprecation(&absent));
     }
 
     fn spine() -> Vec<ReductionDecision> {
@@ -15482,6 +16029,8 @@ pub(crate) mod tests {
             temporal_awareness: true,
             now_ms,
             execute_threshold_percentage: 65.0,
+            protected_tokens_floor: 16_000,
+            protected_tokens_provenance: "derived",
             compaction_enabled: true,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
@@ -16411,6 +16960,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn production_number_wire_matches_pre_precision_feature_golden() {
+        #[derive(serde::Deserialize)]
+        struct NumberWireGolden {
+            schema: u32,
+            provenance: NumberWireProvenance,
+            message_json: String,
+            expected_utf8: String,
+            expected_sha256: String,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct NumberWireProvenance {
+            source_commit: String,
+        }
+
+        let golden: NumberWireGolden = serde_json::from_str(include_str!(
+            "../testdata/production-number-wire-golden.json"
+        ))
+        .expect("parse production number wire golden");
+        assert_eq!(golden.schema, 1);
+        assert_eq!(
+            golden.provenance.source_commit,
+            "b82df651518b1bae1b12540df64489fff4540dad"
+        );
+        let message: CkWireMessage =
+            serde_json::from_str(&golden.message_json).expect("parse golden served message");
+        let served = ServedMessage::from_message(message);
+        assert_eq!(served.canonical_bytes(), golden.expected_utf8.as_bytes());
+        assert_eq!(
+            format!("{:x}", Sha256::digest(served.canonical_bytes())),
+            golden.expected_sha256
+        );
+    }
+
+    #[test]
     fn canonical_message_serializer_matches_value_round_trip_for_golden_corpus() {
         let messages: Vec<CkWireMessage> =
             serde_json::from_str(include_str!("../testdata/ck_wire_golden.json")).unwrap();
@@ -17026,12 +17610,37 @@ pub(crate) mod tests {
         split.geometry = Some(TransformGeometry {
             usable_soft: 128_000,
             usable_hard: 168_000,
+            absolute_wall: 272_000,
             derivation: "s1-pre-carve/input=128000".to_string(),
         });
         let forced =
             transform_with_projection(&s, &split, &pctx("git:proj", "/nonexistent-docs", 0))
                 .unwrap();
         assert_eq!(forced.scheduler_pass, scheduler::PassDecision::Force85);
+
+        let proof_above_emergency_wall = ModuleUsage {
+            current_total_input_tokens: 255_834,
+            context_limit_tokens: 255_834,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
+        };
+        assert_eq!(
+            effective_context_limit_tokens(&proof_above_emergency_wall, split.geometry.as_ref()),
+            255_834.0,
+            "a proven denominator below absolute_wall may exceed usable_hard"
+        );
+
+        let poisoned_usage = ModuleUsage {
+            current_total_input_tokens: 285_310,
+            context_limit_tokens: 593_717,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
+        };
+        assert_eq!(
+            effective_context_limit_tokens(&poisoned_usage, split.geometry.as_ref()),
+            128_000.0,
+            "a host denominator above absolute_wall must fall back to geometry soft"
+        );
 
         let no_geometry = with_usage(
             req("single-geometry", "cfg0", vec![item("m1", 1, "hello")]),
@@ -17252,6 +17861,226 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cc_explicit_drop_specimen_holds_protected_results_until_aged() {
+        use crate::ck_wire::{CkKind, CkOutputKind, CkToolOutput, HarnessMeta, ProviderExtras};
+        let rows: Vec<(i64, String, String, i64)> = serde_json::from_str(include_str!(
+            "../tests/fixtures/explicit_drop_specimen.json"
+        ))
+        .unwrap();
+        let mut messages = Vec::new();
+        let mut tag_rows = Vec::new();
+        for (tag, kind, id, tokens) in &rows {
+            let mid = id.split('#').next().unwrap();
+            let ordinal: u64 = mid.strip_prefix("ccm-").unwrap().parse().unwrap();
+            let block = if kind == "tool_result" {
+                let call_id = format!("toolu_specimen_{tag}");
+                messages.push(CkIngressMessage {
+                    mid: format!("ccm-{}", ordinal - 1),
+                    ordinal: ordinal - 1,
+                    ck: CkWireMessage::from_parts(
+                        "assistant",
+                        vec![CkWireBlock::bare(CkKind::ToolCall {
+                            id: call_id.clone(),
+                            name: "read".into(),
+                            input: serde_json::json!({"tag": tag}),
+                            provider_executed: false,
+                        })],
+                        None,
+                        ProviderExtras::new(),
+                        HarnessMeta::default(),
+                    ),
+                });
+                CkKind::ToolResult {
+                    id: call_id,
+                    tool_name: "read".into(),
+                    output: CkToolOutput::bare(CkOutputKind::Text {
+                        text: "x".repeat(*tokens as usize * 4),
+                    }),
+                    provider_executed: false,
+                }
+            } else {
+                CkKind::Text {
+                    text: "x".repeat(*tokens as usize * 4),
+                }
+            };
+            // Text and the next call can share an assistant owner in Claude Code.
+            if messages.last().is_some_and(|message| message.mid == mid) {
+                panic!("fixture contains duplicate owner {mid}");
+            }
+            messages.push(CkIngressMessage {
+                mid: mid.into(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    if kind == "tool_result" {
+                        "user"
+                    } else {
+                        "assistant"
+                    },
+                    vec![CkWireBlock::bare(block)],
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta::default(),
+                ),
+            });
+            tag_rows.push(mc_store::McTagRow {
+                tag_number: *tag,
+                block_id: id.clone(),
+                kind: kind.clone(),
+                token_count: *tokens,
+                created_at_ms: 0,
+                source_bytes: Vec::new(),
+            });
+        }
+        // Coalesce assistant text and its following call under the same CC message id.
+        let mut merged: Vec<CkIngressMessage> = Vec::new();
+        for message in messages {
+            if let Some(previous) = merged
+                .last_mut()
+                .filter(|previous| previous.mid == message.mid)
+            {
+                let mut content = previous.ck.content.clone();
+                content.extend(message.ck.content);
+                previous.ck = CkWireMessage::from_parts(
+                    "assistant",
+                    content,
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta::default(),
+                );
+            } else {
+                merged.push(message);
+            }
+        }
+        let projection = project_messages(&merged).unwrap();
+        let token_map = tag_rows
+            .iter()
+            .map(|row| (row.block_id.as_str(), row.token_count as usize))
+            .collect();
+        let items = projection
+            .blocks
+            .iter()
+            .map(|block| sel_item_from_flat(block, &token_map))
+            .collect::<Vec<_>>();
+        let protected = ProtectionWindow::from_persisted_rows(&tag_rows, 30_000)
+            .row_identities
+            .block_ids;
+        assert_eq!(protected.len(), 29);
+        let mut ctx = SelectionContext {
+            pass_class: PassClass::EmergencyForce,
+            current_total_input_tokens: 158_855.0,
+            ceiling_tokens: 167_000.0 * 0.85,
+            last_execute_ordinal: 0,
+            scheduler_pressure_execute: true,
+            prior_input_sample: 158_855.0,
+            has_prior_drop: false,
+            agent_drop_ids: rows.iter().map(|row| row.2.clone()).collect(),
+            agent_drop_command_ids: HashMap::new(),
+            first_applied_agent_drop_ids: HashSet::new(),
+            // The observed pass was Force85, not the scheduler's Emergency95 backstop.
+            pass_already_busting: true,
+            supersession_ride_available: true,
+            emergency_window_yields: false,
+            tag_window_protected_block_ids: protected,
+            exempt_message_protected_block_ids: HashSet::new(),
+        };
+        let first = select_reductions_with_outcome(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig { smart_drops: false },
+        );
+        let mut applied = first
+            .decisions
+            .iter()
+            .map(|decision| decision.target_id.clone())
+            .collect::<HashSet<_>>();
+        for (tag, kind, id, _) in &rows {
+            let item = items.iter().find(|item| &item.id == id).unwrap();
+            let protected = ctx.tag_window_protected_block_ids.contains(id);
+            eprintln!(
+                "tag={tag} kind={kind} id={id} paired={} protected={protected} applied={}",
+                item.arc_id.is_some(),
+                applied.contains(id)
+            );
+            if kind == "tool_result" {
+                assert!(
+                    item.arc_id.is_some(),
+                    "result {tag} must pair with its assistant call"
+                );
+                assert!(protected, "result {tag} must be inside the recent window");
+                assert!(
+                    !applied.contains(id),
+                    "result {tag} stays queued while protected"
+                );
+            } else {
+                assert!(applied.contains(id), "unprotected text {tag} applies now");
+            }
+        }
+        assert_eq!(applied.len(), 3);
+        let emergency = first.emergency_drop_assessment.unwrap();
+        assert_eq!(emergency.candidate_tokens, 0.0);
+        assert_eq!(emergency.selected_reclaim_tokens, 0.0);
+
+        // Partial application consumes only the selected targets. The command-level
+        // first-application marker remains set while its other targets wait to age.
+        ctx.agent_drop_ids.retain(|id| !applied.contains(id));
+        assert_eq!(ctx.agent_drop_ids.len(), 29);
+        ctx.first_applied_agent_drop_ids
+            .extend(ctx.agent_drop_ids.iter().cloned());
+        ctx.has_prior_drop = true;
+        let still_protected = select_reductions_with_outcome(
+            &items,
+            &applied,
+            &ctx,
+            &SelectionConfig { smart_drops: false },
+        );
+        assert!(still_protected.decisions.is_empty());
+
+        // Three newer persisted tool tags fill the token budget and structural floor,
+        // moving the real protection window entirely past the queued specimen rows.
+        for n in 0..3 {
+            tag_rows.push(mc_store::McTagRow {
+                tag_number: 609 + n,
+                block_id: format!("newer-{n}#0"),
+                kind: "tool_result".into(),
+                token_count: 10_000,
+                created_at_ms: 0,
+                source_bytes: Vec::new(),
+            });
+        }
+        ctx.tag_window_protected_block_ids =
+            ProtectionWindow::from_persisted_rows(&tag_rows, 30_000)
+                .row_identities
+                .block_ids;
+        assert_eq!(ctx.tag_window_protected_block_ids.len(), 3);
+        assert!(ctx
+            .agent_drop_ids
+            .iter()
+            .all(|id| !ctx.tag_window_protected_block_ids.contains(id)));
+        let later = select_reductions_with_outcome(
+            &items,
+            &applied,
+            &ctx,
+            &SelectionConfig { smart_drops: false },
+        );
+        // The later bust may also reclaim unprotected call blocks automatically;
+        // count the explicit queue targets separately from those arc decisions.
+        let applied_remainder = later
+            .decisions
+            .into_iter()
+            .filter(|decision| ctx.agent_drop_ids.contains(&decision.target_id))
+            .collect::<Vec<_>>();
+        assert_eq!(applied_remainder.len(), 29);
+        for decision in applied_remainder {
+            assert_eq!(decision.kind, "drop");
+            applied.insert(decision.target_id);
+        }
+        ctx.agent_drop_ids.retain(|id| !applied.contains(id));
+        assert!(ctx.agent_drop_ids.is_empty());
+        assert_eq!(applied, rows.iter().map(|row| row.2.clone()).collect());
+    }
+
+    #[test]
     fn producer_gate_runs_on_execute_force_and_hard_advisory_never_plain_defer() {
         let ctx = smart_pctx();
 
@@ -17378,6 +18207,798 @@ pub(crate) mod tests {
             s.load_pending_agent_drops("ses").unwrap().is_empty(),
             "a cached-m1 repair HARD must consume the queued drop"
         );
+    }
+
+    #[test]
+    fn contract_caveman_episode_reopen_then_95() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let mut context = smart_pctx();
+        context.protected_tokens_floor = 0;
+        let mut request = with_usage(
+            req(
+                "ses",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    item("old", 3, &caveman_test_source("old")),
+                    assistant_tool_call("aged", 4, "aged"),
+                    tool_result("aged-result", 5, "aged", &"x".repeat(20_000)),
+                    item("tail", 6, "tail"),
+                ],
+            ),
+            90_000,
+            100_000,
+        );
+        request.caveman_enabled = true;
+        request.caveman_min_chars = 1;
+        request.protected_tokens_effective = Some(0);
+        let first = transform(&s, &request, &context).unwrap();
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|u| u.key == "cav:old#0"));
+        assert!(!s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|u| u.key == "red:aged#0"));
+        let bytes = serde_json::to_vec(&first.ck_messages).unwrap();
+        drop(s);
+        let s = store(dir.path());
+        for usage in [82_000, 85_000, 94_000] {
+            request = with_usage(request, usage, 100_000);
+            let held = transform_with_projection(&s, &request, &context).unwrap();
+            eprintln!(
+                "CONTRACT reopen usage={usage} scheduler={:?} action={} stable={}",
+                held.scheduler_pass,
+                held.response.action,
+                serde_json::to_vec(&held.response.ck_messages).unwrap() == bytes
+            );
+            assert_eq!(
+                serde_json::to_vec(&held.response.ck_messages).unwrap(),
+                bytes
+            );
+            assert!(s.load("ses").unwrap().meta.has_prior_emergency_drop);
+        }
+        request = with_usage(request, 96_000, 100_000);
+        let escaped = transform_with_projection(&s, &request, &context).unwrap();
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|u| u.key == "red:aged#0"));
+        eprintln!(
+            "CONTRACT reopen escape scheduler={:?} action={} reclaimed=aged",
+            escaped.scheduler_pass, escaped.response.action
+        );
+    }
+
+    #[test]
+    fn contract_zero_reclaim_protected_episode_until_95() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let context = smart_pctx();
+        let mut messages = vec![item("a", 1, "raw")];
+        for n in 0..5 {
+            let mut call =
+                assistant_tool_call(&format!("tool-{n}"), 2 + n * 2, &format!("call-{n}"));
+            if let ck_wire::CkKind::ToolCall { input, .. } = &mut call.ck.content[0].kind {
+                *input = json!({"file_path": format!("unique-{n}.rs")});
+            }
+            messages.push(call);
+            messages.push(tool_result(
+                &format!("result-{n}"),
+                3 + n * 2,
+                &format!("call-{n}"),
+                &"payload information ".repeat(1000),
+            ));
+        }
+        let mut request = with_usage(
+            active_cc_req("ses", "cfg-audit-bootstrap", messages),
+            90_000,
+            100_000,
+        );
+        request.protected_tokens_effective = Some(30_000);
+        let bootstrap = with_usage(request.clone(), 10_000, 100_000);
+        transform(&s, &bootstrap, &context).unwrap();
+        s.seed_tags_for_test(
+            "ses",
+            &(0..5)
+                .map(|n| mc_store::TagMintInput {
+                    block_id: format!("result-{n}#0"),
+                    kind: "tool_result".into(),
+                    token_count: 2001,
+                    source_bytes: "payload information ".repeat(1000).into_bytes(),
+                })
+                .collect::<Vec<_>>(),
+            1,
+        )
+        .unwrap();
+        eprintln!(
+            "CONTRACT pre-force tags={:?}",
+            s.load_tags_for_session("ses")
+                .unwrap()
+                .iter()
+                .map(|r| (&r.block_id, &r.kind, r.tag_number, r.token_count))
+                .collect::<Vec<_>>()
+        );
+        let first = transform_with_projection(&s, &request, &context).unwrap();
+        eprintln!(
+            "CONTRACT first force scheduler={:?} action={}",
+            first.scheduler_pass, first.response.action
+        );
+        let state = s.load("ses").unwrap();
+        eprintln!(
+            "CONTRACT rows={:?} units={:?} assessment={:?}",
+            s.load_tags_for_session("ses")
+                .unwrap()
+                .iter()
+                .map(|r| (&r.block_id, &r.kind, r.tag_number, r.token_count))
+                .collect::<Vec<_>>(),
+            state
+                .core
+                .frozen_units
+                .iter()
+                .map(|u| &u.key)
+                .collect::<Vec<_>>(),
+            state.meta.emergency_drop_assessment
+        );
+        assert!(!state.meta.has_prior_emergency_drop);
+        assert!(!state
+            .core
+            .frozen_units
+            .iter()
+            .any(|u| u.key.starts_with("red:")));
+        let assessment = state.meta.emergency_drop_assessment.unwrap();
+        assert_eq!(assessment.selected_reclaim_tokens, 0.0);
+        assert!(assessment.target_unreachable);
+        let bytes = serde_json::to_vec(&first.response.ck_messages).unwrap();
+        for usage in [82_000, 85_000, 94_000] {
+            request = with_usage(request, usage, 100_000);
+            let held = transform_with_projection(&s, &request, &context).unwrap();
+            assert_eq!(
+                serde_json::to_vec(&held.response.ck_messages).unwrap(),
+                bytes
+            );
+            assert!(!s.load("ses").unwrap().meta.has_prior_emergency_drop);
+            eprintln!("CONTRACT zero-reclaim usage={usage} scheduler={:?} action={} stable=true latch=true", held.scheduler_pass, held.response.action);
+        }
+        request = with_usage(request, 96_000, 100_000);
+        let escaped = transform_with_projection(&s, &request, &context).unwrap();
+        let count = s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .filter(|u| u.key.starts_with("red:result-"))
+            .count();
+        eprintln!("CONTRACT zero-reclaim escape scheduler={:?} action={} red_units={count} assessment={:?}", escaped.scheduler_pass, escaped.response.action, s.load("ses").unwrap().meta.emergency_drop_assessment);
+        request.render_config = "cfg-95-control".to_string();
+        let control = transform_with_projection(&s, &request, &context).unwrap();
+        let control_count = s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .filter(|u| u.key.starts_with("red:result-"))
+            .count();
+        eprintln!(
+            "CONTRACT zero-reclaim HARD control action={} red_units={control_count}",
+            control.response.action
+        );
+        assert!(control_count > 0);
+        assert!(count > 0, "95 must release protected result rows even after earlier call-only reductions; HARD control result drops={control_count}");
+    }
+
+    #[test]
+    fn contract_agent_drop_queued_inside_protected_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let context = smart_pctx();
+        let mut request = with_usage(
+            active_cc_req(
+                "ses",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    assistant_tool_call("protected-tool", 2, "protected-call"),
+                    tool_result("protected-result", 3, "protected-call", &"x".repeat(4000)),
+                ],
+            ),
+            10_000,
+            100_000,
+        );
+        request.protected_tokens_effective = Some(4000);
+        transform(&s, &request, &context).unwrap();
+        s.append_pending_agent_drops("ses", &["protected-result#0".to_string()], 1)
+            .unwrap();
+        let queued = transform_with_projection(&s, &request, &context).unwrap();
+        let pending = s.load_pending_agent_drops("ses").unwrap();
+        eprintln!(
+            "CONTRACT protected agent scheduler={:?} action={} pending={}",
+            queued.scheduler_pass,
+            queued.response.action,
+            pending.len()
+        );
+        assert_eq!(pending.len(), 1);
+        assert!(!s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|u| u.key == "red:protected-result#0"));
+        for n in 0..4 {
+            request.messages.push(assistant_tool_call(
+                &format!("new-{n}"),
+                4 + n * 2,
+                &format!("new-call-{n}"),
+            ));
+            request.messages.push(tool_result(
+                &format!("new-result-{n}"),
+                5 + n * 2,
+                &format!("new-call-{n}"),
+                &"y".repeat(8000),
+            ));
+        }
+        let aged = transform_with_projection(&s, &request, &context).unwrap();
+        eprintln!(
+            "CONTRACT aged agent scheduler={:?} action={} pending={}",
+            aged.scheduler_pass,
+            aged.response.action,
+            s.load_pending_agent_drops("ses").unwrap().len()
+        );
+        let aged = transform_with_projection(&s, &request, &context).unwrap();
+        eprintln!(
+            "CONTRACT persisted-aged agent scheduler={:?} action={} pending={}",
+            aged.scheduler_pass,
+            aged.response.action,
+            s.load_pending_agent_drops("ses").unwrap().len()
+        );
+        eprintln!(
+            "CONTRACT aged rows={:?}",
+            s.load_tags_for_session("ses")
+                .unwrap()
+                .iter()
+                .map(|r| (&r.block_id, &r.kind, r.tag_number, r.token_count))
+                .collect::<Vec<_>>()
+        );
+        request.render_config = "cfg-aged".to_string();
+        transform(&s, &request, &context).unwrap();
+        assert!(s.load_pending_agent_drops("ses").unwrap().is_empty());
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|u| u.key == "red:protected-result#0"));
+    }
+
+    #[test]
+    fn contract_boundaryless_zero_reclaim_keeps_episode_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let context = smart_pctx();
+        let mut messages = vec![item("a", 1, "raw")];
+        for n in 0..5 {
+            messages.push(assistant_tool_call(
+                &format!("tool-{n}"),
+                2 + n * 2,
+                &format!("call-{n}"),
+            ));
+            messages.push(tool_result(
+                &format!("result-{n}"),
+                3 + n * 2,
+                &format!("call-{n}"),
+                &"payload information ".repeat(1000),
+            ));
+        }
+        let mut request = with_usage(
+            active_cc_req("audit-boundaryless", "cfg0", messages),
+            10_000,
+            100_000,
+        );
+        request.protected_tokens_effective = Some(30_000);
+        transform(&s, &request, &context).unwrap();
+        let mut bytes = None;
+        for usage in [90_000, 82_000, 85_000, 94_000, 96_000] {
+            request = with_usage(request, usage, 100_000);
+            let response = transform_with_projection(&s, &request, &context).unwrap();
+            let current = serde_json::to_vec(&response.response.ck_messages).unwrap();
+            if let Some(previous) = &bytes {
+                assert_eq!(&current, previous);
+            }
+            bytes = Some(current);
+            let state = s.load("audit-boundaryless").unwrap();
+            assert!(!state.meta.has_prior_emergency_drop);
+            assert!(!state
+                .core
+                .frozen_units
+                .iter()
+                .any(|u| u.key.starts_with("red:")));
+            eprintln!(
+                "CONTRACT boundaryless usage={usage} scheduler={:?} action={} red=0 latch=true",
+                response.scheduler_pass, response.response.action
+            );
+        }
+    }
+
+    #[test]
+    fn contract_explicit_protected_drop_applies_at_95() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let context = smart_pctx();
+        let mut messages = vec![item("a", 1, "raw")];
+        for n in 0..5 {
+            messages.push(assistant_tool_call(
+                &format!("qtool-{n}"),
+                2 + n * 2,
+                &format!("qcall-{n}"),
+            ));
+            messages.push(tool_result(
+                &format!("qresult-{n}"),
+                3 + n * 2,
+                &format!("qcall-{n}"),
+                "small output",
+            ));
+        }
+        let mut request = with_usage(
+            active_cc_req("ses", "cfg-audit-bootstrap", messages),
+            10_000,
+            100_000,
+        );
+        request.protected_tokens_effective = Some(30_000);
+        transform(&s, &request, &context).unwrap();
+        s.seed_tags_for_test(
+            "ses",
+            &(0..5)
+                .map(|n| mc_store::TagMintInput {
+                    block_id: format!("qresult-{n}#0"),
+                    kind: "tool_result".into(),
+                    token_count: 3,
+                    source_bytes: b"small output".to_vec(),
+                })
+                .collect::<Vec<_>>(),
+            1,
+        )
+        .unwrap();
+        s.append_pending_agent_drops("ses", &["qresult-2#0".to_string()], 1)
+            .unwrap();
+        request = with_usage(request, 70_000, 100_000);
+        transform(&s, &request, &context).unwrap();
+        assert_eq!(s.load_pending_agent_drops("ses").unwrap().len(), 1);
+        request = with_usage(request, 96_000, 100_000);
+        let response = transform_with_projection(&s, &request, &context).unwrap();
+        let state = s.load("ses").unwrap();
+        eprintln!(
+            "CONTRACT explicit95 scheduler={:?} action={} pending={} units={:?}",
+            response.scheduler_pass,
+            response.response.action,
+            s.load_pending_agent_drops("ses").unwrap().len(),
+            state
+                .core
+                .frozen_units
+                .iter()
+                .map(|u| &u.key)
+                .collect::<Vec<_>>()
+        );
+        assert!(s.load_pending_agent_drops("ses").unwrap().is_empty());
+        assert!(state
+            .core
+            .frozen_units
+            .iter()
+            .any(|u| u.key == "red:qresult-2#0"));
+    }
+
+    // These episode fixtures need a genuinely aged result, not a call-only reduction
+    // beside a result still protected by the newest-three minimum. Persisted rows
+    // retain chronology even when their messages are outside the current projection.
+    fn age_episode_tools_past_newest_three(s: &McStore) {
+        s.seed_tags_for_test(
+            "ses",
+            &(0..3)
+                .map(|n| mc_store::TagMintInput {
+                    block_id: format!("newer-history-{n}#0"),
+                    kind: "tool_result".into(),
+                    token_count: 20_000,
+                    source_bytes: b"newer".to_vec(),
+                })
+                .collect::<Vec<_>>(),
+            1,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn force_episode_coalesces_lanes_and_defers_late_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let mut context = smart_pctx();
+        context.protected_tokens_floor = 0;
+        let mut messages = vec![
+            item("a", 1, "raw"),
+            item("m3", 3, &caveman_test_source("old user")),
+        ];
+        let named_call = |mid: &str, ordinal, name: &str| {
+            let mut message = assistant_tool_call(mid, ordinal, name);
+            if let ck_wire::CkKind::ToolCall {
+                name: tool_name,
+                input,
+                ..
+            } = &mut message.ck.content[0].kind
+            {
+                *tool_name = name.to_string();
+                *input = json!({"content": "input payload ".repeat(1000)});
+            }
+            message
+        };
+        messages.push(named_call("m8", 8, "aft_grep"));
+        messages.push(tool_result("m9", 9, "aft_grep", &"g".repeat(20_000)));
+        messages.push(named_call("m111", 111, "write"));
+        messages.push(tool_result("m112", 112, "write", &"w".repeat(20_000)));
+        messages.push(assistant_tool_call("reserved", 113, "reserved"));
+        messages.push(tool_result(
+            "reserved-result",
+            114,
+            "reserved",
+            &"r".repeat(20_000),
+        ));
+        messages.extend((115..140).map(|n| item(&format!("tail-{n}"), n, "tail")));
+        let mut request = with_usage(req("ses", "cfg0", messages), 90_000, 100_000);
+        request.serializer_profile = "claude-code-anthropic".to_string();
+        request.caveman_enabled = true;
+        request.caveman_min_chars = 1;
+        request.protected_tags = 0;
+        request.protected_tokens_effective = Some(0);
+        let mut bootstrap = with_usage(request.clone(), 50_000, 100_000);
+        bootstrap.messages.truncate(1);
+        bootstrap.caveman_enabled = false;
+        transform(&s, &bootstrap, &context).unwrap();
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.last_execute_ordinal = 112;
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        let first = transform(&s, &request, &context).unwrap();
+        assert_eq!(first.action, "SOFT");
+        let loaded = s.load("ses").unwrap();
+        assert!(loaded.meta.has_prior_emergency_drop);
+        assert!(loaded.meta.emergency_drain_active);
+        for key in ["red:m8#0", "red:m111#0", "cav:m3#0"] {
+            assert!(
+                loaded.core.frozen_units.iter().any(|u| u.key == key),
+                "missing {key}"
+            );
+        }
+        let bytes = serde_json::to_vec(&first.ck_messages).unwrap();
+        for usage in [90_100, 90_200] {
+            request = with_usage(request, usage, 100_000);
+            let next = transform(&s, &request, &context).unwrap();
+            assert!(
+                serde_json::to_vec(&next.ck_messages).unwrap() == bytes,
+                "force follow-up changed served bytes"
+            );
+        }
+        request
+            .messages
+            .push(assistant_tool_call("late", 141, "late"));
+        request
+            .messages
+            .push(tool_result("late-result", 142, "late", &"l".repeat(20_000)));
+        request = with_usage(request, 91_000, 100_000);
+        transform(&s, &request, &context).unwrap();
+        assert!(!s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|u| u.key == "red:late#0"));
+        age_episode_tools_past_newest_three(&s);
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.soft_refresh_pending = true;
+        loaded.meta.last_execute_ordinal = 142;
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        transform(&s, &request, &context).unwrap();
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|u| u.key == "red:late#0"));
+    }
+
+    #[test]
+    fn force_episode_submargin_dip_does_not_price_second_batch() {
+        for percentages in [
+            vec![
+                85.0964, 81.7246, 82.3389, 82.7754, 82.8856, 82.8856, 83.4737, 84.0778, 84.1683,
+                84.6623, 85.1096,
+            ],
+            vec![85.0425, 83.8479, 84.2479, 84.4868, 84.7048, 85.1850],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            bootstrap_covering_a(&s);
+            let context = smart_pctx();
+            let mut request = with_usage(
+                req(
+                    "ses",
+                    "cfg0",
+                    vec![
+                        item("a", 1, "raw"),
+                        item("old", 3, &caveman_test_source("old").repeat(16)),
+                        {
+                            let mut early = assistant_tool_call("early", 4, "early");
+                            if let ck_wire::CkKind::ToolCall { name, .. } =
+                                &mut early.ck.content[0].kind
+                            {
+                                *name = "bash".into();
+                            }
+                            early
+                        },
+                        tool_result("early-result", 5, "early", &"e".repeat(20_000)),
+                        item("protected", 6, &"tail content ".repeat(30_000)),
+                        item("newest-1", 7, "tail"),
+                        item("newest-2", 8, "tail"),
+                        {
+                            let mut newest = item("newest-3", 9, "continuation");
+                            newest.ck.role = "assistant".into();
+                            newest
+                        },
+                    ],
+                ),
+                (percentages[0] * 1670.0) as u64,
+                167_000,
+            );
+            request.caveman_enabled = true;
+            request.caveman_min_chars = 1;
+            request.protected_tokens_effective = Some(30_000);
+            request.protected_tags = 0;
+            transform(&s, &request, &context).unwrap();
+            let first = s.load("ses").unwrap();
+            assert!(first.meta.has_prior_emergency_drop);
+            assert!(
+                first
+                    .core
+                    .frozen_units
+                    .iter()
+                    .any(|unit| unit.key == "red:early#0"),
+                "units={:?}, assessment={:?}",
+                first
+                    .core
+                    .frozen_units
+                    .iter()
+                    .map(|unit| &unit.key)
+                    .collect::<Vec<_>>(),
+                first.meta.emergency_drop_assessment
+            );
+            let assessment = first.meta.emergency_drop_assessment.unwrap();
+            assert!(assessment.target_unreachable);
+            for percentage in percentages.iter().copied().skip(1) {
+                request = with_usage(request, (percentage * 1670.0) as u64, 167_000);
+                transform(&s, &request, &context).unwrap();
+                assert!(s.load("ses").unwrap().meta.emergency_drain_active);
+                assert!(
+                    s.load("ses").unwrap().meta.has_prior_emergency_drop,
+                    "episode cleared at {percentage}%"
+                );
+                assert_eq!(
+                    s.load("ses")
+                        .unwrap()
+                        .meta
+                        .emergency_drop_assessment
+                        .as_ref(),
+                    Some(&assessment)
+                );
+            }
+            request
+                .messages
+                .push(assistant_tool_call("late", 10, "late"));
+            request
+                .messages
+                .push(tool_result("late-result", 11, "late", &"x".repeat(8_000)));
+            // The final provider sample includes the newly appended 2k estimated tail.
+            let before = s.load("ses").unwrap().core.frozen_units;
+            transform(&s, &request, &context).unwrap();
+            let after = s.load("ses").unwrap();
+            assert!(after.meta.has_prior_emergency_drop);
+            assert_eq!(
+                after.core.frozen_units.len(),
+                before.len(),
+                "sub-margin dip must not mint another batch"
+            );
+            request = with_usage(request, 133_600, 167_000); // Exactly 80% is still held.
+            transform(&s, &request, &context).unwrap();
+            assert!(s.load("ses").unwrap().meta.has_prior_emergency_drop);
+            request = with_usage(request, 133_599, 167_000);
+            transform(&s, &request, &context).unwrap();
+            assert!(!s.load("ses").unwrap().meta.has_prior_emergency_drop);
+        }
+    }
+
+    #[test]
+    fn caveman_only_force_batch_holds_newly_aged_tool_until_independent_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let mut context = smart_pctx();
+        context.protected_tokens_floor = 0;
+        let mut request = with_usage(
+            req(
+                "ses",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    item("old", 3, &caveman_test_source("old")),
+                    assistant_tool_call("aged", 4, "aged"),
+                    tool_result("aged-result", 5, "aged", &"x".repeat(20_000)),
+                    item("tail", 6, "tail"),
+                ],
+            ),
+            90_000,
+            100_000,
+        );
+        request.caveman_enabled = true;
+        request.caveman_min_chars = 1;
+        request.protected_tags = 0;
+        request.protected_tokens_effective = Some(0);
+
+        let first = transform(&s, &request, &context).unwrap();
+        assert_eq!(first.action, "SOFT");
+        let first_state = s.load("ses").unwrap();
+        assert!(first_state.meta.has_prior_emergency_drop);
+        assert_eq!(first_state.meta.last_execute_ordinal, 6);
+        assert!(first_state
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "cav:old#0"));
+        assert!(!first_state
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:aged#0"));
+        let assessment = first_state
+            .meta
+            .emergency_drop_assessment
+            .as_ref()
+            .expect("the tiered tool lane must record its empty candidate walk");
+        assert_eq!(assessment.candidate_tokens, 0.0);
+        assert_eq!(assessment.selected_reclaim_tokens, 0.0);
+        assert!(assessment.target_unreachable);
+
+        age_episode_tools_past_newest_three(&s);
+        let first_bytes = serde_json::to_vec(&first.ck_messages).unwrap();
+        request = with_usage(request, 90_100, 100_000);
+        let held = transform(&s, &request, &context).unwrap();
+        assert_eq!(serde_json::to_vec(&held.ck_messages).unwrap(), first_bytes);
+        assert!(!s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:aged#0"));
+
+        s.append_compartments("ses", &[comp(2, 2, 3, "old#0", "published fold")])
+            .unwrap();
+        transform(&s, &request, &context).unwrap();
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "red:aged#0"));
+    }
+
+    #[test]
+    fn force_episode_empty_tool_lane_and_pressure_escape_controls() {
+        for escape in ["exit", "refresh", "hard", "fold", "emergency"] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            bootstrap_covering_a(&s);
+            let context = smart_pctx();
+            let mut request = with_usage(
+                req(
+                    "ses",
+                    "cfg0",
+                    vec![
+                        item("a", 1, "raw"),
+                        item("old", 3, &caveman_test_source("old")),
+                    ],
+                ),
+                90_000,
+                100_000,
+            );
+            request.caveman_enabled = true;
+            request.caveman_min_chars = 1;
+            request.protected_tokens_effective = Some(0);
+            let first = transform(&s, &request, &context).unwrap();
+            assert!(
+                s.load("ses")
+                    .unwrap()
+                    .core
+                    .frozen_units
+                    .iter()
+                    .any(|u| u.key == "cav:old#0"),
+                "empty tool lane must not block text"
+            );
+            let first_bytes = serde_json::to_vec(&first.ck_messages).unwrap();
+            request = with_usage(request, 90_100, 100_000);
+            assert!(
+                serde_json::to_vec(&transform(&s, &request, &context).unwrap().ck_messages)
+                    .unwrap()
+                    == first_bytes
+            );
+            request
+                .messages
+                .push(assistant_tool_call("late", 4, "late"));
+            request
+                .messages
+                .push(tool_result("late-result", 5, "late", &"x".repeat(20_000)));
+            for usage in [90_200, 90_300] {
+                request = with_usage(request, usage, 100_000);
+                transform(&s, &request, &context).unwrap();
+                assert!(!s
+                    .load("ses")
+                    .unwrap()
+                    .core
+                    .frozen_units
+                    .iter()
+                    .any(|u| u.key == "red:late#0"));
+            }
+            age_episode_tools_past_newest_three(&s);
+            let mut loaded = s.load("ses").unwrap();
+            loaded.meta.last_execute_ordinal = 5;
+            if escape == "refresh" {
+                loaded.meta.soft_refresh_pending = true;
+            }
+            s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+            match escape {
+                "exit" => {
+                    request = with_usage(request, 50_000, 100_000);
+                    transform(&s, &request, &context).unwrap();
+                    assert!(!s.load("ses").unwrap().meta.has_prior_emergency_drop);
+                    request = with_usage(request, 90_000, 100_000);
+                }
+                "hard" => request.render_config = "cfg-changed".to_string(),
+                "fold" => s
+                    .append_compartments("ses", &[comp(2, 2, 3, "old#0", "published fold")])
+                    .unwrap(),
+                "emergency" => request = with_usage(request, 96_000, 100_000),
+                _ => {}
+            }
+            transform(&s, &request, &context).unwrap();
+            assert!(
+                s.load("ses")
+                    .unwrap()
+                    .core
+                    .frozen_units
+                    .iter()
+                    .any(|u| u.key == "red:late#0"),
+                "escape {escape} must reclaim"
+            );
+        }
     }
 
     #[test]
@@ -17546,6 +19167,71 @@ pub(crate) mod tests {
         assert_eq!(observed.action, "HARD");
     }
 
+    fn assert_advisory_without_prefix_materialization(reconcile: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.last_execute_ordinal = 99;
+        if reconcile {
+            loaded.core.boundary_id = "missing#0".into();
+            loaded.core.reconcile_pending = true;
+        }
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        let before = loaded.core.frozen_units.clone();
+        let mut owner = assistant_tool_call("owner", 2, "old");
+        owner
+            .ck
+            .content
+            .extend(assistant_tool_call("unused", 2, "new").ck.content);
+        for block in &mut owner.ck.content {
+            if let ck_wire::CkKind::ToolCall { name, .. } = &mut block.kind {
+                *name = "mcp_read".into();
+            }
+        }
+        let mut results = tool_result("results", 3, "old", &"old output ".repeat(400));
+        results.ck.content.extend(
+            tool_result("unused-result", 3, "new", "new output")
+                .ck
+                .content,
+        );
+        let mut request = with_usage(
+            req(
+                "ses",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    owner,
+                    results,
+                    item("tail", 5, "continue"),
+                ],
+            ),
+            75,
+            100,
+        );
+        // The reductions-only subagent branch never executes a prefix plan,
+        // even if it receives inherited HARD or reconcile state.
+        request.is_subagent = true;
+        let mut context = pctx("git:proj", "/nonexistent-docs", 300_002);
+        context.observed_last_response_at_ms = Some(1);
+        let response = transform(&s, &request, &context).unwrap();
+        assert_ne!(response.action, "HARD");
+        let after = s.load("ses").unwrap();
+        assert_eq!(after.core.frozen_units, before, "reconcile={reconcile}");
+        assert_eq!(after.meta.last_execute_ordinal, 99);
+    }
+
+    #[test]
+    fn hard_advisory_without_prefix_materialization_cannot_price_reductions() {
+        assert_advisory_without_prefix_materialization(false);
+    }
+
+    #[test]
+    fn reconcile_advisory_without_prefix_materialization_cannot_price_reductions() {
+        assert_advisory_without_prefix_materialization(true);
+    }
+
     #[test]
     fn reconcile_pending_disables_two_pass_selector() {
         let dir = tempfile::tempdir().unwrap();
@@ -17628,11 +19314,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cc_publish_on_execute_applies_immediately_and_latch_bypasses_historian_veto() {
+    fn cc_publish_on_execute_drains_even_during_historian_without_latch() {
         for (latched, historian_active, applies) in [
             (false, false, true),
             (true, true, true),
-            (false, true, false),
+            (false, true, true),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
@@ -17669,6 +19355,46 @@ pub(crate) mod tests {
             assert_eq!(m1_bytes(&published).contains("PUBLISHED"), applies);
             assert_eq!(s.load("ses").unwrap().meta.emergency_drain_active, latched);
         }
+    }
+
+    #[test]
+    fn published_history_and_age_reclaim_share_one_bust_during_historian() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ride", &[comp(1, 1, 1, "anchor", "BASELINE")])
+            .unwrap();
+        let raw = cc_req(
+            "ride",
+            "cfg0",
+            vec![
+                item("anchor", 1, "baseline"),
+                item("end", 2, "published history"),
+                item("second", 3, "next publication"),
+                assistant_tool_call("old-call", 4, "old-tool"),
+                tool_result("old-result", 5, "old-tool", &"old output ".repeat(200)),
+                item("tail", 6, "continue"),
+            ],
+        );
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 2000);
+        ctx.cache_ttl = "never".into();
+        let boot = transform(&s, &with_usage(raw.clone(), 10, 100), &ctx).unwrap();
+        let only_age = transform(&s, &with_usage(raw.clone(), 75, 100), &ctx).unwrap();
+        assert_eq!(only_age.action, "SOFT+");
+        assert_eq!(only_age.messages(), boot.messages());
+        s.append_compartments("ride", &[comp(2, 2, 2, "end", "PUBLISHED_A")])
+            .unwrap();
+        ctx.historian_active = true;
+        let pass_n = transform(&s, &with_usage(raw.clone(), 75, 100), &ctx).unwrap();
+        assert!(m1_bytes(&pass_n).contains("PUBLISHED_A"));
+        assert!(frozen_red_payload(&s.load("ride").unwrap().core, "old-result#0").is_some());
+        ctx.historian_active = false;
+        s.append_compartments("ride", &[comp(3, 3, 3, "second", "PUBLISHED_B")])
+            .unwrap();
+        let replay = transform(&s, &with_usage(raw.clone(), 10, 100), &ctx).unwrap();
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(replay.messages(), pass_n.messages());
+        let next = transform(&s, &with_usage(raw, 75, 100), &ctx).unwrap();
+        assert!(m1_bytes(&next).contains("PUBLISHED_B"));
     }
 
     #[test]
@@ -17935,7 +19661,7 @@ pub(crate) mod tests {
         let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
         let boot = run(&s, &execute_req, &spine());
         assert_eq!(boot.action, "HARD");
-        s.update_memory_content("git:proj", memory_id, "pending rule", 1)
+        s.update_memory_content("git:proj", memory_id, "pending rule", None, 1)
             .unwrap();
 
         let consumed =
@@ -18309,6 +20035,7 @@ pub(crate) mod tests {
         assert!(s.load("ses").unwrap().meta.last_todo_state.is_none());
         let before = serde_json::to_vec(&boot.ck_messages).unwrap();
         let before_native = opencode_native_bytes(&boot, "ses");
+        let watermark_before = s.load("ses").unwrap().meta.last_execute_ordinal;
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.observed_last_response_at_ms = Some(0);
         let execute = transform(&s, &execute_req, &ctx).unwrap();
@@ -18319,7 +20046,7 @@ pub(crate) mod tests {
         assert_eq!(opencode_native_bytes(&execute, "ses"), before_native);
         let meta = s.load("ses").unwrap().meta;
         assert_eq!(
-            meta.last_execute_ordinal, 0,
+            meta.last_execute_ordinal, watermark_before,
             "zero-drop execute must keep the two-pass watermark frozen"
         );
         // And the pass after it, with an unchanged tail, is a true no-write defer.
@@ -18329,12 +20056,81 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn state_sync_todo_pending_rides_execute_to_native_wire_and_defers_identically() {
+    fn synthetic_todo_ride_only_differential_golden_matches_typescript() {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/todo-ride-only.json")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = req(
+            "todo-golden",
+            "cfg0",
+            vec![item("u1", 1, "please help"), item("a1", 2, "on it")],
+        );
+        request.todo_tool_present = Some(true);
+        let mut context = pctx("git:proj", "/nonexistent-docs", 0);
+        context.cache_ttl = "never".into();
+        let mut previous = Vec::new();
+        for step in golden["steps"].as_array().unwrap() {
+            if !step["state"].is_null() {
+                let mut loaded = s.load("todo-golden").unwrap();
+                loaded.meta.last_todo_state = Some(serde_json::to_string(&step["state"]).unwrap());
+                s.commit(
+                    "todo-golden",
+                    loaded.row_version,
+                    &loaded.core,
+                    &loaded.meta,
+                )
+                .unwrap();
+            }
+            if step["flush"] == true {
+                s.arm_soft_refresh("todo-golden").unwrap();
+            }
+            let response = transform(
+                &s,
+                &with_usage(
+                    request.clone(),
+                    if step["execute"] == true { 75 } else { 10 },
+                    100,
+                ),
+                &context,
+            )
+            .unwrap();
+            let todos = response
+                .messages()
+                .iter()
+                .flat_map(|m| &m.content)
+                .find_map(|block| {
+                    if let ck_wire::CkKind::ToolCall {
+                        id, name, input, ..
+                    } = &block.kind
+                    {
+                        if name == "todowrite" && id.starts_with("mc_synthetic_todo_") {
+                            return Some(input["todos"].clone());
+                        }
+                    }
+                    None
+                })
+                .unwrap_or(serde_json::Value::Null);
+            assert_eq!(todos, step["expectedTodo"], "{}", step["name"]);
+            let wire = serde_json::to_vec(response.messages()).unwrap();
+            if step["replay"] == true {
+                assert_eq!(response.action, "SOFT+", "{}", step["name"]);
+                assert_eq!(wire, previous, "{}", step["name"]);
+            } else {
+                assert_ne!(wire, previous);
+            }
+            previous = wire;
+        }
+    }
+
+    #[test]
+    fn state_sync_todo_waits_for_priced_execute_and_defers_identically() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let mut request = req("todo-sync", "cfg0", vec![item("a", 1, "raw")]);
         request.todo_tool_present = Some(true);
-        assert_eq!(run(&s, &request, &spine()).action, "HARD");
+        let bootstrap = run(&s, &request, &spine());
+        assert_eq!(bootstrap.action, "HARD");
 
         let state_json =
             r#"[{"content":"State sync todo","status":"in_progress","priority":"high"}]"#;
@@ -18375,6 +20171,10 @@ pub(crate) mod tests {
         })
         .unwrap();
 
+        let pending = run(&s, &with_usage(request.clone(), 70, 100), &spine());
+        assert_eq!(pending.action, "SOFT+");
+        assert_eq!(pending.messages(), bootstrap.messages());
+        s.arm_soft_refresh("todo-sync").unwrap();
         let bust = run(&s, &with_usage(request.clone(), 70, 100), &spine());
         assert_eq!(bust.action, "SOFT");
         let expected_call_id = "mc_synthetic_todo_c4a22134ee90be17";
@@ -18464,6 +20264,10 @@ pub(crate) mod tests {
             Some("todo-before")
         );
 
+        let pressure_only = run(&s, &with_usage(disabled.clone(), 70, 100), &spine());
+        assert_eq!(pressure_only.action, "SOFT+");
+        assert_eq!(synthetic_todo_pair_bytes(&pressure_only), frozen_pair);
+        s.arm_soft_refresh("todo-disabled").unwrap();
         let bust = run(&s, &with_usage(disabled, 70, 100), &spine());
         assert!(bust.committed);
         assert!(bust.messages().iter().all(|message| {
@@ -18483,7 +20287,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn low_usage_ttl_fold_neither_age_reclaims_nor_advances_the_watermark() {
+    fn low_usage_ttl_fold_carries_age_reclaim_without_pressure() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -18514,8 +20318,8 @@ pub(crate) mod tests {
                 .core
                 .frozen_units
                 .iter()
-                .all(|unit| !unit.key.starts_with("red:m1#") && !unit.key.starts_with("red:m2#")),
-            "an idle-TTL fold must not run the pressure-only age sweep"
+                .any(|unit| unit.key.starts_with("red:m1#") || unit.key.starts_with("red:m2#")),
+            "an idle-TTL fold carries the waiting age sweep on the same bust"
         );
     }
 
@@ -19009,17 +20813,6 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(boot.action, "HARD");
 
-        // Stamp the watermark over the aged arc with an empty riding opportunity.
-        s.arm_soft_refresh(SESSION).unwrap();
-        let stamp = transform(
-            &s,
-            &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
-            &context,
-        )
-        .unwrap();
-        assert_eq!(stamp.action, "SOFT");
-        assert_eq!(s.load(SESSION).unwrap().meta.last_execute_ordinal, 3);
-
         // Mint a fresh arc above the watermark; a low-usage defer cannot move it.
         messages.push(assistant_edit_call("fresh-call", 4, "fresh-edit", "a.txt"));
         messages.push(edit_result("fresh-result", 5, "fresh-edit", "fresh output"));
@@ -19032,23 +20825,11 @@ pub(crate) mod tests {
         assert_eq!(minted.action, "SOFT+");
         assert_eq!(s.load(SESSION).unwrap().meta.last_execute_ordinal, 3);
 
-        // Queue a pending memory change: it reaches the rendered m1 memory block only
-        // when a bust materializes it, and an engaged veto defers that. The queued change
-        // therefore makes the veto itself observable on the ordinary pass below.
-        s.insert_memory(memory_input(
-            "git:proj",
-            "ARCHITECTURE",
-            "veto probe rule",
-            0,
-        ))
-        .unwrap();
-
         let mut veto_ctx = pctx("git:proj", "/nonexistent-docs", 0);
         veto_ctx.cache_ttl = "never".to_string();
         veto_ctx.historian_active = true;
 
-        // Ordinary execute under the historian veto: the veto engages (the m1 delta stays
-        // queued), the age batch is not admitted and the watermark stays frozen.
+        // With no published delta, ordinary pressure cannot originate an age bust.
         let ordinary = transform(
             &s,
             &with_usage(req(SESSION, "cfg0", messages.clone()), 70, 100),
@@ -19058,10 +20839,6 @@ pub(crate) mod tests {
         assert_eq!(
             ordinary.action, "SOFT+",
             "the vetoed ordinary execute must stay defer-shaped"
-        );
-        assert!(
-            !m1_bytes(&ordinary).contains("veto probe rule"),
-            "the engaged historian veto must defer the queued m1 delta"
         );
         let loaded = s.load(SESSION).unwrap();
         assert_eq!(
@@ -19079,10 +20856,6 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(force.action, "SOFT");
-        assert!(
-            m1_bytes(&force).contains("veto probe rule"),
-            "the force pass busts and consumes the queued m1 delta"
-        );
         let loaded = s.load(SESSION).unwrap();
         assert!(
             frozen_red_payload(&loaded.core, "aged-call#0").is_some(),
@@ -19132,9 +20905,14 @@ pub(crate) mod tests {
         assert_eq!(boot.action, "HARD");
         assert_eq!(
             s.load(SESSION).unwrap().meta.last_execute_ordinal,
-            0,
-            "a no-pressure boot must not stamp the watermark"
+            4,
+            "bootstrap is an independently priced fold"
         );
+        // Seed the legacy zero-watermark state to exercise an empty native batch.
+        let mut loaded = s.load(SESSION).unwrap();
+        loaded.meta.last_execute_ordinal = 0;
+        s.commit(SESSION, loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
 
         // Riding pass under injection: the native batch (empty at a zero watermark) is
         // replaced by the injected decision, yet the opportunity predicate still advances
@@ -21491,7 +23269,7 @@ pub(crate) mod tests {
                 &mut native,
                 std::slice::from_ref(&live.ck),
                 &ingress,
-                u64::MAX,
+                &[],
                 false,
             ),
             0
@@ -22045,6 +23823,9 @@ pub(crate) mod tests {
         );
     }
 
+    include!("transform/reasoning_clear_tests.rs");
+    include!("transform/reasoning_clear_gate_tests.rs");
+
     #[test]
     fn reasoning_cutoff_batches_on_one_fold_and_survives_restart() {
         fn signed_assistant(mid: &str, ordinal: u64) -> CkIngressMessage {
@@ -22481,7 +24262,7 @@ pub(crate) mod tests {
                 &mut native,
                 &served,
                 &ingress,
-                60,
+                &[strip_unit("reasoning_clear", "old", "")],
                 false,
             ),
             1,
@@ -22497,7 +24278,7 @@ pub(crate) mod tests {
                 &mut native,
                 &served,
                 &ingress,
-                60,
+                &[strip_unit("reasoning_clear", "old", "")],
                 false,
             ),
             0
@@ -22521,7 +24302,7 @@ pub(crate) mod tests {
                 &mut in_flight,
                 &served,
                 &ingress,
-                60,
+                &[strip_unit("reasoning_clear", "old", "")],
                 true,
             ),
             1
@@ -22615,7 +24396,7 @@ pub(crate) mod tests {
                     &mut native,
                     std::slice::from_ref(&message),
                     &ingress,
-                    1,
+                    &[strip_unit("reasoning_clear", "assistant", "")],
                     false,
                 ),
                 0
@@ -23616,10 +25397,10 @@ pub(crate) mod tests {
                 .map(|part| part["state"]["input"].clone())
                 .collect::<Vec<_>>(),
             vec![
-                json!({ "detail": "xxxxx...[truncated]", "path": "a.txt" }),
-                json!({ "detail": "yyyyy...[truncated]", "path": "b.txt" }),
+                json!({ "dropped": "[dropped]" }),
+                json!({ "dropped": "[dropped]" }),
             ],
-            "model-visible native calls must retain only real argument keys"
+            "model-visible native calls must expose only the dropped-input marker"
         );
         assert!(parts.iter().all(|part| {
             part["state"]["status"] == "completed"
@@ -24913,7 +26694,7 @@ pub(crate) mod tests {
         );
         assert_eq!(before.action, "HARD");
 
-        s.update_memory_content("git:proj", memory_id, "corrected", 1)
+        s.update_memory_content("git:proj", memory_id, "corrected", None, 1)
             .unwrap();
         s.arm_soft_refresh("ses").unwrap();
         let soft = run(
@@ -25691,7 +27472,7 @@ pub(crate) mod tests {
         let first_stats = crate::attach_native_messages_incremental(
             &mut first,
             &request,
-            0,
+            &[],
             &BTreeMap::new(),
             None,
             None,
@@ -25721,7 +27502,7 @@ pub(crate) mod tests {
         let replay_stats = crate::attach_native_messages_incremental(
             &mut replay,
             &request,
-            0,
+            &[],
             &BTreeMap::new(),
             None,
             None,
@@ -25890,7 +27671,7 @@ pub(crate) mod tests {
         crate::attach_native_messages_incremental(
             &mut first_native,
             &first_request,
-            0,
+            &[],
             &BTreeMap::new(),
             None,
             None,
@@ -25917,7 +27698,7 @@ pub(crate) mod tests {
         let stats = crate::attach_native_messages_incremental(
             &mut moved_native,
             &moved_request,
-            0,
+            &[],
             &BTreeMap::new(),
             None,
             None,
@@ -26453,6 +28234,7 @@ pub(crate) mod tests {
                 "git:proj",
                 *memory_id,
                 &format!("updated rule {revision}"),
+                None,
                 revision as i64 + 1,
             )
             .unwrap();
@@ -26651,7 +28433,7 @@ pub(crate) mod tests {
         let transitioned_config = s.load("opencode-flip").unwrap().meta.last_render_config;
         assert_eq!(transition.action, "HARD");
         assert_ne!(transitioned_config, before_config);
-        assert!(transitioned_config.contains("tfe:4:tfe3"));
+        assert!(transitioned_config.contains("tfe:4:tfe4"));
         assert!(!serde_json::to_string(transition.messages())
             .unwrap()
             .contains("§1§"));
@@ -26693,7 +28475,7 @@ pub(crate) mod tests {
             .unwrap()
             .meta
             .last_render_config
-            .contains("tfe:4:tfe3"));
+            .contains("tfe:4:tfe4"));
 
         let after_commit = run(&s, &request, &spine());
         assert_eq!(after_commit.action, "SOFT+");
@@ -26715,7 +28497,7 @@ pub(crate) mod tests {
             .unwrap()
             .meta
             .last_render_config
-            .contains("tfe3"));
+            .contains("tfe4"));
 
         let replay = run(&s, &request, &spine());
         assert_eq!(replay.action, "SOFT+");
@@ -27798,7 +29580,7 @@ pub(crate) mod tests {
                 "user",
                 "m1",
                 1,
-                &["rust ownership beta <sidekick-augmentation>existing</sidekick-augmentation>"],
+                &["rust ownership beta <ctx-search-hint>existing</ctx-search-hint>"],
             )],
         );
         let stacked_projection = project_messages(&stacked_request.messages).unwrap();
@@ -28982,28 +30764,36 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn channel1_hygiene_ratio_nudge_replays_and_suppresses_refire() {
+    fn channel1_hygiene_ratio_nudge_replays_and_structural_minimum_suppresses_refire() {
         run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
             let huge = "word ".repeat(40_000);
-            let messages = vec![
-                assistant_tool_call("call1", 1, "c1"),
-                tool_result("result1", 2, "c1", &huge),
-                assistant_tool_call("call2", 3, "c2"),
-                tool_result("result2", 4, "c2", &huge),
-            ];
+            let mut messages = Vec::new();
+            for number in 1..=5 {
+                messages.push(assistant_tool_call(
+                    &format!("call{number}"),
+                    number * 2 - 1,
+                    &format!("c{number}"),
+                ));
+                messages.push(tool_result(
+                    &format!("result{number}"),
+                    number * 2,
+                    &format!("c{number}"),
+                    &huge,
+                ));
+            }
             let mut request = active_cc_req("nudge", "cfg0", messages.clone());
             request.protected_tags = 0;
             let request = with_usage(request, 900, 1024);
             run(&s, &request, &spine());
             let first = run(&s, &request, &spine());
-            let first_result = tail_bytes(&first, "result2").to_string();
+            let first_result = tail_bytes(&first, "result5").to_string();
             assert!(first_result.contains("<system-reminder>"));
             assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
 
             let replay = run(&s, &request, &spine());
-            assert_eq!(tail_bytes(&replay, "result2"), first_result);
+            assert_eq!(tail_bytes(&replay, "result5"), first_result);
             assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
 
             let mut grace_meta = s.load("nudge").unwrap();
@@ -29021,7 +30811,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let grace_replay = run(&s, &request, &spine());
-            assert_eq!(tail_bytes(&grace_replay, "result2"), first_result);
+            assert_eq!(tail_bytes(&grace_replay, "result5"), first_result);
             assert_eq!(
                 grace_replay
                     .messages()
@@ -29052,40 +30842,41 @@ pub(crate) mod tests {
             .unwrap();
 
             let mut refire_messages = messages;
-            refire_messages.push(assistant_tool_call("call3", 5, "c3"));
-            refire_messages.push(tool_result("result3", 6, "c3", &huge));
+            refire_messages.push(assistant_tool_call("call6", 11, "c6"));
+            let refire_huge = huge.repeat(3);
+            refire_messages.push(tool_result("result6", 12, "c6", &refire_huge));
             let mut refire_request = active_cc_req("nudge", "cfg0", refire_messages.clone());
             refire_request.protected_tags = 0;
             let refire_request = with_usage(refire_request, 900, 1024);
             let sticky = run(&s, &refire_request, &spine());
-            let sticky_result = tail_bytes(&sticky, "result3").to_string();
+            let sticky_result = tail_bytes(&sticky, "result6").to_string();
             assert_eq!(
-                tail_bytes(&sticky, "result2"),
+                tail_bytes(&sticky, "result5"),
                 first_result,
-                "the first reminder span is frozen while the new cache-busting tail appends its own span"
+                "the first reminder stays frozen while the structural minimum suppresses a new span"
             );
             assert!(
-                sticky_result.contains("Reminder: "),
-                "expected sticky refire, got {sticky_result}"
+                !sticky_result.contains("Reminder: "),
+                "the newest-three structural minimum must suppress this refire"
             );
-            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 2);
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
             let sticky_replay = run(&s, &refire_request, &spine());
-            assert_eq!(tail_bytes(&sticky_replay, "result3"), sticky_result);
-            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 2);
+            assert_eq!(tail_bytes(&sticky_replay, "result6"), sticky_result);
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
 
             let mut loaded = s.load("nudge").unwrap();
             loaded.meta.channel1_reduce_suppressed = true;
             s.commit("nudge", loaded.row_version, &loaded.core, &loaded.meta)
                 .unwrap();
-            refire_messages.push(assistant_tool_call("call4", 7, "c4"));
-            refire_messages.push(tool_result("result4", 8, "c4", &huge));
+            refire_messages.push(assistant_tool_call("call7", 13, "c7"));
+            refire_messages.push(tool_result("result7", 14, "c7", &huge));
             let mut suppressed_request = active_cc_req("nudge", "cfg0", refire_messages);
             suppressed_request.protected_tags = 0;
             let suppressed = run(&s, &with_usage(suppressed_request, 900, 1024), &spine());
-            assert!(tail_bytes(&suppressed, "result2").contains("<system-reminder>"));
-            assert!(tail_bytes(&suppressed, "result3").contains("<system-reminder>"));
-            assert!(!tail_bytes(&suppressed, "result4").contains("<system-reminder>"));
-            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 2);
+            assert!(tail_bytes(&suppressed, "result5").contains("<system-reminder>"));
+            assert!(!tail_bytes(&suppressed, "result6").contains("<system-reminder>"));
+            assert!(!tail_bytes(&suppressed, "result7").contains("<system-reminder>"));
+            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
         });
     }
 
@@ -29120,7 +30911,7 @@ pub(crate) mod tests {
             s.append_pending_agent_drops_with_command(
                 "drop-grace",
                 Some("drop-two-arcs"),
-                &["result4#0".to_string()],
+                &["result1#0".to_string()],
                 1,
                 false,
             )
@@ -29134,7 +30925,7 @@ pub(crate) mod tests {
             let applying = run(&s, &applying_request, &spine());
             let after_applying = s.load("drop-grace").unwrap();
             assert!(
-                frozen_red_targets(&after_applying.core).contains("result4#0"),
+                frozen_red_targets(&after_applying.core).contains("result1#0"),
                 "pending drop was not applied: {:?}",
                 s.load_pending_agent_drops("drop-grace").unwrap(),
             );
@@ -29204,7 +30995,7 @@ pub(crate) mod tests {
         let on_config = store.load("surface-flip").unwrap().meta.last_render_config;
         assert!(on_config.contains("tf1"));
         assert!(on_config.contains("gfull"));
-        assert!(on_config.contains("tfe:4:tfe3"));
+        assert!(on_config.contains("tfe:4:tfe4"));
         let on_steady = run(&store, &active, &spine());
         assert_ne!(on_steady.action, "HARD");
         assert_eq!(on_steady.surface_state, SurfaceState::Active);
@@ -29737,8 +31528,10 @@ pub(crate) mod tests {
         let initial_store = store(dir.path());
         let messages = vec![
             item("covered", 0, "covered"),
-            item("first", 1, "first"),
-            item("held", 2, "held"),
+            assistant_tool_call("call1", 1, "c1"),
+            tool_result("result1", 2, "c1", "first"),
+            assistant_tool_call("call2", 3, "c2"),
+            tool_result("result2", 4, "c2", "held"),
         ];
         initial_store
             .replace_compartments("held-output", &[comp(1, 0, 0, "covered", "summary")])
@@ -29752,7 +31545,7 @@ pub(crate) mod tests {
             .append_pending_agent_drops_with_command(
                 "held-output",
                 Some("command-a"),
-                &["first#0".to_string(), "held#0".to_string()],
+                &["result1#0".to_string(), "result2#0".to_string()],
                 1,
                 false,
             )
@@ -29804,7 +31597,7 @@ pub(crate) mod tests {
             assert!(
                 frozen_red_payload(
                     &store_after_restart.load("held-output").unwrap().core,
-                    "held#0",
+                    "result2#0",
                 )
                 .is_none(),
                 "a held remainder must remain unfrozen until a ride opportunity"
@@ -29913,214 +31706,332 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn newest_tag_block_set_isolates_protected_and_applied_pending_rows() {
+    fn persisted_tool_row_set_protects_pending_drops_by_exact_identity() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        // The protected set is the newest 20 ACTIVE tags as exact block ids.
-        // This fixture is built so every cheaper implementation class fails at
-        // the rank-20 boundary itself, not just at the extremes:
-        //   - ACTIVE numbers have holes: m23#0 is stale-provenance and three
-        //     "ghost" rows hold the TOP numbers (26-28) for blocks absent from
-        //     the array, so any numeric-threshold cutoff (from the active max
-        //     or the global max) lands on the wrong rows.
-        //   - Ordinal 24 carries TWO tagged blocks (m24#0, m24#1), so
-        //     one-block-per-ordinal counting shifts the boundary by one.
-        // Active numbers: {1..22, 24, 25} (24 rows). Newest 20 by number:
-        // {5..22, 24, 25} — the boundary pair is number 5 (rank 20, protected)
-        // vs number 4 (rank 21, applied), and both carry pending drops.
-        let mut messages = (1..=24)
-            .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
-            .collect::<Vec<_>>();
-        messages[23] = two_block_item("m24", 24, "text 24", "attachment 24");
-
-        let mut tags = (1..=24)
-            .map(|ordinal| TagMintInput {
-                block_id: format!("m{ordinal}#0"),
-                kind: "message".to_string(),
-                token_count: 1,
-                source_bytes: if ordinal == 23 {
-                    // Stale provenance: stored bytes no longer match the live
-                    // carrier, so this row must not occupy a protected slot.
-                    b"text from a previous life".to_vec()
-                } else {
-                    format!("text {ordinal}").into_bytes()
-                },
-            })
-            .collect::<Vec<_>>();
-        tags.push(TagMintInput {
-            block_id: "m24#1".to_string(),
-            kind: "message".to_string(),
-            token_count: 1,
-            source_bytes: b"attachment 24".to_vec(),
-        });
-        for ghost in 1..=3 {
-            tags.push(TagMintInput {
-                block_id: format!("ghost{ghost}#0"),
-                kind: "message".to_string(),
-                token_count: 1,
-                source_bytes: b"ghost".to_vec(),
-            });
+        let payload = "word ".repeat(1_000);
+        let mut messages = Vec::new();
+        for number in 1..=5 {
+            messages.push(assistant_tool_call(
+                &format!("call{number}"),
+                number * 2 - 1,
+                &format!("c{number}"),
+            ));
+            messages.push(tool_result(
+                &format!("result{number}"),
+                number * 2,
+                &format!("c{number}"),
+                &payload,
+            ));
         }
-        store.seed_tags_for_test("protected", &tags, 1).unwrap();
-        store
-            .append_pending_agent_drops_with_command(
-                "protected",
-                Some("range-command"),
-                &["m4#0".to_string(), "m5#0".to_string(), "m24#1".to_string()],
-                99,
-                false,
-            )
-            .unwrap();
-
-        let response = run(
-            &store,
-            &active_cc_req("protected", "cfg0", messages),
-            &spine(),
-        );
-        assert_eq!(response.action, "HARD");
-        let loaded = store.load("protected").unwrap();
-        // Rank 21 (number 4) is just outside the protected set: applied.
-        assert_eq!(frozen_red_payload(&loaded.core, "m4#0"), Some("[dropped]"));
-        // Rank 20 (number 5) is the last protected slot: retained. Under a
-        // threshold cutoff (active-max 25 - 20, or global-max 28 - 20) or
-        // one-per-ordinal counting this row loses protection and applies.
-        assert_eq!(frozen_red_payload(&loaded.core, "m5#0"), None);
-        // The second block on ordinal 24 is itself active and protected; an
-        // implementation that counts one block per ordinal applies this drop.
-        assert_eq!(frozen_red_payload(&loaded.core, "m24#1"), None);
-        let mut retained = store
-            .load_pending_agent_drops("protected")
-            .unwrap()
-            .into_iter()
-            .map(|row| row.target_id)
-            .collect::<Vec<_>>();
-        retained.sort();
-        assert_eq!(retained, vec!["m24#1".to_string(), "m5#0".to_string()]);
-        let pending = store.load_pending_agent_drops("protected").unwrap();
-        assert!(pending.iter().all(|row| {
-            row.command_id.as_deref() == Some("range-command")
-                && row.command_first_applied_at_ms.is_some()
-        }));
-        let replay = store
-            .append_pending_agent_drops_with_command(
-                "protected",
-                Some("range-command"),
-                &["m5#0".to_string(), "m24#1".to_string()],
-                100,
-                false,
-            )
-            .unwrap();
-        assert_eq!(replay.queued, 0);
-        assert!(replay.duplicate);
-        assert_eq!(
-            store.load_pending_agent_drops("protected").unwrap(),
-            pending
-        );
-    }
-
-    #[test]
-    fn frozen_row_does_not_consume_a_protection_slot() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        // 21 tagged live blocks, numbers 1..21. m21#0 is frozen by an earlier
-        // active pass, so the ACTIVE set is exactly m1..m20 — all 20 fit the
-        // protected window and the oldest row's pending drop must be retained.
-        // If frozen rows still consumed slots, m21 would take one, m1 would
-        // fall to rank 21, and its drop would apply.
-        let messages = (1..=21)
-            .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
-            .collect::<Vec<_>>();
-        let tags = (1..=21)
-            .map(|ordinal| TagMintInput {
-                block_id: format!("m{ordinal}#0"),
-                kind: "message".to_string(),
-                token_count: 1,
-                source_bytes: format!("text {ordinal}").into_bytes(),
-            })
-            .collect::<Vec<_>>();
-        store.seed_tags_for_test("slot-free", &tags, 1).unwrap();
-
-        // Pass 1 bootstraps, then the freeze is seeded directly in durable state
-        // (selection itself refuses to reduce a protected newest tag, so a
-        // pre-existing freeze — e.g. from an earlier phase with more tags — is
-        // the realistic way a high-ranked block arrives already frozen).
-        let request = active_cc_req("slot-free", "cfg0", messages);
+        let mut request = active_cc_req("protected-row-identities", "cfg0", messages);
+        request.protected_tokens_effective = Some(4_000);
         run(&store, &request, &spine());
-        let seeded = store.load("slot-free").unwrap();
-        let mut core = seeded.core.clone();
-        core.frozen_units
-            .push(red_unit("m21#0", "drop", "[dropped]"));
         store
-            .commit("slot-free", seeded.row_version, &core, &seeded.meta)
+            .append_pending_agent_drops(
+                "protected-row-identities",
+                &["result1#0".to_string(), "result2#0".to_string()],
+                99,
+            )
             .unwrap();
-        assert_eq!(
-            frozen_red_payload(&store.load("slot-free").unwrap().core, "m21#0"),
-            Some("[dropped]"),
-            "precondition: m21#0 frozen before the tested pass"
-        );
 
-        // Pass 2 (tested): a render-config change forces a producing HARD so the
-        // pending row is genuinely selected against the protected set — a defer
-        // pass would retain it regardless and prove nothing.
-        store
-            .append_pending_agent_drops("slot-free", &["m1#0".to_string()], 99)
-            .unwrap();
-        let producing = active_cc_req(
-            "slot-free",
-            "cfg1",
-            (1..=21)
-                .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
-                .collect::<Vec<_>>(),
+        request.render_config = "cfg1".to_string();
+        let tested = run(&store, &request, &spine());
+        assert_eq!(tested.action, "HARD");
+        let loaded = store.load("protected-row-identities").unwrap();
+        assert_eq!(
+            frozen_red_payload(&loaded.core, "result1#0"),
+            Some("[dropped]")
         );
-        let tested = run(&store, &producing, &spine());
-        assert_eq!(tested.action, "HARD", "tested pass must produce");
-        let loaded = store.load("slot-free").unwrap();
-        assert_eq!(frozen_red_payload(&loaded.core, "m1#0"), None);
-        let pending = store.load_pending_agent_drops("slot-free").unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].target_id, "m1#0");
+        assert_eq!(frozen_red_payload(&loaded.core, "result2#0"), None);
+        assert_eq!(
+            store
+                .load_pending_agent_drops("protected-row-identities")
+                .unwrap()
+                .into_iter()
+                .map(|row| row.target_id)
+                .collect::<Vec<_>>(),
+            vec!["result2#0".to_string()]
+        );
     }
 
     #[test]
-    fn newest_tag_block_set_excludes_stale_provenance_from_slots() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        // Exactly 21 tagged live blocks. The NEWEST row (m21#0) has stale
-        // provenance. Under exact semantics it cannot hold a slot, so the
-        // protected 20 are m20..m1 and a pending drop on m1#0 (rank 21 by
-        // number, rank 20 among ACTIVE rows) is PROTECTED. An implementation
-        // that skips the provenance re-check frees m1#0 and applies the drop.
-        let messages = (1..=21)
-            .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
-            .collect::<Vec<_>>();
-        let tags = (1..=21)
-            .map(|ordinal| TagMintInput {
-                block_id: format!("m{ordinal}#0"),
-                kind: "message".to_string(),
-                token_count: 1,
-                source_bytes: if ordinal == 21 {
-                    b"stale bytes".to_vec()
-                } else {
-                    format!("text {ordinal}").into_bytes()
-                },
+    fn frozen_persisted_tool_row_remains_a_protection_member() {
+        let rows = (1..=4)
+            .map(|number| McTagRow {
+                tag_number: number,
+                block_id: format!("result{number}#0"),
+                kind: "tool_result".to_string(),
+                token_count: 1_500,
+                created_at_ms: 0,
+                source_bytes: Vec::new(),
             })
             .collect::<Vec<_>>();
-        store.seed_tags_for_test("stale-slot", &tags, 1).unwrap();
-        store
-            .append_pending_agent_drops("stale-slot", &["m1#0".to_string()], 2)
-            .unwrap();
+        let window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
 
-        let response = run(
-            &store,
-            &active_cc_req("stale-slot", "cfg0", messages),
-            &spine(),
+        assert!(window.row_identities.block_ids.contains("result4#0"));
+        assert!(window.row_identities.block_ids.contains("result2#0"));
+        assert_eq!(window.cutoff.cutoff, Some(TagNumber(2)));
+    }
+
+    #[test]
+    fn floor_snapshot_geometry_move_changes_hint_only_after_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = (1..=5)
+            .map(|number| McTagRow {
+                tag_number: number,
+                block_id: format!("result{number}#0"),
+                kind: "tool_result".to_string(),
+                token_count: 1_000,
+                created_at_ms: 0,
+                source_bytes: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let applying_window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
+        let active = rows
+            .iter()
+            .map(|row| ActiveTagForNudge {
+                tag_number: row.tag_number,
+                kind: row.kind.clone(),
+                token_count: row.token_count,
+                tool_name: "bash".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let applying_hint = serde_json::to_vec(&oldest_reclaimable_hint(
+            &active,
+            &applying_window.cutoff,
+            &HashSet::new(),
+        ))
+        .unwrap();
+
+        let mut meta = ModuleMeta {
+            protected_tokens_effective: Some(4_000),
+            ..ModuleMeta::default()
+        };
+        let db = store(dir.path());
+        db.commit("marker-invariance", None, &CoreState::default(), &meta)
+            .unwrap();
+        let recomputed_window = ProtectionWindow::from_persisted_rows(&rows, 8_000);
+        let recomputed_hint = serde_json::to_vec(&oldest_reclaimable_hint(
+            &active,
+            &recomputed_window.cutoff,
+            &HashSet::new(),
+        ))
+        .unwrap();
+        assert_ne!(
+            recomputed_hint, applying_hint,
+            "moving geometry would observably rewrite the hint bytes if defer recomputed the floor"
         );
-        assert_eq!(response.action, "HARD");
-        let loaded = store.load("stale-slot").unwrap();
-        assert_eq!(frozen_red_payload(&loaded.core, "m1#0"), None);
-        let pending = store.load_pending_agent_drops("stale-slot").unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].target_id, "m1#0");
+        let defer_floor = resolve_floor_snapshot(
+            None,
+            meta.protected_tokens_effective,
+            8_000,
+            FloorPass::Defer,
+        );
+        meta.protected_tokens_effective = defer_floor.persisted;
+        assert_eq!(defer_floor.effective, 4_000);
+        drop(db);
+
+        let restarted = store(dir.path());
+        let replay_meta = restarted.load("marker-invariance").unwrap().meta;
+        let replay_window = ProtectionWindow::from_persisted_rows(
+            &rows,
+            replay_meta.protected_tokens_effective.unwrap(),
+        );
+        let replay_hint = serde_json::to_vec(&oldest_reclaimable_hint(
+            &active,
+            &replay_window.cutoff,
+            &HashSet::new(),
+        ))
+        .unwrap();
+
+        assert_eq!(replay_window.cutoff, applying_window.cutoff);
+        assert_eq!(replay_window.member_rows, applying_window.member_rows);
+        assert_eq!(replay_hint, applying_hint);
+        assert_eq!(
+            restarted
+                .load("marker-invariance")
+                .unwrap()
+                .meta
+                .protected_tokens_effective,
+            Some(4_000)
+        );
+    }
+
+    #[test]
+    fn unsnapshotted_defer_inputs_survive_restart_and_changes_surface_as_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(dir.path());
+        let request = active_cc_req(
+            "pre-snapshot-lifecycle",
+            "cfg",
+            vec![item("m1", 1, "unchanged")],
+        );
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.protected_tokens_floor = 4_000;
+        transform(&db, &request, &ctx).unwrap();
+        let mut legacy = db.load(&request.session_id).unwrap();
+        legacy.meta.protected_tokens_effective = None;
+        db.commit(
+            &request.session_id,
+            legacy.row_version,
+            &legacy.core,
+            &legacy.meta,
+        )
+        .unwrap();
+        let first = transform(&db, &request, &ctx).unwrap();
+        assert_eq!(first.action, "SOFT+");
+        assert_eq!(
+            db.load(&request.session_id)
+                .unwrap()
+                .meta
+                .protected_tokens_effective,
+            None
+        );
+        drop(db);
+        let restarted = store(dir.path());
+        let replay = transform(&restarted, &request, &ctx).unwrap();
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(first.messages()).unwrap(),
+            serde_json::to_vec(replay.messages()).unwrap()
+        );
+        assert_eq!(
+            restarted
+                .load(&request.session_id)
+                .unwrap()
+                .meta
+                .protected_tokens_effective,
+            None
+        );
+        ctx.protected_tokens_floor = 8_000;
+        let changed = transform(&restarted, &request, &ctx).unwrap();
+        assert_eq!(changed.action, "HARD");
+        assert_eq!(
+            changed.materialize_reason.as_deref(),
+            Some("protected_tokens_inputs_changed")
+        );
+        assert_eq!(
+            restarted
+                .load(&request.session_id)
+                .unwrap()
+                .meta
+                .protected_tokens_effective,
+            Some(8_000)
+        );
+    }
+
+    #[test]
+    fn three_pass_marker_contraction_defer_and_reexpansion_preserve_window_and_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(dir.path());
+        let mut messages = vec![item("prefix", 1, "immutable prefix")];
+        for n in 1..=5 {
+            messages.push(assistant_tool_call(
+                &format!("call{n}"),
+                n * 2,
+                &format!("c{n}"),
+            ));
+            messages.push(tool_result(
+                &format!("result{n}"),
+                n * 2 + 1,
+                &format!("c{n}"),
+                &"word ".repeat(1_000),
+            ));
+        }
+        let mut request = active_cc_req("window-three-pass", "cfg0", messages);
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.protected_tokens_floor = 4_000;
+        transform(&db, &request, &ctx).unwrap();
+        request.render_config = "cfg1".to_string();
+        let applying = transform(&db, &request, &ctx).unwrap();
+        assert_eq!(applying.action, "HARD");
+        let observe = |db: &McStore| {
+            let loaded = db.load("window-three-pass").unwrap();
+            let rows = db.load_tags_for_session("window-three-pass").unwrap();
+            let window = ProtectionWindow::from_persisted_rows(
+                &rows,
+                loaded.meta.protected_tokens_effective.unwrap(),
+            );
+            let active = rows
+                .iter()
+                .map(|row| ActiveTagForNudge {
+                    tag_number: row.tag_number,
+                    kind: row.kind.clone(),
+                    token_count: row.token_count,
+                    tool_name: "bash".to_string(),
+                })
+                .collect::<Vec<_>>();
+            let hint = serde_json::to_vec(&oldest_reclaimable_hint(
+                &active,
+                &window.cutoff,
+                &HashSet::new(),
+            ))
+            .unwrap();
+            (
+                window.cutoff,
+                window.row_identities,
+                hint,
+                serde_json::to_vec(&loaded.core.frozen_units).unwrap(),
+            )
+        };
+        let before = observe(&db);
+        let full = request.messages.clone();
+        request.messages.drain(1..5);
+        request.channel2_nudge_state = "pending".to_string();
+        ctx.protected_tokens_floor = 8_000;
+        let contracted = transform(&db, &request, &ctx).unwrap();
+        assert_eq!(contracted.action, "SOFT+");
+        assert_eq!(observe(&db), before);
+        request.messages = full;
+        let expanded = transform(&db, &request, &ctx).unwrap();
+        assert_eq!(expanded.action, "SOFT+");
+        assert_eq!(observe(&db), before);
+        assert_eq!(
+            serde_json::to_vec(applying.messages()).unwrap(),
+            serde_json::to_vec(expanded.messages()).unwrap()
+        );
+        drop(db);
+        let restarted = store(dir.path());
+        let replay = transform(&restarted, &request, &ctx).unwrap();
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(observe(&restarted), before);
+        assert_eq!(
+            serde_json::to_vec(expanded.messages()).unwrap(),
+            serde_json::to_vec(replay.messages()).unwrap()
+        );
+    }
+
+    #[test]
+    fn persisted_tool_membership_does_not_depend_on_live_source_provenance() {
+        let rows = vec![
+            McTagRow {
+                tag_number: 7,
+                block_id: "missing-from-projection#0".to_string(),
+                kind: "tool_result".to_string(),
+                token_count: 4_000,
+                created_at_ms: 0,
+                source_bytes: b"old source".to_vec(),
+            },
+            McTagRow {
+                tag_number: 8,
+                block_id: "live#0".to_string(),
+                kind: "tool_result".to_string(),
+                token_count: 4_000,
+                created_at_ms: 0,
+                source_bytes: b"new source".to_vec(),
+            },
+        ];
+        let window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
+
+        assert_eq!(window.row_identities.block_ids.len(), 2);
+        assert!(
+            window
+                .row_identities
+                .block_ids
+                .contains("missing-from-projection#0"),
+            "membership is computed from persisted rows before projection lookup"
+        );
     }
 
     #[test]
@@ -31517,7 +33428,10 @@ pub(crate) mod tests {
         let no_units = new_caveman_units(
             &CoreState::default(),
             &request,
-            &tags,
+            CavemanTagState {
+                rows: &tags,
+                protection_cutoff: &protection_cutoff(None),
+            },
             &live,
             None,
             false,
@@ -31525,7 +33439,18 @@ pub(crate) mod tests {
         );
         assert!(no_units.is_empty(), "defer must not mint a cav unit");
 
-        let units = new_caveman_units(&CoreState::default(), &request, &tags, &live, None, true, 1);
+        let units = new_caveman_units(
+            &CoreState::default(),
+            &request,
+            CavemanTagState {
+                rows: &tags,
+                protection_cutoff: &protection_cutoff(None),
+            },
+            &live,
+            None,
+            true,
+            1,
+        );
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].key, "cav:m1#0");
         assert_eq!(units[0].reset_rule, "3");
@@ -31719,7 +33644,18 @@ pub(crate) mod tests {
             created_at_ms: 0,
             source_bytes: source.as_bytes().to_vec(),
         }];
-        let units = new_caveman_units(&core, &request, &tags, &live, None, true, 1);
+        let units = new_caveman_units(
+            &core,
+            &request,
+            CavemanTagState {
+                rows: &tags,
+                protection_cutoff: &protection_cutoff(None),
+            },
+            &live,
+            None,
+            true,
+            1,
+        );
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].reset_rule, "3");
         assert!(units[0].frozen_payload.len() <= lite.len());
@@ -31753,7 +33689,10 @@ pub(crate) mod tests {
         assert!(new_caveman_units(
             &CoreState::default(),
             &subagent,
-            std::slice::from_ref(&tag),
+            CavemanTagState {
+                rows: std::slice::from_ref(&tag),
+                protection_cutoff: &protection_cutoff(None),
+            },
             &live,
             None,
             true,
@@ -31777,7 +33716,10 @@ pub(crate) mod tests {
         assert!(new_caveman_units(
             &CoreState::default(),
             &reasoning,
-            std::slice::from_ref(&tag),
+            CavemanTagState {
+                rows: std::slice::from_ref(&tag),
+                protection_cutoff: &protection_cutoff(None),
+            },
             &live,
             None,
             true,
@@ -31798,7 +33740,10 @@ pub(crate) mod tests {
         assert!(new_caveman_units(
             &CoreState::default(),
             &protected,
-            &[tag],
+            CavemanTagState {
+                rows: &[tag],
+                protection_cutoff: &protection_cutoff(Some(1)),
+            },
             &live,
             None,
             true,
@@ -32590,7 +34535,7 @@ pub(crate) mod tests {
             format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
             format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
             "mpe2".to_string(),
-            "tfe3".to_string(),
+            "tfe4".to_string(),
         );
         s.commit("staged-tfe", loaded.row_version, &loaded.core, &loaded.meta)
             .unwrap();
@@ -32606,7 +34551,7 @@ pub(crate) mod tests {
             format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
             format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
             "mpe3".to_string(),
-            "tfe3".to_string(),
+            "tfe4".to_string(),
         );
         assert_eq!(
             s.load("staged-tfe").unwrap().meta.last_render_config,
@@ -32629,32 +34574,63 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn opencode_identity_refuses_collateral_cc_profile_epoch_hard() {
+    fn opencode_identity_prices_global_skeleton_epoch_change_once() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let request = active_opencode_req(
-            "opencode-profile-epoch",
+            "opencode-skeleton-epoch",
             "rust-mode/tf1/gfull",
-            vec![wire_item("user", "m1", 1, &["stable bytes"])],
+            vec![unstamped_opencode_tool_pair(
+                "legacy-pair",
+                1,
+                "legacy-call",
+            )],
         );
         run(&s, &request, &spine());
         let mut loaded = s.load(&request.session_id).unwrap();
-        // Pin the previous format epochs to verify compatibility independently of this binary:
-        // memory 2, compartments 2, no OpenCode profile epoch, shared tagger 3.
-        let master_identity = effective_render_config_with_epochs(
+        let baseline_identity = loaded.meta.last_render_config.clone();
+        let old_identity = effective_render_config_with_epochs(
             &s,
             &request.render_config,
             "mre2".to_string(),
             "cre2".to_string(),
-            String::new(),
+            "mpe1".to_string(),
             "tfe3".to_string(),
         );
-        assert_eq!(
-            loaded.meta.last_render_config.as_bytes(),
-            master_identity.as_bytes(),
-            "a Claude Code-only byte change must not alter OpenCode's render identity"
+        let new_identity = effective_render_config_with_epochs(
+            &s,
+            &request.render_config,
+            "mre2".to_string(),
+            "cre2".to_string(),
+            "mpe1".to_string(),
+            "tfe4".to_string(),
         );
-        loaded.meta.last_render_config = master_identity;
+        assert_ne!(old_identity, new_identity);
+
+        // Model a persisted epoch-3 session whose newest-window skeleton still
+        // contains legacy clamped arguments. Replacing those bytes must first
+        // advance render identity through a priced HARD, never a defer render.
+        loaded.core.frozen_units.extend([
+            red_unit(
+                "legacy-pair#0",
+                "skeleton",
+                r#"{"detail":"xxxxx...[truncated]","path":"pair.txt"}"#,
+            ),
+            red_unit("legacy-pair#1", "drop", "[dropped]"),
+            transition_consumed_unit(
+                &[
+                    RendererTransitionClass::PoisonedReasoning,
+                    RendererTransitionClass::UnmatchedPair,
+                    RendererTransitionClass::SplitCoverage,
+                    RendererTransitionClass::SyntheticAnchorSplit,
+                    RendererTransitionClass::ReductionEnvelope,
+                    RendererTransitionClass::TemporalParity,
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        ]);
+        loaded.meta.last_render_config = old_identity;
         s.commit(
             &request.session_id,
             loaded.row_version,
@@ -32662,10 +34638,40 @@ pub(crate) mod tests {
             &loaded.meta,
         )
         .unwrap();
-        let replay = run(&s, &request, &spine());
+
+        let first = run(&s, &request, &spine());
+        assert_eq!(first.action, "HARD", "epoch 4 must price the byte change");
+        assert_eq!(first.materialize_reason.as_deref(), Some("epoch_change"));
+        assert_eq!(baseline_identity, new_identity);
         assert_eq!(
-            replay.action, "SOFT+",
-            "OpenCode must not pay a collateral HARD"
+            s.load(&request.session_id).unwrap().meta.last_render_config,
+            new_identity
+        );
+        let marker_input = first
+            .messages()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match &block.kind {
+                ck_wire::CkKind::ToolCall { input, .. } => Some(input),
+                _ => None,
+            })
+            .expect("served skeleton tool input");
+        assert_eq!(
+            marker_input
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["dropped"]
+        );
+
+        let replay = run(&s, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(first.messages()).unwrap(),
+            serde_json::to_vec(replay.messages()).unwrap(),
+            "post-HARD defer replay must remain byte-identical"
         );
     }
 
@@ -32754,6 +34760,95 @@ pub(crate) mod tests {
             one_shot.action, "SOFT+",
             "after last_render_config records mpe3, the profile fold must not loop"
         );
+    }
+
+    #[test]
+    fn tool_result_codec_profile_epochs_hard_once_then_restart_replay_identically() {
+        for profile in [SerializerProfile::OpencodeAiSdk, SerializerProfile::Pi] {
+            assert_eq!(crate::profile_render_epoch(profile), 1);
+            let dir = tempfile::tempdir().unwrap();
+            let session = format!("tool-result-epoch-{}", profile.wire_id());
+            let golden: Value = serde_json::from_str(include_str!(
+                "../testdata/codec/tool-result-child-parity.json"
+            ))
+            .unwrap();
+            let mut result_ingress = match profile {
+                SerializerProfile::OpencodeAiSdk => {
+                    crate::codec::decode_opencode(golden["opencode_messages"].as_array().unwrap())
+                        .messages
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                }
+                SerializerProfile::Pi => {
+                    crate::codec::decode_pi(golden["pi_entries"].as_array().unwrap())
+                        .messages
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                }
+                _ => unreachable!(),
+            };
+            result_ingress
+                .ck
+                .content
+                .retain(|block| matches!(&block.kind, ck_wire::CkKind::ToolResult { .. }));
+            result_ingress.ck.role = "tool".to_string();
+            result_ingress.mid = "m2".to_string();
+            result_ingress.ordinal = 2;
+            result_ingress.ck.meta.harness_id = Some("m2".to_string());
+            result_ingress.ck.meta.ordinal = Some(2);
+            let request = profile_req(
+                profile,
+                &session,
+                "cfg0",
+                vec![wire_tool_call("m1", 1, "call-parity"), result_ingress],
+            );
+            let transitioned_bytes;
+            {
+                let s = store(dir.path());
+                s.replace_compartments(&session, &[comp(1, 1, 2, "m2", "SUMMARY")])
+                    .unwrap();
+                assert_eq!(run(&s, &request, &spine()).action, "HARD");
+
+                let mut loaded = s.load(&session).unwrap();
+                loaded.meta.last_render_config = global_epoch_effective_render_config(&s, "cfg0");
+                loaded
+                    .core
+                    .frozen_units
+                    .iter_mut()
+                    .find(|unit| unit.key == "m0")
+                    .unwrap()
+                    .frozen_payload = "PRE-CHANGE-TOOL-RESULT-CHILD-BYTES".to_string();
+                s.commit(&session, loaded.row_version, &loaded.core, &loaded.meta)
+                    .unwrap();
+
+                let transitioned = run(&s, &request, &spine());
+                assert_eq!(transitioned.action, "HARD");
+                assert_eq!(
+                    transitioned.materialize_reason.as_deref(),
+                    Some("epoch_change")
+                );
+                assert!(!m0_bytes(&transitioned).contains("PRE-CHANGE-TOOL-RESULT-CHILD-BYTES"));
+                transitioned_bytes = serde_json::to_vec(transitioned.messages()).unwrap();
+
+                let defer = run(&s, &request, &spine());
+                assert_eq!(defer.action, "SOFT+");
+                assert!(!defer.committed);
+                assert_eq!(
+                    serde_json::to_vec(defer.messages()).unwrap(),
+                    transitioned_bytes
+                );
+            }
+
+            let restarted = run(&store(dir.path()), &request, &spine());
+            assert_eq!(restarted.action, "SOFT+");
+            assert!(!restarted.committed);
+            assert_eq!(
+                serde_json::to_vec(restarted.messages()).unwrap(),
+                transitioned_bytes
+            );
+        }
     }
 
     #[test]
@@ -33121,7 +35216,6 @@ pub(crate) mod tests {
                 pass_class: PassClass::Execute,
                 current_total_input_tokens: 1_000.0,
                 ceiling_tokens: 2_000.0,
-                protected_cutoff_ordinal: 0,
                 last_execute_ordinal: 1,
                 scheduler_pressure_execute: true,
                 prior_input_sample: 0.0,
@@ -33131,6 +35225,7 @@ pub(crate) mod tests {
                 first_applied_agent_drop_ids: HashSet::new(),
                 pass_already_busting: true,
                 supersession_ride_available: false,
+                emergency_window_yields: false,
                 tag_window_protected_block_ids: HashSet::new(),
                 exempt_message_protected_block_ids: HashSet::new(),
             },
@@ -33391,7 +35486,6 @@ pub(crate) mod tests {
                 pass_class: PassClass::Execute,
                 current_total_input_tokens: 0.0,
                 ceiling_tokens: 0.0,
-                protected_cutoff_ordinal: 0,
                 last_execute_ordinal: 0,
                 scheduler_pressure_execute: false,
                 prior_input_sample: 0.0,
@@ -33401,6 +35495,7 @@ pub(crate) mod tests {
                 first_applied_agent_drop_ids: HashSet::new(),
                 pass_already_busting: false,
                 supersession_ride_available: true,
+                emergency_window_yields: false,
                 tag_window_protected_block_ids: HashSet::new(),
                 exempt_message_protected_block_ids: HashSet::new(),
             },
@@ -34487,6 +36582,166 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn system_reminder_strip_matches_typescript_golden() {
+        let fixture: Value = serde_json::from_str(include_str!("../../../packages/plugin/scripts/test-fixtures/cache-bust-sentinel/reminder-restart-001871.json")).unwrap();
+        for (source, expected) in fixture["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(fixture["stripped"].as_array().unwrap())
+        {
+            assert_eq!(
+                strip_system_injection(source.as_str().unwrap()).as_deref(),
+                expected.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn system_reminder_legacy_unserved_units_defer_across_store_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let process_a = store(dir.path());
+        let request = req(
+            "reminder-restart",
+            "cfg0",
+            vec![wire_item(
+                "user",
+                "aft",
+                1,
+                &[
+                    "Opencode restarted",
+                    "authored sibling",
+                    "<system-reminder>peer-message-notice</system-reminder>",
+                    "<system-reminder>Wake digest one</system-reminder>",
+                    "<system-reminder>Wake digest two</system-reminder>",
+                    "<system-reminder>Wake digest three</system-reminder>",
+                ],
+            )],
+        );
+        run(&process_a, &request, &spine());
+        run(&process_a, &request, &spine());
+        let whole = run(&process_a, &request, &spine());
+        assert_eq!(whole.action, "SOFT+");
+        assert!(serde_json::to_string(&whole.ck_messages)
+            .unwrap()
+            .contains("Wake digest"));
+        let mut loaded = process_a.load(&request.session_id).unwrap();
+        // Model the old warm-cache omission: strips were committed, but the served
+        // fingerprint still records the unchanged six-part message.
+        for index in 2..6 {
+            loaded.core.frozen_units.push(strip_unit(
+                "system_injected_block",
+                &format!("aft#{index}"),
+                "",
+            ));
+        }
+        process_a
+            .commit(
+                &request.session_id,
+                loaded.row_version,
+                &loaded.core,
+                &loaded.meta,
+            )
+            .unwrap();
+        drop(process_a);
+        let process_b = store(dir.path());
+        let replay = run(&process_b, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(
+            canonical_response_hash(&whole),
+            canonical_response_hash(&replay)
+        );
+        assert!(process_b
+            .load(&request.session_id)
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .filter(|unit| unit.key.starts_with(SYSTEM_STRIP_BLOCK_PREFIX))
+            .all(|unit| unit.reset_rule == SYSTEM_STRIP_PENDING));
+        let mut priced_request = request.clone();
+        priced_request.render_config = "cfg1".to_string();
+        let priced = run(&process_b, &priced_request, &spine());
+        assert_eq!(priced.action, "HARD");
+        assert!(!serde_json::to_string(&priced.ck_messages)
+            .unwrap()
+            .contains("Wake digest"));
+        drop(process_b);
+        let process_c = store(dir.path());
+        let replay = run(&process_c, &priced_request, &spine());
+        assert!(!serde_json::to_string(&replay.ck_messages)
+            .unwrap()
+            .contains("Wake digest"));
+    }
+
+    #[test]
+    fn system_reminder_bust_invalidates_warm_tail_before_restart() {
+        let (mut core, meta, mut request, _) = output_cache_fixture("baseline", "delta");
+        request.messages = vec![wire_item(
+            "user",
+            "aft",
+            1,
+            &[
+                "Opencode restarted",
+                "authored sibling",
+                "<system-reminder>peer-message-notice</system-reminder>",
+                "<system-reminder>Wake digest one</system-reminder>",
+                "<system-reminder>Wake digest two</system-reminder>",
+                "<system-reminder>Wake digest three</system-reminder>",
+            ],
+        )];
+        let projection = project_messages(&request.messages).unwrap();
+        let overlay = TagOverlayState {
+            tag_by_block_id: (0..6)
+                .map(|index| (format!("aft#{index}"), 434 + index as i64))
+                .collect(),
+            ..Default::default()
+        };
+        let whole = build_cached_fixture(
+            &core,
+            &meta,
+            &request,
+            &projection,
+            Some(&overlay),
+            None,
+            false,
+        );
+        let snapshot = SerializedOutputCacheSnapshot {
+            entries: whole.cache_entries,
+        };
+        for index in 2..6 {
+            core.frozen_units.push(strip_unit(
+                "system_injected_block",
+                &format!("aft#{index}"),
+                "",
+            ));
+        }
+        let bust = build_cached_fixture(
+            &core,
+            &meta,
+            &request,
+            &projection,
+            Some(&overlay),
+            Some(&snapshot),
+            true,
+        );
+        let cold = build_cached_fixture(
+            &core,
+            &meta,
+            &request,
+            &projection,
+            Some(&overlay),
+            None,
+            false,
+        );
+        assert_eq!(
+            canonical_output(&bust.messages),
+            canonical_output(&cold.messages),
+            "a priced strip must reach the warm wire, not first-apply after restart"
+        );
+    }
+
+    #[test]
     fn warm_cache_selection_bust_does_not_replay_collapsed_synthetic_todo_as_live() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -34536,6 +36791,18 @@ pub(crate) mod tests {
             ck: collapsed,
         });
         let replay_request = active_cc_req("duplicate-tool-use", "cfg0", replay_messages);
+        // Keep the arc unaged so the later explicit-selection fixture, not the
+        // renderer-repair fold's automatic sweep, owns its first reduction.
+        let mut loaded = store.load("duplicate-tool-use").unwrap();
+        loaded.meta.last_execute_ordinal = 0;
+        store
+            .commit(
+                "duplicate-tool-use",
+                loaded.row_version,
+                &loaded.core,
+                &loaded.meta,
+            )
+            .unwrap();
 
         let warm =
             apply_once_with_estimator(&store, &replay_request, &context, estimate, Some(&cache))
@@ -34803,7 +37070,7 @@ pub(crate) mod tests {
         let mut response =
             TransformResponse::passthrough(served, request.full_array_fingerprint.clone());
         let attach_started_at = Instant::now();
-        crate::attach_native_messages(&mut response, &request, 0, None);
+        crate::attach_native_messages(&mut response, &request, &[], None);
         let attach_ms = elapsed_ms(attach_started_at);
         let encode_started_at = Instant::now();
         let _encoded = serde_json::to_vec(&response).unwrap();
@@ -35465,6 +37732,38 @@ pub(crate) mod tests {
         assert_eq!(mismatch_response.action, "PASSTHROUGH");
         assert_eq!(mismatch_response.lineage_switch_consumed_id, None);
         assert!(store.load("resolved-target").unwrap().row_version.is_none());
+    }
+
+    #[test]
+    fn force_episode_latch_does_not_block_d5_descent() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        seed_fake_compaction_prior(&s, "A");
+        let mut loaded = s.load("B").unwrap();
+        loaded.meta.has_prior_emergency_drop = true;
+        loaded.meta.last_emergency_input_sample = 90_000.0;
+        loaded.meta.emergency_drain_active = true;
+        s.commit("B", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        let request = with_usage(
+            fake_compaction_request(
+                "B",
+                "A",
+                2,
+                701,
+                true,
+                fake_compaction_messages("2026-08-06", &continuation_summary("force")),
+            ),
+            90_100,
+            100_000,
+        );
+        let response = run(&s, &request, &spine());
+        assert_eq!(
+            response.lineage_descent_disposition.as_deref(),
+            Some("descended")
+        );
+        assert_eq!(response.action, "HARD");
+        assert_eq!(response.lineage_switch_consumed_id, Some(701));
     }
 
     #[test]

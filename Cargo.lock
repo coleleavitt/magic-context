@@ -608,6 +608,7 @@ dependencies = [
  "mc-tokenizer",
  "regex",
  "rusqlite",
+ "ryu-js",
  "serde",
  "serde_json",
  "sha2",
@@ -846,6 +847,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -979,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -1002,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.17.20"
+version = "0.17.39"
 dependencies = [
  "base64",
  "cortexkit-paths",
@@ -1035,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "serde",
  "serde_json",
