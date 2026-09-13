@@ -23,7 +23,6 @@
     "directory": "packages/plugin"
   },
   "files": [
-    "server.js",
     "dist",
     "src/tui",
     "src/tui-compiled",
@@ -56,7 +55,6 @@
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
     "@opencode-ai/plugin": "^1.17.11",
     "@opencode-ai/sdk": "^1.17.11",
-    "@opencode/plugin": "2.0.3",
     "@opentui/core": "^0.4.2",
     "@opentui/solid": "^0.4.2",
     "ai-tokenizer": "^1.0.6",
@@ -72,6 +70,7 @@
     "sharp": "^0.35.0"
   },
   "devDependencies": {
+    "@opencode/plugin": "2.0.3",
     "@opencode/cli": "2.0.3",
     "@opencode/client": "2.0.3",
     "effect": "4.0.0-rc.112",
@@ -89,10 +88,6 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    },
-    "./server": {
-      "types": "./dist/v2/server.d.ts",
-      "import": "./dist/v2/server.js"
     },
     "./tui": {
       "types": "./src/tui/index.tsx",
