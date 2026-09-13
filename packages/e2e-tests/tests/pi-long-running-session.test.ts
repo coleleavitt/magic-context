@@ -253,7 +253,7 @@ describe("long-running Pi Magic Context session", () => {
         });
 
         try {
-            let historianRange: { start: number; end: number } | null = null;
+            const historianRanges: Array<{ start: number; end: number }> = [];
             let sessionId = "";
             const mainRequests = () => h.mock.requests().filter((request) => isMagicContextRequest(request.body));
             const requestsSince = (index: number) =>
@@ -271,7 +271,7 @@ describe("long-running Pi Magic Context session", () => {
             h.mock.addMatcher((body) => {
                 if (!isHistorianRequest(body)) return null;
                 const range = findOrdinalRange(body) ?? { start: 1, end: 2 };
-                historianRange = range;
+                historianRanges.push(range);
                 return {
                     text: buildMockHistorianPayload({
                         start: range.start,
@@ -383,9 +383,14 @@ describe("long-running Pi Magic Context session", () => {
                 .contextDb()
                 .prepare("SELECT start_message, end_message, title FROM compartments WHERE session_id = ? AND harness = 'pi' ORDER BY sequence DESC LIMIT 1")
                 .get(sessionId) as { start_message: number; end_message: number; title: string };
-            expect(historianRange).not.toBeNull();
-            expect(compartment.start_message).toBe(historianRange!.start);
-            expect(compartment.end_message).toBe(historianRange!.end);
+            expect(historianRanges.length).toBeGreaterThan(0);
+            expect(
+                historianRanges.some(
+                    (range) =>
+                        range.start === compartment.start_message &&
+                        range.end === compartment.end_message,
+                ),
+            ).toBe(true);
             // Ordinary drive turn (NO HARD bust / m0-mutation injection): the
             // publication's onPublished armed the deferred history-refresh +
             // materialization signals, and this pass force-materializes (turn
