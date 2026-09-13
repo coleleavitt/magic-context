@@ -49,6 +49,7 @@ import {
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const MODULE_ID = "magic-context";
+const HERMETIC_DAEMON_RUST_LOG = "info";
 const RUST_E2E_PID_FILE = "rust-e2e-pids.json";
 const BROCA_ID = "broca";
 const BROCA_SCRIPT = join(REPO_ROOT, "packages/e2e-tests/src/rust-runner/fake-broca.ts");
@@ -457,6 +458,10 @@ export class HermeticSubcStack {
                 // and defeats a substring poll. NO_COLOR makes tracing emit plain
                 // text (the registration check also strips ANSI as a backstop).
                 NO_COLOR: "1",
+                // The hermetic readiness proof parses the daemon's info-level
+                // registration line. Never inherit an unrelated desktop RUST_LOG
+                // filter (for example niri/smithay-only targets) that suppresses it.
+                RUST_LOG: HERMETIC_DAEMON_RUST_LOG,
                 // The module connects as a plain client; clear any inherited
                 // supervised-identity vars so it does not reuse a reserved slot.
                 SUBC_MODULE_ID: "",
@@ -940,6 +945,7 @@ export class HermeticSubcStack {
 export const __hermeticSubcTest = {
     currentTreeCkMcBinary,
     isStaleRustE2ePidRecord,
+    hermeticDaemonRustLog: HERMETIC_DAEMON_RUST_LOG,
     rustE2eCargoEnv,
     rustE2eCargoTargetDir: RUST_E2E_CARGO_TARGET_DIR,
     stalePidAgeMs: RUST_E2E_STALE_PID_AGE_MS,

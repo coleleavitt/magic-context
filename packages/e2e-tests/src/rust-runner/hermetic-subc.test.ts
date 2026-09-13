@@ -15,6 +15,10 @@ describe("hermetic Rust process isolation", () => {
         );
     });
 
+    it("pins daemon info logs instead of inheriting desktop-only filters", () => {
+        expect(__hermeticSubcTest.hermeticDaemonRustLog).toBe("info");
+    });
+
     it("ignores a prebuilt module override when selecting the hermetic binary", () => {
         expect(__hermeticSubcTest.currentTreeCkMcBinary("/tmp/stale/ck-mc")).toBe(
             join(__hermeticSubcTest.rustE2eCargoTargetDir, "release/ck-mc"),
