@@ -143,6 +143,8 @@ export interface MagicContextDeps {
     onSessionCacheInvalidated?: (sessionId: string) => void;
     compactionHandler: ReturnType<typeof createCompactionHandler>;
     liveSessionState?: LiveSessionState;
+    /** Adapter-owned production marker inspection; direct hook harnesses stay filesystem-independent. */
+    inspectOpenCodeMarkerOwnership?: boolean;
     config: {
         protected_tokens?: number;
         protectedTokenTierOverrides?: ProtectedTokensTierOverrides;
@@ -1116,7 +1118,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         commitSeenLastPass,
         internalChildSessions,
         client: deps.client,
-        inspectOpenCodeMarkerOwnership: true,
+        inspectOpenCodeMarkerOwnership: deps.inspectOpenCodeMarkerOwnership === true,
         directory: deps.directory,
         allowHomeProject: deps.config.allow_home_project,
         injectDocs: deps.config.dreamer?.inject_docs !== false,
