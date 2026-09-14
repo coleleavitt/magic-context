@@ -80,7 +80,6 @@ import {
 import {
     describePiPackageEntry,
     getPiMagicContextPackageSpecifier,
-    hasPiMagicContextPackage,
     isPiMagicContextPackageEntry,
 } from "../lib/pi-package-entry";
 import { type PromptIO, promptIO } from "../lib/prompts";
@@ -99,6 +98,33 @@ const PACKAGE_NAME = "@cortexkit/pi-magic-context";
 // the new scope, so older Pi installs cannot load this extension.
 const MIN_PI_VERSION = "0.74.0";
 const ROW_COUNT_TABLES = ["tags", "compartments", "memories", "notes", "dream_runs"];
+
+function isLocalPiMagicContextPackageEntry(entry: unknown): boolean {
+    if (typeof entry === "string") {
+        const packagePath = entry.trim();
+        if (!isAbsolute(packagePath)) return false;
+        try {
+            const parsed = JSON.parse(readFileSync(join(packagePath, "package.json"), "utf-8")) as {
+                name?: unknown;
+            };
+            return parsed.name === PACKAGE_NAME;
+        } catch {
+            return false;
+        }
+    }
+    if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+        const object = entry as Record<string, unknown>;
+        return (
+            isLocalPiMagicContextPackageEntry(object.source) ||
+            isLocalPiMagicContextPackageEntry(object.name)
+        );
+    }
+    return false;
+}
+
+function isConfiguredPiMagicContextPackageEntry(entry: unknown): boolean {
+    return isPiMagicContextPackageEntry(entry) || isLocalPiMagicContextPackageEntry(entry);
+}
 
 type CheckStatus = "pass" | "warn" | "fail" | "info";
 
@@ -577,7 +603,7 @@ async function runHealthChecks(options: {
         } else {
             packages = packagesFrom(parsed.value);
             add(results, "pass", `Pi settings found at ${settingsPath}`);
-            if (hasPiMagicContextPackage(packages)) {
+            if (packages.some(isConfiguredPiMagicContextPackageEntry)) {
                 add(results, "pass", `${PI_PACKAGE_SOURCE} is registered in packages[]`);
             } else {
                 add(results, "fail", `${PI_PACKAGE_SOURCE} is missing from packages[]`);
@@ -902,7 +928,9 @@ async function runHealthChecks(options: {
     // extensions today, but we still check for self-conflicts that the user
     // can hit (e.g. accidentally registering both an npm entry AND a local
     // dev-path entry, which causes duplicate plugin loading).
-    const piEntries = packages.filter(isPiMagicContextPackageEntry).map(describePiPackageEntry);
+    const piEntries = packages
+        .filter(isConfiguredPiMagicContextPackageEntry)
+        .map(describePiPackageEntry);
     if (piEntries.length > 1) {
         add(
             results,
@@ -914,7 +942,7 @@ async function runHealthChecks(options: {
     }
 
     const otherExtensions = packages
-        .filter((entry) => !isPiMagicContextPackageEntry(entry))
+        .filter((entry) => !isConfiguredPiMagicContextPackageEntry(entry))
         .map(describePiPackageEntry);
     if (otherExtensions.length > 0) {
         add(results, "info", `Other Pi extensions registered: ${otherExtensions.join(", ")}`);
@@ -922,7 +950,7 @@ async function runHealthChecks(options: {
         add(results, "info", "No other Pi extensions listed in settings.json");
     }
 
-    const configuredEntry = packages.find(isPiMagicContextPackageEntry);
+    const configuredEntry = packages.find(isConfiguredPiMagicContextPackageEntry);
     const configuredSpecifier = getPiMagicContextPackageSpecifier(configuredEntry);
     const expectedPluginVersion =
         pinnedVersionFromPackageSpecifier(configuredSpecifier) ?? latest ?? null;

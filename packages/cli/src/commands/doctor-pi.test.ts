@@ -408,6 +408,38 @@ describe("Pi doctor", () => {
         expect(output).toContain("PASS Embedding provider: local (native runtime selected and OK)");
     });
 
+    it("accepts a local package path whose manifest has the Magic Context package name", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        const localPlugin = join(root, "src", "pi-plugin");
+        mkdirSync(localPlugin, { recursive: true });
+        writeFileSync(
+            join(localPlugin, "package.json"),
+            JSON.stringify({ name: "@cortexkit/pi-magic-context", version: "0.42.3" }),
+        );
+        writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: [localPlugin] }));
+        const configHome = process.env.XDG_CONFIG_HOME ?? join(root, ".config");
+        writeFileSync(
+            join(configHome, "cortexkit", "magic-context.jsonc"),
+            JSON.stringify({ embedding: { provider: "local" } }),
+        );
+        writeFileSync(
+            join(cwd, ".cortexkit", "magic-context.jsonc"),
+            JSON.stringify({ enabled: true }),
+        );
+        createInstalledPiPlugin(agentDir, true);
+        const prompts = new MockPrompts();
+
+        const code = await runDoctor(baseOptions(root, cwd, prompts));
+
+        expect(code).toBe(0);
+        const output = prompts.messages.join("\n");
+        expect(output).toContain("PASS npm:@cortexkit/pi-magic-context is registered");
+        expect(output).toContain(`No conflicting magic-context entries in Pi packages[]`);
+        expect(output).not.toContain("Other Pi extensions registered");
+    });
+
     it("repairs missing package entry and missing user config in --force mode", async () => {
         const root = makeTempRoot();
         const cwd = makeTempRoot("mc-pi-doctor-cwd-");
