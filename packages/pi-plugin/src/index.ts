@@ -731,7 +731,16 @@ export async function persistPiPressureFromMessageEnd(args: {
 		model: activeModel,
 		provenInputTokens: observedSafeInputTokens,
 	});
-	const reportedContextLimit = reportedGeometry?.usableSoft ?? 0;
+	// Compare proven input against the ADVERTISED window, not `usableSoft`.
+	// `usableSoft` is Magic Context's own scheduling line (window minus the
+	// output reserve, capped at 25% of the window), so a session that overruns
+	// it while staying under the wall is behaving exactly as designed — e.g.
+	// Anthropic's 200K/64K Opus 4.5 carves a 50K reserve, and every session
+	// between 150K and 195,904 tokens would otherwise raise this alert and
+	// blame Pi for a number Magic Context computed itself. OpenCode's twin in
+	// hooks/magic-context/event-handler.ts already compares the raw catalog
+	// limit; this keeps the two harnesses on the same rule.
+	const reportedContextWindow = reportedGeometry?.derivation.absoluteWall ?? 0;
 	const pressure = computePiPressure(
 		usage,
 		effectiveContextLimit,
@@ -756,8 +765,8 @@ export async function persistPiPressureFromMessageEnd(args: {
 			contextLimit > 0 ? (pressure.inputTokens / contextLimit) * 100 : 0;
 		if (
 			requestSucceeded &&
-			reportedContextLimit > 0 &&
-			reportedContextLimit < provenSafeInputTokens &&
+			reportedContextWindow > 0 &&
+			reportedContextWindow < provenSafeInputTokens &&
 			!meta.cacheAlertSent
 		) {
 			updates.cacheAlertSent = true;
@@ -766,7 +775,7 @@ export async function persistPiPressureFromMessageEnd(args: {
 					? `${activeModel.provider}/${activeModel.id}`
 					: "the active model";
 			await args.notifyIssue?.(
-				`⚠️ Magic Context: Pi reports a context limit of ${formatTokens(reportedContextLimit)} tokens for ${modelLabel}, but this session has sent ${formatTokens(provenSafeInputTokens)} tokens successfully. Magic Context will keep using the larger proven value for its pressure math. If Pi's model metadata is wrong for your provider, set contextWindow for that model in Pi's model configuration.`,
+				`⚠️ Magic Context: ${modelLabel} advertises a context window of ${formatTokens(reportedContextWindow)} tokens, but this session has sent ${formatTokens(provenSafeInputTokens)} tokens successfully. Magic Context will keep using the larger proven value for its pressure math. If the advertised window is wrong for your provider, set contextWindow for that model in Pi's model configuration.`,
 			);
 		}
 		updates.lastContextPercentage = percentage;

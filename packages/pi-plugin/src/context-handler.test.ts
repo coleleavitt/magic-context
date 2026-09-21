@@ -2674,13 +2674,54 @@ describe("registerPiContextHandler", () => {
 			expect(meta.lastUsageContextLimit).toBe(120_000);
 			expect(notify).toHaveBeenCalledTimes(1);
 			const warning = String(notify.mock.calls[0]?.[0]);
-			expect(warning).toContain("Pi reports a context limit of 30,000 tokens");
+			expect(warning).toContain(
+				"test-provider/test-model advertises a context window of 30,000 tokens",
+			);
 			expect(warning).toContain(
 				"this session has sent 90,000 tokens successfully",
 			);
 			expect(warning).toContain("larger proven value for its pressure math");
 			expect(warning).toContain("contextWindow");
 			expect(warning).not.toContain("Restart Pi");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("stays silent when a session overruns only the output reserve, not the window", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-reserve-overrun";
+		try {
+			const { persistPiPressureFromMessageEnd } = await import("./index");
+			const notify = mock(async () => undefined);
+
+			// Anthropic Opus 4.5: 200K window, 64K max output. The output reserve
+			// is capped at 25% of the window (50K), so usableSoft is 150K while the
+			// real wall stays 200K. A 153,277-token request is therefore a normal
+			// soft-line overrun, NOT evidence that Pi's catalog row is wrong.
+			await persistPiPressureFromMessageEnd({
+				db,
+				sessionId,
+				message: assistantMessage("done", 1, {
+					provider: "anthropic",
+					model: "claude-opus-4-5-20251101",
+					usage: { input: 153_277, cacheRead: 0, cacheWrite: 0 },
+				}),
+				piContextWindow: 200_000,
+				piContextWindowSource: "catalog",
+				piModel: {
+					provider: "anthropic",
+					id: "claude-opus-4-5-20251101",
+					contextWindow: 200_000,
+					maxTokens: 64_000,
+				},
+				notifyIssue: notify,
+			});
+
+			expect(notify).not.toHaveBeenCalled();
+			const meta = getOrCreateSessionMeta(db, sessionId);
+			expect(meta.cacheAlertSent).toBe(false);
+			expect(meta.observedSafeInputTokens).toBe(153_277);
 		} finally {
 			closeQuietly(db);
 		}
