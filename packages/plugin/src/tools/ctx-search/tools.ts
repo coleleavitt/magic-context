@@ -4,7 +4,10 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
-import { directoryHasGitMetadata } from "../../features/magic-context/memory/project-identity";
+import {
+    describeUnresolvedProjectIdentity,
+    directoryHasGitMetadata,
+} from "../../features/magic-context/memory/project-identity";
 import {
     createUnifiedSearchDiagnostics,
     formatSearchResults,
@@ -32,7 +35,7 @@ const VALID_SOURCES: ReadonlySet<CtxSearchSource> = new Set([
 ]);
 
 function normalizeLimit(limit?: number): number {
-    if (typeof limit !== "number" || !Number.isFinite(limit)) {
+    if (typeof limit !== "number" || !Number.isFinite(limit) || limit === 0) {
         return DEFAULT_CTX_SEARCH_LIMIT;
     }
 
@@ -41,10 +44,10 @@ function normalizeLimit(limit?: number): number {
 
 /** Validate and normalize the `sources` arg. Drops unknown strings (the enum
  *  constraint catches them at the schema layer, but we still want a safe
- *  runtime check for plugins/tests that call this directly). Returns
- *  `undefined` only when the caller OMITTED `sources`; an explicit [] must stay
- *  [] so unifiedSearch honors the documented "no sources" meaning instead of
- *  widening back to "all sources". */
+ *  runtime check for plugins/tests that call this directly). Required-all
+ *  surfaces fill unused arrays with `[]`; treat that the same as omitting
+ *  `sources` so the search covers every enabled source instead of silently
+ *  returning nothing. */
 function normalizeSources(sources?: string[]): CtxSearchSource[] | undefined {
     if (sources === undefined) return undefined;
     const result: CtxSearchSource[] = [];
@@ -58,7 +61,7 @@ function normalizeSources(sources?: string[]): CtxSearchSource[] | undefined {
             }
         }
     }
-    return result;
+    return sources.length === 0 ? undefined : result;
 }
 
 const ctxSearchArgsShape = {
@@ -126,7 +129,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
             // runs `opencode -s <id>` from outside the project.
             const projectPath = deps.resolveProjectPath(toolContext.directory);
             if (!projectPath) {
-                return "Error: Could not resolve project identity for search.";
+                return `Error: Could not resolve project identity for search: ${describeUnresolvedProjectIdentity(toolContext.directory)}`;
             }
             await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
             const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);

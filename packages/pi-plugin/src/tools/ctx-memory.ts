@@ -34,6 +34,11 @@
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
+	curateCategoryForMemoryCategory,
+	getActiveCurateCategory,
+	getCurateCategoryScopeRefusal,
+} from "@magic-context/core/features/magic-context/dreamer/curate-category-rotation";
+import {
 	assessCurateMutationSafety,
 	recordCurateSafetyRefusal,
 } from "@magic-context/core/features/magic-context/dreamer/curate-memory-safety";
@@ -181,7 +186,7 @@ function err(text: string) {
 }
 
 function normalizeLimit(limit?: number): number {
-	if (typeof limit !== "number" || !Number.isFinite(limit))
+	if (typeof limit !== "number" || !Number.isFinite(limit) || limit === 0)
 		return DEFAULT_LIST_LIMIT;
 	return Math.max(1, Math.floor(limit));
 }
@@ -233,8 +238,10 @@ function formatMemoryList(memories: Memory[]): string {
 			r.updated.padEnd(widths.updated),
 			r.content,
 		].join(" | ");
+	// `get` returns rows of any status; claim "active" only when every row is.
+	const allActive = memories.every((memory) => memory.status === "active");
 	return [
-		`Found ${rows.length} active ${rows.length === 1 ? "memory" : "memories"}:`,
+		`Found ${rows.length} ${allActive ? "active " : ""}${rows.length === 1 ? "memory" : "memories"}:`,
 		"",
 		fmt(headers),
 		[
@@ -292,10 +299,11 @@ function updateMemoryContentInCurrentTransaction(
 	memory: Memory,
 	content: string,
 	normalizedHash: string,
+	category: MemoryCategory,
 ): void {
 	db.prepare(
-		"UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
-	).run(content, normalizedHash, Date.now(), memory.id);
+		"UPDATE memories SET content = ?, normalized_hash = ?, category = ?, updated_at = ? WHERE id = ?",
+	).run(content, normalizedHash, category, Date.now(), memory.id);
 	// The classify `shareable` verdict was scored against the OLD content; new
 	// content invalidates it. Fail closed → private; the dreamer re-scores later.
 	if (hasMemoryShareableColumn(db)) {
@@ -409,6 +417,37 @@ export function createCtxMemoryTool(
 				);
 			}
 			await deps.ensureProjectRegistered?.(ctx.cwd, deps.db);
+			const activeCurateCategory = dreamerAllowed
+				? getActiveCurateCategory(deps.db, projectIdentity)
+				: null;
+			if (activeCurateCategory) {
+				const usesCategory = ["write", "update", "merge", "list"].includes(
+					params.action,
+				);
+				const usesIds = ["update", "archive", "merge", "get"].includes(
+					params.action,
+				);
+				const usesSuccessor =
+					params.action === "update" || params.action === "archive";
+				const scopeRefusal = getCurateCategoryScopeRefusal({
+					scope: activeCurateCategory,
+					action: params.action,
+					requestedCategory: usesCategory ? params.category : undefined,
+					ids: usesIds
+						? [
+								...(params.ids ?? []),
+								...(usesSuccessor && Number.isInteger(params.superseded_by)
+									? [params.superseded_by as number]
+									: []),
+							]
+						: [],
+					categoryForId: (id) => {
+						const category = getMemoryById(deps.db, id)?.category;
+						return category ? curateCategoryForMemoryCategory(category) : null;
+					},
+				});
+				if (scopeRefusal) return err(scopeRefusal);
+			}
 			const workspaceIdentitySet = resolveWorkspaceIdentitySet(
 				deps.db,
 				projectIdentity,
@@ -577,9 +616,15 @@ export function createCtxMemoryTool(
 				const limit = normalizeLimit(params.limit);
 				const filtered = getMemoriesByProject(deps.db, projectIdentity);
 				const category = params.category;
-				const filtered2 = category
-					? filtered.filter((m) => m.category === category)
-					: filtered;
+				const filtered2 = activeCurateCategory
+					? filtered.filter(
+							(memory) =>
+								curateCategoryForMemoryCategory(memory.category) ===
+								activeCurateCategory,
+						)
+					: category
+						? filtered.filter((memory) => memory.category === category)
+						: filtered;
 				return ok(formatMemoryList(filtered2.slice(0, limit)));
 			}
 
@@ -639,11 +684,12 @@ export function createCtxMemoryTool(
 				}
 
 				const normalizedHash = computeNormalizedHash(content);
+				const targetCategory = params.category ?? memory.category;
 				const targetIdentity = targetIdentityForStoredPath(memory.projectPath);
 				const duplicate = getMemoryByHash(
 					deps.db,
 					targetIdentity,
-					memory.category,
+					targetCategory,
 					normalizedHash,
 				);
 				if (duplicate && duplicate.id !== memory.id) {
@@ -658,12 +704,13 @@ export function createCtxMemoryTool(
 						memory,
 						content,
 						normalizedHash,
+						targetCategory,
 					);
 					queueMemoryMutation(deps.db, {
 						projectPath: targetIdentity,
 						mutationType: "update",
 						targetMemoryId: memory.id,
-						category: memory.category,
+						category: targetCategory,
 						newContent: content,
 					});
 				});
@@ -673,7 +720,7 @@ export function createCtxMemoryTool(
 					memoryId: memory.id,
 					content,
 				});
-				return ok(`Updated memory [ID: ${memory.id}] in ${memory.category}.`);
+				return ok(`Updated memory [ID: ${memory.id}] in ${targetCategory}.`);
 			}
 
 			if (params.action === "merge") {

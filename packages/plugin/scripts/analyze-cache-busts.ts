@@ -43,6 +43,8 @@ import {
     normalizeRequestBody,
 } from "./cache-bust-body-sources";
 
+import { withSchedulerLogFallback } from "./cache-bust-scheduler-log";
+
 type Json = Record<string, unknown>;
 type ByteVerdict = "BUST" | "STABLE";
 type MeterVerdict = ByteVerdict | "LATENCY" | "UNMETERED";
@@ -68,6 +70,7 @@ interface Args {
     allBusts: boolean;
     allRows: boolean;
     help: boolean;
+    mcLogPath?: string;
 }
 
 interface MeterUsage {
@@ -89,6 +92,7 @@ interface Snapshot {
     session: string;
     messagesCount: number;
     provider: BodyProvider;
+    wireModel?: string;
     sourceDir: string;
     segments: Segment[];
     usage?: MeterUsage;
@@ -120,6 +124,8 @@ export interface OpenCodeCacheBustAnalysisOptions {
     anthropicDir?: string;
     openaiDir?: string;
     decisions?: readonly CacheBustDecisionAttribution[];
+    /** Use scheduler lines when a pass has no DB row; null disables this additional evidence source. */
+    mcLogPath?: string | null;
 }
 
 interface DumpCandidate {
@@ -144,6 +150,7 @@ function parseArgs(argv: string[]): Args {
     };
     const valueOptions = new Set([
         "--session",
+        "--mc-log",
         "--dir",
         "--anthropic-dir",
         "--openai-dir",
@@ -187,6 +194,7 @@ function parseArgs(argv: string[]): Args {
           ];
     return {
         sessionPrefix: getOpt("--session") ?? positionalSession,
+        mcLogPath: getOpt("--mc-log"),
         sources,
         since: getOpt("--since"),
         until: getOpt("--until"),
@@ -246,6 +254,10 @@ function buildSegments(
             id: `message[${index}] ${describeNormalizedMessage(message)}`,
         })),
     };
+}
+
+function wireModel(body: Json): string | undefined {
+    return typeof body.model === "string" && body.model.length > 0 ? body.model : undefined;
 }
 
 function asJson(value: unknown): Json | undefined {
@@ -499,6 +511,7 @@ function loadCandidateSnapshots(candidate: DumpCandidate, opts: Args): Snapshot[
                 session: candidate.session,
                 messagesCount: normalized.segments.length,
                 provider: normalized.provider,
+                wireModel: wireModel(body),
                 sourceDir: candidate.source.dir,
                 segments: normalized.segments,
                 usage: loadMeterUsage(responsePath, normalized.provider),
@@ -553,6 +566,7 @@ function openCodeAnalyzerCommand(
         "--show-diff",
         "--all-rows",
     ];
+    if (options.mcLogPath) args.push("--mc-log", shellQuote(options.mcLogPath));
     if (options.anthropicDir) {
         args.push("--anthropic-dir", shellQuote(options.anthropicDir));
     }
@@ -620,7 +634,7 @@ export function analyzeOpenCodeCacheBustSession(
             : boundedSnapshots.slice(
                   options.sinceExclusiveMs === undefined ? 0 : Math.max(0, firstNewIndex - 2),
               );
-    const rows = analyzeSnapshots(analysisSnapshots, options.decisions);
+    const rows = analyzeSnapshots(analysisSnapshots, withSchedulerLogFallback(options.decisions ?? [], options.sessionId, options.mcLogPath));
     const requests: AnalyzedCacheRequest[] = rows.flatMap((row) => {
         const timestampMs = Date.parse(row.current.createdAt);
         if (!Number.isFinite(timestampMs) || !inWindow(timestampMs)) return [];
@@ -646,6 +660,7 @@ export function analyzeOpenCodeCacheBustSession(
         ];
     });
     const analyzedRequestTimestamps = boundedSnapshots
+        .filter((snapshot) => !isUsageMissing(snapshot))
         .map((snapshot) => Date.parse(snapshot.createdAt))
         .filter(inWindow);
     return {
@@ -653,6 +668,11 @@ export function analyzeOpenCodeCacheBustSession(
         highWaterMarkMs:
             analyzedRequestTimestamps.length > 0 ? Math.max(...analyzedRequestTimestamps) : null,
     };
+}
+
+function isUsageMissing(snapshot: Snapshot): boolean {
+    const usage = snapshot.usage;
+    return usage === undefined || (usage.cacheRead === 0 && usage.input === 0);
 }
 
 /** First wire-order segment index where prev/cur diverge (added/removed/changed). */
@@ -688,32 +708,49 @@ function lastBreakpointIndex(segs: Segment[]): number {
     return last;
 }
 
+/**
+ * Does the divergence land inside the prefix the previous request left cached?
+ *
+ * Anthropic writes the cache at the breakpoints of the request that was sent, so
+ * the reusable prefix ends at the PREVIOUS request's last breakpoint. Measuring
+ * against the CURRENT request's last breakpoint instead made every appended
+ * message look like a bust: this client moves its tail cache_control marker onto
+ * the newest message, so the marker always sat at or after the append and the
+ * append always looked like it fell inside a cached prefix that did not yet
+ * exist. OpenAI has no breakpoints — its prefix cache is implicit, so only an
+ * in-place change or removal inside the previous prompt busts it.
+ */
+function bustsReusablePrefix(
+    previous: Snapshot,
+    current: Snapshot,
+    divergenceIndex: number,
+): boolean {
+    if (divergenceIndex < 0) return false;
+    return current.provider === "openai"
+        ? divergenceIndex < previous.segments.length
+        : divergenceIndex <= lastBreakpointIndex(previous.segments);
+}
+
 export function analyzeSnapshots(
     snaps: readonly Snapshot[],
     decisions: readonly CacheBustDecisionAttribution[] = [],
 ): AnalysisRow[] {
     let previousShortRead = false;
     let previousBustDivergenceIndex: number | undefined;
+    let previousMetered: Snapshot | undefined;
     const rows: AnalysisRow[] = [];
     for (let index = 0; index < snaps.length; index += 1) {
         const current = snaps[index];
-        if (index === 0) {
-            rows.push({ current, divergenceIndex: -1, verdict: "BASE" });
-            continue;
-        }
-        const previous = snaps[index - 1];
-        const divergenceIndex = firstDivergence(previous.segments, current.segments);
-        // Anthropic exposes explicit breakpoints. OpenAI's cache is an implicit prefix,
-        // so an in-place change/removal busts while ordinary appended input does not.
-        const byteBust =
-            current.provider === "openai"
-                ? divergenceIndex >= 0 && divergenceIndex < previous.segments.length
-                : divergenceIndex !== -1 &&
-                  divergenceIndex <= lastBreakpointIndex(current.segments);
-        const byteVerdict: ByteVerdict = byteBust ? "BUST" : "STABLE";
-        if (!current.usage || !previous.usage) {
-            previousShortRead = false;
-            previousBustDivergenceIndex = undefined;
+        if (isUsageMissing(current)) {
+            const previous = previousMetered;
+            const divergenceIndex = previous
+                ? firstDivergence(previous.segments, current.segments)
+                : -1;
+            const byteVerdict = previous
+                ? bustsReusablePrefix(previous, current, divergenceIndex)
+                    ? "BUST"
+                    : "STABLE"
+                : undefined;
             rows.push({
                 current,
                 previous,
@@ -721,10 +758,22 @@ export function analyzeSnapshots(
                 byteVerdict,
                 verdict: "UNMETERED",
                 meterVsBytes: "UNMETERED",
+                divergenceClass: "usage_missing",
             });
             continue;
         }
-        const prevTotal = previous.usage.total;
+        if (!previousMetered) {
+            rows.push({ current, divergenceIndex: -1, verdict: "BASE" });
+            previousMetered = current;
+            continue;
+        }
+        const previous = previousMetered;
+        if (!previous.usage || !current.usage) continue;
+        const divergenceIndex = firstDivergence(previous.segments, current.segments);
+        const byteVerdict: ByteVerdict = bustsReusablePrefix(previous, current, divergenceIndex)
+            ? "BUST"
+            : "STABLE";
+        const prevTotal = previous.usage!.total;
         const epsilon = Math.max(64, previous.usage.input);
         const meterFloor = prevTotal - epsilon;
         // Anthropic separates direct input from cache writes, so it belongs in the
@@ -765,9 +814,12 @@ export function analyzeSnapshots(
             divergenceIndex < 0
                 ? undefined
                 : (current.segments[divergenceIndex] ?? previous.segments[divergenceIndex]);
+        // A LATENCY row is also classified: a short read over an unchanged reusable
+        // prefix is a provider-side fact and deserves a name, not a blank cell.
         const divergenceClass =
-            verdict === "BUST"
+            verdict === "BUST" || verdict === "LATENCY"
                 ? classifyCacheBust({
+                      providerShortReadWithIdenticalPrefix: verdict === "LATENCY",
                       divergenceIndex,
                       previousMessageCount: previous.segments.length,
                       previousBustDivergenceIndex,
@@ -775,10 +827,15 @@ export function analyzeSnapshots(
                       currentProvider: current.provider,
                       firstDivergenceRole: divergentSegment?.role,
                       firstDivergenceSize: divergentSegment?.bytes,
-                      rewrittenTokens,
-                      cacheCreationTokens: current.usage.cacheCreation,
-                      promptTokens: prevTotal,
-                      inheritedFold: attributionDecision !== decision,
+                       rewrittenTokens,
+                       cacheCreationTokens: current.usage.cacheCreation,
+                       promptTokens: prevTotal,
+                       providerComparableRead: current.usage.cacheRead,
+                       directInput: current.usage.input,
+                       previousTotal: prevTotal,
+                       previousModel: previous.wireModel,
+                       currentModel: current.wireModel,
+                       inheritedFold: attributionDecision !== decision,
                       contentEvidence: [previous, current]
                           .flatMap((snapshot) =>
                               snapshot.segments.slice(
@@ -792,6 +849,7 @@ export function analyzeSnapshots(
                   })
                 : undefined;
         previousBustDivergenceIndex = verdict === "BUST" ? divergenceIndex : undefined;
+        previousMetered = current;
         rows.push({
             current,
             previous,
@@ -863,7 +921,13 @@ function meterCell(row: AnalysisRow): string {
         row.current.provider === "openai"
             ? `cached=${read.toLocaleString()}`
             : `read=${read.toLocaleString()} + input=${directInput.toLocaleString()} = ${row.comparableRead?.toLocaleString()}`;
-    return `${comparable}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()}, ε=${row.epsilon?.toLocaleString()})${rewritten}`;
+    const wireModel =
+        row.previous?.wireModel &&
+        row.current.wireModel &&
+        row.previous.wireModel !== row.current.wireModel
+            ? `; wireModel=${row.previous.wireModel} → ${row.current.wireModel}`
+            : "";
+    return `${comparable}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()}, ε=${row.epsilon?.toLocaleString()})${rewritten}${wireModel}`;
 }
 
 const HELP = `usage: bun scripts/analyze-cache-busts.ts --session <prefix> [options]
@@ -877,6 +941,7 @@ Sources (both searched by default):
              WebSocket captures can have no response file and are UNMETERED.
 
 Options:
+  --mc-log <path>       scheduler log fallback (default: MAGIC_CONTEXT_LOG_PATH or harness log)
   --dir <path>          inspect one explicit directory (legacy override)
   --anthropic-dir <p>   override the Anthropic source
   --openai-dir <path>   override the OpenAI source
@@ -915,7 +980,7 @@ function main(): void {
         );
         console.log("");
     }
-    const rows = analyzeSnapshots(snaps);
+    const rows = analyzeSnapshots(snaps, withSchedulerLogFallback([], snaps[0].session, opts.mcLogPath));
     const provider = snaps[0].provider;
     const meterRule =
         snaps.find((snapshot) => snapshot.usage)?.usage?.rule ??

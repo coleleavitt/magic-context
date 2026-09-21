@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
     type AuthorityDrainResponse,
@@ -12,6 +12,7 @@ import {
     pullMemoryMirrorOnce,
     reconcileAuthorityProject,
 } from "../../features/magic-context/context-authority";
+import { reembedMirrorInvalidatedMemories } from "../../features/magic-context/memory/mirror-reembed";
 import {
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
@@ -121,6 +122,7 @@ import {
     encodeOpenCodeMessagesToCk,
     resolveOrdinalsForModule,
 } from "./module-wire";
+import { onNoteTrigger } from "./note-nudger";
 import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
@@ -162,6 +164,8 @@ export const RUST_PARK_RETRY_INTERVAL = 5;
 export const RUST_EMERGENCY_WALL_PCT = 95;
 export const RUST_PARK_PROBE_PRESSURE_BYPASS_PCT = 90;
 const RUST_SEND_TIMEOUT_MS = 15_000;
+export const RUST_STALL_PROBE_AFTER_MS = 10_000;
+export const RUST_HEALTH_PROBE_TIMEOUT_MS = 2_000;
 // A frozen defer prevents an immediate LKG/module/LKG double bust. After eight healthy module
 // passes or sixteen new raw messages, continued replay adds more stale-snapshot risk than value.
 const RUST_LKG_FROZEN_HEALTHY_PASS_LIMIT = 8;
@@ -258,6 +262,8 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         project: string;
         /** Bound route root for this authority query. */
         projectRoot?: string;
+        /** Existing OpenCode session route used by host tools. */
+        sessionId?: string;
         domain: "memories" | "notes";
     }): Promise<{ authority: AuthorityStatus | null }>;
     authorityPrepare?(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
@@ -272,6 +278,14 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         live_only?: boolean;
         projectRoot?: string;
     }): Promise<{ page: import("../../features/magic-context/context-authority").ChangefeedPage }>;
+    mirrorMemory?(args: { module_row_id: number; projectRoot?: string }): Promise<{
+        row: import("../../features/magic-context/context-authority").ChangefeedRow | null;
+    }>;
+    memoryIdentityAck?(args: {
+        project: string;
+        rows: Array<{ module_row_id: number; context_row_id: number }>;
+        projectRoot?: string;
+    }): Promise<{ acknowledged: number }>;
     deleteSession?(sessionId: string, projectRoot: string): Promise<void>;
     closeSession?(sessionId: string): void;
     getCompartmentsAfter?(
@@ -411,6 +425,9 @@ interface RustSessionState extends ModuleStateSyncState {
     lkgRepresentationFrozen: boolean;
     lkgFrozenHealthyPasses: number;
     lkgFrozenAtInputCount: number | null;
+    /** Highest fold coverage ordinal this process has already armed the deferred-note
+     * nudge for. Null until the first committed boundary of the process is observed. */
+    noteNudgePublishedOrdinal: number | null;
 }
 
 export interface RustModeTransformOptions {
@@ -442,10 +459,22 @@ export interface RustModeTransformOptions {
     sessionProjectIdentityResolverForTests?: typeof resolveProjectIdentityForSession;
     /** Override only to observe memory-project identity caching in tests. */
     memoryProjectIdentityResolverForTests?: typeof resolveProjectIdentity;
+    /** Arm host-side turn recovery after an engine-reconnecting refusal. */
+    onEngineReconnectRefusal?: (args: {
+        sessionId: string;
+        projectRoot: string;
+        refusedUserMessageId: string;
+        providerProvenEmergency: boolean;
+        compactionOff: boolean;
+    }) => void;
     /** Disable hot-path I/O caches to establish an uncached differential-timing baseline. */
     disableHotPathIoCachesForTests?: boolean;
     /** Test-only callback after a capture is accepted, reporting the reused digest prefix length. */
     onLkgCaptureForTests?: (reusedPrefix: number) => void;
+    /** Test-only override for the stalled-request health-probe threshold. */
+    stallProbeAfterMsForTests?: number;
+    /** Test-only override for the health-probe deadline. */
+    healthProbeTimeoutMsForTests?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -712,6 +741,44 @@ function materializedCompactionBoundary(
     };
 }
 
+/**
+ * Arm the deferred-note nudge when a response reports that a fold published new
+ * compartments.
+ *
+ * In rust mode the module owns the historian, so the host never reaches the publish
+ * path that arms this nudge in TypeScript mode; without this the deferred notes are
+ * only ever re-surfaced by the commit and todo triggers. The committed materialized
+ * boundary above is the host's view of that publish, and its coverage ordinal grows
+ * only when a fold covered more raw history. Re-rendering the same fold repeats the
+ * same ordinal, so comparing against the highest ordinal already armed keeps every
+ * later cache-busting pass from re-arming.
+ *
+ * `persistedBoundaryOrdinal` is the compaction marker already applied to this session,
+ * read before this pass could advance it. It seeds the comparison so a fold published
+ * by an earlier process is not treated as new after a restart.
+ *
+ * Cooldown, clear-on-use, and the "are there notes at all" question stay where the
+ * other two triggers leave them: in the shared nudge state machine.
+ */
+function armNoteNudgeOnRustPublish(args: {
+    db: TransformDeps["db"];
+    sessionId: string;
+    state: RustSessionState;
+    boundary: ReturnType<typeof materializedCompactionBoundary>;
+    persistedBoundaryOrdinal: number | null;
+}): void {
+    if (!args.boundary) return;
+    const armedThrough =
+        args.state.noteNudgePublishedOrdinal ?? args.persistedBoundaryOrdinal ?? -1;
+    args.state.noteNudgePublishedOrdinal = Math.max(armedThrough, args.boundary.ordinal);
+    if (args.boundary.ordinal <= armedThrough) return;
+    sessionLog(
+        args.sessionId,
+        `rust fold published compartments through ordinal ${args.boundary.ordinal} (previously ${armedThrough}); arming the deferred-note nudge`,
+    );
+    onNoteTrigger(args.db, args.sessionId, "historian_complete");
+}
+
 function formatRustPassLog(args: {
     decision: string;
     reason: string;
@@ -821,6 +888,14 @@ function responseValue(response: unknown): Record<string, unknown> {
 }
 
 function mirrorProjectionKey(response: Record<string, unknown>): string | null {
+    const memoryMirrorHead = response.memory_mirror_head;
+    if (
+        typeof memoryMirrorHead === "number" &&
+        Number.isSafeInteger(memoryMirrorHead) &&
+        memoryMirrorHead >= 0
+    ) {
+        return JSON.stringify(["memory-feed", memoryMirrorHead]);
+    }
     const rowVersion = response.row_version;
     if (typeof rowVersion !== "number" || !Number.isSafeInteger(rowVersion) || rowVersion < 0) {
         return null;
@@ -828,6 +903,8 @@ function mirrorProjectionKey(response: Record<string, unknown>): string | null {
     const renderedMemoryIds = Array.isArray(response.rendered_memory_ids)
         ? response.rendered_memory_ids
         : [];
+    // Older modules do not publish the feed frontier. Keep their legacy projection trigger
+    // rather than polling on every pass; current modules use the exact feed sequence above.
     return JSON.stringify([
         rowVersion,
         response.boundary_id ?? null,
@@ -982,6 +1059,7 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             lkgRepresentationFrozen: false,
             lkgFrozenHealthyPasses: 0,
             lkgFrozenAtInputCount: null,
+            noteNudgePublishedOrdinal: null,
         };
         states.set(sessionId, state);
     }
@@ -1738,6 +1816,67 @@ export function createRustModeTransform(
         }
     };
 
+    const callTransformWithStallProbe = async (
+        args: Parameters<RustModeModuleClient["call"]>[0],
+        attemptTimeoutMs: number,
+    ): Promise<unknown> => {
+        const startedAtMs = Date.now();
+        const deadlineMs = startedAtMs + attemptTimeoutMs;
+        const probeAfterMs = options.stallProbeAfterMsForTests ?? RUST_STALL_PROBE_AFTER_MS;
+        const probeTimeoutMs = options.healthProbeTimeoutMsForTests ?? RUST_HEALTH_PROBE_TIMEOUT_MS;
+        const originalAttemptId = randomUUID();
+        const originalBody = isRecord(args.body)
+            ? { ...args.body, attempt_id: originalAttemptId }
+            : args.body;
+        const original = callModule({ ...args, body: originalBody }, attemptTimeoutMs);
+        if (attemptTimeoutMs <= probeAfterMs) return original;
+
+        let stallTimer: ReturnType<typeof setTimeout> | undefined;
+        const first = await Promise.race([
+            original.then(
+                (response) => ({ kind: "response" as const, response }),
+                (error) => ({ kind: "error" as const, error }),
+            ),
+            new Promise<{ kind: "stalled" }>((resolve) => {
+                stallTimer = setTimeout(() => resolve({ kind: "stalled" }), probeAfterMs);
+            }),
+        ]);
+        if (first.kind !== "stalled") clearTimeout(stallTimer);
+        if (first.kind === "response") return first.response;
+        if (first.kind === "error") throw first.error;
+
+        const probeBudgetMs = Math.min(probeTimeoutMs, Math.max(0, deadlineMs - Date.now()));
+        if (probeBudgetMs <= 0) return original;
+        try {
+            await callModule(
+                {
+                    sessionId: args.sessionId,
+                    projectRoot: args.projectRoot,
+                    method: "session.status",
+                    body: {
+                        method: "session.status",
+                        v: 1,
+                        session_id: args.sessionId,
+                    },
+                    bypassSessionLane: true,
+                },
+                probeBudgetMs,
+            );
+        } catch {
+            // A failed probe indicates that the module may be unavailable. Keep waiting on
+            // the original request so normal timeout handling chooses refusal or fallback.
+            return original;
+        }
+
+        sessionLog(
+            args.sessionId,
+            `rust transform still pending after healthy probe original_attempt=${originalAttemptId} stall_ms=${Date.now() - startedAtMs}; duplicate resend suppressed`,
+        );
+        // A healthy status response does not prove the original mutating transform stopped.
+        // Keep its single deadline instead of overlapping a second request against stale state.
+        return original;
+    };
+
     const markFailure = (sessionId: string, state: RustSessionState, error: unknown): void => {
         state.consecutiveFailures = isNonRetryableStateSyncFailure(error)
             ? Math.max(RUST_FAILURE_PARK_THRESHOLD, state.consecutiveFailures + 1)
@@ -2018,14 +2157,20 @@ export function createRustModeTransform(
         let rowVersion = 0;
         let coveredOrdinal = 0;
         let markerAt: string | null = null;
+        // Read before this pass can advance the marker: the nudge arm below needs the
+        // coverage a previous process already published.
+        let persistedBoundaryOrdinal: number | null = null;
         try {
             const marker = getPersistedCompactionMarkerState(deps.db, sessionId);
             markerAt = marker?.targetEndMessageId ?? marker?.boundaryMessageId ?? null;
+            persistedBoundaryOrdinal = marker?.boundaryOrdinal ?? null;
         } catch {
             // Diagnostics remain available even when the local state database is unavailable.
         }
         let appliedAt: number | undefined;
         let emergencyFailClosed = false;
+        let providerProvenEmergency = false;
+        let recoveryProjectRoot = options.projectRoot ?? deps.directory ?? "";
         // Parking must not hide pressure from the recovery policy. Usage is cheap to read
         // and is the same value copied onto the module request when this pass runs.
         const passUsageSnapshot = loadContextUsage(deps.contextUsageMap, deps.db, sessionId);
@@ -2069,11 +2214,11 @@ export function createRustModeTransform(
         const hasTrustedEmergencyWall = transformGeometry
             ? transformGeometry.usable_hard > 0
             : resolvedContextLimit !== undefined && resolvedContextLimit > 0;
+        const hardWallPercentage = hardWallUsagePercentage(passUsageSnapshot, transformGeometry);
+        const providerOverflowProven = isProviderOverflowFailClosedProven(sessionId);
         emergencyFailClosed =
-            isProviderOverflowFailClosedProven(sessionId) ||
-            (hardWallUsagePercentage(passUsageSnapshot, transformGeometry) >=
-                RUST_EMERGENCY_WALL_PCT &&
-                hasTrustedEmergencyWall);
+            providerOverflowProven ||
+            (hardWallPercentage >= RUST_EMERGENCY_WALL_PCT && hasTrustedEmergencyWall);
         if (overflowState) {
             const detectedLimitMatchesModel =
                 overflowState.detectedContextLimitModelKey === null ||
@@ -2084,10 +2229,14 @@ export function createRustModeTransform(
                 // An unknown persisted arm alone is not proof. A second provider rejection
                 // while that arm is durable records the process-local reconfirmation.
                 isProviderOverflowReconfirmed(sessionId);
-            emergencyFailClosed ||=
+            const persistedProviderEmergency =
                 overflowState.needsEmergencyRecovery &&
                 overflowState.emergencyRecoveryOrigin === "provider_overflow" &&
                 hasProviderProof;
+            emergencyFailClosed ||= persistedProviderEmergency;
+            providerProvenEmergency =
+                hardWallPercentage >= RUST_EMERGENCY_WALL_PCT &&
+                (providerOverflowProven || persistedProviderEmergency);
         }
         const serveRawFallback = (cause?: unknown): void => {
             const contextLimit =
@@ -2623,6 +2772,7 @@ export function createRustModeTransform(
                 nowMs: Date.now(),
             };
             const projectRoot = options.projectRoot ?? directory;
+            recoveryProjectRoot = projectRoot;
             const authoritySeqAdoption = { used: false };
             const memorySyncRequested =
                 options.memorySyncRequestedSessions?.delete(sessionId) === true;
@@ -2889,9 +3039,12 @@ export function createRustModeTransform(
                 detail = "",
             ): Promise<TransformSeriesResult> => {
                 const pagingStartedAt = performance.now();
+                // A one-page content-addressed envelope lets the module replay a completed
+                // request when only its response was lost, without executing the transform twice.
                 const pages = buildPagedModuleTransformPayloads(
                     payload,
                     options.modulePageMaxBytes,
+                    true,
                 );
                 timings.paging += performance.now() - pagingStartedAt;
                 const seedMessageCount = Array.isArray(payload.input)
@@ -2907,7 +3060,10 @@ export function createRustModeTransform(
                     const transportStartedAt = performance.now();
                     let moduleResponse: unknown;
                     try {
-                        const attemptClass = paged
+                        const attemptClass:
+                            | "transform_page_upload"
+                            | "transform_series_execute"
+                            | undefined = paged
                             ? index === pages.length - 1
                                 ? "transform_series_execute"
                                 : "transform_page_upload"
@@ -2919,25 +3075,23 @@ export function createRustModeTransform(
                                 : attemptClass === "transform_page_upload"
                                   ? TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS
                                   : timeoutMs);
-                        moduleResponse = await callModule(
-                            {
-                                sessionId,
-                                projectRoot,
-                                method: "transform",
-                                body: page,
-                                onTimings: (detail) => {
-                                    for (const key of Object.keys(
-                                        detail,
-                                    ) as (keyof typeof detail)[])
-                                        timings.transportDetail[key] += detail[key];
-                                },
-                                // A reconnect discards a collecting page series. Page zero can be
-                                // retried safely, but later pages must make the caller restart it.
-                                generationSensitive: paged && index > 0,
-                                attemptClass,
+                        const callArgs = {
+                            sessionId,
+                            projectRoot,
+                            method: "transform" as const,
+                            body: page,
+                            onTimings: (detail: import("./module-transport").ModuleCallTimings) => {
+                                for (const key of Object.keys(detail) as (keyof typeof detail)[])
+                                    timings.transportDetail[key] += detail[key];
                             },
-                            attemptTimeoutMs,
-                        );
+                            // A reconnect discards a collecting page series. Page zero can be
+                            // retried safely, but later pages must make the caller restart it.
+                            generationSensitive: paged && index > 0,
+                            attemptClass,
+                        };
+                        moduleResponse = page.transform_page_complete
+                            ? await callTransformWithStallProbe(callArgs, attemptTimeoutMs)
+                            : await callModule(callArgs, attemptTimeoutMs);
                     } catch (error) {
                         if (paged && isTransformPageAttemptMismatch(error)) {
                             return {
@@ -3521,6 +3675,19 @@ export function createRustModeTransform(
             } catch (error) {
                 sessionLog(sessionId, "rust rendered-memory mirror write failed (ignored):", error);
             }
+            try {
+                armNoteNudgeOnRustPublish({
+                    db: deps.db,
+                    sessionId,
+                    state,
+                    boundary: materializedBoundary,
+                    persistedBoundaryOrdinal,
+                });
+            } catch (error) {
+                // The module output is already installed for this pass, so a failure while
+                // recording the nudge must not fail the pass; a later publish arms it again.
+                sessionLog(sessionId, "rust note-nudge arm after publish failed (ignored):", error);
+            }
             const deliveryStartedAt = performance.now();
             if (deliveryPassIds.length > 0) {
                 try {
@@ -3649,6 +3816,14 @@ export function createRustModeTransform(
                                 state.muralCuePoolVersion = mirrorDrain.cuePoolVersion;
                                 state.muralCache = null;
                             }
+                            // A module-side edit arrives here as changed content, and
+                            // the mirror drops the row's now-stale embedding. Put a
+                            // fresh one back while the module still holds authority,
+                            // so an edited memory does not quietly fall out of scored
+                            // recall for the rest of the session.
+                            if (mirrorDrain.rowsApplied > 0) {
+                                await reembedMirrorInvalidatedMemories(deps.db);
+                            }
                             if (mirrorDrain.complete) {
                                 state.memoryMirrorProjectionKey = projectionKey;
                             } else if (mirrorDrain.budgetExhausted) {
@@ -3720,6 +3895,25 @@ export function createRustModeTransform(
                 sessionLog(sessionId, "mc_rust_emergency_refusal before_lkg");
                 markFailure(sessionId, state, error);
                 finishPass(false, false);
+                const refusedUser = newestUserMessage(messages);
+                const refusedUserMessageId = refusedUser ? messageIdOf(refusedUser) : null;
+                if (refusedUserMessageId) {
+                    try {
+                        options.onEngineReconnectRefusal?.({
+                            sessionId,
+                            projectRoot: recoveryProjectRoot,
+                            refusedUserMessageId,
+                            providerProvenEmergency,
+                            compactionOff: deps.compactionOff === true,
+                        });
+                    } catch (recoveryError) {
+                        sessionLog(
+                            sessionId,
+                            "rust refusal recovery failed to arm:",
+                            recoveryError,
+                        );
+                    }
+                }
                 throw new EmergencyFailClosedError(ENGINE_RECONNECTING_USER_MESSAGE, {
                     cause: error,
                 });

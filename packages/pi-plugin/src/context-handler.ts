@@ -134,7 +134,10 @@ import {
 	applyPendingOperations,
 	RECENT_TOOL_SKELETON_WINDOW,
 } from "@magic-context/core/hooks/magic-context/apply-operations";
-import { hasReclaimRide } from "@magic-context/core/hooks/magic-context/cache-busting-signals";
+import {
+	hasReclaimRide,
+	reclaimRideLabel,
+} from "@magic-context/core/hooks/magic-context/cache-busting-signals";
 import { replayCavemanCompression } from "@magic-context/core/hooks/magic-context/caveman-cleanup";
 import {
 	rearmChannel2AfterCoverageAdvancingHardFold,
@@ -143,6 +146,10 @@ import {
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
 import { evaluateChannel2 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
+import {
+	type DroppedTokenReduction,
+	estimateDroppedTokensFromTagReductions,
+} from "@magic-context/core/hooks/magic-context/dropped-token-estimate";
 import { EmergencyFailClosedError } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 import {
 	DEFAULT_CONTEXT_LIMIT,
@@ -178,6 +185,7 @@ import {
 } from "@magic-context/core/hooks/magic-context/supersession-reclaim";
 import { stripSystemInjection } from "@magic-context/core/hooks/magic-context/system-injection-stripper";
 import { stripTagPrefix } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
+import { formatTailHygienePrefixMismatch } from "@magic-context/core/hooks/magic-context/tail-hygiene-walk";
 import {
 	advanceToolReclaimWatermarkToCurrentMax,
 	buildSyntheticToolReclaimOps,
@@ -284,6 +292,13 @@ import {
 import { capturePiServedArray } from "./served-array-ledger";
 import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
 import { stripPiProcessedImages } from "./strip-processed-images-pi";
+import {
+	adoptPiCompactionSystemSnapshot,
+	isPiSystemEntry,
+	isPiSystemMessageEntry,
+	type PiEffectiveSystemState,
+	resolvePiEffectiveSystemState,
+} from "./system-entry-pi";
 import { clearPiSystemPromptSession } from "./system-prompt";
 import {
 	assertPiTailHygieneContentUnchanged,
@@ -1433,7 +1448,11 @@ function collectMessageEntryIds(
 	};
 
 	if (compactionIndex >= 0) {
-		// Index 0 = synthetic compaction summary — no SessionEntry id.
+		const hasSystemSnapshot = isPiSystemEntry(
+			(entries[compactionIndex] as { systemMessage?: unknown }).systemMessage,
+		);
+		if (hasSystemSnapshot) ids.push(undefined);
+		// The synthetic summary has no SessionEntry id.
 		ids.push(undefined);
 
 		// Pre-compaction: emit ids from firstKeptEntryId (inclusive) up to
@@ -1448,7 +1467,11 @@ function collectMessageEntryIds(
 				if (typeof entryId === "string" && entryId === firstKeptEntryId) {
 					foundFirstKept = true;
 				}
-				if (!foundFirstKept) continue;
+				if (
+					!foundFirstKept ||
+					(hasSystemSnapshot && isPiSystemMessageEntry(entry))
+				)
+					continue;
 				if (isEmitEligible(entry)) {
 					ids.push(entry.id);
 				}
@@ -1688,7 +1711,11 @@ function buildPiAlignedEntryIds(
 		return entries.filter(isPiContextEmitEligible).map((entry) => entry.id);
 	}
 
-	const ids: (string | undefined)[] = [undefined];
+	const compaction = entries[compactionIndex] as { systemMessage?: unknown };
+	const hasSystemSnapshot = isPiSystemEntry(compaction.systemMessage);
+	const ids: (string | undefined)[] = hasSystemSnapshot
+		? [undefined, undefined]
+		: [undefined];
 	if (firstKeptEntryId !== undefined) {
 		let foundFirstKept = false;
 		for (let index = 0; index < compactionIndex; index += 1) {
@@ -1696,7 +1723,12 @@ function buildPiAlignedEntryIds(
 			if ((entry as { id?: unknown } | undefined)?.id === firstKeptEntryId) {
 				foundFirstKept = true;
 			}
-			if (foundFirstKept && isPiContextEmitEligible(entry)) ids.push(entry.id);
+			if (
+				foundFirstKept &&
+				isPiContextEmitEligible(entry) &&
+				!(hasSystemSnapshot && isPiSystemMessageEntry(entry))
+			)
+				ids.push(entry.id);
 		}
 	}
 	for (let index = compactionIndex + 1; index < entries.length; index += 1) {
@@ -1706,7 +1738,7 @@ function buildPiAlignedEntryIds(
 	return ids;
 }
 
-// The first two prepended Pi messages already contain the compartment summaries.
+// The injected history users already contain the compartment summaries.
 // Calling appendCompaction makes Pi add the same summary during the next projection,
 // changing bytes sent to the provider one pass after cache invalidation. Remove it
 // only when the branch entry proves this plugin created the matching compaction.
@@ -1715,7 +1747,8 @@ function stripMcOwnedPiCompactionSummary(
 	entryIds: (string | undefined)[],
 	branchEntries: readonly unknown[],
 ): boolean {
-	const summaryMessage = messages[0] as
+	const summaryIndex = isPiSystemEntry(messages[0]) ? 1 : 0;
+	const summaryMessage = messages[summaryIndex] as
 		| { role?: unknown; summary?: unknown; tokensBefore?: unknown }
 		| undefined;
 	if (summaryMessage?.role !== "compactionSummary") return false;
@@ -1742,13 +1775,13 @@ function stripMcOwnedPiCompactionSummary(
 	if (
 		summaryMessage.summary !== compaction.summary ||
 		summaryMessage.tokensBefore !== compaction.tokensBefore ||
-		entryIds[0] !== undefined
+		entryIds[summaryIndex] !== undefined
 	) {
 		return false;
 	}
 
-	messages.splice(0, 1);
-	entryIds.splice(0, 1);
+	messages.splice(summaryIndex, 1);
+	entryIds.splice(summaryIndex, 1);
 	return true;
 }
 
@@ -2814,7 +2847,7 @@ export function registerPiContextHandler(
 					let usageContextLimit = isSaneLimit(piUsage?.contextWindow)
 						? piUsage.contextWindow
 						: undefined;
-					let usageContextWindowSource: "observed" | "catalog" = "observed";
+					let usageContextWindowSource: "observed" | "catalog" = "catalog";
 					let detectedContextLimit: number | undefined;
 
 					// Overflow recovery: a previous LLM call ended with a
@@ -3570,6 +3603,17 @@ export function registerPiContextHandler(
 								previous: getPiChannel1Baseline(sessionId),
 							});
 							const effective = effectivePiTailHygiene(baseline);
+							// One line per invalidation event, not one per pass: the baseline
+							// only carries a mismatch on the pass that re-measured because of it.
+							if (baseline.lastPrefixMismatch) {
+								sessionLog(
+									sessionId,
+									formatTailHygienePrefixMismatch(
+										baseline.lastPrefixMismatch,
+										baseline.baselineGeneration,
+									),
+								);
+							}
 							const durableGrace =
 								baseline.evaluable && !baseline.generationInvalidated
 									? captureChannel1PostReduceGraceBaseline(
@@ -4432,7 +4476,7 @@ function maybeFireHistorian(args: {
 		usageContextLimit = isSaneLimit(piUsage?.contextWindow)
 			? piUsage.contextWindow
 			: undefined;
-		let usageContextWindowSource: "observed" | "catalog" = "observed";
+		let usageContextWindowSource: "observed" | "catalog" = "catalog";
 		let detectedContextLimit: number | undefined;
 		// Cold-start: fall back to the model's window when usage hasn't reported
 		// a sane one yet (first pass after restart).
@@ -5057,6 +5101,18 @@ async function runCompactionOffPipeline(
 
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (args.compactionOff) return runCompactionOffPipeline(args);
+	let foldingSystemState: PiEffectiveSystemState | null = null;
+	try {
+		// Capture the provider-visible system state before transforming the served
+		// array. A pending compaction marker must compare this input state with the
+		// system state that Pi persists in its session.
+		foldingSystemState = resolvePiEffectiveSystemState(args.messages);
+	} catch (error) {
+		sessionLog(
+			args.sessionId,
+			`Pi folding-input system state could not be resolved; native marker drain will remain pending: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
 	const forceMaterializationPercentage =
 		args.forceMaterializationPercentage ??
 		escalationBands(65).forceMaterializationPercentage;
@@ -5068,7 +5124,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	let heuristicOrReasoningDidMutate = false;
 	let didMutateFromFlushedStatuses = false;
 	let droppedCount = 0;
-	const droppedTokens = 0;
+	let droppedTokens = 0;
+	const droppedTokenReductions: DroppedTokenReduction[] = [];
 	let emergency = false;
 	let autoReclaimDidMutateThisPass = false;
 	let suppressDeferredHistoryDrain = false;
@@ -5355,31 +5412,27 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		!args.sessionMeta.isSubagent &&
 		executePressureEligible &&
 		routinePressureAppliedBySession.get(args.sessionId) === true;
-	const historianRunning = inFlightHistorian.has(args.sessionId);
-	// Published summaries and reductions cannot change the historian's raw input.
-	// Share one permission across refresh and reduction lanes, including overlap.
-	const publishedWorkDrainAllowed =
-		args.schedulerDecision === "execute" ||
-		args.forceMaterialization === true ||
-		foldExecutedThisPass ||
-		firstRenderBust ||
-		hasPendingMaterialization(args.sessionId) ||
-		deferredMaterializeEligible;
 	const hasPendingMaterializeSignal = hasPendingMaterialization(args.sessionId);
 	// Pi sessions are primary-equivalent today. If Pi adds subagents on this
 	// transform path, subagents should bypass this once-per-turn guard like
 	// OpenCode does, because they do not share the primary agent's turn cache.
 	const rideSignals = {
 		hardFold: foldExecutedThisPass || firstRenderBust,
-		force: args.forceMaterialization === true || emergencyDropEligible,
-		explicitFlush: hasPendingMaterializeSignal || args.isCacheBusting,
+		force:
+			(args.forceMaterialization === true || emergencyDropEligible) &&
+			(args.contextUsage.percentage >= 95 ||
+				getEmergencyInputSample(args.db, args.sessionId) === 0),
+		explicitFlush:
+			hasPendingMaterializeSignal ||
+			(deferredMaterializeEligible && !prefixPreflightContended),
 		publishedHistory:
 			!prefixPreflightContended &&
-			(publishedM1RefreshedThisPass ||
+			(args.isCacheBusting ||
+				publishedM1RefreshedThisPass ||
 				(canConsumeDeferredLate && deferredHistoryWasPendingAtPassStart)),
-		agentDrop: false,
 	};
-	let isCacheBustingPass = hasReclaimRide(rideSignals);
+	const isCacheBustingPass = hasReclaimRide(rideSignals);
+	const publishedWorkDrainAllowed = isCacheBustingPass;
 	const usesTokenProtection =
 		args.protectedTokenTierOverrides !== undefined ||
 		args.protectedTokens !== undefined;
@@ -5393,7 +5446,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				sessionLog(args.sessionId, warning),
 		});
 	let protectionFloorResolution = resolveProtectionFloor();
-	let shouldRunHeuristics =
+	const shouldRunHeuristics =
 		args.heuristics !== undefined &&
 		isCacheBustingPass &&
 		(rideSignals.publishedHistory ||
@@ -5548,12 +5601,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// them, matching OpenCode's cache-stable per-pass gate.
 	const shouldReadPendingOps =
 		!args.compactionOff &&
-		(args.schedulerDecision === "execute" ||
+		(publishedWorkDrainAllowed ||
+			args.schedulerDecision === "execute" ||
 			args.forceMaterialization ||
 			hasPendingMaterializeSignal ||
 			foldExecutedThisPass ||
-			firstRenderBust ||
-			historianRunning);
+			firstRenderBust);
 	const pendingOps = shouldReadPendingOps
 		? getPendingOps(args.db, args.sessionId)
 		: [];
@@ -5578,23 +5631,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					RECENT_TOOL_SKELETON_WINDOW,
 				)
 			: [];
-	const baseShouldApplyPendingOps =
-		args.schedulerDecision === "execute" ||
-		args.forceMaterialization ||
-		hasPendingMaterializeSignal ||
-		foldExecutedThisPass ||
-		firstRenderBust;
-	// `canConsumeDeferredLate` is computed once, above shouldRunHeuristics, as a
-	// bust-opportunity gate independent of shouldRunHeuristics. Explicit flush
-	// (hasPendingMaterializeSignal) still forces application through
-	// baseShouldApplyPendingOps, matching OpenCode's separate flush gate.
 	const deferredMaterialize =
 		canConsumeDeferredLate && deferredMaterializationWasPending;
 	const deferredHistoryRefresh =
 		canConsumeDeferredLate && deferredHistoryRefreshWasPending;
-	const shouldApplyPendingOps =
-		(baseShouldApplyPendingOps || deferredMaterialize) &&
-		publishedWorkDrainAllowed;
+	const shouldApplyPendingOps = publishedWorkDrainAllowed;
 	mutationGateObserverForTests?.({
 		foldDue: foldDueDecision.value,
 		foldExecuted: foldExecutedThisPass,
@@ -5612,7 +5653,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					? "force_materialization"
 					: foldExecutedThisPass && args.schedulerDecision !== "execute"
 						? `m0_hard_fold (drain folded into executed m[0] bust, scheduler=${args.schedulerDecision})`
-						: `scheduler_execute (scheduler=${args.schedulerDecision})`;
+						: `${reclaimRideLabel(rideSignals)} (scheduler=${args.schedulerDecision})`;
 		const pendingOpsDepth = getPendingOpsCount(args.db, args.sessionId);
 		const pendingDecisionLog = `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${pendingOpsDepth === null ? "not loaded (deferred pass)" : pendingOpsDepth} context=${args.contextUsage.percentage.toFixed(1)}%`;
 		sessionLog(args.sessionId, pendingDecisionLog);
@@ -5628,6 +5669,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					: protectedTagNumbersForPass,
 				pendingOperationTags,
 				pendingOps,
+				[],
+				new Set(),
+				(reduction) => droppedTokenReductions.push(reduction),
 			);
 			if (pendingOpsDidMutate) {
 				droppedCount += pendingOps.length;
@@ -5637,10 +5681,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				"applyPendingOperations",
 				tApplyPending,
 			);
-			rideSignals.agentDrop = pendingOpsDidMutate;
-			isCacheBustingPass = hasReclaimRide(rideSignals);
-			if (pendingOpsDidMutate)
-				shouldRunHeuristics = args.heuristics !== undefined;
 			executedWorkThisPass ||= isCacheBustingPass;
 			// materializationSatisfiedThisPass enables the deferred-HISTORY drain
 			// below. OpenCode drains deferred-history on history-consumption alone
@@ -5671,8 +5711,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	} else {
 		const pendingOpsDepth = getPendingOpsCount(args.db, args.sessionId);
 		const refusalReason =
-			args.schedulerDeferReason ??
-			(historianRunning ? "historian_in_flight" : "scheduler_defer");
+			args.schedulerDeferReason ?? "no_originating_cache_bust";
 		const pendingDecisionLog = `pending ops WILL NOT APPLY — reason=${refusalReason} pendingOps=${pendingOpsDepth === null ? "not loaded (deferred pass)" : pendingOpsDepth} context=${args.contextUsage.percentage.toFixed(1)}%`;
 		sessionLog(args.sessionId, pendingDecisionLog);
 		pendingDecisionLogObserverForTests?.(pendingDecisionLog);
@@ -5840,7 +5879,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			? "force_materialization"
 			: foldExecutedThisPass && args.schedulerDecision !== "execute"
 				? `m0_hard_fold (drain folded into executed m[0] bust, scheduler=${args.schedulerDecision})`
-				: `scheduler_execute (pendingOps=${pendingOps.length}, scheduler=${args.schedulerDecision})`;
+				: `${reclaimRideLabel(rideSignals)} (pendingOps=${pendingOps.length}, scheduler=${args.schedulerDecision})`;
 		const heuristicsDecisionLog = `heuristics WILL RUN — reason=${reason}, context=${args.contextUsage.percentage.toFixed(1)}%, turn=n/a`;
 		sessionLog(args.sessionId, heuristicsDecisionLog);
 		pendingDecisionLogObserverForTests?.(heuristicsDecisionLog);
@@ -5849,8 +5888,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			args.heuristics === undefined
 				? "disabled"
 				: (args.schedulerDeferReason ??
-					(historianRunning
-						? "historian_in_flight"
+					(!isCacheBustingPass
+						? "no_originating_cache_bust"
 						: alreadyRanHeuristicsThisTurn
 							? "already_ran_this_turn"
 							: "scheduler_defer"));
@@ -5956,6 +5995,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						ridingCleanup.compressedTextTags,
 					mutatedTextTags:
 						heuristicsResult.mutatedTextTags + ridingCleanup.mutatedTextTags,
+					droppedTokenReductions: [
+						...heuristicsResult.droppedTokenReductions,
+						...ridingCleanup.droppedTokenReductions,
+					],
 				};
 				routineCleanupApplied = true;
 			}
@@ -5979,6 +6022,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				heuristicsResult.droppedStaleReduceCalls +
 				heuristicsResult.mutatedTextTags;
 			emergency ||= heuristicsResult.emergencyDroppedTools > 0;
+			if (heuristicsResult.droppedTokenReductions.length > 0) {
+				droppedTokenReductions.push(...heuristicsResult.droppedTokenReductions);
+			}
 			if (heuristicMutationCount > 0) heuristicOrReasoningDidMutate = true;
 			heuristicsExecuted = true;
 			executedWorkThisPass = true;
@@ -6162,6 +6208,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				[],
 				syntheticPendingOps,
 				editMarkerTagIds,
+				(reduction) => droppedTokenReductions.push(reduction),
 			);
 			if (autoReclaimDidMutate) {
 				droppedCount += syntheticPendingOps.length;
@@ -6595,11 +6642,16 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					args.sessionId,
 					`Pi compaction-marker drain skipped: pending ordinal ${pending.ordinal} is newer than rendered boundary ${boundary?.ordinal ?? "<none>"} endMessageId=${boundary?.endMessageId ?? "<none>"} (m[1] coverage ${m1Coverage?.ordinal ?? "<none>"} endMessageId=${m1Coverage?.endMessageId ?? "<none>"}); preserving deferred signals`,
 				);
-			} else if (!args.appendCompaction || !args.readBranchEntries) {
+			} else if (
+				!args.appendCompaction ||
+				!args.readBranchEntries ||
+				!foldingSystemState
+			) {
 				suppressDeferredHistoryDrain = true;
+				preserveDeferredMaterializationForMarkerDrain = true;
 				sessionLog(
 					args.sessionId,
-					"Pi compaction-marker drain skipped: sessionManager appendCompaction/getBranch unavailable; preserving deferred-history signal",
+					"Pi compaction-marker drain skipped: sessionManager appendCompaction/getBranch or folding system state unavailable; preserving deferred signals",
 				);
 			} else {
 				const outcome = applyDeferredPiCompactionMarker(
@@ -6611,6 +6663,55 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					args.sessionId,
 					pending,
 				);
+				let markerEquivalent = outcome.kind === "stale-skip";
+				if (outcome.kind === "applied" || outcome.kind === "already-current") {
+					const syntheticHistoryMessages = injectionResult
+						? args.messages.slice(
+								Math.max(0, injectionResult.syntheticLeadingCount - 2),
+								injectionResult.syntheticLeadingCount,
+							)
+						: [];
+					const adoption = adoptPiCompactionSystemSnapshot(
+						args.messages,
+						args.readBranchEntries(),
+						outcome.compactionId,
+						foldingSystemState,
+						syntheticHistoryMessages,
+					);
+					if (adoption.kind === "adopted") {
+						markerEquivalent = true;
+						if (injectionResult) {
+							const lastSynthetic = syntheticHistoryMessages.at(-1);
+							const lastSyntheticIndex = lastSynthetic
+								? args.messages.indexOf(lastSynthetic as never)
+								: -1;
+							if (lastSyntheticIndex >= 0) {
+								injectionResult.syntheticLeadingCount = lastSyntheticIndex + 1;
+							}
+						}
+					} else {
+						suppressDeferredHistoryDrain = true;
+						preserveDeferredMaterializationForMarkerDrain = true;
+						if (adoption.kind === "divergent") {
+							const promptLengthDelta =
+								adoption.persistedPromptLength - adoption.foldingPromptLength;
+							// appendCompaction has already persisted this entry. Pi exposes no
+							// retraction API, and 0.86 session-manager.js:187-190 re-emits
+							// [systemMessage, summary]. Keep MC's fold for this pass and retain
+							// the pending marker so the next pass rechecks the then-current
+							// journal instead of trusting the persisted snapshot.
+							sessionLog(
+								args.sessionId,
+								`Pi compaction-marker equivalence refused compactionId=${outcome.compactionId}: foldingOnlyTools=${JSON.stringify(adoption.foldingOnlyTools)} persistedOnlyTools=${JSON.stringify(adoption.persistedOnlyTools)} changedTools=${JSON.stringify(adoption.changedTools)} promptLengthDelta=${promptLengthDelta} (folding=${adoption.foldingPromptLength}, persisted=${adoption.persistedPromptLength}); persisted entry cannot be retracted, pending marker retained for next-pass journal recheck`,
+							);
+						} else {
+							sessionLog(
+								args.sessionId,
+								`Pi compaction-marker equivalence unavailable for compactionId=${outcome.compactionId}: ${adoption.reason}; preserving deferred signals`,
+							);
+						}
+					}
+				}
 				if (outcome.kind === "waiting-for-entry") {
 					suppressDeferredHistoryDrain = true;
 					preserveDeferredMaterializationForMarkerDrain = true;
@@ -6620,6 +6721,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						`Pi compaction-marker drain retryable failure: ${outcome.error.message}`,
 					);
 				} else if (
+					markerEquivalent &&
 					clearPendingPiCompactionMarkerStateIf(
 						args.db,
 						args.sessionId,
@@ -6627,7 +6729,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					)
 				) {
 					consumeDeferredHistoryRefresh(args.sessionId);
-				} else {
+				} else if (markerEquivalent) {
 					casLost = true;
 					sessionLog(
 						args.sessionId,
@@ -6727,6 +6829,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		autoReclaimDidMutateThisPass ||
 		materialized ||
 		historyWasConsumedThisPass;
+
+	if (bustedThisPass || isCacheBustingPass) {
+		droppedTokens = estimateDroppedTokensFromTagReductions(
+			args.db,
+			args.sessionId,
+			droppedTokenReductions,
+		);
+	}
 
 	return {
 		messages: outputMessages,

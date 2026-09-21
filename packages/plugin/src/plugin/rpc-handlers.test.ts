@@ -212,6 +212,45 @@ describe("buildStatusDetail — active profile", () => {
     });
 });
 
+describe("buildStatusDetail — memory importance histogram", () => {
+    test("returns the exact active distribution and unclassified denominator", () => {
+        const db = createTestDb();
+        try {
+            const projectIdentity = resolveProjectIdentity(process.cwd());
+            const rows = [5, 25, 50, 65, 100].map((importance, index) =>
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "CONSTRAINTS",
+                    content: `rpc-status-memory-${index}`,
+                    importance,
+                }),
+            );
+            db.prepare("UPDATE memories SET classified_at = 123 WHERE id IN (?, ?, ?, ?)").run(
+                rows[0]!.id,
+                rows[1]!.id,
+                rows[3]!.id,
+                rows[4]!.id,
+            );
+
+            const detail = buildStatusDetail(db, "ses-memory-histogram", process.cwd());
+
+            expect(detail.memoryImportanceHistogram).toEqual({
+                total: 5,
+                unclassified: 1,
+                bands: {
+                    "0-19": 1,
+                    "20-39": 1,
+                    "40-59": 1,
+                    "60-79": 1,
+                    "80-100": 1,
+                },
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
 describe("buildStatusDetail — protected-token floor", () => {
     test("uses the durable first-observed floor for pre-snapshot sessions after restart", () => {
         const db = createTestDb();
@@ -898,6 +937,67 @@ describe("buildStatusDetail — cacheNeverExpires with 'never' TTL", () => {
 });
 
 describe("buildStatusDetail — Rust host paths", () => {
+    test("surfaces a frozen non-frontier memory mirror from module and host evidence", () => {
+        const db = createTestDb();
+        try {
+            db.prepare(
+                "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES ('memories', 3726, ?)",
+            ).run(Date.now() - 40_001);
+            db.prepare(
+                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES ('git:status', 1, 'ARCHITECTURE', 'hash')",
+            ).run();
+
+            const detail = buildStatusDetail(
+                db,
+                "ses-rust-mirror-stall",
+                process.cwd(),
+                undefined,
+                { transform_mode: "rust" },
+                undefined,
+                undefined,
+                { memory_mirror: { feed_head: 4850 } },
+            );
+
+            expect(detail.memoryMirror).toMatchObject({
+                cursor: 3726,
+                feedHead: 4850,
+                liveRows: 1,
+                pendingRows: 1124,
+                stalled: true,
+                code: "MC-M01",
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("surfaces a host marker that disagrees with module authority status", () => {
+        const db = createTestDb();
+        try {
+            const directory = process.cwd();
+            const projectIdentity = resolveProjectIdentity(directory);
+            expect(projectIdentity).not.toBeNull();
+            db.prepare(
+                "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, 'store', 1)",
+            ).run(projectIdentity);
+
+            const detail = buildStatusDetail(
+                db,
+                "ses-rust-authority-mismatch",
+                directory,
+                undefined,
+                { transform_mode: "rust" },
+                undefined,
+                undefined,
+                { authority: { memories: { project: projectIdentity ?? "", state: "TS" } } },
+            );
+
+            expect(detail.memoryAuthorityMismatch).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("marks host paths module-side only for Rust mode", () => {
         const db = createTestDb();
         try {

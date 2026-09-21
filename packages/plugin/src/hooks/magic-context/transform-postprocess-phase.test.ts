@@ -59,7 +59,12 @@ import { clearToolPermissionDenied } from "./ctx-reduce-availability";
 import type { Channel1State } from "./ctx-reduce-nudge";
 import { estimateMessageTokens } from "./final-wire-token-estimate";
 import * as compartmentInjection from "./inject-compartments";
-import { injectM0M1, type M0HardSignals } from "./inject-compartments";
+import {
+    capturePrefixTrimSourceOrder,
+    injectM0M1,
+    type M0HardSignals,
+} from "./inject-compartments";
+import * as readSessionFormatting from "./read-session-formatting";
 import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { stripStructuralNoise } from "./strip-structural-noise";
 import {
@@ -263,7 +268,7 @@ function cloneMessages(messages: MessageLike[]): MessageLike[] {
 }
 
 describe("postprocess replay snapshot", () => {
-    it("serves byte-identical passes from one row read and reloads on the next pass", async () => {
+    it("serves byte-identical passes from one cached row and reloads after a database write", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-replay-snapshot";
@@ -278,8 +283,8 @@ describe("postprocess replay snapshot", () => {
 
         const preparedSql: string[] = [];
         const spiedDb = new Proxy(db, {
-            get(target, prop, receiver) {
-                if (prop !== "prepare") return Reflect.get(target, prop, receiver);
+            get(target, prop) {
+                if (prop !== "prepare") return Reflect.get(target, prop, target);
                 return (sql: string) => {
                     preparedSql.push(sql);
                     return target.prepare.call(target, sql);
@@ -314,7 +319,7 @@ describe("postprocess replay snapshot", () => {
         expect(digest(second)).toBe(digest(first));
         expect(
             preparedSql.filter((sql) => sql.includes("SELECT stale_reduce_stripped_ids")).length,
-        ).toBe(2);
+        ).toBe(1);
         expect(
             preparedSql.some((sql) =>
                 /SELECT (?:note_nudge_anchors|trailing_blank_decisions) FROM/.test(sql),
@@ -1218,6 +1223,13 @@ describe("deferred compaction marker representation", () => {
                     memoryCount: 0,
                     rebuiltFromDb: true,
                 },
+                prefixTrimSourceOrder: capturePrefixTrimSourceOrder([
+                    {
+                        info: { id: "msg-boundary", role: "user", sessionID: sessionId },
+                        parts: [{ type: "text", text: "covered" }],
+                    } as MessageLike,
+                    ...foldMessages,
+                ]),
                 m0M1: {
                     projectDirectory: dataHome,
                     injectDocs: false,
@@ -2000,6 +2012,235 @@ describe("postprocess emergency drop accounting", () => {
     });
 });
 
+describe("dropped-token telemetry", () => {
+    const LARGE_ARRAY_THRESHOLD = 9 * 1024 * 1024;
+
+    function largeMessageArray(sessionId: string, droppedMessage: MessageLike): MessageLike[] {
+        const payload = "large telemetry fixture ".repeat(70_000);
+        return [
+            droppedMessage,
+            ...Array.from({ length: 7 }, (_, index) => ({
+                info: {
+                    id: `large-${index}`,
+                    role: index % 2 === 0 ? "user" : "assistant",
+                    sessionID: sessionId,
+                },
+                parts: [{ type: "text", text: payload }],
+            })),
+        ] as MessageLike[];
+    }
+
+    function insertKnownToolTag(
+        sessionId: string,
+        messageId: string,
+        tagNumber: number,
+        tokenCount: number,
+    ): void {
+        insertTag(db, sessionId, messageId, "tool", 4000, tagNumber, 0, "bash", 0, null, null, {
+            tokenCount,
+            inputTokenCount: 0,
+            reasoningTokenCount: 0,
+        });
+    }
+
+    it("sums persisted output token counts for three skeletonized tags", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-dropped-token-sum";
+        const counts = [111, 222, 333];
+        const messages = counts.map((_, index) => makeToolMessage(`counted-${index + 1}`));
+        const targets = new Map<number, TagTarget>();
+        for (let index = 0; index < counts.length; index += 1) {
+            const tagNumber = index + 1;
+            insertKnownToolTag(sessionId, `counted-${tagNumber}`, tagNumber, counts[index]!);
+            queuePendingOp(db, sessionId, tagNumber, "drop", tagNumber);
+            targets.set(tagNumber, makeDropTarget(messages[index]!));
+        }
+
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
+                schedulerDeferReason: null,
+                tags: getActiveTagsBySession(db, sessionId),
+                targets,
+            }),
+        );
+
+        expect(result.droppedTokens).toBe(666);
+        expect(getPendingOps(db, sessionId)).toEqual([]);
+    });
+
+    it("never sends a whole multi-megabyte message array to the exact tokenizer seam", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-dropped-token-no-array-tokenize";
+        const droppedMessage = makeToolMessage("small-drop");
+        const messages = largeMessageArray(sessionId, droppedMessage);
+        insertKnownToolTag(sessionId, "small-drop", 1, 41);
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+        const tokenizerInputSizes: number[] = [];
+        const tokenizer = spyOn(readSessionFormatting, "estimateTokens").mockImplementation(
+            (text) => {
+                tokenizerInputSizes.push(text.length);
+                return Math.ceil(text.length / 3.5);
+            },
+        );
+
+        try {
+            expect(JSON.stringify(messages).length).toBeGreaterThan(LARGE_ARRAY_THRESHOLD);
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    schedulerDecision: "execute",
+                    schedulerDeferReason: null,
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets: new Map([[1, makeDropTarget(droppedMessage)]]),
+                }),
+            );
+
+            expect(tokenizerInputSizes.filter((size) => size > LARGE_ARRAY_THRESHOLD)).toEqual([]);
+        } finally {
+            tokenizer.mockRestore();
+        }
+    });
+
+    it("keeps execute and following defer bytes pinned while draining the same operations", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-dropped-token-wire-parity";
+        const counts = [111, 222, 333];
+        const buildMessages = () =>
+            counts.map((_, index) => makeToolMessage(`parity-${index + 1}`));
+        const buildTargets = (messages: MessageLike[]) =>
+            new Map<number, TagTarget>(
+                messages.map((message, index) => [index + 1, makeDropTarget(message)]),
+            );
+        for (let index = 0; index < counts.length; index += 1) {
+            const tagNumber = index + 1;
+            insertKnownToolTag(sessionId, `parity-${tagNumber}`, tagNumber, counts[index]!);
+            queuePendingOp(db, sessionId, tagNumber, "drop", tagNumber);
+        }
+
+        const executeMessages = buildMessages();
+        const executeResult = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, executeMessages, {
+                schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
+                schedulerDeferReason: null,
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: buildTargets(executeMessages),
+            }),
+        );
+        const executeHash = createHash("sha256")
+            .update(JSON.stringify(executeMessages))
+            .digest("hex");
+        expect(getPendingOps(db, sessionId)).toEqual([]);
+        expect(executeResult.bustedThisPass).toBe(true);
+
+        const deferMessages = buildMessages();
+        const deferTargets = buildTargets(deferMessages);
+        expect(applyFlushedStatuses(sessionId, db, deferTargets)).toBe(true);
+        const deferResult = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, deferMessages, {
+                schedulerDecision: "defer",
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: deferTargets,
+                didMutateFromFlushedStatuses: true,
+            }),
+        );
+        const deferHash = createHash("sha256").update(JSON.stringify(deferMessages)).digest("hex");
+
+        expect(executeHash).toBe(
+            "5ae4d6ca0f7871c9c7a0d7f15f342cc6221ca3374ab7c5de1e189d115c3102ae",
+        );
+        expect(deferHash).toBe(executeHash);
+        expect(deferResult.bustedThisPass).toBe(false);
+        expect(deferResult.droppedTokens).toBe(0);
+    });
+
+    it("keeps the event loop responsive across a 10 MB pending-operation pass", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-dropped-token-responsive";
+        const droppedMessage = makeToolMessage("responsive-drop");
+        const messages = largeMessageArray(sessionId, droppedMessage);
+        insertKnownToolTag(sessionId, "responsive-drop", 1, 41);
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+
+        const delayedResponse = async (value: unknown): Promise<unknown> => {
+            for (let turn = 0; turn < 4; turn += 1) {
+                await new Promise<void>((resolve) => setImmediate(resolve));
+            }
+            return { data: value };
+        };
+        const client = {
+            app: { agents: () => delayedResponse([{ name: "test-agent", permission: [] }]) },
+            session: {
+                get: () => delayedResponse({ agent: "test-agent", permission: [] }),
+            },
+        } as never;
+        const tickTimes: number[] = [];
+        const timer = setInterval(() => tickTimes.push(performance.now()), 5);
+        let loopTurns = 0;
+        let counting = true;
+        const countTurns = () => {
+            if (!counting) return;
+            loopTurns += 1;
+            setImmediate(countTurns);
+        };
+
+        try {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            setImmediate(countTurns);
+            const passStartedAt = performance.now();
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    schedulerDecision: "execute",
+                    pendingMaterializationSessions: new Set([sessionId]),
+                    schedulerDeferReason: null,
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets: new Map([[1, makeDropTarget(droppedMessage)]]),
+                    client,
+                    activeAgent: "test-agent",
+                }),
+            );
+            const passFinishedAt = performance.now();
+            counting = false;
+            await new Promise<void>((resolve) => setImmediate(resolve));
+
+            expect(loopTurns).toBeGreaterThanOrEqual(4);
+            const observedTimes = [
+                passStartedAt,
+                ...tickTimes.filter((time) => time >= passStartedAt && time <= passFinishedAt),
+                passFinishedAt,
+            ].sort((left, right) => left - right);
+            let maxGapMs = 0;
+            for (let index = 1; index < observedTimes.length; index += 1) {
+                maxGapMs = Math.max(
+                    maxGapMs,
+                    (observedTimes[index] ?? 0) - (observedTimes[index - 1] ?? 0),
+                );
+            }
+            const passDurationMs = passFinishedAt - passStartedAt;
+            // The yield count above is the load-invariant proof that the pass never runs as one
+            // synchronous stretch. The timer-gap bound is wall-clock: on a loaded CI runner a 5 ms
+            // interval timer is simply not scheduled for tens of milliseconds even while the loop
+            // yields (release r1 of 0.42.4 read a 42 ms gap on a 43 ms pass), so it is asserted
+            // only under the explicit perf gate and recorded otherwise.
+            if (process.env.MC_PERF_GATE === "1") {
+                expect(maxGapMs).toBeLessThanOrEqual(Math.max(passDurationMs / 2, 20));
+            } else {
+                console.log(
+                    `dropped-token responsiveness: loopTurns=${loopTurns} maxGapMs=${maxGapMs.toFixed(1)} passMs=${passDurationMs.toFixed(1)} (perf gate off)`,
+                );
+            }
+        } finally {
+            counting = false;
+            clearInterval(timer);
+        }
+    }, 30_000);
+});
+
 describe("two-pass tool reclaim", () => {
     function tagStatuses(sessionId: string): Map<number, string> {
         return new Map(getTagsBySession(db, sessionId).map((tag) => [tag.tagNumber, tag.status]));
@@ -2042,6 +2283,7 @@ describe("two-pass tool reclaim", () => {
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, [first, second], {
                 schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
                 tags: getActiveTagsBySession(db, sessionId),
                 targets: new Map([
                     [1, makeDropTarget(first)],
@@ -2083,6 +2325,7 @@ describe("two-pass tool reclaim", () => {
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, [trigger, small, large], {
                 schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
                 tags: getActiveTagsBySession(db, sessionId),
                 targets: new Map([
                     [1, makeDropTarget(trigger)],
@@ -2123,6 +2366,7 @@ describe("two-pass tool reclaim", () => {
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, [trigger, older, newest], {
                 schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
                 smartDrops: false,
                 tags: getActiveTagsBySession(db, sessionId),
                 targets: new Map([
@@ -2153,6 +2397,7 @@ describe("two-pass tool reclaim", () => {
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, [visible], {
                 schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
                 tags: getActiveTagsBySession(db, sessionId),
                 targets: new Map([[2, makeDropTarget(visible)]]),
                 sessionMeta: getOrCreateSessionMeta(db, sessionId),
@@ -2339,12 +2584,13 @@ describe("issue #386 sustained execute-pressure batching", () => {
         // That keeps the batching assertion focused on the pressure latch rather than changing
         // which historical outputs constitute the working set.
         const protectedTokens = 12_000;
-        const runPressurePass = async (inputTokens: number) => {
+        const runPressurePass = async (inputTokens: number, flush = false) => {
             const protectionWindow = getProtectionWindowForSession(db, sessionId, protectedTokens);
             return runPostTransformPhase(
                 basePostTransformArgs(db, sessionId, messages, {
                     schedulerDecision: "execute",
                     contextUsage: { percentage: 90, inputTokens },
+                    pendingMaterializationSessions: new Set(flush ? [sessionId] : []),
                     emergencyCeilingTokens: Math.floor(
                         contextLimit * (executeThresholdPercentage / 100),
                     ),
@@ -2407,6 +2653,9 @@ describe("issue #386 sustained execute-pressure batching", () => {
 
         queuePendingOp(db, sessionId, 19, "drop", 1);
         await runPressurePass(92_000);
+        expect(getPendingOps(db, sessionId)).toHaveLength(1);
+        expect(JSON.stringify(messages.slice(0, 30))).toBe(pricedPrefix);
+        await runPressurePass(92_000, true);
         const ridingStatuses = new Map(
             getTagsBySession(db, sessionId).map((tag) => [tag.tagNumber, tag.status]),
         );
@@ -2458,6 +2707,7 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, [trigger, older, newer, ...recentTail], {
                 schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
                 smartDrops: false,
                 tags: getActiveTagsBySession(db, sessionId),
                 targets: new Map([
@@ -2484,6 +2734,7 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, [trigger, older, newer, ...recentTail], {
                 schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
                 smartDrops: true,
                 tags: getActiveTagsBySession(db, sessionId),
                 targets: new Map([
@@ -2554,6 +2805,7 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
             await runPostTransformPhase(
                 basePostTransformArgs(db, sessionId, contractedMessages, {
                     schedulerDecision: "execute",
+                    pendingMaterializationSessions: new Set([sessionId]),
                     smartDrops: true,
                     tags: getActiveTagsBySession(db, sessionId),
                     targets,
@@ -2756,6 +3008,13 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                     memoryCount: 0,
                     rebuiltFromDb: true,
                 },
+                prefixTrimSourceOrder: capturePrefixTrimSourceOrder([
+                    {
+                        info: { id: "msg-fold-boundary", role: "user", sessionID: sessionId },
+                        parts: [{ type: "text", text: "covered" }],
+                    } as MessageLike,
+                    ...hardMessages,
+                ]),
                 m0M1: {
                     projectPath: FOLD_PROJECT,
                     projectDirectory: FOLD_PROJECT,
@@ -3404,6 +3663,7 @@ describe("final message representation", () => {
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, foldMessages, {
                 schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
                 contextUsage: { percentage: 60, inputTokens: 6000 },
                 currentTurnId: "turn-late-clear",
                 resolvedProviderID: "anthropic",
@@ -3538,6 +3798,7 @@ describe("final message representation", () => {
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, foldMessages, {
                 schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
                 contextUsage: { percentage: 60, inputTokens: 6000 },
                 currentTurnId: "turn-preserve-reasoning",
                 resolvedProviderID: "anthropic",
@@ -3644,6 +3905,7 @@ describe("final message representation", () => {
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, foldMessages, {
                 schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
                 contextUsage: { percentage: 60, inputTokens: 6000 },
                 currentTurnId: "turn-final-adjacency",
                 resolvedProviderID: "anthropic",
@@ -4000,8 +4262,7 @@ describe("final message representation", () => {
         expect(JSON.stringify(deferTarget.parts)).toBe(acceptedBytes);
         expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
 
-        // Pass N+1: execute is the existing cache-busting gate, so first
-        // application and persistence happen together.
+        // This explicit flush performs the first strip and persists it in the same pass.
         const bustMessages = buildMessages(true);
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, bustMessages, {
@@ -6258,11 +6519,12 @@ describe("contract adversarial cache sequences", () => {
         });
         expect(moved.floor).toBe(8000);
         expect(moved.preSnapshotInputChanged).toBe(true);
-        const pass = async (decision: "execute" | "defer") => {
+        const pass = async (decision: "execute" | "defer", flush = false) => {
             const window = getProtectionWindowForSession(db, sessionId, moved.floor);
             await runPostTransformPhase(
                 basePostTransformArgs(db, sessionId, messages, {
                     schedulerDecision: decision,
+                    pendingMaterializationSessions: new Set(flush ? [sessionId] : []),
                     targets,
                     tags: getActiveTagsBySession(db, sessionId),
                     protectedTagIds: window.protectedTagNumbers,
@@ -6280,7 +6542,7 @@ describe("contract adversarial cache sequences", () => {
         for (let n = 11; n <= 14; n++) seed(n);
         await pass("defer");
         expect(getPendingOps(db, sessionId)).toHaveLength(1);
-        await pass("execute");
+        await pass("execute", true);
         expect(getPendingOps(db, sessionId)).toHaveLength(0);
         expect(getTagsBySession(db, sessionId).find((t) => t.tagNumber === 9)?.status).toBe(
             "dropped",
@@ -6616,4 +6878,301 @@ it("contract OC zero yield stays armed and text-only reclaim consumes the shared
     await pass(90.2);
     expect(JSON.stringify(messages)).toBe(bytes);
     expect(getEmergencyInputSample(db, sessionId)).toBe(90100);
+});
+
+describe("ride-only queued drops", () => {
+    for (const historianRunning of [false, true]) {
+        it(`holds execute-only queued drops with historian=${historianRunning}`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `ride-only-${historianRunning}`;
+            const message = makeToolMessage("ride-only-tool");
+            insertTag(
+                db,
+                sessionId,
+                "ride-only-call",
+                "tool",
+                1000,
+                1,
+                0,
+                "bash",
+                0,
+                message.info.id,
+            );
+            padRecentToolSkeletonWindow(sessionId, 1);
+            if (historianRunning)
+                registerActiveCompartmentRun(sessionId, new Promise<void>(() => {}));
+            const args = basePostTransformArgs(db, sessionId, [message], {
+                canRunCompartments: historianRunning,
+                schedulerDecision: "execute",
+                schedulerDeferReason: undefined,
+                contextUsage: { percentage: 65, inputTokens: 65000 },
+                compartmentInProgress: historianRunning,
+                targets: new Map([[1, makeDropTarget(message)]]),
+            });
+            await runPostTransformPhase(args);
+            const baseline = JSON.stringify(args.messages);
+            queuePendingOp(db, sessionId, 1, "drop");
+            const log = spyOn(loggerModule, "sessionLog");
+            try {
+                await runPostTransformPhase(args);
+                expect(JSON.stringify(args.messages)).toBe(baseline);
+                expect(getPendingOps(db, sessionId)).toHaveLength(1);
+                expect(
+                    log.mock.calls.some(
+                        (call) =>
+                            String(call[1]).includes(
+                                "held — reason=no originating cache-bust opportunity",
+                            ) && String(call[1]).includes(`historianRunning=${historianRunning}`),
+                    ),
+                ).toBe(true);
+                for (let pass = 0; pass < 4; pass++) {
+                    await runPostTransformPhase({ ...args, schedulerDecision: "defer" });
+                    expect(JSON.stringify(args.messages)).toBe(baseline);
+                }
+                args.pendingMaterializationSessions.add(sessionId);
+                await runPostTransformPhase(args);
+                expect(getPendingOps(db, sessionId)).toHaveLength(0);
+            } finally {
+                log.mockRestore();
+            }
+        });
+    }
+});
+
+it("queued agent batches consume only one force episode", async () => {
+    db = new Database(":memory:");
+    initializeDatabase(db);
+    const sessionId = "ride-force-batches";
+    const first = makeToolMessage("force-first");
+    const second = makeToolMessage("force-second");
+    for (const [index, message] of [first, second].entries()) {
+        insertTag(
+            db,
+            sessionId,
+            `force-call-${index}`,
+            "tool",
+            1000,
+            index + 1,
+            0,
+            "bash",
+            0,
+            message.info.id,
+        );
+    }
+    padRecentToolSkeletonWindow(sessionId, 2);
+    const args = basePostTransformArgs(db, sessionId, [first, second], {
+        schedulerDecision: "execute",
+        contextUsage: { percentage: 90, inputTokens: 90000 },
+        targets: new Map([
+            [1, makeDropTarget(first)],
+            [2, makeDropTarget(second)],
+        ]),
+    });
+    queuePendingOp(db, sessionId, 1, "drop");
+    await runPostTransformPhase(args);
+    expect(getPendingOps(db, sessionId)).toHaveLength(0);
+    const frozen = JSON.stringify(args.messages);
+    queuePendingOp(db, sessionId, 2, "drop");
+    await runPostTransformPhase(args);
+    expect(getPendingOps(db, sessionId)).toHaveLength(1);
+    expect(JSON.stringify(args.messages)).toBe(frozen);
+    args.pendingMaterializationSessions.add(sessionId);
+    await runPostTransformPhase(args);
+    expect(getPendingOps(db, sessionId)).toHaveLength(0);
+});
+
+it("four pure defer passes preserve served bytes and durable drop state", async () => {
+    db = new Database(":memory:");
+    initializeDatabase(db);
+    const sessionId = "four-defer-replay";
+    const snapshots: string[] = [];
+    insertTag(db, sessionId, "replay-call", "tool", 1000, 1, 0, "bash", 0, "replay-tool");
+    padRecentToolSkeletonWindow(sessionId, 1);
+    queuePendingOp(db, sessionId, 1, "drop", 1);
+    const pass = async (flush: boolean) => {
+        const message = makeToolMessage("replay-tool");
+        const messages = [message];
+        applyFlushedStatuses(
+            sessionId,
+            db,
+            new Map([[1, makeDropTarget(message)]]),
+            getTagsBySession(db, sessionId),
+        );
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                pendingMaterializationSessions: new Set(flush ? [sessionId] : []),
+                targets: new Map([[1, makeDropTarget(message)]]),
+            }),
+        );
+        return JSON.stringify({
+            messages,
+            status: getTagsBySession(db, sessionId).map((tag) => [tag.tagNumber, tag.status]),
+            pending: getPendingOps(db, sessionId).length,
+        });
+    };
+    await pass(true);
+    const baseline = await pass(false);
+    for (let index = 0; index < 4; index++) {
+        const snapshot = await pass(false);
+        expect(snapshot).toBe(baseline);
+        snapshots.push(snapshot);
+    }
+    console.log(
+        "RIDE_REPLAY_OC",
+        createHash("sha256").update(JSON.stringify(snapshots)).digest("hex"),
+    );
+});
+
+describe("postprocess defer instrumentation and scaling", () => {
+    it("reports measured postprocess substages once per defer pass", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const logs: string[] = [];
+        const log = spyOn(loggerModule, "sessionLog").mockImplementation((_id, ...values) => {
+            logs.push(values.join(" "));
+        });
+        let clock = 0;
+        let step = 7;
+        const now = spyOn(performance, "now").mockImplementation(() => (clock += step));
+        try {
+            for (const increment of [7, 13]) {
+                step = increment;
+                logs.length = 0;
+                await runPostTransformPhase(
+                    basePostTransformArgs(db, "timed-defer", [], {
+                        channel1StateBySession: new Map(),
+                        resolvedProviderID: "anthropic",
+                    }),
+                );
+                for (const stage of [
+                    "setupAndOperations",
+                    "replaySnapshot",
+                    "placeholderNeutralize",
+                    "nudgeAndSticky",
+                    "markerReconcile",
+                    "noteAndTodoSynthesis",
+                    "frozenDecisions",
+                    "tailReads",
+                    "tailMeasure",
+                    "tailState",
+                    "tailBaseline",
+                    "tailGuard",
+                ]) {
+                    const records = logs.filter((line) => line.includes(`stage=pp.${stage} `));
+                    expect(records).toHaveLength(1);
+                    const elapsed = Number(records[0].match(/elapsed=([\d.]+)ms/)?.[1]);
+                    expect(elapsed).toBeGreaterThanOrEqual(increment);
+                    if (stage === "tailReads") expect(elapsed).toBe(increment);
+                }
+            }
+        } finally {
+            now.mockRestore();
+            log.mockRestore();
+        }
+    });
+
+    it("keeps defer per-message cost load-invariant between 200 and 2000 messages", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const log = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+        const previousEnv = process.env.NODE_ENV;
+        process.env.NODE_ENV = "production";
+        try {
+            const medians: number[] = [];
+            for (const count of [200, 2000]) {
+                const input = Array.from({ length: count }, (_, index) => ({
+                    info: { id: `load-${index}`, role: index % 2 ? "assistant" : "user" },
+                    parts: [
+                        { type: "text", text: `Actual payload ${index}: ${"sample ".repeat(100)}` },
+                    ],
+                })) as MessageLike[];
+                const state = new Map<string, Channel1State>();
+                const args = basePostTransformArgs(db, `load-${count}`, [], {
+                    channel1StateBySession: state,
+                    resolvedProviderID: "anthropic",
+                });
+                const times: number[] = [];
+                for (let pass = 0; pass < 25; pass += 1) {
+                    args.messages = cloneMessages(input);
+                    const start = performance.now();
+                    await runPostTransformPhase(args);
+                    if (pass >= 5) times.push(performance.now() - start);
+                }
+                times.sort((a, b) => a - b);
+                medians.push(times[Math.floor(times.length / 2)]);
+            }
+            expect(medians[1] / 2000 / (medians[0] / 200)).toBeLessThan(3);
+            if (process.env.MC_PERF_GATE === "1") expect(medians[1]).toBeLessThan(10);
+        } finally {
+            if (previousEnv === undefined) delete process.env.NODE_ENV;
+            else process.env.NODE_ENV = previousEnv;
+            log.mockRestore();
+        }
+    });
+});
+
+describe("pending-ops and heuristics permission labels", () => {
+    // The permission these two logs announce is the reclaim ride, not the
+    // scheduler decision. Both fall-throughs used to print "scheduler_execute"
+    // even on passes where the scheduler had deferred, so an operator reading
+    // the log could not tell a published-history drain from a force-band drain.
+    async function permissionLines(
+        sessionId: string,
+        overrides: Partial<Parameters<typeof runPostTransformPhase>[0]>,
+    ): Promise<string[]> {
+        const logs: string[] = [];
+        const log = spyOn(loggerModule, "sessionLog").mockImplementation((_id, ...values) => {
+            logs.push(values.join(" "));
+        });
+        try {
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, [], {
+                    resolvedProviderID: "anthropic",
+                    ...overrides,
+                }),
+            );
+        } finally {
+            log.mockRestore();
+        }
+        return logs.filter(
+            (line) => line.includes("WILL APPLY — reason=") || line.includes("WILL RUN — reason="),
+        );
+    }
+
+    it("names the ride that granted the pass, and names a different one on a different ride", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+
+        const publishedHistory = await permissionLines("ses-ride-published-history", {
+            contextUsage: { percentage: 20, inputTokens: 1_000 },
+            historyRebuiltThisPass: true,
+            pendingCompartmentInjection: {
+                block: "",
+                compartmentEndMessage: 2,
+                compartmentEndMessageId: "ride-end",
+                compartmentCount: 1,
+                skippedVisibleMessages: 0,
+                factCount: 0,
+                memoryCount: 0,
+                rebuiltFromDb: true,
+            },
+        });
+        // At this emergency-level context usage the force band is the only ride
+        // that is true, so the pass must be labelled differently from the one above.
+        const forceBand = await permissionLines("ses-ride-force-band", {
+            fullFeatureMode: false,
+            contextUsage: { percentage: 96, inputTokens: 1_000 },
+        });
+
+        expect(publishedHistory).toEqual([
+            "heuristics WILL RUN — reason=ride=publishedHistory (pendingOps=0, scheduler=defer), context=20.0%, turn=null",
+            "pending ops WILL APPLY — reason=ride=publishedHistory (scheduler=defer), pendingOps=0, context=20.0%",
+        ]);
+        expect(forceBand).toEqual([
+            "heuristics WILL RUN — reason=ride=force (pendingOps=0, scheduler=defer), context=96.0%, turn=null",
+            "pending ops WILL APPLY — reason=ride=force (scheduler=defer), pendingOps=0, context=96.0%",
+        ]);
+        expect(publishedHistory).not.toEqual(forceBand);
+    });
 });

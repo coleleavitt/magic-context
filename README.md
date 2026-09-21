@@ -111,7 +111,7 @@ If you cannot run the wizard, add this to `opencode.jsonc`:
 }
 ```
 
-> **Plugin updates:** A bare plugin entry is pinned to the downloaded exact version before restart so OpenCode does not remove the active package mid-session. To deliberately keep it unpinned after removing a version, write `@latest` explicitly.
+> **Plugin updates:** A bare plugin entry is pinned to the downloaded exact version before restart so OpenCode does not remove the active package mid-session. Magic Context records the exact spec written by its updater and advances that updater-owned pin on later checks. Any other exact spec is treated as pinned by you and is not changed. Because provenance is keyed to the exact spec string, manually changing the entry to the same spec the updater last wrote is indistinguishable from the updater's pin and will be advanced. To opt out, set `auto_update: false` or pin any other exact version. To deliberately stay unpinned, write `@latest` explicitly (OpenCode may remove an unpinned active package mid-session).
 
 Then create `magic-context.jsonc` with the OpenCode historian setting:
 
@@ -301,7 +301,6 @@ Recall works **across sessions** (a new session inherits everything) and **acros
 | `/ctx-flush` | Force all queued operations immediately, bypassing cache TTL |
 | `/ctx-recomp` | Rebuild compartments from raw history (accepts a `start-end` range). Use when stored state seems wrong |
 | `/ctx-wrapup [messages_to_keep]` | Compact older live history while keeping the newest N messages raw; queued compaction materializes on the next model message |
-| `/ctx-session-upgrade` | Upgrade this session to the latest history format: rebuild compartments and migrate project memories |
 | `/ctx-dream` | Run dreamer maintenance on demand: maintain memory, docs, smart notes, and user-profile review |
 | `/ctx-embed` | Embedding status, or start/pause history compartment embedding (`start` \| `pause`) |
 
@@ -330,7 +329,7 @@ It reads directly from Magic Context's SQLite database. No extra server, no API.
 
 Settings live in `magic-context.jsonc`. Most settings have sensible defaults, but the active harness's historian model (`historian.opencode.model`, `historian.pi.model`, or `historian.omp.model`) is required for history compacting; project config merges on top of user-wide settings. For the full reference — cache TTL tuning, per-model execute thresholds, historian and dreamer model selection, embedding providers, memory settings, and prompt-surface presets (`full`/`light`) — see **[CONFIGURATION.md](./CONFIGURATION.md)** or the **[configuration reference on docs.cortexkit.io](https://docs.cortexkit.io/magic-context/reference/configuration/)**.
 
-> **Note on per-model settings (OpenCode/Pi/OMP):** settings that route per model — like `prompt_surface.models` — apply to the injected guidance block. Tool descriptions are registered once per process by the current (v1) plugin API and follow the default preset; per-model tool descriptions arrive with the OpenCode v2 plugin API once the SDK stabilizes ([#260](https://github.com/cortexkit/magic-context/issues/260)).
+> **Note on per-model settings:** `prompt_surface.models` always routes the injected guidance block. OpenCode 1.x, Pi, and OMP register tool descriptions once per process (they follow `prompt_surface.default`). OpenCode 2 rewrites the five `ctx_*` descriptions per request from the draft model.
 
 **Config locations** (one shared CortexKit location, project overrides user):
 1. `<project-root>/.cortexkit/magic-context.jsonc`
@@ -390,7 +389,9 @@ Magic Context also writes to a few other locations:
 
 ## Development
 
-**Requirements:** [Bun](https://bun.sh) ≥ 1.0
+**Requirements:** [Bun](https://bun.sh) ≥ 1.4.0
+
+Bun 1.3.x has module-evaluation and resolver error-shape differences that can turn unrelated contributor changes into noisy parallel-test and build failures (issues [#445](https://github.com/cortexkit/magic-context/issues/445) and [#446](https://github.com/cortexkit/magic-context/issues/446)). Repository gates run a version preflight so unsupported Bun releases fail with the required version instead of unrelated test errors.
 
 ```sh
 bun install         # Install dependencies
@@ -415,18 +416,18 @@ Run a single dry pass from the repository root; each new unaccounted bust window
 bun packages/plugin/scripts/cache-bust-sentinel.ts --once
 ```
 
-Omit `--once` for the built-in one-minute loop, or invoke `--once` from cron/launchd every 1–5 minutes. The template at `packages/plugin/scripts/launchd/com.cortexkit.magic-context.cache-bust-sentinel.plist` uses a five-minute cadence, deliberately has `RunAtLoad=false`, and is not installed automatically. Replace its `__BUN_PATH__`, `__REPO_ROOT__`, and `__LOG_DIR__` placeholders before loading it. A cron equivalent is:
+Omit `--once` for the built-in one-minute loop, or invoke `--once` from cron/launchd every 1–5 minutes. The template at `packages/plugin/scripts/launchd/com.cortexkit.magic-context.cache-bust-sentinel.plist` uses a five-minute cadence, enables `--send`, deliberately has `RunAtLoad=false`, and is not installed automatically. Replace its `__BUN_PATH__`, `__REPO_ROOT__`, and `__LOG_DIR__` placeholders before loading it. A cron equivalent is:
 
 ```cron
-*/5 * * * * cd /path/to/magic-context && /path/to/bun packages/plugin/scripts/cache-bust-sentinel.ts --once >> /path/to/cache-bust-sentinel.jsonl 2>> /path/to/cache-bust-sentinel.log
+*/5 * * * * cd /path/to/magic-context && /path/to/bun packages/plugin/scripts/cache-bust-sentinel.ts --once --send >> /path/to/cache-bust-sentinel.jsonl 2>> /path/to/cache-bust-sentinel.log
 ```
 
-`--send` switches from JSON-line dry-run output to the `prefrontal` module's `wake.event_record` subc operation. Do not enable it until that operation is deployed. Known dispositions (`accepted`, `unowned_session`, `dedup`, and `superseded`) are counted and logged; malformed replies fail the run. Use `--connection-file`, `--wake-module-id`, `--state-file`, `--db`, or `--rust-store` only when the corresponding runtime location is non-default.
+`--send` switches from JSON-line dry-run output to the `prefrontal-core` module's `agent.deliver` subc operation. It sends a high-urgency registry peer message to `agent_b613e5cf2ee55b8c` from the rendered name `mc-cache-bust-sentinel` by default; the request also stamps the sender as session `health-sentinel-mc` on harness `magic-context`. Use `--wake-agent-id` or `--wake-from-agent` to select another target or rendered sender name. Delivered and queued dispositions are counted as accepted, while a repeated committed order for the same delivery id is counted as deduplicated; sender refusals are counted without retrying the delivery id, and malformed replies or idempotency conflicts fail the run. Use `--connection-file`, `--wake-module-id`, `--wake-agent-id`, `--wake-from-agent`, `--state-file`, `--db`, or `--rust-store` only when the corresponding runtime location is non-default.
 
 ---
 ## Contributing
 
-Bug reports and pull requests are welcome. For larger changes, open an issue first to discuss the approach. Run `bun run format` before submitting; CI rejects unformatted code.
+Bug reports and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the approved-issue and harness-coverage rules before starting.
 
 ---
 

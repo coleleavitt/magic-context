@@ -96,7 +96,10 @@ import {
 import { renderMemoryBlock } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
 import { persistFilteredNoise } from "@magic-context/core/hooks/magic-context/persist-filtered-noise";
-import { producerWindowFailureReason } from "@magic-context/core/hooks/magic-context/producer-window-guard";
+import {
+	fitAtomicHistorianSourceToProducerWindow,
+	producerWindowFailureReason,
+} from "@magic-context/core/hooks/magic-context/producer-window-guard";
 import {
 	createDefaultBoundarySnapshotForTests,
 	describeBoundaryDiagnostics,
@@ -137,6 +140,7 @@ import {
 	convertEntriesToRawMessages,
 	SYNTH_USER_ID_PREFIX,
 } from "./read-session-pi";
+import { isPiSystemEntry } from "./system-entry-pi";
 
 const HISTORIAN_AGENT_NAME = "magic-context-historian";
 const DEFAULT_HISTORIAN_TIMEOUT_MS = 600_000;
@@ -820,14 +824,28 @@ async function runPiHistorianTraced(
 				sessionCompartments: priorCompartments,
 			});
 
+			const fittedAtomicSource = chunk.oversizeAtomicUnit
+				? fitAtomicHistorianSourceToProducerWindow({
+						text: chunk.text,
+						resultBoundaries: chunk.toolResultBoundaries,
+						contextLimitTokens: historianContextLimit,
+						maxOutputTokens,
+					})
+				: null;
 			const chunkText = chunk.oversizeAtomicUnit
-				? chunk.text
+				? (fittedAtomicSource?.text ?? chunk.text)
 				: truncateHistorianInputIfNeeded(chunk.text, historianChunkTokens);
 			const producerSourceTokens = estimateTokens(chunkText);
 			if (boundarySnapshot.oversizeAtomicUnit || chunk.oversizeAtomicUnit) {
 				sessionLog(
 					sessionId,
 					`historian oversize admission: range=${chunk.startIndex}-${chunk.endIndex} rawComponentTokens=${boundarySnapshot.diagnostics?.head.completedFence.tokenMass ?? "unknown"} perRunCap=${perRunCap} producerSourceTokens=${producerSourceTokens} historianChunkTokens=${historianChunkTokens}; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
+				);
+			}
+			if (fittedAtomicSource && fittedAtomicSource.removedTokens > 0) {
+				sessionLog(
+					sessionId,
+					`historian pathological component split: range=${chunk.startIndex}-${chunk.endIndex} resultBoundary=${fittedAtomicSource.splitBoundaryOrdinal ?? "midpoint"} removedTokens=${fittedAtomicSource.removedTokens} producerSourceTokens=${producerSourceTokens} producerInputLimitTokens=${fittedAtomicSource.producerInputLimitTokens ?? "unknown"}`,
 				);
 			}
 			const producerWindowFailure = producerWindowFailureReason({
@@ -1874,6 +1892,8 @@ export function buildPiCompactionSummary(
  * by a real entry that can. Folded tool-result slots are different: their
  * synthesized id represents kept-tail content, so advancing past one would drop
  * that content; leave the marker pending until a safe boundary is available.
+ * System slots keep their ordinals but cannot anchor the kept conversation tail;
+ * Pi's compaction snapshot preserves their effective state instead.
  */
 export function findFirstKeptEntryId(
 	entries: readonly unknown[],
@@ -1881,7 +1901,7 @@ export function findFirstKeptEntryId(
 ): string | null {
 	const target = lastCompactedOrdinal + 1;
 	for (const message of convertEntriesToRawMessages(entries)) {
-		if (message.ordinal < target) continue;
+		if (message.ordinal < target || isPiSystemEntry(message)) continue;
 		if (message.id.startsWith(SYNTH_USER_ID_PREFIX)) return null;
 		if (message.id.length === 0) continue;
 		return message.id;

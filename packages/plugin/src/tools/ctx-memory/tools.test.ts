@@ -19,6 +19,7 @@ import {
     setMemoryClassification,
 } from "../../features/magic-context";
 import { takeCurateSafetyRefusalCount } from "../../features/magic-context/dreamer/curate-memory-safety";
+import { writeTaskStateJson } from "../../features/magic-context/dreamer/storage-task-schedule";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
@@ -186,6 +187,14 @@ function createTestDb(dbPath = ":memory:"): Database {
             rekeyed_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS mirror_identity (
+            domain TEXT NOT NULL,
+            module_project TEXT NOT NULL,
+            module_row_id INTEGER NOT NULL,
+            context_row_id INTEGER NOT NULL,
+            PRIMARY KEY (domain, module_project, module_row_id)
+        );
+
         CREATE
         VIRTUAL
         TABLE IF
@@ -267,6 +276,24 @@ function installTestEmbeddingProvider(
                 isLoaded: () => true,
             }) satisfies EmbeddingProvider,
     );
+}
+
+/**
+ * Record the host<->module row mapping the Rust mirror would have written.
+ *
+ * Under module authority the facade only forwards ids it can address, so a
+ * fixture that wants a module round trip has to look mirrored.
+ */
+function mirrorMemoryId(
+    db: Database,
+    hostId: number,
+    moduleRowId: number,
+    projectPath = "/repo/project",
+): number {
+    db.prepare(
+        "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
+    ).run(projectPath, moduleRowId, hostId);
+    return hostId;
 }
 
 function registerMemoryEmbeddingsForProject(
@@ -390,6 +417,21 @@ describe("createCtxMemoryTools", () => {
         });
 
         it("routes all module-owned memory actions without writing the TS table", async () => {
+            // The ids in this fixture must be addressable: the module facade now
+            // classifies every requested id and refuses ones with no mirrored
+            // counterpart, so a bare id would never reach the backend.
+            const mirroredIds = ["mirrored source one", "mirrored source two"].map(
+                (content, index) =>
+                    mirrorMemoryId(
+                        db,
+                        insertMemory(db, {
+                            projectPath: "/repo/project",
+                            category: "CONSTRAINTS",
+                            content,
+                        }).id,
+                        9000 + index,
+                    ),
+            );
             const routed: Array<{ action: string; ids?: number[]; memoryProject: string }> = [];
             const moduleTools = createCtxMemoryTools({
                 db,
@@ -410,13 +452,18 @@ describe("createCtxMemoryTools", () => {
             });
             const actions = [
                 { action: "write", category: "CONSTRAINTS", content: "module write" },
-                { action: "update", ids: [1], content: "module update" },
-                { action: "archive", ids: [1] },
-                { action: "merge", ids: [1, 2], content: "module merge" },
-                { action: "get", ids: [1] },
+                { action: "update", ids: [mirroredIds[0]], content: "module update" },
+                { action: "archive", ids: [mirroredIds[0]] },
+                { action: "merge", ids: mirroredIds, content: "module merge" },
+                { action: "list", limit: 5 },
+                { action: "get", ids: [mirroredIds[0]] },
             ] as const;
             for (const request of actions) {
-                const result = await moduleTools.ctx_memory.execute(request, toolContext());
+                const context =
+                    request.action === "list"
+                        ? dreamerToolContext("/repo/project", "ses-memory")
+                        : toolContext();
+                const result = await moduleTools.ctx_memory.execute(request, context);
                 expect(result).toContain(`module ${request.action}`);
             }
             expect(routed.map((request) => request.action)).toEqual([
@@ -424,10 +471,12 @@ describe("createCtxMemoryTools", () => {
                 "update",
                 "archive",
                 "merge",
+                "list",
                 "get",
             ]);
             expect(routed.every((request) => request.memoryProject === "/repo/project")).toBe(true);
-            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+            // Only the two seeded rows: the module path wrote nothing to the TS table.
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(2);
         });
 
         it("maps a raced module drain rejection to the transition retry message", async () => {
@@ -488,9 +537,50 @@ describe("createCtxMemoryTools", () => {
             expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
         });
 
+        it("reports a durable authority mismatch instead of a transient read or write retry", async () => {
+            db.prepare(
+                "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, ?, ?)",
+            ).run("/repo/project", "store-1", Date.now());
+            for (const authorityState of [null, "TS"] as const) {
+                const moduleTools = createCtxMemoryTools({
+                    db,
+                    resolveProjectPath: () => "/repo/project",
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                    rustToolBackends: {
+                        authorityState: async () => authorityState,
+                    },
+                });
+                const read = await moduleTools.ctx_memory.execute(
+                    { action: "get", ids: [1] },
+                    toolContext(),
+                );
+                const write = await moduleTools.ctx_memory.execute(
+                    { action: "write", category: "CONSTRAINTS", content: "must not write" },
+                    toolContext(),
+                );
+                expect(read).toBe(
+                    "Memory authority is inconsistent between the host and module. Run `ck doctor drain-authority` before changing Rust mode. (MC-M02)",
+                );
+                expect(write).toBe(read);
+            }
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
         it("keeps module call details in logs and returns capability copy", async () => {
             const content = "module failure must preserve this content";
             const moduleError = "supervisor state: MODULE call failed";
+            const mergeIds = ["merge source one", "merge source two"].map((seed, index) =>
+                mirrorMemoryId(
+                    db,
+                    insertMemory(db, {
+                        projectPath: "/repo/project",
+                        category: "CONSTRAINTS",
+                        content: seed,
+                    }).id,
+                    9100 + index,
+                ),
+            );
             const moduleTools = createCtxMemoryTools({
                 db,
                 resolveProjectPath: () => "/repo/project",
@@ -505,7 +595,7 @@ describe("createCtxMemoryTools", () => {
             });
 
             const result = await moduleTools.ctx_memory.execute(
-                { action: "merge", ids: [1, 2], content },
+                { action: "merge", ids: mergeIds, content },
                 toolContext(),
             );
 
@@ -514,10 +604,20 @@ describe("createCtxMemoryTools", () => {
             );
             expect(result).not.toContain(moduleError);
             expect(result).not.toContain(content);
-            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+            // Only the two mirrored fixtures: the failed module call wrote nothing.
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(2);
         });
 
         it("does not echo content attached to a read-only module refusal", async () => {
+            const readId = mirrorMemoryId(
+                db,
+                insertMemory(db, {
+                    projectPath: "/repo/project",
+                    category: "CONSTRAINTS",
+                    content: "mirrored read target",
+                }).id,
+                9200,
+            );
             const moduleTools = createCtxMemoryTools({
                 db,
                 resolveProjectPath: () => "/repo/project",
@@ -531,7 +631,7 @@ describe("createCtxMemoryTools", () => {
                 },
             });
             const result = await moduleTools.ctx_memory.execute(
-                { action: "get", ids: [1], content: "read-only content must not echo" },
+                { action: "get", ids: [readId], content: "read-only content must not echo" },
                 toolContext(),
             );
             expect(result).toBe(
@@ -766,6 +866,14 @@ describe("createCtxMemoryTools", () => {
             expect(getMutationRows(db, "/repo/project", [memory.id])).toMatchObject([
                 { mutationType: "archive", targetMemoryId: memory.id },
             ]);
+            // The get header must not call an archived row "active"; the STATUS column tells the truth.
+            const fetched = await tools.ctx_memory.execute(
+                { action: "get", ids: [memory.id] },
+                toolContext(),
+            );
+            expect(fetched).toContain("Found 1 memory:");
+            expect(fetched).not.toContain("active memory");
+            expect(fetched).toContain("archived");
         });
 
         it("archives a batch of memories in one call, all-or-nothing", async () => {
@@ -989,6 +1097,157 @@ describe("createCtxMemoryTools", () => {
         expect(getMemoryById(db, own.id)?.status).toBe("archived");
     });
 
+    describe("#given module authority and a workspace-shared memory", () => {
+        // <project-memory> renders workspace-shared memories owned by other
+        // projects. The module mirrors only this project's rows, so those ids
+        // have no module counterpart and never will. Reads still have to work,
+        // mutations have to say why they never will, and one such id must not
+        // take down the rest of the batch.
+        const seedWorkspace = (): void => {
+            db.exec(`
+                INSERT INTO workspaces (id, name, created_at, updated_at, share_categories)
+                VALUES (1, 'ws', 1, 1, '["CONSTRAINTS"]');
+                INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+                VALUES (1, '/repo/project', 'Own', '/repo/project', 1),
+                       (1, '/repo/foreign', 'Foreign', '/repo/foreign', 1);
+            `);
+        };
+        const seedForeignShared = (content: string): number => {
+            const foreign = insertMemory(db, {
+                projectPath: "/repo/foreign",
+                category: "CONSTRAINTS",
+                content,
+            });
+            db.prepare("UPDATE memories SET shareable = 1, scope = 'project' WHERE id = ?").run(
+                foreign.id,
+            );
+            return foreign.id;
+        };
+        const moduleToolsWith = (
+            routed: Array<{ action: string; ids?: number[] }>,
+            text = "module reply",
+        ) =>
+            createCtxMemoryTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                rustToolBackends: {
+                    authorityState: async () => "MODULE",
+                    memory: async (request) => {
+                        routed.push({ action: request.action, ids: request.ids });
+                        return { content: [{ type: "text", text }] };
+                    },
+                },
+            });
+
+        it("reads a foreign shared memory from the host instead of refusing it", async () => {
+            seedWorkspace();
+            const foreignId = seedForeignShared(
+                "Foreign shared constraint that outlives this repo.",
+            );
+            const routed: Array<{ action: string; ids?: number[] }> = [];
+
+            const result = await moduleToolsWith(routed).ctx_memory.execute(
+                { action: "get", ids: [foreignId] },
+                toolContext(),
+            );
+
+            expect(result).toContain("Foreign shared constraint that outlives this repo.");
+            expect(result).toContain(String(foreignId));
+            expect(result).not.toContain("retry");
+            // No mappable id was requested, so the module was never called.
+            expect(routed).toEqual([]);
+        });
+
+        it("refuses to update a foreign shared memory with a refusal that is never transient", async () => {
+            seedWorkspace();
+            const foreignId = seedForeignShared("Foreign shared constraint under curation.");
+            const routed: Array<{ action: string; ids?: number[] }> = [];
+
+            const result = await moduleToolsWith(routed).ctx_memory.execute(
+                { action: "update", ids: [foreignId], content: "rewritten by the wrong project" },
+                toolContext(),
+            );
+
+            expect(result).toBe(
+                `id ${foreignId}: not owned by this project's module — read-only here; retrying will not help.`,
+            );
+            expect(result).not.toContain("retry;");
+            expect(routed).toEqual([]);
+            expect(getMemoryById(db, foreignId)?.content).toBe(
+                "Foreign shared constraint under curation.",
+            );
+        });
+
+        it("keeps the transient retry wording for this project's own not-yet-mirrored row", async () => {
+            seedWorkspace();
+            const own = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "CONSTRAINTS",
+                content: "Own row written seconds ago.",
+            });
+            const routed: Array<{ action: string; ids?: number[] }> = [];
+
+            const result = await moduleToolsWith(routed).ctx_memory.execute(
+                { action: "update", ids: [own.id], content: "corrected own row" },
+                toolContext(),
+            );
+
+            expect(result).toBe(
+                `id ${own.id}: not mirrored yet — it was written seconds ago or the mirror is behind; retry.`,
+            );
+            expect(routed).toEqual([]);
+        });
+
+        it("returns a per-id outcome for a batch mixing mapped, shared, and unknown ids", async () => {
+            seedWorkspace();
+            const mappedId = mirrorMemoryId(
+                db,
+                insertMemory(db, {
+                    projectPath: "/repo/project",
+                    category: "CONSTRAINTS",
+                    content: "Mapped own memory.",
+                }).id,
+                9400,
+            );
+            const foreignId = seedForeignShared("Foreign shared constraint in a mixed batch.");
+            const missingId = 987_654;
+            const routed: Array<{ action: string; ids?: number[] }> = [];
+
+            const result = await moduleToolsWith(routed, "module get reply").ctx_memory.execute(
+                { action: "get", ids: [mappedId, foreignId, missingId] },
+                toolContext(),
+            );
+
+            // The mappable id still reaches the module, and the module never sees
+            // an id it cannot address.
+            expect(routed).toEqual([{ action: "get", ids: [mappedId] }]);
+            expect(result).toContain("module get reply");
+            expect(result).toContain("Foreign shared constraint in a mixed batch.");
+            expect(result).toContain(`id ${missingId}: not found or not visible from this project`);
+        });
+
+        it("reports a foreign memory in a non-shared category as not visible, never as shared", async () => {
+            seedWorkspace();
+            const hidden = insertMemory(db, {
+                projectPath: "/repo/foreign",
+                category: "ARCHITECTURE",
+                content: "Foreign architecture detail not shared with this project.",
+            });
+            const routed: Array<{ action: string; ids?: number[] }> = [];
+
+            const result = await moduleToolsWith(routed).ctx_memory.execute(
+                { action: "get", ids: [hidden.id] },
+                toolContext(),
+            );
+
+            expect(result).toBe(`id ${hidden.id}: not found or not visible from this project`);
+            expect(result).not.toContain("Foreign architecture detail");
+            expect(routed).toEqual([]);
+        });
+    });
+
     it("REFUSES a PRIMARY merge that pulls in a foreign memory in a NON-shared category", async () => {
         // Primary mutations require ownership, not workspace visibility. A shared
         // workspace may make foreign memories readable, but the caller may only
@@ -1058,6 +1317,41 @@ describe("createCtxMemoryTools", () => {
         expect(result).toBe(`Error: Memory with ID ${foreignShared.id} was not found.`);
         expect(getMemoryById(db, own.id)?.status).toBe("active");
         expect(getMemoryById(db, foreignShared.id)?.status).toBe("active");
+    });
+
+    it("refuses a dreamer mutation outside the persisted curate category scope", async () => {
+        const projectRule = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "PROJECT_RULES",
+            content: "Keep category-scoped curation deterministic.",
+        });
+        const architecture = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE",
+            content: "The scheduler owns the dreamer task registry.",
+        });
+        writeTaskStateJson(
+            db,
+            "/repo/project",
+            "curate",
+            JSON.stringify({ curate: { cursor: 0, activeCategory: "PROJECT_RULES" } }),
+        );
+
+        const result = await tools.ctx_memory.execute(
+            {
+                action: "update",
+                ids: [architecture.id],
+                content: "The shared scheduler owns the dreamer task registry.",
+            },
+            dreamerToolContext("/repo/project"),
+        );
+
+        expect(result).toContain("memory ID");
+        expect(result).toContain("outside the scoped category");
+        expect(getMemoryById(db, architecture.id)?.content).toBe(
+            "The scheduler owns the dreamer task registry.",
+        );
+        expect(getMemoryById(db, projectRule.id)?.status).toBe("active");
     });
 
     it("REJECTS merging memories from DIFFERENT categories (structural guard)", async () => {
@@ -1352,6 +1646,8 @@ describe("createCtxMemoryTools", () => {
                 category: "ARCHITECTURE",
                 content: "The loader initializes and validates the registry.",
             });
+            mirrorMemoryId(db, source.id, 9300);
+            mirrorMemoryId(db, successor.id, 9301);
             const routed: Array<{ action: string; ids?: number[]; content?: string }> = [];
             const moduleTools = createCtxMemoryTools({
                 db,
@@ -2725,6 +3021,309 @@ describe("createCtxMemoryTools", () => {
             expect(result).toContain(String(own.id));
             expect(result).toContain("Own constraint present.");
             expect(result).toContain(`id ${missing}: not found or not visible from this project`);
+        });
+    });
+
+    describe("required-all filler", () => {
+        const isolatedWrite = async (args: Record<string, unknown>) => {
+            const isolated = createTestDb();
+            try {
+                const isolatedTools = createCtxMemoryTools({
+                    db: isolated,
+                    resolveProjectPath: () => "/repo/project",
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                });
+                return await isolatedTools.ctx_memory.execute(args, toolContext());
+            } finally {
+                closeQuietly(isolated);
+            }
+        };
+
+        it("write ignores ids/limit/reason filler, including ids:[0]", async () => {
+            const clean = await isolatedWrite({
+                action: "write",
+                category: "PROJECT_RULES",
+                content: "Same standalone fact.",
+            });
+            const filler = await isolatedWrite({
+                action: "write",
+                category: "PROJECT_RULES",
+                content: "Same standalone fact.",
+                ids: [1],
+                limit: 0,
+                reason: "",
+            });
+            const zeroIds = await isolatedWrite({
+                action: "write",
+                category: "PROJECT_RULES",
+                content: "Same standalone fact.",
+                ids: [0],
+                limit: 0,
+                reason: "",
+            });
+            expect(filler).toBe(clean);
+            expect(zeroIds).toBe(clean);
+            expect(clean).toContain("Saved memory [ID: 1] in PROJECT_RULES.");
+        });
+
+        it("archive with empty reason and unused-field filler matches a clean archive", async () => {
+            const run = async (archiveArgs: Record<string, unknown>) => {
+                const isolated = createTestDb();
+                try {
+                    const isolatedTools = createCtxMemoryTools({
+                        db: isolated,
+                        resolveProjectPath: () => "/repo/project",
+                        memoryEnabled: true,
+                        embeddingEnabled: false,
+                    });
+                    const created = await isolatedTools.ctx_memory.execute(
+                        {
+                            action: "write",
+                            category: "PROJECT_RULES",
+                            content: "Archive this fact.",
+                        },
+                        toolContext(),
+                    );
+                    expect(created).toContain("Saved memory [ID: 1]");
+                    return await isolatedTools.ctx_memory.execute(archiveArgs, toolContext());
+                } finally {
+                    closeQuietly(isolated);
+                }
+            };
+            const clean = await run({ action: "archive", ids: [1] });
+            const filler = await run({
+                action: "archive",
+                ids: [1],
+                content: "",
+                category: "PROJECT_RULES",
+                limit: 0,
+                reason: "",
+            });
+            expect(filler).toBe(clean);
+            expect(clean).toContain("Archived memory [ID: 1]");
+        });
+
+        it("update/get/merge ignore unused-field filler and match the clean call", async () => {
+            const seed = async () => {
+                const isolated = createTestDb();
+                const isolatedTools = createCtxMemoryTools({
+                    db: isolated,
+                    resolveProjectPath: () => "/repo/project",
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                });
+                await isolatedTools.ctx_memory.execute(
+                    {
+                        action: "write",
+                        category: "PROJECT_RULES",
+                        content: "Original fact.",
+                    },
+                    toolContext(),
+                );
+                await isolatedTools.ctx_memory.execute(
+                    {
+                        action: "write",
+                        category: "PROJECT_RULES",
+                        content: "Duplicate fact to merge.",
+                    },
+                    toolContext(),
+                );
+                return { isolated, isolatedTools };
+            };
+
+            const updateCleanDb = await seed();
+            const updateFillerDb = await seed();
+            const getCleanDb = await seed();
+            const getFillerDb = await seed();
+            const mergeCleanDb = await seed();
+            const mergeFillerDb = await seed();
+            try {
+                const updateClean = await updateCleanDb.isolatedTools.ctx_memory.execute(
+                    { action: "update", ids: [1], content: "Updated fact." },
+                    toolContext(),
+                );
+                const updateFiller = await updateFillerDb.isolatedTools.ctx_memory.execute(
+                    {
+                        action: "update",
+                        ids: [1],
+                        content: "Updated fact.",
+                        category: "PROJECT_RULES",
+                        limit: 0,
+                        reason: "",
+                    },
+                    toolContext(),
+                );
+                const getClean = await getCleanDb.isolatedTools.ctx_memory.execute(
+                    { action: "get", ids: [1] },
+                    toolContext(),
+                );
+                const getFiller = await getFillerDb.isolatedTools.ctx_memory.execute(
+                    {
+                        action: "get",
+                        ids: [1],
+                        content: "",
+                        category: "PROJECT_RULES",
+                        limit: 0,
+                        reason: "",
+                    },
+                    toolContext(),
+                );
+                const mergeClean = await mergeCleanDb.isolatedTools.ctx_memory.execute(
+                    {
+                        action: "merge",
+                        ids: [1, 2],
+                        content: "Merged standalone fact.",
+                    },
+                    toolContext(),
+                );
+                const mergeFiller = await mergeFillerDb.isolatedTools.ctx_memory.execute(
+                    {
+                        action: "merge",
+                        ids: [1, 2],
+                        content: "Merged standalone fact.",
+                        category: "PROJECT_RULES",
+                        limit: 0,
+                        reason: "",
+                    },
+                    toolContext(),
+                );
+                const stamp = /\d{4}-\d{2}-\d{2}T[\d:.]+Z/g;
+                expect(updateFiller).toBe(updateClean);
+                expect(getFiller.replace(stamp, "<ts>")).toBe(getClean.replace(stamp, "<ts>"));
+                expect(mergeFiller).toBe(mergeClean);
+            } finally {
+                closeQuietly(updateCleanDb.isolated);
+                closeQuietly(updateFillerDb.isolated);
+                closeQuietly(getCleanDb.isolated);
+                closeQuietly(getFillerDb.isolated);
+                closeQuietly(mergeCleanDb.isolated);
+                closeQuietly(mergeFillerDb.isolated);
+            }
+        });
+
+        it("keeps unused ids and category filler inert under an active dreamer category scope", async () => {
+            const run = async (action: "write" | "get" | "list", filler: boolean) => {
+                const isolated = createTestDb();
+                try {
+                    const projectRule = insertMemory(isolated, {
+                        projectPath: "/repo/project",
+                        category: "PROJECT_RULES",
+                        content: "Different scoped fact.",
+                    });
+                    const architecture = insertMemory(isolated, {
+                        projectPath: "/repo/project",
+                        category: "ARCHITECTURE",
+                        content: "Scoped architecture fact.",
+                    });
+                    writeTaskStateJson(
+                        isolated,
+                        "/repo/project",
+                        "curate",
+                        JSON.stringify({ curate: { cursor: 0, activeCategory: "ARCHITECTURE" } }),
+                    );
+                    const isolatedTools = createCtxMemoryTools({
+                        db: isolated,
+                        resolveProjectPath: () => "/repo/project",
+                        memoryEnabled: true,
+                        embeddingEnabled: false,
+                    });
+                    const args =
+                        action === "write"
+                            ? {
+                                  action,
+                                  category: "ARCHITECTURE",
+                                  content: "New scoped architecture fact.",
+                                  ...(filler
+                                      ? { ids: [projectRule.id], limit: 0, reason: "" }
+                                      : {}),
+                              }
+                            : action === "get"
+                              ? {
+                                    action,
+                                    ids: [architecture.id],
+                                    ...(filler
+                                        ? {
+                                              content: "",
+                                              category: "PROJECT_RULES",
+                                              limit: 0,
+                                              reason: "",
+                                          }
+                                        : {}),
+                                }
+                              : {
+                                    action,
+                                    category: "ARCHITECTURE",
+                                    ...(filler
+                                        ? {
+                                              ids: [projectRule.id],
+                                              content: "",
+                                              limit: 0,
+                                              reason: "",
+                                          }
+                                        : {}),
+                                };
+                    return await isolatedTools.ctx_memory.execute(
+                        args,
+                        toolContext("ses-dreamer", DREAMER_AGENT),
+                    );
+                } finally {
+                    closeQuietly(isolated);
+                }
+            };
+            const stamp = /\d{4}-\d{2}-\d{2}T[\d:.]+Z/g;
+            const clean = {
+                write: await run("write", false),
+                get: (await run("get", false)).replace(stamp, "<ts>"),
+                list: (await run("list", false)).replace(stamp, "<ts>"),
+            };
+            const filler = {
+                write: await run("write", true),
+                get: (await run("get", true)).replace(stamp, "<ts>"),
+                list: (await run("list", true)).replace(stamp, "<ts>"),
+            };
+
+            expect(filler).toEqual(clean);
+            expect(clean.write).toContain("Saved memory");
+            expect(clean.get).toContain("Scoped architecture fact");
+            expect(clean.list).toContain("Scoped architecture fact");
+        });
+
+        it("list treats limit 0 as the default and filler ids do not bypass the dreamer-only gate", async () => {
+            for (const label of ["one", "two", "three"]) {
+                insertMemory(db, {
+                    projectPath: "/repo/project",
+                    category: "PROJECT_RULES",
+                    content: `List filler ${label}.`,
+                });
+            }
+            const dreamer = toolContext("ses-dreamer", DREAMER_AGENT);
+            const clean = await tools.ctx_memory.execute({ action: "list" }, dreamer);
+            const filler = await tools.ctx_memory.execute(
+                {
+                    action: "list",
+                    ids: [1],
+                    content: "",
+                    category: "PROJECT_RULES",
+                    limit: 0,
+                    reason: "",
+                },
+                dreamer,
+            );
+            const primaryFiller = await tools.ctx_memory.execute(
+                {
+                    action: "list",
+                    ids: [1],
+                    content: "",
+                    category: "PROJECT_RULES",
+                    limit: 0,
+                    reason: "",
+                },
+                toolContext(),
+            );
+            expect(filler).toBe(clean);
+            expect(clean).toContain("Found 3 active memories");
+            expect(primaryFiller).toBe("Error: Action 'list' is not allowed in this context.");
         });
     });
 });

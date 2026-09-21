@@ -70,6 +70,8 @@ export interface RustTestHarnessOptions {
     startHistorianProducer?: boolean;
     /** Copy an existing module store into the isolated data directory before ck-mc starts. */
     seedModuleStorePath?: string;
+    /** Build the hermetic module with the otherwise-absent drive-fault feature. */
+    driveFaultBinary?: boolean;
 }
 
 export interface SdkClient {
@@ -82,7 +84,7 @@ export interface SdkClient {
             path: { id: string };
             body: {
                 model: { providerID: string; modelID: string };
-                parts: Array<{ type: "text"; text: string }>;
+                parts: Array<{ type: "text"; text: string; synthetic?: boolean }>;
                 agent?: string;
             };
         }) => Promise<{ data?: unknown; error?: unknown }>;
@@ -206,7 +208,9 @@ export class RustTestHarness {
             );
         }
 
-        const { ckMcBin, ckSubcBin } = await buildHermeticBinaries(prereqs.subconsciousRoot);
+        const { ckMcBin, ckSubcBin } = await buildHermeticBinaries(prereqs.subconsciousRoot, {
+            driveFault: options.driveFaultBinary,
+        });
 
         const mock = new MockProvider();
         const { baseURL } = await mock.start();
@@ -392,6 +396,43 @@ export class RustTestHarness {
             );
         }
         throw new Error("session.create failed");
+    }
+
+    /**
+     * Create a child session the way OpenCode's `task` tool does: POST /session with a
+     * `parentID`. The plugin reads that field from the `session.created` event and marks
+     * the row a subagent, which is the only way to drive subagent behaviour end to end.
+     */
+    async createChildSession(parentId: string, title?: string): Promise<string> {
+        const maxAttempts = 5;
+        for (let i = 1; i <= maxAttempts; i++) {
+            const res = await this.clientInstance.session.create({
+                query: { directory: this.env.workdir },
+                body: { parentID: parentId, ...(title ? { title } : {}) },
+            });
+            if (res.data) return res.data.id;
+            if (i < maxAttempts) {
+                await Bun.sleep(200 * i);
+                continue;
+            }
+            throw new Error(
+                `child session.create failed after ${maxAttempts} attempts. stderr:\n${this.opencodeInstance.stderr()}`,
+            );
+        }
+        throw new Error("child session.create failed");
+    }
+
+    /** Read the plugin's persisted subagent flag, or null before the row exists. */
+    isSubagent(sessionId: string): boolean | null {
+        try {
+            const row = this.contextDb()
+                .prepare("SELECT is_subagent FROM session_meta WHERE session_id = ?")
+                .get(sessionId) as { is_subagent?: unknown } | null;
+            if (!row) return null;
+            return row.is_subagent === 1 || row.is_subagent === true;
+        } catch {
+            return null;
+        }
     }
 
     /**
@@ -620,6 +661,13 @@ export class RustTestHarness {
             providerID?: string;
             modelID?: string;
             messageID?: string;
+            /**
+             * Send the prompt the way OpenCode's own notice deliveries do: a text part
+             * flagged `synthetic`. The flag keeps the message out of the terminal's
+             * human-turn rendering; OpenCode still persists it as an ordinary user row
+             * and still serializes it to the model on every later pass.
+             */
+            synthetic?: boolean;
         } = {},
     ): Promise<unknown> {
         const timeoutMs = options.timeoutMs ?? 180_000;
@@ -630,7 +678,7 @@ export class RustTestHarness {
                     providerID: options.providerID ?? this.providerID,
                     modelID: options.modelID ?? this.modelID,
                 },
-                parts: [{ type: "text", text }],
+                parts: [{ type: "text", text, ...(options.synthetic ? { synthetic: true } : {}) }],
                 ...(options.agent ? { agent: options.agent } : {}),
                 ...(options.messageID ? { messageID: options.messageID } : {}),
             },
@@ -668,21 +716,39 @@ export class RustTestHarness {
         });
     }
 
+    /** Fetch the session row via the SDK (revert marker, timestamps). */
+    async getSession(
+        sessionId: string,
+    ): Promise<{ revert?: { messageID?: string }; time?: { updated?: number } } | undefined> {
+        const response = await this.clientInstance.session.get({ path: { id: sessionId } });
+        return (response as { data?: { revert?: { messageID?: string } } }).data ?? undefined;
+    }
+
     /** Fetch the session's messages via the SDK (for choosing a mid-session id to remove). */
     async listMessages(
         sessionId: string,
     ): Promise<
         Array<{
-            info?: { id?: string; role?: string };
-            parts?: Array<{ type?: string; text?: string }>;
+            info?: { id?: string; role?: string; parentID?: string };
+            parts?: Array<{
+                type?: string;
+                text?: string;
+                synthetic?: boolean;
+                ignored?: boolean;
+            }>;
         }>
     > {
         const res = await this.clientInstance.session.messages({ path: { id: sessionId } });
         const data = (res as { data?: unknown }).data;
         return Array.isArray(data)
             ? (data as Array<{
-                  info?: { id?: string; role?: string };
-                  parts?: Array<{ type?: string; text?: string }>;
+                  info?: { id?: string; role?: string; parentID?: string };
+                  parts?: Array<{
+                type?: string;
+                text?: string;
+                synthetic?: boolean;
+                ignored?: boolean;
+            }>;
               }>)
             : [];
     }
@@ -781,14 +847,14 @@ export class RustTestHarness {
 
     /** Poll until `predicate` returns truthy or `timeoutMs` elapses. */
     async waitFor<T>(
-        predicate: () => T | null | undefined | false,
+        predicate: () => T | null | undefined | false | Promise<T | null | undefined | false>,
         opts: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
     ): Promise<T> {
         const timeoutMs = opts.timeoutMs ?? 60_000;
         const intervalMs = opts.intervalMs ?? 100;
         const deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline) {
-            const value = predicate();
+            const value = await predicate();
             if (value) return value as T;
             await Bun.sleep(intervalMs);
         }

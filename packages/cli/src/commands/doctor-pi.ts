@@ -12,6 +12,10 @@ import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
 import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magic-context";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
+    formatDreamerTickFailure,
+    getDreamerTickFailure,
+} from "@magic-context/core/features/magic-context/dreamer/tick-failure";
+import {
     type EmbeddingProbeOutcome,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
@@ -80,7 +84,10 @@ import {
 import {
     describePiPackageEntry,
     getPiMagicContextPackageSpecifier,
+    hasPiMagicContextPackage,
+    isConfiguredPiMagicContextEntry as isConfiguredPiMagicContextEntryIn,
     isPiMagicContextPackageEntry,
+    localPiMagicContextPackageDir as resolveLocalPiMagicContextPackageDir,
 } from "../lib/pi-package-entry";
 import { type PromptIO, promptIO } from "../lib/prompts";
 import { sanitizeDiagnosticEndpoint, sanitizeDiagnosticText } from "../lib/redaction";
@@ -98,33 +105,6 @@ const PACKAGE_NAME = "@cortexkit/pi-magic-context";
 // the new scope, so older Pi installs cannot load this extension.
 const MIN_PI_VERSION = "0.74.0";
 const ROW_COUNT_TABLES = ["tags", "compartments", "memories", "notes", "dream_runs"];
-
-function isLocalPiMagicContextPackageEntry(entry: unknown): boolean {
-    if (typeof entry === "string") {
-        const packagePath = entry.trim();
-        if (!isAbsolute(packagePath)) return false;
-        try {
-            const parsed = JSON.parse(readFileSync(join(packagePath, "package.json"), "utf-8")) as {
-                name?: unknown;
-            };
-            return parsed.name === PACKAGE_NAME;
-        } catch {
-            return false;
-        }
-    }
-    if (entry && typeof entry === "object" && !Array.isArray(entry)) {
-        const object = entry as Record<string, unknown>;
-        return (
-            isLocalPiMagicContextPackageEntry(object.source) ||
-            isLocalPiMagicContextPackageEntry(object.name)
-        );
-    }
-    return false;
-}
-
-function isConfiguredPiMagicContextPackageEntry(entry: unknown): boolean {
-    return isPiMagicContextPackageEntry(entry) || isLocalPiMagicContextPackageEntry(entry);
-}
 
 type CheckStatus = "pass" | "warn" | "fail" | "info";
 
@@ -345,18 +325,27 @@ function packagesFrom(settings: Record<string, unknown>): unknown[] {
  * <cwd>/.pi/npm/node_modules/<pkg> (project). We collect every plausible dir
  * with a package.json; the resolver stays SILENT for any that don't exist.
  */
+function localPiMagicContextPackageDir(entry: unknown): string | null {
+    return resolveLocalPiMagicContextPackageDir(entry, getPiAgentConfigDir());
+}
+
+function isConfiguredPiMagicContextEntry(entry: unknown): boolean {
+    return isConfiguredPiMagicContextEntryIn(entry, getPiAgentConfigDir());
+}
+
 function piPluginDirCandidates(packages: unknown[], cwd: string): string[] {
     const dirs: string[] = [];
     const agentDir = getPiAgentConfigDir();
 
     // Local dev-path entries: a string spec that is NOT an npm: specifier and
     // resolves to a directory on disk. Relative entries are resolved against the
-    // Pi agent dir (Pi's settings.packages base).
+    // Pi agent dir (Pi's settings.packages base). Only directories whose
+    // package.json names the magic-context plugin itself are candidates — other
+    // local extensions registered in packages[] must not be probed for the
+    // embedding runtime.
     for (const entry of packages) {
-        const spec = typeof entry === "string" ? entry.trim() : "";
-        if (!spec || spec.startsWith("npm:")) continue;
-        const resolved = isAbsolute(spec) ? spec : join(agentDir, spec);
-        dirs.push(resolved);
+        const resolved = localPiMagicContextPackageDir(entry);
+        if (resolved) dirs.push(resolved);
     }
 
     // Managed npm install roots (hoisted): <root>/node_modules/<pkg>.
@@ -603,7 +592,7 @@ async function runHealthChecks(options: {
         } else {
             packages = packagesFrom(parsed.value);
             add(results, "pass", `Pi settings found at ${settingsPath}`);
-            if (packages.some(isConfiguredPiMagicContextPackageEntry)) {
+            if (hasPiMagicContextPackage(packages)) {
                 add(results, "pass", `${PI_PACKAGE_SOURCE} is registered in packages[]`);
             } else {
                 add(results, "fail", `${PI_PACKAGE_SOURCE} is missing from packages[]`);
@@ -739,6 +728,9 @@ async function runHealthChecks(options: {
                 for (const stall of listShadowBackfillStalls(db)) {
                     add(results, "warn", formatShadowBackfillStall(stall));
                 }
+                const tickFailure = getDreamerTickFailure(db);
+                if (tickFailure) add(results, "warn", formatDreamerTickFailure(tickFailure));
+                else add(results, "pass", "Background maintenance completed its last pass");
             }
         } catch (error) {
             if (error instanceof UnsupportedSchemaVersionError) {
@@ -877,6 +869,8 @@ async function runHealthChecks(options: {
         // persistence-capable Node WASM fallback. Resolution starts from the
         // installed plugin dir and stays silent when no tree can be inspected.
         let runtimeReported = false;
+        let firstFallback: ReturnType<typeof checkLocalEmbeddingRuntimeByResolution> | null = null;
+        const brokenWarnings: string[] = [];
         let runtimeUnverifiedReason = "no installed plugin tree found to inspect";
         for (const pluginDir of piPluginDirCandidates(packages, options.cwd)) {
             const runtime = checkLocalEmbeddingRuntimeByResolution(
@@ -904,23 +898,34 @@ async function runHealthChecks(options: {
                 break;
             }
             if (runtime.state === "wasm-fallback") {
-                add(results, "warn", formatLocalEmbeddingRuntimeWasmFallback(runtime));
-                runtimeReported = true;
-                break;
+                // Remember the best degraded candidate but keep probing: a WASM
+                // fallback in an earlier tree must not mask a later native-capable
+                // install.
+                firstFallback ??= runtime;
+                continue;
             }
             if (isLocalEmbeddingRuntimeBroken(runtime)) {
-                add(results, "warn", formatLocalEmbeddingRuntimeDoctorWarning(runtime));
-                runtimeReported = true;
-                break;
+                // Keep probing: an earlier broken candidate (e.g. a stale local
+                // dev-path tree) must not mask a healthy managed install.
+                brokenWarnings.push(
+                    `${formatLocalEmbeddingRuntimeDoctorWarning(runtime)} Candidate: ${pluginDir}`,
+                );
+                continue;
             }
             if (runtime.state === "unknown") runtimeUnverifiedReason = runtime.reason;
         }
         if (!runtimeReported) {
-            add(
-                results,
-                "warn",
-                `Embedding provider ${loadedConfig.config.embedding.provider}: selected runtime unverified (${runtimeUnverifiedReason})`,
-            );
+            if (firstFallback) {
+                add(results, "warn", formatLocalEmbeddingRuntimeWasmFallback(firstFallback));
+            } else if (brokenWarnings.length > 0) {
+                for (const warning of brokenWarnings) add(results, "warn", warning);
+            } else {
+                add(
+                    results,
+                    "warn",
+                    `Embedding provider ${loadedConfig.config.embedding.provider}: selected runtime unverified (${runtimeUnverifiedReason})`,
+                );
+            }
         }
     }
 
@@ -928,9 +933,7 @@ async function runHealthChecks(options: {
     // extensions today, but we still check for self-conflicts that the user
     // can hit (e.g. accidentally registering both an npm entry AND a local
     // dev-path entry, which causes duplicate plugin loading).
-    const piEntries = packages
-        .filter(isConfiguredPiMagicContextPackageEntry)
-        .map(describePiPackageEntry);
+    const piEntries = packages.filter(isConfiguredPiMagicContextEntry).map(describePiPackageEntry);
     if (piEntries.length > 1) {
         add(
             results,
@@ -942,7 +945,7 @@ async function runHealthChecks(options: {
     }
 
     const otherExtensions = packages
-        .filter((entry) => !isConfiguredPiMagicContextPackageEntry(entry))
+        .filter((entry) => !isConfiguredPiMagicContextEntry(entry))
         .map(describePiPackageEntry);
     if (otherExtensions.length > 0) {
         add(results, "info", `Other Pi extensions registered: ${otherExtensions.join(", ")}`);
@@ -950,7 +953,7 @@ async function runHealthChecks(options: {
         add(results, "info", "No other Pi extensions listed in settings.json");
     }
 
-    const configuredEntry = packages.find(isConfiguredPiMagicContextPackageEntry);
+    const configuredEntry = packages.find(isPiMagicContextPackageEntry);
     const configuredSpecifier = getPiMagicContextPackageSpecifier(configuredEntry);
     const expectedPluginVersion =
         pinnedVersionFromPackageSpecifier(configuredSpecifier) ?? latest ?? null;

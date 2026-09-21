@@ -68,16 +68,16 @@ use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, Storag
 use mc_store::TagNumberRow;
 use mc_store::{
     canonical_root, validate_state_import_compartments, AuthoritySeedRow, DeferredExecuteState,
-    FacadeMutationOutcome, HistorianChunkRange, HistorianDecision, HistorianPhase,
-    HistorianRecentDecision, InsertMemoryInput, LoadedState, MappingUpdate, McStore, McStoreError,
-    McTagRow, ModuleDropSeedRow, ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError,
-    ModuleStateSyncRequest, ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow,
-    NoteCasOutcome, NoteDismissOutcome, NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed,
-    NoteWriteInput, PendingAgentDrop, PendingAgentDropSeedRow, PendingCompactionMarkerState,
-    RecordWrapupCommandOutcome, StateImportError, StateImportPreflight, StateImportValidationError,
-    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
-    TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
-    LATEST_MIGRATION_VERSION,
+    FacadeMemoryMutationError, FacadeMutationOutcome, HistorianChunkRange, HistorianDecision,
+    HistorianPhase, HistorianRecentDecision, HostMemoryIdentityAck, InsertMemoryInput, LoadedState,
+    MappingUpdate, McStore, McStoreError, McTagRow, ModuleDropSeedRow, ModuleMemoryMutationRow,
+    ModuleMemoryRow, ModuleStateSyncError, ModuleStateSyncRequest, ModuleStripSeedRow,
+    ModuleWorkspaceMemberRow, ModuleWorkspaceRow, NoteCasOutcome, NoteDismissOutcome,
+    NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop,
+    PendingAgentDropSeedRow, PendingCompactionMarkerState, RecordWrapupCommandOutcome,
+    StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
+    StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
+    VerificationUpdate, WrapupCommandRecord, LATEST_MIGRATION_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -89,9 +89,9 @@ use subc_client_rs::{
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
 use classify::{
-    child_session_id, has_manifest_envelope, CLASSIFY_AWAIT_TIMEOUT, CLASSIFY_MAX_OUTPUT_TOKENS,
-    CLASSIFY_RECOVERY_TIMEOUT, CLASSIFY_SYSTEM_PROMPT, CLASSIFY_TASK, CLASSIFY_TEMPERATURE,
-    MAX_CLASSIFY_PROMPT_BYTES,
+    child_session_id, has_manifest_envelope, next_attempt_nonce, CLASSIFY_AWAIT_TIMEOUT,
+    CLASSIFY_MAX_OUTPUT_TOKENS, CLASSIFY_RECOVERY_TIMEOUT, CLASSIFY_SYSTEM_PROMPT, CLASSIFY_TASK,
+    CLASSIFY_TEMPERATURE, MAX_CLASSIFY_PROMPT_BYTES,
 };
 use config::{derive_historian_chunk_tokens, ConfigCache, McModuleConfig};
 use healing::{tail_reclaim, SerializerProfile};
@@ -240,12 +240,25 @@ const STORE_OPENED: u8 = 3;
 const STORE_LEASE_WAIT_WINDOW: Duration = Duration::from_secs(60);
 const STORE_LEASE_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const STORE_LEASE_MAX_BACKOFF: Duration = Duration::from_secs(1);
+// How long a request may block on a store open that is still in flight before it refuses. A
+// request already blocks up to SESSION_RESOLVE_DEADLINE (2s, session_resolver.rs) resolving its
+// session before it ever reads the store, so a wait well inside that stays within the deadline
+// this lane already tolerates. One local database open is far quicker than that, so the budget
+// sits at the low end: long enough that a fast open never refuses a first call, short enough that
+// a wedged open still answers. The lease window (up to a minute) is never waited on here.
+const STORE_OPENING_REQUEST_WAIT: Duration = Duration::from_millis(500);
+// The user-facing sentence for a context service that cannot answer right now, mirroring the
+// MC-C10 entry of the plugin's user-facing failure catalog. Anything a user reads instead of a
+// tool result uses this text; engine detail belongs in the error code and the logs.
+const CONTEXT_SERVICE_UNAVAILABLE_MESSAGE: &str =
+    "Magic Context is temporarily unavailable. Retry in a moment. (MC-C10)";
 
 #[derive(Clone, Copy)]
 struct StoreOpenPolicy {
     wait_window: Duration,
     initial_backoff: Duration,
     max_backoff: Duration,
+    request_wait: Duration,
 }
 
 impl Default for StoreOpenPolicy {
@@ -254,12 +267,165 @@ impl Default for StoreOpenPolicy {
             wait_window: STORE_LEASE_WAIT_WINDOW,
             initial_backoff: STORE_LEASE_INITIAL_BACKOFF,
             max_backoff: STORE_LEASE_MAX_BACKOFF,
+            request_wait: STORE_OPENING_REQUEST_WAIT,
+        }
+    }
+}
+
+/// Where the descriptor being opened came from. A refusal names it because the two origins mean
+/// different investigations: a daemon-assigned path is a storage-seam problem, while a dev
+/// fallback means this process resolved a path on its own and can therefore collide with another
+/// incarnation that resolved the very same one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DescriptorOrigin {
+    DaemonAck,
+    DevFallback,
+}
+
+impl DescriptorOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DaemonAck => "daemon_ack",
+            Self::DevFallback => "dev_fallback",
+        }
+    }
+}
+
+/// The descriptor label a refusal or health report may carry. A storage location is sensitive
+/// (the sqlite path contains a home directory, a postgres DSN contains a credential), so only the
+/// file name plus a short hash of its directory survives: enough to tell two rigs' stores apart,
+/// never enough to disclose where either lives.
+fn redacted_descriptor_label(descriptor: &StorageDescriptor) -> String {
+    match &descriptor.backend {
+        StorageBackend::Sqlite { path } => {
+            let path = Path::new(path);
+            let file = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unnamed");
+            let directory = path.parent().and_then(Path::to_str).unwrap_or("");
+            let digest = sha256_hex(directory.as_bytes());
+            format!("sqlite:{file}@{}", &digest[..12])
+        }
+        StorageBackend::Postgres { database, .. } => format!("postgres:{database}"),
+    }
+}
+
+/// The descriptor of the open attempt in progress (or the last one that ran).
+#[derive(Clone, Debug)]
+struct StoreOpenAttempt {
+    label: String,
+    origin: DescriptorOrigin,
+}
+
+/// Why a store open ended for good. Recorded BEFORE the phase returns to idle so a request that
+/// observes an idle phase always finds the reason, instead of falling through to the
+/// "nothing was ever attempted" arm and blaming a missing ack that did arrive.
+#[derive(Clone, Debug)]
+struct StoreOpenFailure {
+    reason: String,
+    origin: &'static str,
+    descriptor: String,
+    at_ms: u64,
+}
+
+/// Why a request found no open store handle.
+///
+/// The handle is a single `Option`, so its emptiness on its own cannot say which of these holds —
+/// and they need opposite responses: retry in a moment, wait for another process to exit, look up
+/// why the open failed, or find out why no ack arrived. One shared code and message would be
+/// wrong in nearly every case, so the seam reports the state it actually observed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StoreRefusal {
+    /// No HELLO_ACK has arrived, so no open has ever been attempted.
+    NeverAcked,
+    /// An open is in flight and this request already spent its wait budget.
+    Opening { elapsed_ms: u64 },
+    /// Another live process holds the single-writer lease; the open keeps retrying until its
+    /// window runs out.
+    LeaseWait {
+        elapsed_ms: u64,
+        wait_window_ms: u64,
+        descriptor: String,
+    },
+    /// The open ended and is not retried, so every later request refuses the same way until the
+    /// module restarts.
+    Failed {
+        reason: String,
+        origin: &'static str,
+        descriptor: String,
+    },
+}
+
+impl StoreRefusal {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::NeverAcked => "store_unavailable",
+            Self::Opening { .. } => "store_opening",
+            Self::LeaseWait { .. } => "store_lease_wait",
+            Self::Failed { .. } => "store_open_failed",
+        }
+    }
+
+    /// Whether an identical request sent later can succeed without anyone intervening.
+    fn retryable(&self) -> bool {
+        !matches!(self, Self::Failed { .. })
+    }
+
+    fn message(&self) -> String {
+        let disposition = if self.retryable() {
+            "retryable"
+        } else {
+            "terminal"
+        };
+        match self {
+            Self::NeverAcked => format!(
+                "storage is not open: no HELLO_ACK has arrived on this connection, so no open has been attempted yet ({disposition})"
+            ),
+            Self::Opening { elapsed_ms } => format!(
+                "storage open is still in flight: elapsed_ms={elapsed_ms} ({disposition})"
+            ),
+            Self::LeaseWait {
+                elapsed_ms,
+                wait_window_ms,
+                descriptor,
+            } => format!(
+                "storage single-writer lease is held by another live process: elapsed_ms={elapsed_ms} wait_window_ms={wait_window_ms} descriptor={descriptor} ({disposition})"
+            ),
+            Self::Failed {
+                reason,
+                origin,
+                descriptor,
+            } => format!(
+                "storage open failed and is not retried before restart: reason={reason} descriptor_origin={origin} descriptor={descriptor} ({disposition})"
+            ),
+        }
+    }
+
+    /// The refusal as an error frame for an internal lane (transform, status, sync, authority),
+    /// whose reader is an operator or a log.
+    fn into_outcome(self) -> HandlerOutcome {
+        HandlerOutcome::Error {
+            code: self.code().to_string(),
+            message: self.message(),
+        }
+    }
+
+    /// The refusal as an error frame for a facade tool, whose message reaches the user. The text
+    /// stays the user-facing sentence — engine internals (paths, lease state, open errors) must
+    /// never surface in tool output — while the code still carries the arm for logs.
+    fn into_facade_outcome(self) -> HandlerOutcome {
+        HandlerOutcome::Error {
+            code: self.code().to_string(),
+            message: CONTEXT_SERVICE_UNAVAILABLE_MESSAGE.to_string(),
         }
     }
 }
 
 struct StoreOpenCoordinator {
     phase: AtomicU8,
+    phase_changed: Notify,
+    opening_started_at_ms: AtomicU64,
     wait_started_at_ms: AtomicU64,
     cancelled: AtomicBool,
     cancel: Notify,
@@ -267,12 +433,16 @@ struct StoreOpenCoordinator {
     waiter_completed: Notify,
     waiter_starts: AtomicU64,
     policy: Mutex<StoreOpenPolicy>,
+    attempt: Mutex<Option<StoreOpenAttempt>>,
+    failure: Mutex<Option<StoreOpenFailure>>,
 }
 
 impl StoreOpenCoordinator {
     fn new() -> Self {
         Self {
             phase: AtomicU8::new(STORE_OPEN_IDLE),
+            phase_changed: Notify::new(),
+            opening_started_at_ms: AtomicU64::new(0),
             wait_started_at_ms: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
             cancel: Notify::new(),
@@ -280,6 +450,107 @@ impl StoreOpenCoordinator {
             waiter_completed: Notify::new(),
             waiter_starts: AtomicU64::new(0),
             policy: Mutex::new(StoreOpenPolicy::default()),
+            attempt: Mutex::new(None),
+            failure: Mutex::new(None),
+        }
+    }
+
+    /// Publish a phase and wake the requests waiting on an in-flight open. Every phase write goes
+    /// through here so a waiter can never sleep through the transition it is waiting for.
+    fn set_phase(&self, phase: u8) {
+        self.phase.store(phase, Ordering::Release);
+        self.phase_changed.notify_waiters();
+    }
+
+    /// Note which descriptor this attempt opens, and drop any reason left by an earlier attempt so
+    /// a fresh open is never reported as the old failure.
+    fn begin_attempt(&self, descriptor: &StorageDescriptor, origin: DescriptorOrigin, now_ms: u64) {
+        *self.attempt.lock().expect("store open attempt mutex") = Some(StoreOpenAttempt {
+            label: redacted_descriptor_label(descriptor),
+            origin,
+        });
+        *self.failure.lock().expect("store open failure mutex") = None;
+        self.opening_started_at_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    fn attempt_snapshot(&self) -> Option<StoreOpenAttempt> {
+        self.attempt
+            .lock()
+            .expect("store open attempt mutex")
+            .clone()
+    }
+
+    fn failure_snapshot(&self) -> Option<StoreOpenFailure> {
+        self.failure
+            .lock()
+            .expect("store open failure mutex")
+            .clone()
+    }
+
+    /// Record why the open ended, then release the phase. The order matters: a request that sees
+    /// the idle phase must already be able to read the reason.
+    fn fail_and_idle(&self, reason: String, now_ms: u64) {
+        let attempt = self.attempt_snapshot();
+        *self.failure.lock().expect("store open failure mutex") = Some(StoreOpenFailure {
+            reason,
+            origin: attempt
+                .as_ref()
+                .map_or("unknown", |attempt| attempt.origin.as_str()),
+            descriptor: attempt.map_or_else(|| "unknown".to_string(), |attempt| attempt.label),
+            at_ms: now_ms,
+        });
+        self.set_phase(STORE_OPEN_IDLE);
+    }
+
+    /// The one place that turns "no store handle" into an answer, so every seam refuses with the
+    /// state that actually holds.
+    fn refusal(&self, now_ms: u64) -> StoreRefusal {
+        let elapsed_since = |at_ms: u64| {
+            if at_ms == 0 {
+                0
+            } else {
+                now_ms.saturating_sub(at_ms)
+            }
+        };
+        match self.phase.load(Ordering::Acquire) {
+            // The handle is published before the phase flips to opened, so an opened phase with an
+            // empty handle exists only in the instant between those two writes: still in flight.
+            STORE_OPENING | STORE_OPENED => StoreRefusal::Opening {
+                elapsed_ms: elapsed_since(self.opening_started_at_ms.load(Ordering::Relaxed)),
+            },
+            STORE_OPEN_WAITING => StoreRefusal::LeaseWait {
+                elapsed_ms: elapsed_since(self.wait_started_at_ms.load(Ordering::Relaxed)),
+                wait_window_ms: self
+                    .policy
+                    .lock()
+                    .expect("store open policy mutex")
+                    .wait_window
+                    .as_millis() as u64,
+                descriptor: self
+                    .attempt_snapshot()
+                    .map_or_else(|| "unknown".to_string(), |attempt| attempt.label),
+            },
+            _ => match self.failure_snapshot() {
+                Some(failure) => StoreRefusal::Failed {
+                    reason: failure.reason,
+                    origin: failure.origin,
+                    descriptor: failure.descriptor,
+                },
+                // Idle with nothing ever attempted is the only genuinely never-acked state.
+                None if self.waiter_starts.load(Ordering::Relaxed) == 0 => StoreRefusal::NeverAcked,
+                // An attempt ran but left no reason. Unreachable by construction (every exit from
+                // the open records one), and reported as a failed open rather than as a missing
+                // ack so a bookkeeping gap can never masquerade as "the daemon never acked".
+                None => StoreRefusal::Failed {
+                    reason: "store open ended without recording a reason".to_string(),
+                    origin: self
+                        .attempt_snapshot()
+                        .map_or("unknown", |attempt| attempt.origin.as_str()),
+                    descriptor: self
+                        .attempt_snapshot()
+                        .map_or_else(|| "unknown".to_string(), |attempt| attempt.label),
+                },
+            },
         }
     }
 
@@ -299,6 +570,30 @@ impl StoreOpenCoordinator {
                 "lane": TRANSFORM_HEALTH_LANE,
                 "storage_state": "waiting_for_lease",
                 "storage_lease_wait_elapsed_ms": elapsed_ms,
+            })),
+        })
+    }
+
+    /// A terminally failed open is reported on the health lane as well, so `ck module status`
+    /// discriminates it too and the reason is not confined to this process's stderr.
+    fn failed_report(&self) -> Option<HealthReport> {
+        if self.phase.load(Ordering::Acquire) != STORE_OPEN_IDLE {
+            return None;
+        }
+        let failure = self.failure_snapshot()?;
+        Some(HealthReport {
+            status: HealthStatus::Failing,
+            detail: Some(format!(
+                "storage open failed and is not retried: {} (descriptor {} from {}); requests refuse with store_open_failed until the module restarts",
+                failure.reason, failure.descriptor, failure.origin
+            )),
+            metrics: Some(json!({
+                "lane": TRANSFORM_HEALTH_LANE,
+                "storage_state": "open_failed",
+                "storage_open_failure_reason": failure.reason,
+                "storage_descriptor": failure.descriptor,
+                "storage_descriptor_origin": failure.origin,
+                "storage_open_failed_at_ms": failure.at_ms,
             })),
         })
     }
@@ -633,8 +928,9 @@ impl Drop for TransformDispatchTicket<'_> {
 /// with their hardcoded fallbacks, so a diverged epoch map cannot silently skip the
 /// safety fold.
 /// Bumps when the shared project-memory render changes. Epoch 1 is the compact,
-/// category-grouped `#id: fact` format and applies to every serializer profile.
-pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 2;
+/// category-grouped `#id: fact` format; epoch 3 applies reinforcement recency when
+/// an importance band exceeds the render budget. Applies to every serializer profile.
+pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 3;
 /// Bumps when the shared compartment render changes. Epoch 1 replaces rendered
 /// `<compartment>` elements with markdown headings in m0 and m1; epoch 2 sanitizes
 /// historian-authored titles before placing them inside the session-history wrapper.
@@ -649,8 +945,9 @@ pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 2;
 pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 3;
 /// Bumps for provider-visible byte changes local to OpenCode's AI SDK codec. Epoch 1
 /// promotes valid text attachments from opaque to text and demotes malformed media-shaped
-/// attachments to opaque so their retained ingress representation is replayed verbatim.
-pub const PROFILE_EPOCH_OPENCODE_AI_SDK: u32 = 1;
+/// attachments to opaque so their retained ingress representation is replayed verbatim. Epoch 2
+/// prevents a tag first discovered after serve from appearing until an independent bust.
+pub const PROFILE_EPOCH_OPENCODE_AI_SDK: u32 = 2;
 /// Bumps for provider-visible byte changes local to Pi's codec. Epoch 1 demotes malformed
 /// text, image, and file result children to opaque so their retained ingress representation
 /// is replayed verbatim.
@@ -1919,6 +2216,7 @@ impl ModuleMemoryWire {
             .unwrap_or_else(|| mc_store::compute_normalized_memory_hash(&self.content));
         ModuleMemoryRow {
             id: self.id,
+            host_row_id: Some(self.id),
             project_path,
             category: self.category,
             content: self.content,
@@ -3181,6 +3479,78 @@ struct RuntimeStoreError {
     at_ms: i64,
 }
 
+const MEMORY_MIRROR_STALL_THRESHOLD_MS: u64 = 40_000;
+const MEMORY_MIRROR_STALLED_CODE: &str = "MC-M01";
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryMirrorHealthSnapshot {
+    feed_head: u64,
+    module_live_rows: u64,
+    host_cursor: u64,
+    host_cursor_updated_at_ms: u64,
+    cursor_age_ms: u64,
+    pending_rows: u64,
+    stalled: bool,
+}
+
+struct MemoryMirrorHealth {
+    feed_head: AtomicU64,
+    module_live_rows: AtomicU64,
+    host_cursor: AtomicU64,
+    host_cursor_updated_at_ms: AtomicU64,
+}
+
+impl MemoryMirrorHealth {
+    const fn new() -> Self {
+        Self {
+            feed_head: AtomicU64::new(0),
+            module_live_rows: AtomicU64::new(0),
+            host_cursor: AtomicU64::new(0),
+            host_cursor_updated_at_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn observe_frontier(&self, feed_head: i64, module_live_rows: i64) {
+        self.feed_head
+            .store(feed_head.max(0) as u64, Ordering::Relaxed);
+        self.module_live_rows
+            .store(module_live_rows.max(0) as u64, Ordering::Relaxed);
+    }
+
+    fn observe_pull(&self, cursor: i64, observed_at_ms: u64) {
+        self.host_cursor
+            .store(cursor.max(0) as u64, Ordering::Relaxed);
+        self.host_cursor_updated_at_ms
+            .store(observed_at_ms, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, now_ms: u64) -> MemoryMirrorHealthSnapshot {
+        let feed_head = self.feed_head.load(Ordering::Relaxed);
+        let module_live_rows = self.module_live_rows.load(Ordering::Relaxed);
+        let host_cursor = self.host_cursor.load(Ordering::Relaxed);
+        let host_cursor_updated_at_ms = self.host_cursor_updated_at_ms.load(Ordering::Relaxed);
+        let cursor_age_ms = if host_cursor_updated_at_ms == 0 {
+            0
+        } else {
+            now_ms.saturating_sub(host_cursor_updated_at_ms)
+        };
+        let pending_rows = feed_head.saturating_sub(host_cursor);
+        let stalled = host_cursor_updated_at_ms > 0
+            && module_live_rows > 0
+            && pending_rows > 0
+            && cursor_age_ms >= MEMORY_MIRROR_STALL_THRESHOLD_MS;
+        MemoryMirrorHealthSnapshot {
+            feed_head,
+            module_live_rows,
+            host_cursor,
+            host_cursor_updated_at_ms,
+            cursor_age_ms,
+            pending_rows,
+            stalled,
+        }
+    }
+}
+
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
@@ -3262,6 +3632,7 @@ pub struct McHandler {
     /// while the transport shim is upgraded, without rejecting the mutation.
     missing_facade_command_id_sessions: Mutex<HashSet<String>>,
     runtime_store_errors: Mutex<HashMap<String, RuntimeStoreError>>,
+    memory_mirror_health: MemoryMirrorHealth,
 }
 
 #[async_trait]
@@ -3832,10 +4203,11 @@ impl McHandler {
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
             runtime_store_errors: Mutex::new(HashMap::new()),
+            memory_mirror_health: MemoryMirrorHealth::new(),
         }
     }
 
-    fn begin_store_open(&self, descriptor: StorageDescriptor) {
+    fn begin_store_open(&self, descriptor: StorageDescriptor, origin: DescriptorOrigin) {
         if self.store.get().is_some()
             || self
                 .store_open
@@ -3851,6 +4223,9 @@ impl McHandler {
             return;
         }
 
+        self.store_open
+            .begin_attempt(&descriptor, origin, now_ms().max(0) as u64);
+        self.store_open.phase_changed.notify_waiters();
         self.store_open
             .active_waiters
             .fetch_add(1, Ordering::AcqRel);
@@ -3876,17 +4251,20 @@ impl McHandler {
         let mut last_lease_error = match Self::open_store_once(&descriptor).await {
             Ok(opened) => {
                 if coordinator.cancelled.load(Ordering::Acquire) {
-                    coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                    coordinator.fail_and_idle(
+                        "store open cancelled during shutdown".to_string(),
+                        now_ms().max(0) as u64,
+                    );
                     return;
                 }
                 let _ = store_slot.set(Arc::new(opened));
-                coordinator.phase.store(STORE_OPENED, Ordering::Release);
+                coordinator.set_phase(STORE_OPENED);
                 return;
             }
             Err(error) if store_open_error_is_live_lease(&error) => error,
             Err(error) => {
                 eprintln!("mc-module: store open failed: {error}");
-                coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                coordinator.fail_and_idle(error.to_string(), now_ms().max(0) as u64);
                 return;
             }
         };
@@ -3895,9 +4273,7 @@ impl McHandler {
         coordinator
             .wait_started_at_ms
             .store(now_ms().max(0) as u64, Ordering::Relaxed);
-        coordinator
-            .phase
-            .store(STORE_OPEN_WAITING, Ordering::Release);
+        coordinator.set_phase(STORE_OPEN_WAITING);
         eprintln!(
             "mc-module: storage lease held; waiting up to {}s for predecessor exit",
             STORE_LEASE_WAIT_WINDOW.as_secs()
@@ -3908,11 +4284,7 @@ impl McHandler {
         loop {
             let elapsed = started.elapsed();
             if coordinator.cancelled.load(Ordering::Acquire) {
-                eprintln!(
-                    "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
-                    elapsed.as_secs_f64()
-                );
-                coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                Self::abandon_lease_wait_on_shutdown(&coordinator, elapsed);
                 return;
             }
             if elapsed >= policy.wait_window {
@@ -3920,7 +4292,13 @@ impl McHandler {
                     "mc-module: storage lease wait expired after {:.2}s; store open failed: {last_lease_error}",
                     elapsed.as_secs_f64()
                 );
-                coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                coordinator.fail_and_idle(
+                    format!(
+                        "storage lease wait expired after {:.2}s: {last_lease_error}",
+                        elapsed.as_secs_f64()
+                    ),
+                    now_ms().max(0) as u64,
+                );
                 return;
             }
 
@@ -3928,21 +4306,13 @@ impl McHandler {
                 .min(policy.wait_window.saturating_sub(elapsed));
             tokio::select! {
                 _ = coordinator.cancel.notified() => {
-                    eprintln!(
-                        "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
-                        started.elapsed().as_secs_f64()
-                    );
-                    coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                    Self::abandon_lease_wait_on_shutdown(&coordinator, started.elapsed());
                     return;
                 }
                 _ = tokio::time::sleep(delay) => {}
             }
             if coordinator.cancelled.load(Ordering::Acquire) {
-                eprintln!(
-                    "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
-                    started.elapsed().as_secs_f64()
-                );
-                coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                Self::abandon_lease_wait_on_shutdown(&coordinator, started.elapsed());
                 return;
             }
             if started.elapsed() >= policy.wait_window {
@@ -3952,11 +4322,11 @@ impl McHandler {
             match Self::open_store_once(&descriptor).await {
                 Ok(opened) => {
                     if coordinator.cancelled.load(Ordering::Acquire) {
-                        coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                        Self::abandon_lease_wait_on_shutdown(&coordinator, started.elapsed());
                         return;
                     }
                     let _ = store_slot.set(Arc::new(opened));
-                    coordinator.phase.store(STORE_OPENED, Ordering::Release);
+                    coordinator.set_phase(STORE_OPENED);
                     eprintln!(
                         "mc-module: storage lease released; store opened after {:.2}s",
                         started.elapsed().as_secs_f64()
@@ -3973,10 +4343,80 @@ impl McHandler {
                         "mc-module: storage lease wait ended after {:.2}s; store open failed: {error}",
                         started.elapsed().as_secs_f64()
                     );
-                    coordinator.phase.store(STORE_OPEN_IDLE, Ordering::Release);
+                    coordinator.fail_and_idle(error.to_string(), now_ms().max(0) as u64);
                     return;
                 }
             }
+        }
+    }
+
+    /// A shutdown ends the open for good as far as any later request is concerned, so it records a
+    /// reason like any other terminal exit rather than leaving the idle phase unexplained.
+    fn abandon_lease_wait_on_shutdown(coordinator: &StoreOpenCoordinator, elapsed: Duration) {
+        eprintln!(
+            "mc-module: storage lease wait cancelled during shutdown after {:.2}s",
+            elapsed.as_secs_f64()
+        );
+        coordinator.fail_and_idle(
+            format!(
+                "storage lease wait cancelled during shutdown after {:.2}s",
+                elapsed.as_secs_f64()
+            ),
+            now_ms().max(0) as u64,
+        );
+    }
+
+    /// The refusal for a lane that does not wait for an in-flight open, rendered for an operator:
+    /// the synchronous seams, plus the host-driven lanes (sync, mirror, authority, note delivery)
+    /// whose caller retries on its own schedule. Transform and the facade tools wait instead.
+    fn store_refusal(&self) -> HandlerOutcome {
+        self.store_open
+            .refusal(now_ms().max(0) as u64)
+            .into_outcome()
+    }
+
+    /// The refusal for a synchronous facade seam, rendered for the user.
+    fn facade_store_refusal(&self) -> HandlerOutcome {
+        self.store_open
+            .refusal(now_ms().max(0) as u64)
+            .into_facade_outcome()
+    }
+
+    /// The store handle for a request lane, waiting out a bounded budget when an open is still in
+    /// flight. An empty handle during the open is a startup race, not a failure: a first request
+    /// that a few hundred milliseconds would have served should not be refused. The lease wait is
+    /// deliberately excluded — it runs up to `STORE_LEASE_WAIT_WINDOW`, far beyond any request's
+    /// deadline, so that arm refuses at once with its own retryable code.
+    async fn store_for_request(&self) -> Result<Arc<McStore>, StoreRefusal> {
+        if let Some(store) = self.store.get() {
+            return Ok(Arc::clone(store));
+        }
+        let deadline = Instant::now()
+            + self
+                .store_open
+                .policy
+                .lock()
+                .expect("store open policy mutex")
+                .request_wait;
+        while self.store_open.phase.load(Ordering::Acquire) == STORE_OPENING {
+            // Arm the wakeup before re-reading the handle, so an open that lands between the two
+            // cannot be missed and leave this request asleep for the whole budget.
+            let phase_changed = self.store_open.phase_changed.notified();
+            if let Some(store) = self.store.get() {
+                return Ok(Arc::clone(store));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero()
+                || tokio::time::timeout(remaining, phase_changed)
+                    .await
+                    .is_err()
+            {
+                break;
+            }
+        }
+        match self.store.get() {
+            Some(store) => Ok(Arc::clone(store)),
+            None => Err(self.store_open.refusal(now_ms().max(0) as u64)),
         }
     }
 
@@ -4100,6 +4540,7 @@ impl McHandler {
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
             runtime_store_errors: Mutex::new(HashMap::new()),
+            memory_mirror_health: MemoryMirrorHealth::new(),
         }
     }
 
@@ -4690,6 +5131,54 @@ impl McHandler {
             .lock()
             .expect("config mutex")
             .effective_for_project(project_root)
+    }
+
+    fn observe_memory_mirror_frontier(&self, store: &McStore) -> Result<i64, McStoreError> {
+        let feed_head = store.changefeed_head("memories")?;
+        let live_rows = store.live_memory_row_count()?;
+        self.memory_mirror_health
+            .observe_frontier(feed_head, live_rows);
+        Ok(feed_head)
+    }
+
+    fn memory_mirror_status_value(&self, now: u64) -> Value {
+        let mirror = self.memory_mirror_health.snapshot(now);
+        json!({
+            "feed_head": mirror.feed_head,
+            "module_live_rows": mirror.module_live_rows,
+            "host_cursor": mirror.host_cursor,
+            "host_cursor_updated_at_ms": mirror.host_cursor_updated_at_ms,
+            "cursor_age_ms": mirror.cursor_age_ms,
+            "pending_rows": mirror.pending_rows,
+            "stalled": mirror.stalled,
+            "code": mirror.stalled.then_some(MEMORY_MIRROR_STALLED_CODE),
+        })
+    }
+
+    fn augment_memory_mirror_health(&self, mut report: HealthReport, now: u64) -> HealthReport {
+        let mirror = self.memory_mirror_health.snapshot(now);
+        if let Some(metrics) = report.metrics.as_mut().and_then(Value::as_object_mut) {
+            metrics.insert(
+                "memory_mirror".to_string(),
+                self.memory_mirror_status_value(now),
+            );
+        }
+        if mirror.stalled {
+            report.status = HealthStatus::Degraded;
+            let mirror_detail = format!(
+                "{MEMORY_MIRROR_STALLED_CODE} memory mirror cursor stalled: cursor={} feed_head={} pending_rows={} live_rows={} age_ms={}; send another message to resume it, or run ck doctor drain-authority",
+                mirror.host_cursor,
+                mirror.feed_head,
+                mirror.pending_rows,
+                mirror.module_live_rows,
+                mirror.cursor_age_ms,
+            );
+            report.detail = Some(match report.detail {
+                Some(detail) => format!("{detail}; {mirror_detail}"),
+                None => mirror_detail,
+            });
+        }
+        report
     }
 
     fn handler_entry_state<'a>(
@@ -6224,7 +6713,7 @@ impl McHandler {
             Some(store) => Arc::clone(store),
             None => {
                 discard(self);
-                return store_unavailable_error();
+                return self.store_refusal();
             }
         };
         match store.preflight_state_import(&parsed.session_id, &parsed.import_id) {
@@ -6380,7 +6869,7 @@ impl McHandler {
         };
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
-            None => return store_unavailable_error(),
+            None => return self.store_refusal(),
         };
         let tags = match store.load_tags_for_session(session_id) {
             Ok(tags) => tags,
@@ -6508,7 +6997,7 @@ impl McHandler {
         let state_hash = sha256_hex(normalized.as_bytes());
         let store = match self.store.get() {
             Some(store) => store,
-            None => return store_unavailable_error(),
+            None => return self.store_refusal(),
         };
         match store.set_todo_state(&session_id, &normalized, owner_message_id, &state_hash) {
             Ok(TodoStateSetOutcome::Updated { .. }) | Ok(TodoStateSetOutcome::Noop) => {
@@ -6529,7 +7018,7 @@ impl McHandler {
             };
         let store = match self.store.get() {
             Some(store) => store,
-            None => return store_unavailable_error(),
+            None => return self.store_refusal(),
         };
         match store.arm_soft_refresh(&session_id) {
             Ok(armed) => respond(json!({ "ok": true, "armed": armed })),
@@ -6554,7 +7043,7 @@ impl McHandler {
         }
         let store = match self.store.get() {
             Some(store) => store,
-            None => return store_unavailable_error(),
+            None => return self.store_refusal(),
         };
         match store.load_recomp_command(&session_id, command_id) {
             Ok(Some(row)) => {
@@ -6690,7 +7179,7 @@ impl McHandler {
             };
         let store = match self.store.get() {
             Some(store) => store,
-            None => return store_unavailable_error(),
+            None => return self.store_refusal(),
         };
         match store.delete_session(&session_id, &binding.project_root.to_string_lossy()) {
             Ok(deleted_rows) => {
@@ -6727,7 +7216,7 @@ impl McHandler {
             };
         let store = match self.store.get() {
             Some(store) => store,
-            None => return store_unavailable_error(),
+            None => return self.store_refusal(),
         };
         if request.get("state_sync_inventory").and_then(Value::as_bool) == Some(true) {
             let (meta, boundary, sequence) =
@@ -6958,6 +7447,39 @@ impl McHandler {
             500,
         );
         let wrapup_active = wrapup_latch.map(|(_, rounds)| rounds);
+        if let Err(error) = self.observe_memory_mirror_frontier(store) {
+            return HandlerOutcome::Error {
+                code: "store_load_failed".to_string(),
+                message: error.to_string(),
+            };
+        }
+        let route_project_root = binding.project_root.to_string_lossy();
+        let authority_status = |domain: &str| -> Result<Value, McStoreError> {
+            Ok(
+                match store.authority_project_state_for_route(&route_project_root, domain)? {
+                    Some((project, state)) => json!({ "project": project, "state": state }),
+                    None => Value::Null,
+                },
+            )
+        };
+        let memory_authority = match authority_status("memories") {
+            Ok(authority) => authority,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "authority_status_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let notes_authority = match authority_status("notes") {
+            Ok(authority) => authority,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "authority_status_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
         let mut response = json!({
             "ok": true,
             "summary": summary,
@@ -6982,6 +7504,11 @@ impl McHandler {
             // `last_divergence` field so stable status reads cannot imply a fresh bust.
             "pass_trace": pass_trace,
             "runtime_store_error": self.runtime_store_error_value(&session_id),
+            "memory_mirror": self.memory_mirror_status_value(now_ms().max(0) as u64),
+            "authority": {
+                "memories": memory_authority,
+                "notes": notes_authority,
+            },
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "fake_compaction": {
                 "compaction_seen": descent_counters.compaction_seen,
@@ -7238,7 +7765,7 @@ impl McHandler {
         };
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
-            None => return store_unavailable_error(),
+            None => return self.store_refusal(),
         };
         let route_project_root = binding.project_root.to_string_lossy().to_string();
         let project_path = match store.authority_project_for_route(&route_project_root, "memories")
@@ -7754,7 +8281,7 @@ impl McHandler {
 
     fn handle_authority_status_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let Some(store) = self.store.get() else {
-            return store_unavailable_error();
+            return self.store_refusal();
         };
         let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
             return invalid_params_error(
@@ -7785,7 +8312,7 @@ impl McHandler {
 
     fn handle_authority_prepare_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let Some(store) = self.store.get() else {
-            return store_unavailable_error();
+            return self.store_refusal();
         };
         let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
             return invalid_params_error(
@@ -7879,7 +8406,7 @@ impl McHandler {
 
     fn handle_authority_seed_value(&self, request: &Value) -> HandlerOutcome {
         let Some(store) = self.store.get() else {
-            return store_unavailable_error();
+            return self.store_refusal();
         };
         let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
             return invalid_params_error(
@@ -7932,7 +8459,7 @@ impl McHandler {
 
     fn handle_authority_drain_value(&self, request: &Value, method: &str) -> HandlerOutcome {
         let Some(store) = self.store.get() else {
-            return store_unavailable_error();
+            return self.store_refusal();
         };
         let Some((context_store_uuid, project, domain)) = authority_request_key(request) else {
             return invalid_params_error(
@@ -8039,20 +8566,69 @@ impl McHandler {
         }
     }
 
+    fn handle_mirror_memory_value(&self, request: &Value) -> HandlerOutcome {
+        let Some(store) = self.store.get() else {
+            return self.store_refusal();
+        };
+        let Some(module_row_id) = request.get("module_row_id").and_then(Value::as_i64) else {
+            return invalid_params_error("mirror.memory requires module_row_id");
+        };
+        match store.pull_memory_changefeed_row(module_row_id) {
+            Ok(row) => respond(json!({ "ok": true, "row": row })),
+            Err(error) => HandlerOutcome::Error {
+                code: "mirror_memory_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_memory_identity_ack_value(&self, request: &Value) -> HandlerOutcome {
+        let Some(store) = self.store.get() else {
+            return self.store_refusal();
+        };
+        let Some(project) = request.get("project").and_then(Value::as_str) else {
+            return invalid_params_error("memory.identity.ack requires project");
+        };
+        let Some(rows) = request.get("rows").and_then(Value::as_array) else {
+            return invalid_params_error("memory.identity.ack requires rows");
+        };
+        let acknowledgements = rows
+            .iter()
+            .map(|row| {
+                Some(HostMemoryIdentityAck {
+                    module_row_id: row.get("module_row_id")?.as_i64()?,
+                    host_row_id: row.get("context_row_id")?.as_i64()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(acknowledgements) = acknowledgements else {
+            return invalid_params_error(
+                "memory.identity.ack rows require module_row_id and context_row_id",
+            );
+        };
+        match store.acknowledge_host_memory_ids(project, &acknowledgements) {
+            Ok(acknowledged) => respond(json!({ "ok": true, "acknowledged": acknowledged })),
+            Err(error) => HandlerOutcome::Error {
+                code: "memory_identity_ack_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
     fn handle_mirror_pull_value(&self, request: &Value) -> HandlerOutcome {
         let Some(store) = self.store.get() else {
-            return store_unavailable_error();
+            return self.store_refusal();
         };
         let Some(domain) = request.get("domain").and_then(Value::as_str) else {
             return invalid_params_error("mirror.pull requires domain");
         };
         let cursor = request.get("cursor").and_then(Value::as_i64).unwrap_or(0);
         let limit = request.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
-        let page = if request
+        let live_only = request
             .get("live_only")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        let page = if live_only {
             if domain != "memories" {
                 return invalid_params_error("live mirror snapshots currently support memories");
             }
@@ -8061,7 +8637,20 @@ impl McHandler {
             store.pull_changefeed(domain, cursor, limit)
         };
         match page {
-            Ok(page) => respond(json!({ "ok": true, "page": page })),
+            Ok(page) => {
+                if domain == "memories" && !live_only {
+                    if let (Ok(feed_head), Ok(live_rows)) = (
+                        store.changefeed_head("memories"),
+                        store.live_memory_row_count(),
+                    ) {
+                        self.memory_mirror_health
+                            .observe_frontier(feed_head, live_rows);
+                    }
+                    self.memory_mirror_health
+                        .observe_pull(page.next_cursor, now_ms().max(0) as u64);
+                }
+                respond(json!({ "ok": true, "page": page }))
+            }
             Err(error) => HandlerOutcome::Error {
                 code: "mirror_pull_failed".to_string(),
                 message: error.to_string(),
@@ -8228,7 +8817,7 @@ impl McHandler {
     fn handle_guidance_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
-            None => return store_unavailable_error(),
+            None => return self.store_refusal(),
         };
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
             return HandlerOutcome::Error {
@@ -8507,9 +9096,15 @@ impl McHandler {
     fn handle_status_value(&self, request: &Value) -> HandlerOutcome {
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
-            None => return store_unavailable_error(),
+            None => return self.store_refusal(),
         };
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+            if let Err(error) = self.observe_memory_mirror_frontier(&store) {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                };
+            }
             return match store.load("__health__") {
                 Ok(state) => respond(json!({
                     "ok": true,
@@ -8526,6 +9121,7 @@ impl McHandler {
                     },
                     "storage_versions": storage_versions_block(&store),
                     "memory_holders": self.memory_holder_metrics(),
+                    "memory_mirror": self.memory_mirror_status_value(now_ms().max(0) as u64),
                 })),
                 Err(e) => HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -8636,6 +9232,24 @@ impl McHandler {
         let request_decode_started_at = Instant::now();
         let mut delta_expand_ms = 0.0;
         const REQUEST_OBSERVED_KEY: &str = "request_observed_at_ms";
+        let request_attempt_id = request
+            .get("attempt_id")
+            .and_then(Value::as_str)
+            .filter(|attempt_id| !attempt_id.is_empty())
+            .map(|attempt_id| attempt_id.chars().take(128).collect::<String>())
+            .unwrap_or_else(|| {
+                format!(
+                    "legacy-{}-{}",
+                    request
+                        .get(REQUEST_OBSERVED_KEY)
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                    request
+                        .get("full_array_fingerprint")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                )
+            });
         let request_observed_to_handler = request
             .get(REQUEST_OBSERVED_KEY)
             .and_then(Value::as_u64)
@@ -8704,14 +9318,16 @@ impl McHandler {
                 }
             }
         }
-        let store = match self.store.get() {
-            Some(store) => Arc::clone(store),
-            None => {
-                return HandlerOutcome::Error {
-                    code: "store_unavailable".to_string(),
-                    message: "store not opened (no HELLO_ACK storage seam)".to_string(),
-                };
-            }
+        #[cfg(feature = "drive-fault")]
+        if maybe_apply_transform_timeout_fault().await {
+            return HandlerOutcome::Error {
+                code: "drive_transform_timeout".to_string(),
+                message: "drive fault stalled this transform before execution".to_string(),
+            };
+        }
+        let store = match self.store_for_request().await {
+            Ok(store) => store,
+            Err(refusal) => return refusal.into_outcome(),
         };
         let binding = match self.resolve_binding(channel, &parsed.session_id) {
             Ok(b) => b,
@@ -8729,6 +9345,10 @@ impl McHandler {
                 };
             }
         };
+        let pass_now = now_ms();
+        let trace_received_started_at = Instant::now();
+        let _ = store.trace_pass_received(&parsed.session_id, &request_attempt_id, pass_now);
+        let trace_received_ms = trace_received_started_at.elapsed().as_secs_f64() * 1_000.0;
         apply_claude_code_config_controls(&mut parsed, &binding.config, serializer_profile);
         parsed
             .prompt_surface_tool_descriptions
@@ -8827,7 +9447,6 @@ impl McHandler {
                     };
                 }
             };
-        let pass_now = now_ms();
         match serializer_profile {
             Some(SerializerProfile::OpencodeAiSdk) => {
                 if let Some((data_url, content_hash)) = host_mural_artifact(parsed.mural.as_ref()) {
@@ -8879,12 +9498,6 @@ impl McHandler {
             HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND,
         );
         let side_channel_drain_ms = side_channel_drain_started_at.elapsed().as_secs_f64() * 1_000.0;
-        // This trace is intentionally outside the fenced cache-state commit: a rejected
-        // pass must still leave a durable breadcrumb, and a trace failure must never
-        // change the transform result.
-        let trace_received_started_at = Instant::now();
-        let _ = store.trace_pass_received(&parsed.session_id, pass_now);
-        let trace_received_ms = trace_received_started_at.elapsed().as_secs_f64() * 1_000.0;
         let hostless_usable_soft = parsed
             .geometry
             .as_ref()
@@ -9040,7 +9653,12 @@ impl McHandler {
                         },
                     );
             }
-            let _ = store.trace_pass_rejected(&parsed.session_id, &message, now_ms());
+            let _ = store.trace_pass_rejected(
+                &parsed.session_id,
+                &request_attempt_id,
+                &message,
+                now_ms(),
+            );
             HandlerOutcome::Error {
                 code: code.to_string(),
                 message,
@@ -9321,7 +9939,7 @@ impl McHandler {
         );
         let native_attach_ms = native_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
         let trace_complete_started_at = Instant::now();
-        let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
+        let _ = store.trace_pass_completed(&parsed.session_id, &request_attempt_id, now_ms());
         let trace_complete_ms = trace_complete_started_at.elapsed().as_secs_f64() * 1_000.0;
         let response_observation_started_at = Instant::now();
         self.record_response_observation(&parsed.session_id, now_ms());
@@ -9349,6 +9967,12 @@ impl McHandler {
                 retained_bytes,
             );
         let snapshot_store_ms = snapshot_store_started_at.elapsed().as_secs_f64() * 1_000.0;
+        match self.observe_memory_mirror_frontier(&store) {
+            Ok(feed_head) => response.memory_mirror_head = Some(feed_head),
+            Err(error) => {
+                eprintln!("mc-module: memory mirror frontier probe failed: {error}");
+            }
+        }
         if let Some(timings) = response.timings.as_mut() {
             timings.handler_total = handler_started_at.elapsed().as_secs_f64() * 1_000.0;
             timings.request_decode = request_decode_ms;
@@ -9476,7 +10100,7 @@ impl McHandler {
         timing.session = binding.session.clone();
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
-            None => return store_unavailable_error(),
+            None => return self.store_refusal(),
         };
 
         if envelope_fields_present == 0 {
@@ -10540,7 +11164,7 @@ impl McHandler {
                 Err(outcome) => return outcome,
             };
         let Some(store) = self.store.get().cloned() else {
-            return store_unavailable_error();
+            return self.store_refusal();
         };
         let Some(task) = request.get("task").and_then(Value::as_str) else {
             return invalid_params_error("dreamer.run_task requires task");
@@ -10676,22 +11300,42 @@ impl McHandler {
         let model_chain = requested_model_chain
             .as_deref()
             .unwrap_or(&binding.config.model_chain);
-        let child_session = child_session_id(&authority_project, command_id);
         let classify_system_prompt = historian_prompt::with_content_language_directive(
             CLASSIFY_SYSTEM_PROMPT,
             binding.config.language.as_deref(),
             historian_prompt::ContentLanguageDirectiveOptions::default(),
         );
-        let _dreamer_run_guard = self.register_dreamer_run(&child_session);
         let mut attempts = 0usize;
-        let mut last_error = String::new();
+        // Every attempt's failure is kept. Overwriting one slot reported whichever model
+        // happened to be last and threw away the cause of the run that actually broke.
+        let mut attempt_errors: Vec<String> = Vec::new();
         let mut output = None;
         for model in model_chain {
             attempts += 1;
+            // Each attempt gets its OWN provider session. An attempt can end while its run
+            // is still active (a parked run, or one abandoned at the await deadline), and a
+            // send into a session that still holds an active run is queued behind it rather
+            // than started -- which the classifier cannot drain.
+            let child_session =
+                child_session_id(&authority_project, command_id, next_attempt_nonce(now_ms()));
+            let _dreamer_run_guard = self.register_dreamer_run(&child_session);
+            let mut record_attempt = |outcome: &str, detail: String| {
+                eprintln!(
+                    "mc-module: classify attempt={attempts} model={model} session={child_session} outcome={outcome}{}",
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {detail}")
+                    }
+                );
+                if !detail.is_empty() {
+                    attempt_errors.push(format!("{model}: {detail}"));
+                }
+            };
             let mut producer = match self.producer_factory.connect(&binding.project_root).await {
                 Ok(producer) => producer,
                 Err(error) => {
-                    last_error = error.to_string();
+                    record_attempt("connect_failed", error.to_string());
                     continue;
                 }
             };
@@ -10725,23 +11369,29 @@ impl McHandler {
                     // The module checks only for the task-specific envelope. Even if the
                     // output limit truncated a result, this layer accepts it when the
                     // envelope remains; the host parser rejects malformed contents.
-                    output = Some((model.clone(), result));
+                    record_attempt("manifest", String::new());
+                    output = Some((model.clone(), result, child_session.clone()));
                     producer.purge_session(&child_session).await;
                     break;
                 }
-                Ok(_) => {
-                    last_error =
-                        "classify producer returned no classify manifest envelope".to_string();
-                }
-                Err(error) => last_error = error.to_string(),
+                Ok(_) => record_attempt(
+                    "no_manifest",
+                    "classify producer returned no classify manifest envelope".to_string(),
+                ),
+                Err(error) => record_attempt("failed", error.to_string()),
             }
             producer.purge_session(&child_session).await;
         }
         if output.is_none() {
+            let failure = if attempt_errors.is_empty() {
+                "classify producer has no usable model".to_string()
+            } else {
+                attempt_errors.join("; ")
+            };
             let response = json!({
                 "ok": false,
                 "code": "dreamer_run_failed",
-                "message": if last_error.is_empty() { "classify producer has no usable model" } else { &last_error },
+                "message": failure,
             });
             let _ = store.record_dream_task_command(
                 &ledger_session,
@@ -10751,10 +11401,10 @@ impl McHandler {
             );
             return HandlerOutcome::Error {
                 code: "dreamer_run_failed".to_string(),
-                message: last_error,
+                message: failure,
             };
         }
-        let (model, result) = output.expect("classifier output set");
+        let (model, result, child_session) = output.expect("classifier output set");
         let response = json!({
             "ok": true,
             "manifest_text": result.text,
@@ -10804,7 +11454,7 @@ impl McHandler {
         };
         let route_root = binding.project_root.to_string_lossy().to_string();
         let Some(store) = self.store.get() else {
-            return store_unavailable_error();
+            return self.store_refusal();
         };
         let authority_project =
             match store.authority_project_state_for_route(&route_root, "memories") {
@@ -10930,7 +11580,7 @@ impl McHandler {
         };
         let route_root = binding.project_root.to_string_lossy().to_string();
         let Some(store) = self.store.get() else {
-            return store_unavailable_error();
+            return self.store_refusal();
         };
         let command_id = args
             .get("command_id")
@@ -11035,7 +11685,7 @@ impl McHandler {
         };
         let route_root = binding.project_root.to_string_lossy().to_string();
         let Some(store) = self.store.get() else {
-            return store_unavailable_error();
+            return self.store_refusal();
         };
         let command_id = args
             .get("command_id")
@@ -11139,7 +11789,7 @@ impl McHandler {
         };
         let route_root = binding.project_root.to_string_lossy().to_string();
         let Some(store) = self.store.get() else {
-            return store_unavailable_error();
+            return self.store_refusal();
         };
         let command_id = args
             .get("command_id")
@@ -11287,7 +11937,7 @@ impl McHandler {
             .map_err(|_| session_unresolved_error())?;
         let route_project_root = binding.project_root.to_string_lossy().to_string();
         let Some(store) = self.store.get() else {
-            return Err(store_unavailable_error());
+            return Err(self.facade_store_refusal());
         };
         let authority = store
             .facade_authority_for_project(requested_project, authority_domain)
@@ -11334,13 +11984,31 @@ impl McHandler {
             return Err(session_unresolved_error());
         }
 
-        // Harness labels are client-supplied routing hints, not authentication. OpenCode may
-        // bypass session.resolve only after server-observed cache state or a live transform
-        // route proves that this exact session belongs to the module; wrapper token namespaces
-        // cannot satisfy that provenance check.
-        let conversation_key = if binding.harness == OPENCODE_HARNESS
-            && self.module_knows_transform_session(bound_session, &binding.project_root)
-        {
+        let route_project_root = binding.project_root.to_string_lossy().to_string();
+        let requested_project =
+            arguments.and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
+        let mut authority_route = match self.store.get() {
+            Some(store) => store
+                .authority_project_state_for_route(&route_project_root, authority_domain)
+                .map_err(|error| {
+                    eprintln!(
+                        "mc-module: {authority_domain} project resolution failed code=authority_project_resolution_failed: {error}"
+                    );
+                    HandlerOutcome::Error {
+                        code: "authority_project_resolution_failed".to_string(),
+                        message: capability_refusal_message(authority_domain).to_string(),
+                    }
+                })?,
+            None => None,
+        };
+        // Both OpenCode entry points use server-observed transform state as the session proof.
+        // Wrapper labels and authority routes alone are insufficient: either could otherwise
+        // rebind a known project to a second root without a host session lookup.
+        let opencode_harness =
+            binding.harness == OPENCODE_HARNESS || binding.harness == "opencode2";
+        let transform_session_known =
+            self.module_knows_transform_session(bound_session, &binding.project_root);
+        let conversation_key = if opencode_harness && transform_session_known {
             bound_session.to_string()
         } else {
             match self
@@ -11365,49 +12033,49 @@ impl McHandler {
             }
         };
 
-        let route_project_root = binding.project_root.to_string_lossy().to_string();
         if bind_authority_for_write {
             if let Some(arguments) = arguments {
                 self.bind_facade_route_for_write(channel, arguments, authority_domain)?;
             }
+            if authority_route.is_none() {
+                authority_route = match self.store.get() {
+                    Some(store) => store
+                        .authority_project_state_for_route(&route_project_root, authority_domain)
+                        .map_err(|error| {
+                            eprintln!(
+                                "mc-module: {authority_domain} project resolution failed code=authority_project_resolution_failed: {error}"
+                            );
+                            HandlerOutcome::Error {
+                                code: "authority_project_resolution_failed".to_string(),
+                                message: capability_refusal_message(authority_domain).to_string(),
+                            }
+                        })?,
+                    None => None,
+                };
+            }
         }
-        let requested_project =
-            arguments.and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
-        let memory_project_path = match self.store.get() {
-            Some(store) => match store
-                .authority_project_state_for_route(&route_project_root, authority_domain)
-            {
-                Ok(Some((authority_project, authority_state))) => {
-                    if requested_project.is_some_and(|requested| requested != authority_project) {
-                        eprintln!(
-                            "mc-module: {authority_domain} route {route_project_root} project mismatch: expected {authority_project}, received {}",
-                            requested_project.unwrap_or_default()
-                        );
-                        return Err(HandlerOutcome::Error {
-                            code: "facade_project_vocabulary_mismatch".to_string(),
-                            message: capability_refusal_message(authority_domain).to_string(),
-                        });
-                    }
-                    if bind_authority_for_write && authority_state != "MODULE" {
-                        // Reads and transforms may keep using the module identity while authority
-                        // drains, but facade mutations must retry instead of writing after ownership changes.
-                        return Err(authority_draining_error(authority_domain));
-                    }
-                    authority_project
-                }
-                // A route without an authority binding remains path-scoped. Lookup failures are
-                // retryable errors: silently using the route could read or write the wrong owner.
-                Ok(None) => route_project_root.clone(),
-                Err(error) => {
+
+        let memory_project_path = match authority_route {
+            Some((authority_project, authority_state)) => {
+                if requested_project.is_some_and(|requested| requested != authority_project) {
                     eprintln!(
-                        "mc-module: {authority_domain} project resolution failed code=authority_project_resolution_failed: {error}"
+                        "mc-module: {authority_domain} route {route_project_root} project mismatch: expected {authority_project}, received {}",
+                        requested_project.unwrap_or_default()
                     );
                     return Err(HandlerOutcome::Error {
-                        code: "authority_project_resolution_failed".to_string(),
+                        code: "facade_project_vocabulary_mismatch".to_string(),
                         message: capability_refusal_message(authority_domain).to_string(),
                     });
                 }
-            },
+                if bind_authority_for_write && authority_state != "MODULE" {
+                    // Reads and transforms may keep using the module identity while authority
+                    // drains, but facade mutations must retry instead of writing after ownership changes.
+                    return Err(authority_draining_error(authority_domain));
+                }
+                authority_project
+            }
+            // A route without an authority binding remains path-scoped. Lookup failures are
+            // retryable errors: silently using the route could read or write the wrong owner.
             None => route_project_root.clone(),
         };
         Ok(FacadeScope {
@@ -11440,9 +12108,9 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        let store = match self.store.get() {
-            Some(store) => store,
-            None => return store_unavailable_error(),
+        let store = match self.store_for_request().await {
+            Ok(store) => store,
+            Err(refusal) => return refusal.into_facade_outcome(),
         };
         let session_id = facade_scope.conversation_key.as_str();
         let tags = match store.load_tags_for_session(session_id) {
@@ -11536,6 +12204,7 @@ impl McHandler {
             }
             reply.push_str(&ctx_reduce_held_reply(&deferred));
         }
+        reply.push_str(" Marking QUEUES content for release. It stays fully visible to you until it is actually released, which may be the next turn or many turns later.");
         mcp_text_result(reply, false)
     }
 
@@ -11547,7 +12216,7 @@ impl McHandler {
         let Some(action) = string_arg(args, "action") else {
             return invalid_params_error("ctx_memory requires an action");
         };
-        if let Err(error) = validate_memory_id_arguments(args)
+        if let Err(error) = validate_memory_id_arguments(args, action)
             .and_then(|_| validate_string_cap(args, "content", MAX_MEMORY_CONTENT_BYTES))
             .and_then(|_| validate_string_cap(args, "reason", MAX_SHORT_FIELD_BYTES))
         {
@@ -11564,12 +12233,49 @@ impl McHandler {
         if !facade_scope.memory_enabled {
             return tool_error_result("Error: memory is disabled for this project.".to_string());
         }
-        let store = match self.store.get() {
-            Some(store) => store,
-            None => return store_unavailable_error(),
+        let store = match self.store_for_request().await {
+            Ok(store) => store,
+            Err(refusal) => return refusal.into_facade_outcome(),
         };
         let memory_project = facade_scope.memory_project_path.as_str();
         let conversation_key = facade_scope.conversation_key.as_str();
+        let id_lane = match memory_id_lane(args) {
+            Ok(lane) => lane,
+            Err(error) => return tool_error_result(format!("Error: {error}.")),
+        };
+        let module_request_ids = memory_ids(args, action);
+        let requested_host_ids = host_memory_ids(args);
+        let mut host_id_by_module = HashMap::new();
+        if id_lane == MemoryIdLane::Host {
+            if module_request_ids.len() != requested_host_ids.len() {
+                return tool_error_result(
+                    "Error: host memory ids must accompany every translated module id.".to_string(),
+                );
+            }
+            for (module_id, host_id) in module_request_ids
+                .iter()
+                .copied()
+                .zip(requested_host_ids.iter().copied())
+            {
+                let acknowledged = store
+                    .get_memory_full(module_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|memory| memory.host_row_id);
+                if acknowledged != Some(host_id) {
+                    return tool_error_result(format!(
+                        "Error: memory id {host_id} has no module mapping yet — it was written seconds ago or the mirror is behind; retry or use the id shown in <project-memory>."
+                    ));
+                }
+                host_id_by_module.insert(module_id, host_id);
+            }
+        } else if !requested_host_ids.is_empty() {
+            return tool_error_result("Error: host_ids require memory_id_lane 'host'.".to_string());
+        }
+        let request_context = MemoryFacadeRequestContext {
+            lane: id_lane,
+            host_id_by_module,
+        };
         if is_mutation {
             if let Err(error) = store.enforce_facade_project_vocabulary(
                 facade_scope.route_project_root.as_str(),
@@ -11634,10 +12340,20 @@ impl McHandler {
                                     metadata_json: None,
                                     now_ms: now_ms(),
                                 })
-                                .map_err(|error| error.to_string())?;
-                            facade_text_response(
-                                format!("Saved memory [ID: {id}] in {category}."),
+                                .map_err(|error| {
+                                    request_context.render_mutation_error(
+                                        FacadeMemoryMutationError::Storage(error),
+                                    )
+                                })?;
+                            let text = if id_lane == MemoryIdLane::Host {
+                                format!("Saved memory in {category}. Its id will appear in <project-memory> on the next pass.")
+                            } else {
+                                format!("Saved memory [ID: {id}] in {category}.")
+                            };
+                            mcp_memory_result(
+                                text,
                                 false,
+                                json!({ "action": "write", "module_id": id, "category": category }),
                             )
                         },
                     ),
@@ -11645,11 +12361,12 @@ impl McHandler {
                 )
             }
             "update" => {
-                let category =
-                    match memory_tool::validate_update_category(string_arg(args, "category")) {
-                        Ok(category) => category,
-                        Err(error) => return tool_error_result(format!("Error: {error}.")),
-                    };
+                let category = match memory_tool::validate_update_category(non_empty_string_arg(
+                    args, "category",
+                )) {
+                    Ok(category) => category,
+                    Err(error) => return tool_error_result(format!("Error: {error}.")),
+                };
                 let Some(id) = single_memory_id(args, "update") else {
                     return tool_error_result(
                         "Error: provide exactly one memory id when action is 'update'.",
@@ -11678,12 +12395,22 @@ impl McHandler {
                                     category,
                                     now_ms(),
                                 )
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| format!("memory {id} was not found"))?;
+                                .map_err(|error| request_context.render_mutation_error(error))?;
+                            let rendered_id = if id_lane == MemoryIdLane::Host {
+                                request_context
+                                    .host_id_by_module
+                                    .get(&memory.id)
+                                    .copied()
+                                    .ok_or_else(|| {
+                                        "translated host memory identity disappeared".to_string()
+                                    })?
+                            } else {
+                                memory.id
+                            };
                             facade_text_response(
                                 format!(
-                                    "Updated memory [ID: {}] in {}.",
-                                    memory.id, memory.category
+                                    "Updated memory [ID: {rendered_id}] in {}.",
+                                    memory.category
                                 ),
                                 false,
                             )
@@ -11699,7 +12426,7 @@ impl McHandler {
                         "Error: provide at least one memory id when action is 'archive'.",
                     );
                 }
-                let reason = string_arg(args, "reason");
+                let reason = non_empty_string_arg(args, "reason");
                 facade_command_outcome(
                     store.with_facade_command(
                         facade_scope.route_project_root.as_str(),
@@ -11712,16 +12439,32 @@ impl McHandler {
                         |tx| {
                             let archived = tx
                                 .archive_memories(memory_project, &ids, reason, now_ms())
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| "memories could not be archived".to_string())?;
+                                .map_err(|error| request_context.render_mutation_error(error))?;
                             if archived.is_empty() {
                                 facade_text_response(
                                     "No active memories needed archiving.".to_string(),
                                     false,
                                 )
                             } else {
+                                let rendered_ids = if id_lane == MemoryIdLane::Host {
+                                    archived
+                                        .iter()
+                                        .map(|id| {
+                                            request_context
+                                                .host_id_by_module
+                                                .get(id)
+                                                .copied()
+                                                .ok_or_else(|| {
+                                                    "translated host memory identity disappeared"
+                                                        .to_string()
+                                                })
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()?
+                                } else {
+                                    archived
+                                };
                                 facade_text_response(
-                                    format!("Archived memory IDs [{}].", join_i64s(&archived)),
+                                    format!("Archived memory IDs [{}].", join_i64s(&rendered_ids)),
                                     false,
                                 )
                             }
@@ -11731,6 +12474,12 @@ impl McHandler {
                 )
             }
             "merge" => {
+                let category = match memory_tool::validate_update_category(non_empty_string_arg(
+                    args, "category",
+                )) {
+                    Ok(category) => category,
+                    Err(error) => return tool_error_result(format!("Error: {error}.")),
+                };
                 let Some(ids) = merge_ids(args) else {
                     return tool_error_result(
                         "Error: provide target_id plus source_ids, or at least two ids when action is 'merge'.",
@@ -11751,7 +12500,7 @@ impl McHandler {
                         action,
                         command_id.as_deref(),
                         |tx| {
-                            let (memory, superseded_ids) = tx
+                            let (mut memory, superseded_ids) = tx
                                 .merge_memories_canonical(
                                     memory_project,
                                     &ids,
@@ -11759,26 +12508,144 @@ impl McHandler {
                                     Some(conversation_key),
                                     now_ms(),
                                 )
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| "memories could not be merged".to_string())?;
-                            facade_text_response(
+                                .map_err(|error| request_context.render_mutation_error(error))?;
+                            if category.is_some_and(|category| category != memory.category) {
+                                memory = tx
+                                    .update_memory_content(
+                                        memory_project,
+                                        memory.id,
+                                        content,
+                                        category,
+                                        now_ms(),
+                                    )
+                                    .map_err(|error| request_context.render_mutation_error(error))?;
+                            }
+                            let rendered_inputs = if id_lane == MemoryIdLane::Host {
+                                requested_host_ids.clone()
+                            } else {
+                                ids.clone()
+                            };
+                            let rendered_superseded = if id_lane == MemoryIdLane::Host {
+                                superseded_ids
+                                    .iter()
+                                    .filter_map(|id| {
+                                        request_context.host_id_by_module.get(id).copied()
+                                    })
+                                    .collect::<Vec<_>>()
+                            } else {
+                                superseded_ids.clone()
+                            };
+                            let text = if id_lane == MemoryIdLane::Host {
+                                match memory.host_row_id {
+                                    Some(host_id) => format!(
+                                        "Merged memories [{}] into canonical memory [ID: {host_id}] in {}; superseded [{}].",
+                                        join_i64s(&rendered_inputs),
+                                        memory.category,
+                                        join_i64s(&rendered_superseded)
+                                    ),
+                                    None => format!(
+                                        "Merged memories [{}] into a canonical memory in {}. Its id will appear in <project-memory> on the next pass.",
+                                        join_i64s(&rendered_inputs), memory.category
+                                    ),
+                                }
+                            } else {
                                 format!(
                                     "Merged memories [{}] into canonical memory [ID: {}] in {}; superseded [{}].",
-                                    join_i64s(&ids),
+                                    join_i64s(&rendered_inputs),
                                     memory.id,
                                     memory.category,
-                                    join_i64s(&superseded_ids)
-                                ),
+                                    join_i64s(&rendered_superseded)
+                                )
+                            };
+                            mcp_memory_result(
+                                text,
                                 false,
+                                json!({
+                                    "action": "merge",
+                                    "canonical_module_id": memory.id,
+                                    "superseded_module_ids": superseded_ids,
+                                    "category": memory.category,
+                                }),
                             )
                         },
                     ),
                     "memories",
                 )
             }
+            "list" => {
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value > 0)
+                    .unwrap_or(20)
+                    .clamp(1, 100) as usize;
+                let category = non_empty_string_arg(args, "category");
+                match store.load_active_memories(memory_project, now_ms()) {
+                    Ok(memories) => {
+                        let rows = memories
+                            .into_iter()
+                            .filter(|memory| category.is_none_or(|value| memory.category == value))
+                            .take(limit)
+                            .collect::<Vec<_>>();
+                        if rows.is_empty() {
+                            return mcp_text_result("No active memories found.".to_string(), false);
+                        }
+                        let pending_host_id = id_lane == MemoryIdLane::Host
+                            && rows.iter().any(|memory| memory.host_row_id.is_none());
+                        let body = rows
+                            .iter()
+                            .map(|memory| {
+                                let prefix = if id_lane == MemoryIdLane::Host {
+                                    memory.host_row_id.map_or_else(
+                                        || "Memory".to_string(),
+                                        |id| format!("Memory [ID: {id}]"),
+                                    )
+                                } else {
+                                    format!("Memory [ID: {}]", memory.id)
+                                };
+                                format!(
+                                    "{prefix} in {} (status: {}): {}",
+                                    memory.category,
+                                    memory.status,
+                                    memory
+                                        .content
+                                        .split_whitespace()
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let mirror_note = if pending_host_id {
+                            "\nNote: one or more memory ids are waiting for the host mirror; retry after the next pass."
+                        } else {
+                            ""
+                        };
+                        // `get` returns rows of any status; claim "active" only when every row is.
+                        let all_active = rows.iter().all(|memory| memory.status == "active");
+                        mcp_text_result(
+                            format!(
+                                "Found {} {}{}:\n\n{body}{mirror_note}",
+                                rows.len(),
+                                if all_active { "active " } else { "" },
+                                if rows.len() == 1 {
+                                    "memory"
+                                } else {
+                                    "memories"
+                                }
+                            ),
+                            false,
+                        )
+                    }
+                    Err(error) => tool_error_result(format!(
+                        "Error: {}",
+                        request_context.render_store_error(error)
+                    )),
+                }
+            }
             "get" => {
                 let ids = memory_ids(args, "get");
-                match memory_tool::get_memories(store, memory_project, &ids) {
+                match memory_tool::get_memories(&store, memory_project, &ids) {
                     Ok(memories) => {
                         let by_id = memories
                             .into_iter()
@@ -11786,20 +12653,34 @@ impl McHandler {
                             .collect::<std::collections::HashMap<_, _>>();
                         let lines = ids
                             .iter()
-                            .map(|id| match by_id.get(id) {
-                                Some(memory) => format!(
-                                    "Memory [ID: {}] in {} (status: {}): {}",
-                                    memory.id, memory.category, memory.status, memory.content
-                                ),
-                                None => {
-                                    format!("id {id}: not found or not visible from this project")
+                            .map(|id| {
+                                let rendered_id = if id_lane == MemoryIdLane::Host {
+                                    request_context
+                                        .host_id_by_module
+                                        .get(id)
+                                        .copied()
+                                        .expect("host lane ids were validated before facade dispatch")
+                                } else {
+                                    *id
+                                };
+                                match by_id.get(id) {
+                                    Some(memory) => format!(
+                                        "Memory [ID: {rendered_id}] in {} (status: {}): {}",
+                                        memory.category, memory.status, memory.content
+                                    ),
+                                    None => format!(
+                                        "id {rendered_id}: not found or not visible from this project"
+                                    ),
                                 }
                             })
                             .collect::<Vec<_>>()
                             .join("\n\n");
                         mcp_text_result(lines, false)
                     }
-                    Err(error) => tool_error_result(format!("Error: {error}")),
+                    Err(error) => tool_error_result(format!(
+                        "Error: {}",
+                        request_context.render_tool_error(error)
+                    )),
                 }
             }
             _ => tool_error_result("Error: Unknown ctx_memory action.".to_string()),
@@ -11817,7 +12698,10 @@ impl McHandler {
         if let Err(error) = validate_string_cap(args, "query", MAX_QUERY_BYTES) {
             return tool_error_result(format!("Error: {error}."));
         }
-        let limit = usize_arg(args, "limit").unwrap_or(8).clamp(1, 25);
+        let limit = usize_arg(args, "limit")
+            .filter(|value| *value > 0)
+            .unwrap_or(8)
+            .clamp(1, 25);
         let sources = facade_search_sources(args);
         let facade_scope = match self
             .resolve_facade_scope(channel, Some(args), "memories", false)
@@ -11826,18 +12710,14 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        let store = match self.store.get() {
-            Some(store) => store,
-            None => return store_unavailable_error(),
+        let store = match self.store_for_request().await {
+            Ok(store) => store,
+            Err(refusal) => return refusal.into_facade_outcome(),
         };
         let memory_project = facade_scope.memory_project_path.as_str();
         let conversation_key = facade_scope.conversation_key.as_str();
-        let visible_memory_ids = match store.load(conversation_key) {
-            Ok(state) => state
-                .meta
-                .rendered_memory_ids
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
+        let state = match store.load(conversation_key) {
+            Ok(state) => state,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
         let include_memories = facade_scope.memory_enabled && sources.memory;
@@ -11845,11 +12725,29 @@ impl McHandler {
             Ok(membership) => membership,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
+        let host_backed_memory_ids = !state.meta.last_serializer_profile.is_empty()
+            && state.meta.last_serializer_profile != "claude-code-anthropic";
+        let visible_memory_ids = if host_backed_memory_ids {
+            let paths = workspace_membership
+                .as_ref()
+                .map(|workspace| workspace.union_identities.clone())
+                .unwrap_or_else(|| vec![memory_project.to_string()]);
+            match store.module_memory_ids_for_host_ids(&paths, &state.meta.rendered_memory_ids) {
+                Ok(mapped) => mapped.values().copied().collect::<BTreeSet<_>>(),
+                Err(error) => return tool_error_result(format!("Error: {error}")),
+            }
+        } else {
+            state
+                .meta
+                .rendered_memory_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        };
 
         if include_memories {
             if let Some(ids) = parse_search_memory_ids(query) {
                 match memory_tool::resolve_memory_ids_for_search_with_diagnostics(
-                    store,
+                    &store,
                     memory_project,
                     &ids,
                     limit.max(ids.len()),
@@ -11877,7 +12775,7 @@ impl McHandler {
         }
 
         match memory_tool::search_available_corpora_for_session_with_diagnostics(
-            store,
+            &store,
             memory_project,
             conversation_key,
             query,
@@ -11915,17 +12813,16 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        let store = match self.store.get() {
-            Some(store) => store,
-            None => return store_unavailable_error(),
+        let store = match self.store_for_request().await {
+            Ok(store) => store,
+            Err(refusal) => return refusal.into_facade_outcome(),
         };
         let session_id = facade_scope.conversation_key.as_str();
-        if args.get("message").is_some() {
-            // Ordinal 0 is a real message on the Claude Code leg (its chunk
-            // transcripts store 0-based ordinals), so the domain is non-negative.
-            let Some(message) = i64_arg(args, "message").filter(|value| *value >= 0) else {
-                return tool_error_result("Error: message must be a non-negative integer.");
-            };
+        let expand_mode = match resolve_ctx_expand_mode(args) {
+            Ok(mode) => mode,
+            Err(error) => return tool_error_result(error),
+        };
+        if let CtxExpandMode::Message(message) = expand_mode {
             if let Some(raw_message) =
                 self.cached_expand_messages(session_id)
                     .and_then(|messages| {
@@ -11956,21 +12853,16 @@ impl McHandler {
                 Err(error) => tool_error_result(format!("Error: {error}")),
             };
         }
-        let Some(start) = i64_arg(args, "start") else {
+        let CtxExpandMode::Range {
+            start,
+            end,
+            verbose,
+        } = expand_mode
+        else {
             return tool_error_result(
                 "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
             );
         };
-        let Some(end) = i64_arg(args, "end") else {
-            return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
-            );
-        };
-        if start < 0 || end < start {
-            return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
-            );
-        }
         let last_compacted_ordinal = match store.last_compacted_ordinal(session_id) {
             Ok(ordinal) => ordinal,
             Err(error) => return tool_error_result(format!("Error: {error}")),
@@ -12004,7 +12896,7 @@ impl McHandler {
             Ok(transcripts) => transcripts,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
-        if args.get("verbose").and_then(Value::as_bool) == Some(true) {
+        if verbose {
             let durable_messages = durable_expand_messages(&transcripts);
             let rendered = self
                 .cached_expand_messages(session_id)
@@ -12054,7 +12946,7 @@ impl McHandler {
             };
         }
         let Some(store) = self.store.get() else {
-            return store_unavailable_error();
+            return self.store_refusal();
         };
         let Some(source_revision) = request.get("source_revision").and_then(Value::as_i64) else {
             return HandlerOutcome::Error {
@@ -12137,7 +13029,7 @@ impl McHandler {
             };
         }
         let Some(store) = self.store.get() else {
-            return store_unavailable_error();
+            return self.store_refusal();
         };
         let result = if ack {
             store.ack_note_delivery(
@@ -12179,39 +13071,36 @@ impl McHandler {
         let action = string_arg(args, "action")
             .or_else(|| non_empty_string_arg(args, "content").map(|_| "write"))
             .unwrap_or("read");
-        let has_note_id = args.contains_key("note_id");
-        let has_note_ids = args.contains_key("note_ids");
-        if has_note_id && has_note_ids {
-            return tool_error_result(
-                "Error: 'note_id' and 'note_ids' cannot be used together; provide one or the other.",
-            );
-        }
-        if has_note_ids && action != "dismiss" {
-            return tool_error_result("Error: 'note_ids' is only valid when action is 'dismiss'.");
-        }
-        let note_ids = if action == "dismiss" && has_note_ids {
-            let Some(values) = args.get("note_ids").and_then(Value::as_array) else {
-                return tool_error_result(
-                    "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.",
-                );
-            };
-            if !(1..=50).contains(&values.len()) {
-                return tool_error_result(
-                    "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.",
-                );
-            }
-            let mut parsed = Vec::with_capacity(values.len());
-            for value in values {
-                let Some(note_id) = value.as_i64().filter(|id| *id > 0) else {
-                    return tool_error_result(
-                        "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.",
-                    );
+        // `note_ids` is the only id field, on the model-facing schema and on
+        // the TS adapter's internal wire alike. `write` and `read` never read
+        // it: tool surfaces that require every declared property make the
+        // model send filler there (issue 460), and filler on an action that
+        // does not use the field must not fail the call. `update` addresses
+        // exactly one note; `dismiss` takes one to fifty.
+        let note_ids = match action {
+            "update" | "dismiss" => {
+                let max = if action == "update" { 1 } else { 50 };
+                let error = if action == "update" {
+                    "Error: 'note_ids' must contain exactly one positive integer id when action is 'update'."
+                } else {
+                    "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'."
                 };
-                parsed.push(note_id);
+                let Some(values) = args.get("note_ids").and_then(Value::as_array) else {
+                    return tool_error_result(error);
+                };
+                if !(1..=max).contains(&values.len()) {
+                    return tool_error_result(error);
+                }
+                let mut parsed = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(note_id) = value.as_i64().filter(|id| *id > 0) else {
+                        return tool_error_result(error);
+                    };
+                    parsed.push(note_id);
+                }
+                Some(parsed)
             }
-            Some(parsed)
-        } else {
-            None
+            _ => None,
         };
         let is_mutation = matches!(action, "write" | "update" | "dismiss");
         let facade_scope = match self
@@ -12221,9 +13110,9 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        let store = match self.store.get() {
-            Some(store) => store,
-            None => return store_unavailable_error(),
+        let store = match self.store_for_request().await {
+            Ok(store) => store,
+            Err(refusal) => return refusal.into_facade_outcome(),
         };
         let project = facade_scope.memory_project_path.as_str();
         let session = facade_scope.conversation_key.as_str();
@@ -12419,11 +13308,10 @@ impl McHandler {
                 )
             }
             "update" => {
-                let Some(note_id) = i64_arg(args, "note_id").filter(|id| *id > 0) else {
-                    return tool_error_result(
-                        "Error: 'note_id' is required when action is 'update'.",
-                    );
-                };
+                let note_id = note_ids
+                    .as_deref()
+                    .and_then(|ids| ids.first().copied())
+                    .unwrap_or(0);
                 let content = string_arg(args, "content");
                 let condition = string_arg(args, "surface_condition")
                     .map(str::trim)
@@ -12492,7 +13380,9 @@ impl McHandler {
             }
             "dismiss" => {
                 let resolution = string_arg(args, "content");
-                if let Some(note_ids) = note_ids.as_deref() {
+                let ids = note_ids.as_deref().unwrap_or(&[]);
+                if ids.len() > 1 {
+                    let note_ids = ids;
                     return facade_command_outcome(
                         store.with_facade_command(
                             facade_scope.route_project_root.as_str(),
@@ -12534,11 +13424,7 @@ impl McHandler {
                         "notes",
                     );
                 }
-                let Some(note_id) = i64_arg(args, "note_id").filter(|id| *id > 0) else {
-                    return tool_error_result(
-                        "Error: 'note_id' is required when action is 'dismiss'.",
-                    );
-                };
+                let note_id = ids[0];
                 facade_command_outcome(
                     store.with_facade_command(
                         facade_scope.route_project_root.as_str(),
@@ -12593,16 +13479,21 @@ impl ModuleHandler for McHandler {
     /// the path isn't known until the ACK lands. Opening runs off the request lane so a
     /// predecessor's live single-writer lease cannot block transform dispatch.
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
-        self.begin_store_open(resolve_descriptor(ack.storage.as_ref()));
+        let (descriptor, origin) = resolve_descriptor_with_origin(ack.storage.as_ref());
+        self.begin_store_open(descriptor, origin);
     }
 
     /// Return an atomics-only liveness snapshot. The SDK invokes this on its separate
     /// channel-0 health task, so neither the store nor a handler lock is touched here.
     async fn health(&self) -> HealthReport {
         let now = now_ms().max(0) as u64;
-        self.store_open
-            .waiting_report(now)
-            .unwrap_or_else(|| DISPATCH_HEALTH.report(now))
+        if let Some(waiting) = self.store_open.waiting_report(now) {
+            return waiting;
+        }
+        if let Some(failed) = self.store_open.failed_report() {
+            return failed;
+        }
+        self.augment_memory_mirror_health(DISPATCH_HEALTH.report(now), now)
     }
 
     /// Record the route's {project_root, session} so the transform path can resolve the
@@ -12686,6 +13577,8 @@ impl McHandler {
                 | "authority.drain_flip"
                 | "authority.drain_finish" => self.handle_authority_drain_value(&request, method),
                 "mirror.pull" => self.handle_mirror_pull_value(&request),
+                "mirror.memory" => self.handle_mirror_memory_value(&request),
+                "memory.identity.ack" => self.handle_memory_identity_ack_value(&request),
                 "guidance.get" => self.handle_guidance_value(channel, &request),
                 "manifest.get" => self.handle_prompt_surface_manifest_value(channel, &request),
                 "dreamer.run_task" => self.handle_dreamer_run_task(channel, &request).await,
@@ -13636,22 +14529,20 @@ fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
 // SAFETY: Deliberate fault injection for the joint CC rig drive — see the `drive-fault`
 // feature note in Cargo.toml for why this ships in the binary at all.
 //
-// Why it exists: the claude-code-anthropic ("CC") transform leg carries no organic
-// traffic, so its mismatch / "raw-only fence" error paths — the consumer's reaction to a
-// response whose echoed fingerprint or message array does not match what it submitted —
-// can only be exercised by a rig drive. To induce those paths the drive needs OUR
-// transform response to be deliberately malformed; the CC-leg peer correctly refuses to
-// carry fault scaffolding on its own side, so the corruption lives here.
+// Why it exists: mismatch, raw-only fence, and timeout recovery paths require faults at
+// the module boundary that normal traffic cannot trigger deterministically. The drive
+// needs this module to malform a response or stall a transform before execution; the
+// protocol peer correctly carries no fault scaffolding, so the injection lives here.
 //
 // Why it is safe: this whole block is compiled ONLY under `--features drive-fault`. A
 // default deploy build has no corruption path at all — that structural absence is the
 // dormancy proof, so there is no runtime-reachable arm a stray env var could trigger.
-// Even under the feature the arm is inert unless MC_DRIVE_FAULT selects it, and it is
-// scoped to transform responses only: respond_transform is the sole transform-response
-// serializer, and facade tools and status/wrapup ops never route through it.
+// Even under the feature the arm is inert unless MC_DRIVE_FAULT selects it. Faults are
+// scoped to the transform request/response path; facade tools and status/wrapup ops do
+// not route through these gates.
 //
 // Additionally, the fault self-disarms after MC_DRIVE_FAULT_COUNT firings (default 1)
-// via a fetch_sub claim on DRIVE_FAULT_REMAINING. This prevents the fault from
+// via a fetch_update claim on DRIVE_FAULT_REMAINING. This prevents the fault from
 // corrupting a recovery pass in the fence+recover drive arc — the only other disarm
 // would be a restart, which injects a variable the arc must not contain. Total WARN
 // lines in logs will equal exactly N, so miscounts are visible.
@@ -13664,6 +14555,7 @@ enum DriveFault {
     FingerprintSkew,
     OmitCkMessages,
     Channel2Arm,
+    TransformTimeout,
 }
 
 /// Map the raw MC_DRIVE_FAULT value to a fault arm. Pure (no env access) so the
@@ -13676,6 +14568,7 @@ fn parse_drive_fault(raw: Option<&str>) -> Option<DriveFault> {
         Some("fingerprint_skew") => Some(DriveFault::FingerprintSkew),
         Some("omit_ck_messages") => Some(DriveFault::OmitCkMessages),
         Some("channel2_arm") => Some(DriveFault::Channel2Arm),
+        Some("transform_timeout") => Some(DriveFault::TransformTimeout),
         _ => None,
     }
 }
@@ -13713,11 +14606,37 @@ fn drive_fault() -> Option<DriveFault> {
         let fault = parse_drive_fault(std::env::var("MC_DRIVE_FAULT").ok().as_deref());
         // Initialize the remaining fault count alongside the arm selection.
         // This runs exactly once per process (OnceLock), so DRIVE_FAULT_REMAINING
-        // is set before any respond_transform call can read it.
+        // is set before any request or response fault can read it.
         let count = parse_drive_fault_count(std::env::var("MC_DRIVE_FAULT_COUNT").ok().as_deref());
         DRIVE_FAULT_REMAINING.store(count, std::sync::atomic::Ordering::Relaxed);
         fault
     })
+}
+
+#[cfg(feature = "drive-fault")]
+fn claim_drive_fault() -> bool {
+    use std::sync::atomic::Ordering;
+    matches!(
+        DRIVE_FAULT_REMAINING.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)),
+        Ok(previous) if previous > 0
+    )
+}
+
+#[cfg(feature = "drive-fault")]
+async fn maybe_apply_transform_timeout_fault() -> bool {
+    if drive_fault() != Some(DriveFault::TransformTimeout) || !claim_drive_fault() {
+        return false;
+    }
+    let delay_ms = std::env::var("MC_DRIVE_FAULT_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16_000);
+    eprintln!(
+        "mc-module: WARN MC_DRIVE_FAULT=transform_timeout active — stalling transform request by {delay_ms} ms for drive"
+    );
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    true
 }
 
 /// Corrupt a transform response per the selected fault arm and log one loud WARN per
@@ -13765,6 +14684,9 @@ fn apply_drive_fault(response: &mut transform::TransformResponse, fault: DriveFa
                 "mc-module: WARN MC_DRIVE_FAULT=channel2_arm active — directive force-armed for drive"
             );
         }
+        DriveFault::TransformTimeout => {
+            unreachable!("transform-timeout faults are consumed before transform execution")
+        }
     }
 }
 
@@ -13784,15 +14706,8 @@ fn respond_transform(
     // total WARN lines in logs will equal exactly N.
     #[cfg(feature = "drive-fault")]
     if let Some(fault) = drive_fault() {
-        // Claim one firing: fetch_update atomically decrements only if the count is > 0.
-        // If the count was already 0, checked_sub returns None and we skip — no underflow.
-        // If the count was > 0, the previous value is returned as Ok(prev) and we fire.
-        use std::sync::atomic::Ordering;
-        match DRIVE_FAULT_REMAINING
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-        {
-            Ok(prev) if prev > 0 => apply_drive_fault(&mut response, fault),
-            _ => {} // exhausted — response passes through cleanly
+        if fault != DriveFault::TransformTimeout && claim_drive_fault() {
+            apply_drive_fault(&mut response, fault);
         }
     }
     if response.status == transform::TransformStatus::Ok && request.tail_delta.is_some() {
@@ -14286,6 +15201,15 @@ fn mcp_text_result(text: String, is_error: bool) -> HandlerOutcome {
     }))
 }
 
+fn mcp_memory_result(text: String, is_error: bool, operation: Value) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": is_error,
+        "memory_operation": operation,
+    }))
+    .map_err(|error| error.to_string())
+}
+
 fn tool_error_result(message: impl Into<String>) -> HandlerOutcome {
     mcp_text_result(message.into(), true)
 }
@@ -14303,7 +15227,7 @@ fn capability_refusal_message(domain: &str) -> &'static str {
             "Memory writes are paused while the engine syncs. Retry in a moment. (MC-C01)"
         }
         "notes" => "Note changes are paused while the engine syncs. Retry in a moment. (MC-C03)",
-        _ => "Magic Context is temporarily unavailable. Retry in a moment. (MC-C10)",
+        _ => CONTEXT_SERVICE_UNAVAILABLE_MESSAGE,
     }
 }
 
@@ -14332,14 +15256,6 @@ fn invalid_params_error(message: impl Into<String>) -> HandlerOutcome {
     HandlerOutcome::Error {
         code: "invalid_params".to_string(),
         message: message.into(),
-    }
-}
-
-fn store_unavailable_error() -> HandlerOutcome {
-    HandlerOutcome::Error {
-        code: "store_unavailable".to_string(),
-        message: "Magic Context is temporarily unavailable. Retry in a moment. (MC-C10)"
-            .to_string(),
     }
 }
 
@@ -14418,16 +15334,33 @@ fn validate_string_cap(
     Ok(())
 }
 
-fn validate_memory_id_arguments(args: &Map<String, Value>) -> Result<(), String> {
-    for key in ["id", "target_id"] {
-        if let Some(value) = args.get(key) {
+fn validate_memory_id_arguments(args: &Map<String, Value>, action: &str) -> Result<(), String> {
+    // Validate only the identifier arguments used by the selected action. Some
+    // callers populate every declared identifier field with placeholder values;
+    // checking or combining unused fields could fail a valid call or select the
+    // wrong record.
+    let ids_len = args.get("ids").and_then(Value::as_array).map(Vec::len);
+    let (scalar_keys, array_keys): (&[&str], &[&str]) = match action {
+        "update" | "archive" | "get" if args.contains_key("ids") => (&[], &["ids"]),
+        "update" | "archive" | "get" => (&["id"], &[]),
+        "merge" if ids_len.is_some_and(|len| len >= 2) => (&[], &["ids"]),
+        "merge" if args.contains_key("target_id") || args.contains_key("source_ids") => {
+            (&["target_id"], &["source_ids"])
+        }
+        "merge" => (&["id"], &["ids"]),
+        // write/list do not address memories; id-shaped placeholders are inert.
+        _ => return Ok(()),
+    };
+
+    for key in scalar_keys {
+        if let Some(value) = args.get(*key) {
             if value.as_i64().is_none_or(|id| id <= 0) {
                 return Err(format!("'{key}' must be a positive 64-bit integer"));
             }
         }
     }
-    for key in ["ids", "source_ids"] {
-        if let Some(value) = args.get(key) {
+    for key in array_keys {
+        if let Some(value) = args.get(*key) {
             let Some(values) = value.as_array() else {
                 return Err(format!(
                     "'{key}' must be an array of positive 64-bit integers"
@@ -14446,12 +15379,14 @@ fn validate_memory_id_arguments(args: &Map<String, Value>) -> Result<(), String>
             }
         }
     }
-    if let (Some(target), Some(sources)) = (
-        args.get("target_id").and_then(Value::as_i64),
-        args.get("source_ids").and_then(Value::as_array),
-    ) {
-        if sources.iter().any(|source| source.as_i64() == Some(target)) {
-            return Err("merge target must not appear in source_ids".to_string());
+    if scalar_keys.contains(&"target_id") && array_keys.contains(&"source_ids") {
+        if let (Some(target), Some(sources)) = (
+            args.get("target_id").and_then(Value::as_i64),
+            args.get("source_ids").and_then(Value::as_array),
+        ) {
+            if sources.iter().any(|source| source.as_i64() == Some(target)) {
+                return Err("merge target must not appear in source_ids".to_string());
+            }
         }
     }
     Ok(())
@@ -14499,6 +15434,46 @@ fn usize_arg(args: &Map<String, Value>, key: &str) -> Option<usize> {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum CtxExpandMode {
+    Message(i64),
+    Range { start: i64, end: i64, verbose: bool },
+}
+
+fn resolve_ctx_expand_mode(args: &Map<String, Value>) -> Result<CtxExpandMode, String> {
+    let message = i64_arg(args, "message");
+    let start = i64_arg(args, "start");
+    let end = i64_arg(args, "end");
+    let message_present = args.get("message").is_some();
+    let message_valid = message.filter(|value| *value >= 0);
+    let range_valid = match (start, end) {
+        (Some(start), Some(end)) if start >= 0 && end >= start => Some((start, end)),
+        _ => None,
+    };
+    let filler_pair = matches!((start, end), (Some(0), Some(0)));
+    let range_named = range_valid.filter(|_| !filler_pair);
+
+    if let Some(message) = message_valid {
+        if range_named.is_none() {
+            return Ok(CtxExpandMode::Message(message));
+        }
+    }
+    if message_present && message_valid.is_none() && range_named.is_none() {
+        return Err("Error: message must be a non-negative integer.".to_string());
+    }
+    if let Some((start, end)) = range_valid {
+        return Ok(CtxExpandMode::Range {
+            start,
+            end,
+            verbose: args.get("verbose").and_then(Value::as_bool) == Some(true),
+        });
+    }
+    Err(
+        "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end)."
+            .to_string(),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
 struct FacadeSearchSources {
     memory: bool,
     message: bool,
@@ -14520,6 +15495,13 @@ fn facade_search_sources(args: &Map<String, Value>) -> FacadeSearchSources {
             note: true,
         };
     };
+    if values.is_empty() {
+        return FacadeSearchSources {
+            memory: true,
+            message: true,
+            note: true,
+        };
+    }
     FacadeSearchSources {
         memory: values.iter().any(|value| value.as_str() == Some("memory")),
         message: values.iter().any(|value| value.as_str() == Some("message")),
@@ -15465,37 +16447,43 @@ fn render_notes(
         ""
     };
     format!(
-        "{body}{anchor_hint}\n\nTo dismiss a stale note: ctx_note(action=\"dismiss\", note_id=N)"
+        "{body}{anchor_hint}\n\nTo dismiss a stale note: ctx_note(action=\"dismiss\", note_ids=[N])"
     )
 }
 
 // The facade never panics on agent input; an absent or malformed id stays a typed tool error.
 fn single_memory_id(args: &Map<String, Value>, action: &str) -> Option<i64> {
-    if let Some(id) = i64_arg(args, "id") {
-        return Some(id);
-    }
     let ids = memory_ids(args, action);
     ids.first().copied().filter(|_| ids.len() == 1)
 }
 
-fn memory_ids(args: &Map<String, Value>, _action: &str) -> Vec<i64> {
+fn memory_ids(args: &Map<String, Value>, action: &str) -> Vec<i64> {
+    if matches!(action, "update" | "archive" | "get") {
+        if let Some(values) = args.get("ids").and_then(Value::as_array) {
+            return dedup_i64s(values.iter().filter_map(Value::as_i64).collect());
+        }
+    }
+
     let mut ids = Vec::new();
     if let Some(id) = i64_arg(args, "id") {
         ids.push(id);
     }
     if let Some(values) = args.get("ids").and_then(Value::as_array) {
-        for value in values {
-            if let Some(id) = value.as_i64() {
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
-            }
-        }
+        ids.extend(values.iter().filter_map(Value::as_i64));
     }
-    ids
+    dedup_i64s(ids)
 }
 
 fn merge_ids(args: &Map<String, Value>) -> Option<Vec<i64>> {
+    if let Some(ids) = args
+        .get("ids")
+        .and_then(Value::as_array)
+        .filter(|ids| ids.len() >= 2)
+    {
+        let ids = dedup_i64s(ids.iter().filter_map(Value::as_i64).collect());
+        return (ids.len() >= 2).then_some(ids);
+    }
+
     let ids = if let Some(target_id) = i64_arg(args, "target_id") {
         let mut ids = vec![target_id];
         ids.extend(
@@ -15521,6 +16509,112 @@ fn join_i64s(ids: &[i64]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryIdLane {
+    Module,
+    Host,
+}
+
+struct MemoryFacadeRequestContext {
+    lane: MemoryIdLane,
+    host_id_by_module: HashMap<i64, i64>,
+}
+
+impl MemoryFacadeRequestContext {
+    fn rendered_id(&self, module_id: i64, known_host_id: Option<i64>) -> Option<i64> {
+        match self.lane {
+            MemoryIdLane::Module => Some(module_id),
+            MemoryIdLane::Host => self
+                .host_id_by_module
+                .get(&module_id)
+                .copied()
+                .or(known_host_id),
+        }
+    }
+
+    fn render_mutation_error(&self, error: FacadeMemoryMutationError) -> String {
+        match error {
+            FacadeMemoryMutationError::Storage(error) => error,
+            FacadeMemoryMutationError::Unavailable { id } => {
+                self.rendered_id(id, None).map_or_else(
+                    || "memory was not found".to_string(),
+                    |id| format!("memory {id} was not found"),
+                )
+            }
+            FacadeMemoryMutationError::DuplicateContent { id, host_id } => {
+                self.rendered_id(id, host_id).map_or_else(
+                    || "memory content already exists".to_string(),
+                    |id| format!("memory content already exists as ID {id}"),
+                )
+            }
+            FacadeMemoryMutationError::InvalidMerge => "memories could not be merged".to_string(),
+        }
+    }
+
+    fn render_store_error(&self, error: McStoreError) -> String {
+        match error {
+            McStoreError::MemoryDuplicateContent { id } => self.rendered_id(id, None).map_or_else(
+                || "memory content already exists".to_string(),
+                |id| format!("memory content already exists as ID {id}"),
+            ),
+            error => error.to_string(),
+        }
+    }
+
+    fn render_tool_error(&self, error: memory_tool::MemoryToolError) -> String {
+        match error {
+            memory_tool::MemoryToolError::Store(error) => {
+                format!("store: {}", self.render_store_error(error))
+            }
+            memory_tool::MemoryToolError::DuplicateSourceId { id } => {
+                self.rendered_id(id, None).map_or_else(
+                    || "duplicate source memory id".to_string(),
+                    |id| format!("duplicate source memory id {id}"),
+                )
+            }
+            memory_tool::MemoryToolError::NotFound { id } => {
+                self.rendered_id(id, None).map_or_else(
+                    || "memory was not found".to_string(),
+                    |id| format!("memory {id} was not found"),
+                )
+            }
+            memory_tool::MemoryToolError::Inactive { id, status } => {
+                self.rendered_id(id, None).map_or_else(
+                    || format!("memory is not mutable in status {status}"),
+                    |id| format!("memory {id} is not mutable in status {status}"),
+                )
+            }
+            memory_tool::MemoryToolError::Superseded { id, superseded_by } => {
+                let id = self.rendered_id(id, None);
+                let superseded_by = self.rendered_id(superseded_by, None);
+                match (id, superseded_by) {
+                    (Some(id), Some(superseded_by)) => {
+                        format!("memory {id} was superseded by {superseded_by}")
+                    }
+                    (Some(id), None) => format!("memory {id} was superseded"),
+                    _ => "memory was superseded".to_string(),
+                }
+            }
+            error => error.to_string(),
+        }
+    }
+}
+
+fn memory_id_lane(args: &Map<String, Value>) -> Result<MemoryIdLane, String> {
+    match string_arg(args, "memory_id_lane") {
+        None | Some("module") => Ok(MemoryIdLane::Module),
+        Some("host") => Ok(MemoryIdLane::Host),
+        Some(_) => Err("memory_id_lane must be 'host' or 'module'".to_string()),
+    }
+}
+
+fn host_memory_ids(args: &Map<String, Value>) -> Vec<i64> {
+    args.get("host_ids")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default()
 }
 
 fn parse_tag_range_string(input: &str) -> Result<Vec<u64>, String> {
@@ -16238,12 +17332,21 @@ fn record_historian_connect_failure(
 /// Resolve the storage descriptor: prefer the daemon-provided `ack.storage`, else
 /// fall back to a local dev path (standalone / no managed storage configured).
 pub fn resolve_descriptor(storage: Option<&Value>) -> StorageDescriptor {
+    resolve_descriptor_with_origin(storage).0
+}
+
+/// The same resolution, plus which of the two sources answered. A refusal or health report names
+/// the origin because a dev fallback is exactly how two incarnations end up resolving one path and
+/// fighting over its single-writer lease.
+fn resolve_descriptor_with_origin(
+    storage: Option<&Value>,
+) -> (StorageDescriptor, DescriptorOrigin) {
     if let Some(value) = storage {
         if let Ok(descriptor) = serde_json::from_value::<StorageDescriptor>(value.clone()) {
-            return descriptor;
+            return (descriptor, DescriptorOrigin::DaemonAck);
         }
     }
-    dev_descriptor()
+    (dev_descriptor(), DescriptorOrigin::DevFallback)
 }
 
 fn dev_descriptor() -> StorageDescriptor {
@@ -16284,7 +17387,7 @@ fn ctx_expand_description() -> String {
 }
 
 fn ctx_note_description() -> String {
-    "Save or inspect durable session notes for future follow-ups. Dismiss one note with note_id or 1–50 with note_ids, never both. surface_condition is accepted and recorded, but condition evaluation arrives later on this leg.".to_string()
+    "Save or inspect durable session notes for future follow-ups. update changes one note (note_ids=[N]); dismiss retires 1–50 (note_ids). surface_condition is accepted and recorded, but condition evaluation arrives later on this leg.".to_string()
 }
 
 fn ctx_memory_schema() -> Value {
@@ -16382,8 +17485,7 @@ fn ctx_note_schema() -> Value {
         "properties": {
             "action": { "type": "string", "enum": ["write", "read", "update", "dismiss"], "description": "Operation to perform. Defaults to write when content is provided, otherwise read." },
             "content": { "type": "string", "maxLength": 65536, "description": "Note text for write/update, or optional dismissal resolution when action is dismiss." },
-            "note_id": { "type": "integer", "minimum": 1, "description": "Note id for update or dismiss." },
-            "note_ids": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 }, "description": "One to fifty note ids for 'dismiss' only; do not combine with note_id." },
+            "note_ids": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 }, "description": "Note ids: exactly one for 'update', one to fifty for 'dismiss'. Ignored by 'write' and 'read'." },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25, "description": "Maximum active notes to return." },
             "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest notes in each section." },
             "filter": { "type": "string", "enum": ["all", "active", "pending", "ready", "dismissed"], "description": "Optional read filter. Defaults to active session notes plus ready smart notes." },
@@ -17200,7 +18302,8 @@ mod tests {
 
     #[test]
     fn profile_render_epoch_is_profile_specific_and_zero_for_unchanged_profiles() {
-        assert_eq!(MEMORY_RENDER_FORMAT_EPOCH, 2);
+        assert_eq!(MEMORY_RENDER_FORMAT_EPOCH, 3);
+        assert_eq!(PROFILE_EPOCH_OPENCODE_AI_SDK, 2);
         assert_eq!(
             profile_render_epoch(SerializerProfile::ClaudeCodeAnthropic),
             PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC
@@ -17251,6 +18354,7 @@ mod tests {
             wait_window,
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(20),
+            request_wait: STORE_OPENING_REQUEST_WAIT,
         }
     }
 
@@ -17284,11 +18388,10 @@ mod tests {
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
 
-        handler.begin_store_open(descriptor);
+        handler.begin_store_open(descriptor, DescriptorOrigin::DevFallback);
         wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
         let before = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
-        assert_eq!(before.0, "store_unavailable");
-        assert_eq!(before.1, "store not opened (no HELLO_ACK storage seam)");
+        assert_eq!(before.0, "store_lease_wait");
 
         drop(predecessor);
         wait_for_store_open(&handler).await;
@@ -17296,8 +18399,11 @@ mod tests {
         assert_eq!(after.0, "route_unbound");
     }
 
+    /// A request that arrives while the lease is still held may retry; once the wait window has
+    /// expired the open is never retried, so the refusal has to stop inviting a retry and name the
+    /// reason instead. The two states therefore MUST NOT answer identically.
     #[tokio::test]
-    async fn lease_held_past_window_preserves_terminal_store_error() {
+    async fn lease_wait_expiry_turns_the_refusal_terminal_with_the_open_reason() {
         let dir = tempfile::tempdir().unwrap();
         let data_home = dir.path().join("data");
         std::fs::create_dir_all(&data_home).unwrap();
@@ -17306,12 +18412,151 @@ mod tests {
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(60)));
 
-        handler.begin_store_open(descriptor);
+        handler.begin_store_open(descriptor, DescriptorOrigin::DevFallback);
         wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
-        let before = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+        let during = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
         wait_for_store_open_phase(&handler, STORE_OPEN_IDLE).await;
         let after = error_frame(call_transform_outcome(&handler, request(big_messages())).await);
-        assert_eq!(after, before);
+
+        assert_eq!(during.0, "store_lease_wait");
+        assert_eq!(after.0, "store_open_failed");
+        assert!(
+            after.1.contains("storage lease wait expired"),
+            "the terminal refusal must carry the open reason: {}",
+            after.1
+        );
+        assert!(
+            after.1.contains("descriptor_origin=dev_fallback"),
+            "the terminal refusal must name where the descriptor came from: {}",
+            after.1
+        );
+        assert!(
+            after.1.contains("terminal"),
+            "a failed open must not invite a retry: {}",
+            after.1
+        );
+        assert_ne!(
+            during, after,
+            "a retryable lease wait and a terminal failed open must not share one refusal"
+        );
+    }
+
+    /// The handle is a bare `Option`, so its emptiness cannot say WHICH state holds. These two
+    /// states need opposite operator actions (wait for the other process to exit vs. find out why
+    /// no ack arrived), so one shared code would be useless in both.
+    #[tokio::test]
+    async fn store_refusal_discriminates_a_lease_wait_from_a_missing_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let _predecessor = McStore::open(&descriptor).unwrap();
+
+        let never_acked = McHandler::new();
+        let missing_ack =
+            error_frame(call_transform_outcome(&never_acked, request(big_messages())).await);
+
+        let waiting = McHandler::new();
+        waiting.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
+        waiting.begin_store_open(descriptor, DescriptorOrigin::DevFallback);
+        wait_for_store_open_phase(&waiting, STORE_OPEN_WAITING).await;
+        let lease_wait =
+            error_frame(call_transform_outcome(&waiting, request(big_messages())).await);
+
+        assert_eq!(missing_ack.0, "store_unavailable");
+        assert_eq!(lease_wait.0, "store_lease_wait");
+        assert_ne!(
+            missing_ack.0, lease_wait.0,
+            "two different storage states must not answer with one code"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_ack_refusal_says_no_open_was_ever_attempted() {
+        let handler = McHandler::new();
+
+        let (code, message) =
+            error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+
+        assert_eq!(code, "store_unavailable");
+        assert!(
+            message.contains("no HELLO_ACK has arrived"),
+            "the never-acked arm is the only one that may blame the missing ack: {message}"
+        );
+        assert!(message.contains("retryable"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn lease_wait_refusal_carries_elapsed_window_and_a_redacted_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let full_path = match &descriptor.backend {
+            StorageBackend::Sqlite { path } => path.clone(),
+            other => panic!("expected sqlite backend, got {other:?}"),
+        };
+        let _predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
+
+        handler.begin_store_open(descriptor, DescriptorOrigin::DevFallback);
+        wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
+        let (code, message) =
+            error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+
+        assert_eq!(code, "store_lease_wait");
+        assert!(message.contains("elapsed_ms="), "{message}");
+        assert!(message.contains("wait_window_ms=500"), "{message}");
+        assert!(message.contains("descriptor=sqlite:store.db@"), "{message}");
+        assert!(
+            !message.contains(&full_path),
+            "a refusal must never disclose the storage path: {message}"
+        );
+        let parent_dir = Path::new(&full_path)
+            .parent()
+            .and_then(Path::to_str)
+            .expect("the dev descriptor path has a parent directory")
+            .to_string();
+        assert!(
+            !message.contains(&parent_dir),
+            "a refusal must never disclose the storage directory: {message}"
+        );
+    }
+
+    /// `ck module status` reads the health lane, so an open that failed terminally has to be
+    /// visible there too — otherwise the only record of the reason is this process's stderr.
+    #[tokio::test]
+    async fn health_reports_the_terminal_store_open_failure_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let _predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(60)));
+
+        handler.begin_store_open(descriptor, DescriptorOrigin::DevFallback);
+        wait_for_store_open_phase(&handler, STORE_OPEN_IDLE).await;
+        let report = <McHandler as ModuleHandler>::health(&handler).await;
+
+        assert_eq!(report.status, HealthStatus::Failing);
+        let detail = report
+            .detail
+            .expect("a failed open must carry a health detail");
+        assert!(detail.contains("storage open failed"), "{detail}");
+        assert!(detail.contains("lease"), "{detail}");
+        let metrics = report
+            .metrics
+            .expect("a failed open must carry health metrics");
+        assert_eq!(metrics["storage_state"], "open_failed");
+        assert_eq!(metrics["storage_descriptor_origin"], "dev_fallback");
+        assert!(
+            metrics["storage_open_failure_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("lease")),
+            "{metrics}"
+        );
     }
 
     #[tokio::test]
@@ -17324,9 +18569,9 @@ mod tests {
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
 
-        handler.begin_store_open(descriptor.clone());
+        handler.begin_store_open(descriptor.clone(), DescriptorOrigin::DevFallback);
         wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
-        handler.begin_store_open(descriptor);
+        handler.begin_store_open(descriptor, DescriptorOrigin::DevFallback);
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         assert_eq!(handler.store_open.waiter_starts.load(Ordering::Relaxed), 1);
@@ -17344,7 +18589,7 @@ mod tests {
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_secs(5)));
         let coordinator = Arc::clone(&handler.store_open);
 
-        handler.begin_store_open(descriptor);
+        handler.begin_store_open(descriptor, DescriptorOrigin::DevFallback);
         wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
         drop(handler);
         tokio::time::timeout(Duration::from_millis(200), async {
@@ -17366,7 +18611,7 @@ mod tests {
         let handler = McHandler::new();
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
 
-        handler.begin_store_open(descriptor);
+        handler.begin_store_open(descriptor, DescriptorOrigin::DevFallback);
         wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
         let first = <McHandler as ModuleHandler>::health(&handler).await;
         tokio::time::sleep(Duration::from_millis(35)).await;
@@ -17390,6 +18635,98 @@ mod tests {
         assert_eq!(
             StoreOpenPolicy::default().wait_window,
             Duration::from_secs(60)
+        );
+    }
+
+    /// Stand in for an open that has begun and not yet landed, so a test can drive the request
+    /// lane's in-flight arm without racing a real open to it.
+    fn mark_store_open_in_flight(handler: &McHandler, descriptor: &StorageDescriptor) {
+        handler.store_open.begin_attempt(
+            descriptor,
+            DescriptorOrigin::DaemonAck,
+            now_ms().max(0) as u64,
+        );
+        handler.store_open.set_phase(STORE_OPENING);
+    }
+
+    /// A first request that arrives during the open must be served by that open, not refused a few
+    /// dozen milliseconds before it lands.
+    #[tokio::test]
+    async fn a_request_waits_out_an_in_flight_store_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let opened = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        mark_store_open_in_flight(&handler, &descriptor);
+
+        let slot = Arc::clone(&handler.store);
+        let coordinator = Arc::clone(&handler.store_open);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _ = slot.set(Arc::new(opened));
+            coordinator.set_phase(STORE_OPENED);
+        });
+        let code = error_code(call_transform_outcome(&handler, request(big_messages())).await);
+
+        assert_eq!(
+            code, "route_unbound",
+            "the request must reach the far side of the store seam once the open lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_open_past_the_wait_budget_refuses_store_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(StoreOpenPolicy {
+            request_wait: Duration::from_millis(20),
+            ..short_store_open_policy(Duration::from_millis(500))
+        });
+        mark_store_open_in_flight(&handler, &descriptor);
+
+        let started = Instant::now();
+        let (code, message) =
+            error_frame(call_transform_outcome(&handler, request(big_messages())).await);
+
+        assert_eq!(code, "store_opening");
+        assert!(message.contains("elapsed_ms="), "{message}");
+        assert!(message.contains("retryable"), "{message}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(20),
+            "the request must spend its budget waiting for the open before refusing"
+        );
+    }
+
+    /// The lease wait runs for up to a minute. Holding a request for that is worse than refusing
+    /// it, so this arm must answer immediately no matter how large the request budget is.
+    #[tokio::test]
+    async fn a_request_never_waits_on_the_storage_lease_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        std::fs::create_dir_all(&data_home).unwrap();
+        let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
+        let _predecessor = McStore::open(&descriptor).unwrap();
+        let handler = McHandler::new();
+        handler.set_store_open_policy_for_test(StoreOpenPolicy {
+            request_wait: Duration::from_secs(5),
+            ..short_store_open_policy(Duration::from_secs(5))
+        });
+
+        handler.begin_store_open(descriptor, DescriptorOrigin::DevFallback);
+        wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
+        let started = Instant::now();
+        let code =
+            error_code(call_transform_outcome(&handler, request(vec![ck("m1", 1, "one")])).await);
+
+        assert_eq!(code, "store_lease_wait");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a lease wait must refuse at once, not hold the request for the lease window"
         );
     }
 
@@ -18081,6 +19418,8 @@ mod tests {
         prompts: Mutex<Vec<String>>,
         systems: Mutex<Vec<String>>,
         models: Mutex<Vec<String>>,
+        /// The provider session each start ran under, in attempt order.
+        sessions: Mutex<Vec<String>>,
         on_await_output: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
@@ -18123,12 +19462,17 @@ mod tests {
 
         async fn start(
             &mut self,
-            _session_id: &str,
+            session_id: &str,
             system: &str,
             prompt: &str,
             model: &str,
         ) -> Result<RunHandle, HistorianProducerError> {
             let n = self.state.starts.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state
+                .sessions
+                .lock()
+                .expect("sessions mutex")
+                .push(session_id.to_string());
             self.state
                 .prompts
                 .lock()
@@ -18805,7 +20149,7 @@ mod tests {
         content: &str,
         now: i64,
     ) -> i64 {
-        store
+        let id = store
             .insert_memory(InsertMemoryInput {
                 project_path: project,
                 route_project_root: None,
@@ -18818,7 +20162,17 @@ mod tests {
                 metadata_json: None,
                 now_ms: now,
             })
-            .unwrap()
+            .unwrap();
+        store
+            .acknowledge_host_memory_ids(
+                project,
+                &[HostMemoryIdentityAck {
+                    module_row_id: id,
+                    host_row_id: id,
+                }],
+            )
+            .unwrap();
+        id
     }
 
     fn activate_module_authority(
@@ -19142,6 +20496,74 @@ mod tests {
     }
 
     #[test]
+    fn memory_mirror_health_surfaces_a_frozen_non_frontier_cursor_with_a_code() {
+        let handler = McHandler::new();
+        handler.memory_mirror_health.observe_frontier(4_850, 275);
+        handler.memory_mirror_health.observe_pull(3_726, 1_000);
+
+        let within_bound =
+            handler.augment_memory_mirror_health(DispatchHealth::new().report(40_999), 40_999);
+        assert_eq!(within_bound.status, HealthStatus::Ok);
+        assert_eq!(
+            within_bound.metrics.unwrap()["memory_mirror"]["stalled"],
+            json!(false)
+        );
+
+        let stalled =
+            handler.augment_memory_mirror_health(DispatchHealth::new().report(41_000), 41_000);
+        assert_eq!(stalled.status, HealthStatus::Degraded);
+        assert!(stalled
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("MC-M01 memory mirror cursor stalled")));
+        let metrics = stalled.metrics.unwrap();
+        assert_eq!(metrics["memory_mirror"]["feed_head"], json!(4_850));
+        assert_eq!(metrics["memory_mirror"]["host_cursor"], json!(3_726));
+        assert_eq!(metrics["memory_mirror"]["pending_rows"], json!(1_124));
+        assert_eq!(metrics["memory_mirror"]["code"], json!("MC-M01"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transform_and_session_status_publish_memory_mirror_frontier_and_authority() {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let project = project.to_string_lossy().to_string();
+        handler.bind_route(7, binding(&project, "ses"));
+        activate_module_authority(&store, "store", "git:mirror-status", &project, "memories");
+        insert_memory(
+            &store,
+            "git:mirror-status",
+            "ARCHITECTURE",
+            "mirror frontier fixture",
+            1,
+        );
+
+        let transformed = call_transform_request_on_channel(
+            &handler,
+            7,
+            request(vec![ck("mirror-status", 1, "hello")]),
+        )
+        .await;
+        let feed_head = store.changefeed_head("memories").unwrap();
+        assert!(feed_head > 0);
+        assert_eq!(transformed["memory_mirror_head"], json!(feed_head));
+
+        let status = call_dispatch_request_on_channel(
+            &handler,
+            7,
+            json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        )
+        .await;
+        assert_eq!(status["memory_mirror"]["feed_head"], json!(feed_head));
+        assert_eq!(status["memory_mirror"]["module_live_rows"], json!(1));
+        assert_eq!(status["authority"]["memories"]["state"], json!("MODULE"));
+        assert_eq!(
+            status["authority"]["memories"]["project"],
+            json!("git:mirror-status")
+        );
+    }
+
+    #[test]
     fn module_health_line_surfaces_last_historian_model_refusal() {
         let health = DispatchHealth::new();
         health.record_historian_outcome(
@@ -19345,6 +20767,10 @@ mod tests {
         assert_eq!(
             parse_drive_fault(Some("omit_ck_messages")),
             Some(DriveFault::OmitCkMessages)
+        );
+        assert_eq!(
+            parse_drive_fault(Some("transform_timeout")),
+            Some(DriveFault::TransformTimeout)
         );
         // Unset, empty, and unrecognized values all leave the response untouched.
         assert_eq!(parse_drive_fault(None), None);
@@ -23525,6 +24951,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn request_trace_ring_records_attempt_lifecycle_and_caps_at_thirty_two() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        for index in 0..35 {
+            let mut input = request(vec![ck("m1", 1, "hello")]);
+            input["attempt_id"] = json!(format!("attempt-{index}"));
+            let response = call_transform_request(&handler, input).await;
+            assert_eq!(response["status"], "ok");
+        }
+
+        let trace = store.load_pass_trace("ses").unwrap().unwrap();
+        assert_eq!(trace.request_history.len(), 32);
+        assert_eq!(
+            trace.request_history.first().unwrap().attempt_id,
+            "attempt-3"
+        );
+        assert_eq!(
+            trace.request_history.last().unwrap().attempt_id,
+            "attempt-34"
+        );
+        assert!(trace.request_history.iter().all(|request| {
+            request.outcome == "completed"
+                && request
+                    .completed_at_ms
+                    .is_some_and(|completed| completed >= request.received_at_ms)
+        }));
+
+        store
+            .trace_pass_received("ses", "attempt-stalled", now_ms())
+            .unwrap();
+        let status = call_dispatch_request(
+            &handler,
+            json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        )
+        .await;
+        let history = status["pass_trace"]["request_history"]
+            .as_array()
+            .expect("session.status exposes request history");
+        assert_eq!(history.len(), 32);
+        assert_eq!(history.last().unwrap()["attempt_id"], "attempt-stalled");
+        assert_eq!(
+            history.last().unwrap()["received_at_ms"],
+            json!(
+                store
+                    .load_pass_trace("ses")
+                    .unwrap()
+                    .unwrap()
+                    .request_history
+                    .last()
+                    .unwrap()
+                    .received_at_ms
+            )
+        );
+        assert_eq!(history.last().unwrap()["completed_at_ms"], Value::Null);
+        assert_eq!(history.last().unwrap()["outcome"], "received");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn repeated_rejects_increment_trace_and_overwrite_last_error() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -23622,6 +25107,22 @@ mod tests {
         assert_eq!(status["epochs"]["state_sync_deltas"], json!(true));
         assert_eq!(status["pass_trace"]["receive_count"], 1);
         assert_eq!(status["pass_trace"]["reject_count"], 1);
+        assert_eq!(
+            status["pass_trace"]["request_history"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(status["pass_trace"]["request_history"][0]["attempt_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("legacy-"));
+        assert_eq!(
+            status["pass_trace"]["request_history"][0]["outcome"],
+            "rejected"
+        );
+        assert!(status["pass_trace"]["request_history"][0]["completed_at_ms"].is_number());
         assert_eq!(
             status["pass_trace"]["last_reject_error"],
             json!("live-source ordinals not strictly increasing")
@@ -24339,7 +25840,7 @@ mod tests {
             "ctx_note",
             json!({
                 "action": "update",
-                "note_id": note_id,
+                "note_ids": [note_id],
                 "surface_condition": "when the replacement path exists",
                 "compiled_provider": "retina-local-fs",
                 "compiled_config": "{\"kind\":\"path_exists\",\"path\":\"new\"}",
@@ -24384,16 +25885,11 @@ mod tests {
     }
 
     #[test]
-    fn ctx_note_schema_pins_the_multi_dismiss_contract() {
+    fn ctx_note_schema_declares_one_id_field() {
         let properties = ctx_note_schema()["properties"].clone();
-        assert_eq!(
-            properties["note_id"],
-            json!({
-                "type": "integer",
-                "minimum": 1,
-                "description": "Note id for update or dismiss."
-            })
-        );
+        // A second scalar id field is what made required-all tool surfaces fail
+        // every call with filler in both (issue 460).
+        assert!(properties.get("note_id").is_none());
         assert_eq!(
             properties["note_ids"],
             json!({
@@ -24401,7 +25897,7 @@ mod tests {
                 "minItems": 1,
                 "maxItems": 50,
                 "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 },
-                "description": "One to fifty note ids for 'dismiss' only; do not combine with note_id."
+                "description": "Note ids: exactly one for 'update', one to fifty for 'dismiss'. Ignored by 'write' and 'read'."
             })
         );
     }
@@ -24621,13 +26117,13 @@ mod tests {
         let _ = call_facade(
             &handler,
             "ctx_note",
-            json!({"action": "update", "note_id": note_id, "content": "remember the updated lattice"}),
+            json!({"action": "update", "note_ids": [note_id], "content": "remember the updated lattice"}),
         )
         .await;
         let _ = call_facade(
             &handler,
             "ctx_note",
-            json!({"action": "dismiss", "note_id": note_id, "content": "finished"}),
+            json!({"action": "dismiss", "note_ids": [note_id], "content": "finished"}),
         )
         .await;
         let dismissed_search = tool_text(
@@ -24676,7 +26172,7 @@ mod tests {
             call_facade(
                 &handler,
                 "ctx_note",
-                json!({"action": "dismiss", "note_id": 3}),
+                json!({"action": "dismiss", "note_ids": [3]}),
             )
             .await,
         );
@@ -25531,6 +27027,88 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn opencode2_transform_route_serves_memory_without_waiting_for_session_resolve() {
+        let resolver = FakeSessionResolver::with(&[("slow-map", FakeResolve::Timeout)]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver.clone(),
+        );
+        let project_root = project.to_str().unwrap();
+        handler.bind_route(
+            7,
+            binding_with_harness(project_root, "opencode2", "slow-map"),
+        );
+        activate_module_authority(
+            &store,
+            "store",
+            "git:authority-route",
+            project_root,
+            "memories",
+        );
+        let mut first_transform = request(vec![ck("opencode2-route", 1, "hello")]);
+        first_transform["session_id"] = json!("slow-map");
+        let transformed = call_transform_request_on_channel(&handler, 7, first_transform).await;
+        assert_eq!(transformed["status"], json!("ok"));
+
+        let memory_id = insert_memory(
+            &store,
+            "git:authority-route",
+            "CONSTRAINTS",
+            "serve from module authority",
+            1,
+        );
+
+        let listed = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "list",
+                "category": "CONSTRAINTS",
+                "limit": 10,
+                "memory_project": "git:authority-route",
+            }),
+        )
+        .await;
+        assert!(tool_body(listed)["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("serve from module authority")));
+
+        let read = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "get",
+                "ids": [memory_id],
+                "memory_project": "git:authority-route",
+            }),
+        )
+        .await;
+        assert_eq!(
+            tool_body(read)["content"][0]["text"],
+            json!(format!(
+            "Memory [ID: {memory_id}] in CONSTRAINTS (status: active): serve from module authority"
+        ))
+        );
+
+        let write = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "write through module authority",
+                "memory_project": "git:authority-route",
+            }),
+        )
+        .await;
+        assert!(tool_body(write)["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Saved memory")));
+        assert_eq!(resolver.calls(), Vec::<String>::new());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn facade_authority_lookup_failure_is_retryable_and_never_falls_back() {
         let resolver =
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
@@ -25983,7 +27561,6 @@ mod tests {
                 vec![
                     "action",
                     "content",
-                    "note_id",
                     "note_ids",
                     "limit",
                     "offset",
@@ -26287,6 +27864,405 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn host_memory_lane_translates_overlap_ids_and_never_mutates_the_raw_module_row() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let project = project.to_str().unwrap();
+        handler.bind_route(7, binding_with_harness(project, "opencode", "token"));
+
+        for index in 1..=7 {
+            assert_eq!(
+                insert_memory(
+                    &store,
+                    project,
+                    "CONSTRAINTS",
+                    &format!("memory-{index}"),
+                    index,
+                ),
+                index
+            );
+        }
+        store
+            .acknowledge_host_memory_ids(
+                project,
+                &[
+                    HostMemoryIdentityAck {
+                        module_row_id: 1,
+                        host_row_id: 2,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: 2,
+                        host_row_id: 102,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: 3,
+                        host_row_id: 4,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: 4,
+                        host_row_id: 104,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: 5,
+                        host_row_id: 6,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: 6,
+                        host_row_id: 106,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: 7,
+                        host_row_id: 7,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let get = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "get",
+                "ids": [1],
+                "host_ids": [2],
+                "memory_id_lane": "host",
+            }),
+        )
+        .await;
+        assert_eq!(
+            tool_text(get),
+            "Memory [ID: 2] in CONSTRAINTS (status: active): memory-1"
+        );
+
+        let raw_overlap = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "get",
+                "ids": [2],
+                "host_ids": [2],
+                "memory_id_lane": "host",
+            }),
+        )
+        .await;
+        assert!(tool_text(raw_overlap).contains("memory id 2 has no module mapping yet"));
+
+        let update = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "update",
+                "ids": [1],
+                "host_ids": [2],
+                "memory_id_lane": "host",
+                "content": "updated-host-two",
+            }),
+        )
+        .await;
+        assert_eq!(tool_text(update), "Updated memory [ID: 2] in CONSTRAINTS.");
+        assert_eq!(
+            store.get_memory_full(1).unwrap().unwrap().content,
+            "updated-host-two"
+        );
+        assert_eq!(
+            store.get_memory_full(2).unwrap().unwrap().content,
+            "memory-2"
+        );
+
+        let archive = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "archive",
+                "ids": [3],
+                "host_ids": [4],
+                "memory_id_lane": "host",
+            }),
+        )
+        .await;
+        assert_eq!(tool_text(archive), "Archived memory IDs [4].");
+        assert_eq!(
+            store.get_memory_full(3).unwrap().unwrap().status,
+            "archived"
+        );
+        assert_eq!(store.get_memory_full(4).unwrap().unwrap().status, "active");
+
+        let merge = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "merge",
+                "ids": [5, 7],
+                "host_ids": [6, 7],
+                "memory_id_lane": "host",
+                "content": "merged-host-six",
+            }),
+        )
+        .await;
+        assert!(!tool_text(merge).contains("ID: 8"));
+        assert_eq!(
+            store.get_memory_full(6).unwrap().unwrap().content,
+            "memory-6"
+        );
+
+        let write = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "memory_id_lane": "host",
+                "host_ids": [],
+                "ids": [],
+                "category": "CONSTRAINTS",
+                "content": "fresh host write",
+            }),
+        )
+        .await;
+        let body = tool_body(write);
+        assert!(body["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("id will appear in <project-memory>"));
+        assert!(body["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .find("ID:")
+            .is_none());
+        assert!(body["memory_operation"]["module_id"].as_i64().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn review_host_identity_does_not_grant_foreign_write_ownership() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "opencode", "token"),
+        );
+        let id = insert_memory(&store, "git:foreign", "CONSTRAINTS", "foreign pinned", 1);
+        store
+            .acknowledge_host_memory_ids(
+                "git:foreign",
+                &[HostMemoryIdentityAck {
+                    module_row_id: id,
+                    host_row_id: 901,
+                }],
+            )
+            .unwrap();
+        let other = insert_memory(
+            &store,
+            "git:foreign",
+            "CONSTRAINTS",
+            "other foreign pinned",
+            2,
+        );
+        store
+            .acknowledge_host_memory_ids(
+                "git:foreign",
+                &[HostMemoryIdentityAck {
+                    module_row_id: other,
+                    host_row_id: 902,
+                }],
+            )
+            .unwrap();
+        let get = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "get", "ids": [id], "host_ids": [901],
+                "memory_id_lane": "host"
+            }),
+        )
+        .await;
+        let get_text = tool_text(get);
+        assert!(
+            get_text.contains("id 901: not found or not visible"),
+            "{get_text}"
+        );
+        assert!(!get_text.contains(&format!("id {id}:")), "{get_text}");
+
+        for action in ["update", "archive", "merge"] {
+            let ids = if action == "merge" {
+                vec![id, other]
+            } else {
+                vec![id]
+            };
+            let host_ids = if action == "merge" {
+                vec![901, 902]
+            } else {
+                vec![901]
+            };
+            let result = call_facade(
+                &handler,
+                "ctx_memory",
+                json!({
+                    "action": action, "ids": ids, "host_ids": host_ids,
+                    "memory_id_lane": "host", "content": "must not write"
+                }),
+            )
+            .await;
+            let text = tool_text(result);
+            eprintln!("host ownership probe {action}: {text}");
+            assert!(!text.contains("Updated memory"), "{text}");
+            assert!(!text.contains("Archived memory IDs"), "{text}");
+            assert!(!text.contains("Merged memories"), "{text}");
+            assert!(
+                text.contains("901"),
+                "host id missing from {action} error: {text}"
+            );
+            assert!(
+                !text.contains(&format!("memory {id} was not found")),
+                "raw module id escaped from {action}: {text}"
+            );
+            let row = store.get_memory_full(id).unwrap().unwrap();
+            assert_eq!(row.content, "foreign pinned");
+            assert_eq!(row.status, "active");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn review_host_ownership_error_must_not_expose_module_id() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "opencode", "token"),
+        );
+        let id = insert_memory(&store, "git:foreign", "CONSTRAINTS", "foreign pinned", 1);
+        store
+            .acknowledge_host_memory_ids(
+                "git:foreign",
+                &[HostMemoryIdentityAck {
+                    module_row_id: id,
+                    host_row_id: 901,
+                }],
+            )
+            .unwrap();
+        let result = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "update", "ids": [id], "host_ids": [901],
+                "memory_id_lane": "host", "content": "must not write"
+            }),
+        )
+        .await;
+        let text = tool_text(result);
+        assert!(text.contains("memory 901 was not found"), "{text}");
+        assert!(
+            !text.contains(&format!("memory {id} was not found")),
+            "raw module id escaped: {text}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_memory_lane_translates_constraint_error_ids() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let project = project.to_str().unwrap();
+        handler.bind_route(7, binding_with_harness(project, "opencode", "token"));
+
+        let target = insert_memory(&store, project, "CONSTRAINTS", "target", 1);
+        let duplicate = insert_memory(&store, project, "CONSTRAINTS", "duplicate", 2);
+        let source = insert_memory(&store, project, "CONSTRAINTS", "source", 3);
+        store
+            .acknowledge_host_memory_ids(
+                project,
+                &[
+                    HostMemoryIdentityAck {
+                        module_row_id: target,
+                        host_row_id: 901,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: duplicate,
+                        host_row_id: 902,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: source,
+                        host_row_id: 903,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let update = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "update", "ids": [target], "host_ids": [901],
+                "memory_id_lane": "host", "content": "duplicate"
+            }),
+        )
+        .await;
+        let update_text = tool_text(update);
+        assert!(
+            update_text.contains("memory content already exists as ID 902"),
+            "{update_text}"
+        );
+        assert!(
+            !update_text.contains(&format!("ID {duplicate}")),
+            "raw duplicate module id escaped: {update_text}"
+        );
+
+        let merge = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "merge", "ids": [target, source], "host_ids": [901, 903],
+                "memory_id_lane": "host", "content": "duplicate"
+            }),
+        )
+        .await;
+        let merge_text = tool_text(merge);
+        assert!(
+            merge_text.contains("memory content already exists as ID 902"),
+            "{merge_text}"
+        );
+        assert!(
+            !merge_text.contains(&format!("ID {duplicate}")),
+            "raw duplicate module id escaped: {merge_text}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_memory_lane_keeps_module_ids_byte_for_byte() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let project = project.to_str().unwrap();
+        handler.bind_route(7, binding_with_harness(project, "claude-code", "token"));
+        assert_eq!(
+            insert_memory(&store, project, "CONSTRAINTS", "claude row", 1),
+            1
+        );
+
+        let get = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({ "action": "get", "ids": [1] }),
+        )
+        .await;
+        assert_eq!(
+            tool_text(get),
+            "Memory [ID: 1] in CONSTRAINTS (status: active): claude row"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn memory_facade_routes_all_authority_actions_into_store_and_changefeed() {
         let producer = Arc::new(ProducerState::default());
         let resolver =
@@ -26556,7 +28532,7 @@ mod tests {
             "note-update",
             json!({
                 "action": "update",
-                "note_id": 1,
+                "note_ids": [1],
                 "content": "updated note",
                 "command_id": "note-update"
             }),
@@ -26576,7 +28552,7 @@ mod tests {
             "note-dismiss",
             json!({
                 "action": "dismiss",
-                "note_id": 1,
+                "note_ids": [1],
                 "command_id": "note-dismiss"
             }),
         )
@@ -26976,8 +28952,8 @@ mod tests {
         }
         for arguments in [
             json!({"action": "write", "content": "late"}),
-            json!({"action": "update", "note_id": note.id, "content": "late"}),
-            json!({"action": "dismiss", "note_id": note.id}),
+            json!({"action": "update", "note_ids": [note.id], "content": "late"}),
+            json!({"action": "dismiss", "note_ids": [note.id]}),
         ] {
             assert_eq!(
                 error_code(call_facade(&handler, "ctx_note", arguments).await),
@@ -27094,6 +29070,127 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn classify_fallback_attempts_never_share_a_provider_session() {
+        // A parked run does not end: it keeps holding its provider session. A second
+        // attempt sent into that same session would be queued behind it instead of
+        // started, and a queued classify run is one nothing here can ever read.
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .expect("await results mutex")
+            .extend([
+                Err(HistorianProducerError::RunPaused {
+                    run_id: "run-parked".to_string(),
+                    reason: Some("awaiting re-auth".to_string()),
+                    classification: None,
+                    class_field_present: false,
+                }),
+                Ok(ProducerOutput {
+                    text: "<classify></classify>".to_string(),
+                    length_capped: false,
+                }),
+            ]);
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(route_root, "ses"));
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+        let generation = store
+            .authority_status("context", "git:identity", "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+
+        let outcome = handler
+            .handle_dreamer_run_task(
+                7,
+                &json!({
+                    "v": 1,
+                    "session_id": "ses",
+                    "task": CLASSIFY_TASK,
+                    "command_id": "parked-then-fallback",
+                    "authority_generation": generation,
+                    "model_chain": ["test/first", "test/second"],
+                    "payload": { "prompt_body": "classify", "items": [] },
+                }),
+            )
+            .await;
+        assert!(
+            matches!(outcome, HandlerOutcome::Response(_)),
+            "the fallback attempt must produce a manifest: {outcome:?}"
+        );
+
+        let sessions = producer.sessions.lock().expect("sessions mutex").clone();
+        assert_eq!(sessions.len(), 2, "{sessions:?}");
+        assert_ne!(
+            sessions[0], sessions[1],
+            "the fallback attempt reused the parked attempt's provider session"
+        );
+        assert!(sessions
+            .iter()
+            .all(|session| session.starts_with("mc-dreamer:classify:")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn classify_failure_names_every_attempt_not_only_the_last() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .expect("await results mutex")
+            .extend([
+                Err(HistorianProducerError::RunPaused {
+                    run_id: "run-parked".to_string(),
+                    reason: Some("awaiting re-auth".to_string()),
+                    classification: None,
+                    class_field_present: false,
+                }),
+                Err(HistorianProducerError::SendQueued {
+                    submission_id: "sub-1".to_string(),
+                    retracted: true,
+                }),
+            ]);
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(route_root, "ses"));
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+        let generation = store
+            .authority_status("context", "git:identity", "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+
+        let outcome = handler
+            .handle_dreamer_run_task(
+                7,
+                &json!({
+                    "v": 1,
+                    "session_id": "ses",
+                    "task": CLASSIFY_TASK,
+                    "command_id": "all-attempts-fail",
+                    "authority_generation": generation,
+                    "model_chain": ["test/first", "test/second"],
+                    "payload": { "prompt_body": "classify", "items": [] },
+                }),
+            )
+            .await;
+        let message = match outcome {
+            HandlerOutcome::Error { message, .. } => message,
+            other => panic!("expected a failed classify run: {other:?}"),
+        };
+        assert!(
+            message.contains("test/first") && message.contains("awaiting re-auth"),
+            "the first attempt's cause must survive: {message}"
+        );
+        assert!(
+            message.contains("test/second"),
+            "the later attempt must still be reported: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cancelled_dreamer_run_unregisters_its_child_session() {
         let producer = Arc::new(ProducerState::default());
         producer.block_output.store(true, Ordering::SeqCst);
@@ -27107,7 +29204,6 @@ mod tests {
             .unwrap()
             .unwrap()
             .generation;
-        let child_session = child_session_id("git:identity", "cancel-command");
         let handler = Arc::new(handler);
         let running_handler = Arc::clone(&handler);
         let task = tokio::spawn(async move {
@@ -27126,6 +29222,15 @@ mod tests {
                 .await
         });
         wait_for_count(&producer.await_outputs, 1).await;
+        // The session is minted per attempt, so read the one the producer actually ran
+        // under rather than recomputing an id this test would have to keep in step.
+        let child_session = producer
+            .sessions
+            .lock()
+            .expect("sessions mutex")
+            .first()
+            .cloned()
+            .expect("the classify attempt started under a session");
         assert!(handler.dreamer_run_registered(&child_session));
 
         task.abort();
@@ -27778,20 +29883,30 @@ mod tests {
             add_before,
             "additive writes must not append mutation-log rows"
         );
-        assert!(store
+        let new_memory = store
             .load_active_memories(additive_project_root, now_ms())
             .unwrap()
-            .iter()
-            .any(|memory| {
-                memory.content == "new additive memory"
-                    && store
-                        .get_memory_full(memory.id)
-                        .unwrap()
-                        .unwrap()
-                        .source_session_id
-                        .as_deref()
-                        == Some(additive_scope)
-            }));
+            .into_iter()
+            .find(|memory| memory.content == "new additive memory")
+            .expect("facade write stored the additive memory");
+        assert_eq!(
+            store
+                .get_memory_full(new_memory.id)
+                .unwrap()
+                .unwrap()
+                .source_session_id
+                .as_deref(),
+            Some(additive_scope)
+        );
+        store
+            .acknowledge_host_memory_ids(
+                additive_project_root,
+                &[HostMemoryIdentityAck {
+                    module_row_id: new_memory.id,
+                    host_row_id: new_memory.id,
+                }],
+            )
+            .unwrap();
         let add_delta = call_transform_request_on_channel(&handler, 9, add_req).await;
         assert_eq!(add_delta["action"], "SOFT");
         assert!(synthetic_text(&add_delta, 1).contains("<new-memories>"));
@@ -30673,9 +32788,14 @@ mod tests {
             .connect_failure_commit_hook
             .lock()
             .expect("connect failure commit hook mutex") = Some(Box::new(move || {
+            // Simulate a concurrent writer by advancing the row_version. The committed state
+            // must actually differ: a byte-identical commit leaves the row, and its version,
+            // untouched and would not create the conflict this test needs.
             let loaded = conflict_store.load("ses").unwrap();
+            let mut meta = loaded.meta.clone();
+            meta.tail_identity_re_adopt_count += 1;
             conflict_store
-                .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .commit("ses", loaded.row_version, &loaded.core, &meta)
                 .unwrap();
         }));
 
@@ -30730,9 +32850,13 @@ mod tests {
             .lock()
             .expect("connect failure commit hook mutex") = Some(Box::new(move || {
             if hook_calls_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Same as above: the conflicting commit has to change something, otherwise
+                // the row_version does not move and no conflict is produced.
                 let loaded = conflict_store.load("ses").unwrap();
+                let mut meta = loaded.meta.clone();
+                meta.tail_identity_re_adopt_count += 1;
                 conflict_store
-                    .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                    .commit("ses", loaded.row_version, &loaded.core, &meta)
                     .unwrap();
             }
         }));
@@ -34795,6 +36919,7 @@ mod tests {
                 history_budget_tokens: 60_000.0,
                 covered_system_messages: &[],
                 memory_enabled: true,
+                host_backed_memory_ids: false,
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: true,
@@ -35051,6 +37176,447 @@ mod tests {
         for property in ["message", "start", "end"] {
             assert_eq!(schema["properties"][property]["minimum"], json!(0));
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_expand_required_all_filler_matches_clean_call_for_every_mode() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, _store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+
+        let range_clean =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 1, "end": 3})).await);
+        let range_filler = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"start": 1, "end": 3, "message": 0, "verbose": false}),
+            )
+            .await,
+        );
+        assert_eq!(range_filler, range_clean);
+
+        let verbose_clean = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"start": 1, "end": 3, "verbose": true}),
+            )
+            .await,
+        );
+        let verbose_filler = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"start": 1, "end": 3, "verbose": true, "message": 0}),
+            )
+            .await,
+        );
+        assert_eq!(verbose_filler, verbose_clean);
+
+        let message_clean =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"message": 2})).await);
+        let message_filler = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"message": 2, "start": 0, "end": 0, "verbose": false}),
+            )
+            .await,
+        );
+        assert_eq!(message_filler, message_clean);
+
+        let zero_message_clean =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"message": 0})).await);
+        let zero_message_filler = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"message": 0, "start": 0, "end": 0, "verbose": false}),
+            )
+            .await,
+        );
+        assert_eq!(zero_message_filler, zero_message_clean);
+
+        let zero_range_clean =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 0, "end": 10})).await);
+        let zero_range_filler = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"start": 0, "end": 10, "message": 0, "verbose": false}),
+            )
+            .await,
+        );
+        assert_eq!(zero_range_filler, zero_range_clean);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_search_required_all_filler_matches_clean_call() {
+        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let project = project.to_str().unwrap();
+        handler.bind_route(7, binding(project, "token"));
+        insert_memory(
+            &store,
+            project,
+            "CONSTRAINTS",
+            "Needle alpha should appear",
+            10,
+        );
+        insert_memory(
+            &store,
+            project,
+            "CONSTRAINTS",
+            "Needle bravo should appear",
+            20,
+        );
+        insert_memory(
+            &store,
+            project,
+            "CONSTRAINTS",
+            "Needle charlie should appear",
+            30,
+        );
+
+        let clean =
+            tool_text(call_facade(&handler, "ctx_search", json!({"query": "Needle"})).await);
+        let filler = tool_text(
+            call_facade(
+                &handler,
+                "ctx_search",
+                json!({"query": "Needle", "sources": [], "limit": 0}),
+            )
+            .await,
+        );
+        assert_eq!(filler, clean);
+        assert!(clean.contains("Found 3 results"), "{clean}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_memory_required_all_filler_matches_clean_call_for_every_action() {
+        let setup = || {
+            let resolver =
+                FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+            handler_with_store_and_resolver(
+                Arc::new(ProducerState::default()),
+                default_test_config(),
+                resolver,
+            )
+        };
+        let filler_ids = |ids: Value| {
+            json!({
+                "ids": ids,
+                "id": 1,
+                "target_id": 1,
+                "source_ids": [1],
+                "memory_project": "",
+                "limit": 0,
+                "reason": ""
+            })
+        };
+        let mut mismatches = Vec::new();
+        let mut check = |action: &'static str, filler: &str, clean: &str| {
+            if filler != clean {
+                mismatches.push(action);
+            }
+        };
+
+        let (write_clean_handler, _store, _dir, _project) = setup();
+        let (write_filler_handler, _store, _dir, _project) = setup();
+        let write_clean = tool_text(
+            call_facade(
+                &write_clean_handler,
+                "ctx_memory",
+                json!({
+                    "action": "write",
+                    "category": "PROJECT_RULES",
+                    "content": "Same standalone fact."
+                }),
+            )
+            .await,
+        );
+        let mut write_filler = filler_ids(json!([0]));
+        write_filler["action"] = json!("write");
+        write_filler["category"] = json!("PROJECT_RULES");
+        write_filler["content"] = json!("Same standalone fact.");
+        let write_filler =
+            tool_text(call_facade(&write_filler_handler, "ctx_memory", write_filler).await);
+        check("write", &write_filler, &write_clean);
+        assert!(write_clean.contains("Saved memory"), "{write_clean}");
+
+        let (update_clean_handler, update_clean_store, _dir, update_clean_project) = setup();
+        let (update_filler_handler, update_filler_store, _dir, update_filler_project) = setup();
+        let update_clean_project = update_clean_project.to_str().unwrap();
+        let update_filler_project = update_filler_project.to_str().unwrap();
+        insert_memory(
+            &update_clean_store,
+            update_clean_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let update_clean_id = insert_memory(
+            &update_clean_store,
+            update_clean_project,
+            "ARCHITECTURE",
+            "Original fact.",
+            20,
+        );
+        insert_memory(
+            &update_filler_store,
+            update_filler_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let update_filler_id = insert_memory(
+            &update_filler_store,
+            update_filler_project,
+            "ARCHITECTURE",
+            "Original fact.",
+            20,
+        );
+        let update_clean = tool_text(
+            call_facade(
+                &update_clean_handler,
+                "ctx_memory",
+                json!({
+                    "action": "update",
+                    "ids": [update_clean_id],
+                    "content": "Updated fact."
+                }),
+            )
+            .await,
+        );
+        let mut update_filler = filler_ids(json!([update_filler_id]));
+        update_filler["action"] = json!("update");
+        update_filler["content"] = json!("Updated fact.");
+        update_filler["category"] = json!("");
+        let update_filler =
+            tool_text(call_facade(&update_filler_handler, "ctx_memory", update_filler).await);
+        check("update", &update_filler, &update_clean);
+
+        let (archive_clean_handler, archive_clean_store, _dir, archive_clean_project) = setup();
+        let (archive_filler_handler, archive_filler_store, _dir, archive_filler_project) = setup();
+        let archive_clean_project = archive_clean_project.to_str().unwrap();
+        let archive_filler_project = archive_filler_project.to_str().unwrap();
+        insert_memory(
+            &archive_clean_store,
+            archive_clean_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let archive_clean_id = insert_memory(
+            &archive_clean_store,
+            archive_clean_project,
+            "PROJECT_RULES",
+            "Archive this fact.",
+            20,
+        );
+        insert_memory(
+            &archive_filler_store,
+            archive_filler_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let archive_filler_id = insert_memory(
+            &archive_filler_store,
+            archive_filler_project,
+            "PROJECT_RULES",
+            "Archive this fact.",
+            20,
+        );
+        let archive_clean = tool_text(
+            call_facade(
+                &archive_clean_handler,
+                "ctx_memory",
+                json!({"action": "archive", "ids": [archive_clean_id]}),
+            )
+            .await,
+        );
+        let mut archive_filler = filler_ids(json!([archive_filler_id]));
+        archive_filler["action"] = json!("archive");
+        archive_filler["content"] = json!("");
+        archive_filler["category"] = json!("");
+        let archive_filler =
+            tool_text(call_facade(&archive_filler_handler, "ctx_memory", archive_filler).await);
+        check("archive", &archive_filler, &archive_clean);
+
+        let (merge_clean_handler, merge_clean_store, _dir, merge_clean_project) = setup();
+        let (merge_filler_handler, merge_filler_store, _dir, merge_filler_project) = setup();
+        let merge_clean_project = merge_clean_project.to_str().unwrap();
+        let merge_filler_project = merge_filler_project.to_str().unwrap();
+        insert_memory(
+            &merge_clean_store,
+            merge_clean_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let merge_clean_id_1 = insert_memory(
+            &merge_clean_store,
+            merge_clean_project,
+            "PROJECT_RULES",
+            "Merge source one.",
+            20,
+        );
+        let merge_clean_id_2 = insert_memory(
+            &merge_clean_store,
+            merge_clean_project,
+            "PROJECT_RULES",
+            "Merge source two.",
+            30,
+        );
+        insert_memory(
+            &merge_filler_store,
+            merge_filler_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let merge_filler_id_1 = insert_memory(
+            &merge_filler_store,
+            merge_filler_project,
+            "PROJECT_RULES",
+            "Merge source one.",
+            20,
+        );
+        let merge_filler_id_2 = insert_memory(
+            &merge_filler_store,
+            merge_filler_project,
+            "PROJECT_RULES",
+            "Merge source two.",
+            30,
+        );
+        let merge_clean = tool_text(
+            call_facade(
+                &merge_clean_handler,
+                "ctx_memory",
+                json!({
+                    "action": "merge",
+                    "ids": [merge_clean_id_1, merge_clean_id_2],
+                    "content": "Merged standalone fact.",
+                    "category": "ARCHITECTURE"
+                }),
+            )
+            .await,
+        );
+        let mut merge_filler = filler_ids(json!([merge_filler_id_1, merge_filler_id_2]));
+        merge_filler["action"] = json!("merge");
+        merge_filler["content"] = json!("Merged standalone fact.");
+        merge_filler["category"] = json!("ARCHITECTURE");
+        let merge_filler =
+            tool_text(call_facade(&merge_filler_handler, "ctx_memory", merge_filler).await);
+        check("merge", &merge_filler, &merge_clean);
+        check(
+            "merge-category",
+            if merge_clean.contains("in ARCHITECTURE") {
+                "present"
+            } else {
+                "missing"
+            },
+            "present",
+        );
+
+        let (get_handler, get_store, _dir, get_project) = setup();
+        let get_project = get_project.to_str().unwrap();
+        insert_memory(
+            &get_store,
+            get_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let get_id = insert_memory(
+            &get_store,
+            get_project,
+            "PROJECT_RULES",
+            "Get this fact.",
+            20,
+        );
+        let get_clean = tool_text(
+            call_facade(
+                &get_handler,
+                "ctx_memory",
+                json!({"action": "get", "ids": [get_id]}),
+            )
+            .await,
+        );
+        let mut get_filler = filler_ids(json!([get_id]));
+        get_filler["action"] = json!("get");
+        get_filler["content"] = json!("");
+        get_filler["category"] = json!("");
+        let get_filler = tool_text(call_facade(&get_handler, "ctx_memory", get_filler).await);
+        check("get", &get_filler, &get_clean);
+
+        let (list_handler, list_store, _dir, list_project) = setup();
+        let list_project = list_project.to_str().unwrap();
+        for (offset, label) in ["one", "two", "three"].into_iter().enumerate() {
+            insert_memory(
+                &list_store,
+                list_project,
+                "PROJECT_RULES",
+                &format!("List filler {label}."),
+                10 + i64::try_from(offset).unwrap(),
+            );
+        }
+        let list_clean =
+            tool_text(call_facade(&list_handler, "ctx_memory", json!({"action": "list"})).await);
+        let mut list_filler = filler_ids(json!([1]));
+        list_filler["action"] = json!("list");
+        list_filler["content"] = json!("");
+        list_filler["category"] = json!("");
+        let list_filler = tool_text(call_facade(&list_handler, "ctx_memory", list_filler).await);
+        check("list", &list_filler, &list_clean);
+
+        assert!(
+            mismatches.is_empty(),
+            "required-all output drifted for: {}",
+            mismatches.join(", ")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_empty_drop_filler_is_refused_without_queuing() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+
+        let omitted = tool_text(call_facade(&handler, "ctx_reduce", json!({})).await);
+        let empty = tool_text(call_facade(&handler, "ctx_reduce", json!({"drop": ""})).await);
+        assert_eq!(empty, omitted);
+        assert!(empty.contains("'drop' must be provided"), "{empty}");
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        let append = handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "",
+                "command_id": "empty-drop-cmd",
+            }),
+        );
+        let (code, message) = error_frame(append);
+        assert_eq!(code, "bad_request");
+        assert!(
+            message.contains("'drop' must be a nonempty string"),
+            "{message}"
+        );
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 }
 

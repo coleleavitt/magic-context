@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import {
 	mkdirSync,
 	mkdtempSync,
@@ -247,6 +248,136 @@ describe("Pi cache-bust analyzer meter", () => {
 		]);
 		expect(rows[2].rewrittenTokens).toBe(173524);
 	});
+	test("skips a zero-usage pass as a baseline and busts the next real short read", () => {
+		const pass = (sequence: number, timestamp: number, cacheRead: number, input: number) => ({
+			ledger: {
+				version: 1 as const,
+				session_id: "usage-missing-baseline",
+				pass_ts: new Date(timestamp).toISOString(),
+				sequence,
+				message_count: 2,
+				sha256: String(sequence),
+				previous_sha256: sequence === 0 ? null : String(sequence - 1),
+				first_divergence_message_index: 0,
+				block_vector_start: 0,
+				block_vectors: ["user:text(1)"],
+			},
+			usage: {
+				timestamp,
+				createdAt: new Date(timestamp).toISOString(),
+				line: sequence,
+				ordinal: sequence,
+				messageId: String(sequence),
+				input,
+				cacheRead,
+				cacheWrite: 0,
+				total: input + cacheRead,
+			},
+			intervening: [],
+		});
+		const rows = __test.analyzeJoinedPasses(
+			[pass(0, 0, 20_000, 100), pass(1, 1_000, 0, 0), pass(2, 2_000, 100, 100)],
+			{
+				decisions: [
+					{
+						timestampMs: 2_000,
+						decision: "defer",
+						materialized: false,
+						materializeReason: null,
+						emergency: false,
+						droppedTokens: 0,
+						droppedCount: 0,
+						inputTokens: 100,
+						flush: false,
+						source: "fixture",
+					},
+				],
+			},
+		);
+
+		expect(rows[1]?.verdict).toBe("UNMETERED");
+		expect(rows[1]?.divergenceClass).toBe("usage_missing");
+		expect(rows[2]?.prevTotal).toBe(20_100);
+		expect(rows[2]?.verdict).toBe("BUST");
+		expect(rows[2]?.divergenceClass).toBe("unaccounted_defer_pass");
+	});
+
+	test("classifies a zero cache read with a large prior meter as a provider full miss", () => {
+		const passes = [
+			{
+				ledger: {
+					version: 1 as const,
+					session_id: "provider-full-miss",
+					pass_ts: new Date(0).toISOString(),
+					sequence: 0,
+					message_count: 2,
+					sha256: "previous",
+					previous_sha256: null,
+					first_divergence_message_index: 0,
+					block_vector_start: 0,
+					block_vectors: ["user:text(1)"],
+				},
+				usage: {
+					timestamp: 0,
+					createdAt: new Date(0).toISOString(),
+					line: 0,
+					ordinal: 0,
+					messageId: "previous",
+					input: 100,
+					cacheRead: 20_000,
+					cacheWrite: 0,
+					total: 20_100,
+				},
+				intervening: [],
+			},
+			{
+				ledger: {
+					version: 1 as const,
+					session_id: "provider-full-miss",
+					pass_ts: new Date(1_000).toISOString(),
+					sequence: 1,
+					message_count: 2,
+					sha256: "current",
+					previous_sha256: "previous",
+					first_divergence_message_index: 0,
+					block_vector_start: 0,
+					block_vectors: ["user:text(2)"],
+				},
+				usage: {
+					timestamp: 1_000,
+					createdAt: new Date(1_000).toISOString(),
+					line: 1,
+					ordinal: 1,
+					messageId: "current",
+					input: 100,
+					cacheRead: 0,
+					cacheWrite: 0,
+					total: 100,
+				},
+				intervening: [],
+			},
+		];
+
+		const rows = __test.analyzeJoinedPasses(passes, {
+			decisions: [
+				{
+					timestampMs: 1_000,
+					decision: "defer",
+					materialized: false,
+					materializeReason: null,
+					emergency: false,
+					droppedTokens: 0,
+					droppedCount: 0,
+					inputTokens: 100,
+					flush: false,
+					source: "fixture",
+				},
+			],
+		});
+
+		expect(rows[1]?.divergenceClass).toBe("provider_full_miss");
+	});
+
 	test("detector control reports a known post-compaction collapse as BUST at the seam", () => {
 		const sessionRoot = temporaryDirectory("pi-cache-positive-session-");
 		const storageDir = temporaryDirectory("pi-cache-positive-ledger-");
@@ -352,5 +483,174 @@ describe("Pi cache-bust analyzer meter", () => {
 		expect(rows[1].comparableRead).toBe(10_470);
 		expect(rows[1].verdict).toBe("STABLE");
 		expect(rows[1].attribution).toBe("identical digest");
+	});
+});
+
+
+describe("Pi cache-bust analyzer context.db join and attribution", () => {
+	function setupBustFixture(options: {
+		sessionId: string;
+		decisionRow?: {
+			tsMs: number;
+			decision: string;
+			droppedCount: number;
+			droppedTokens?: number;
+			messageId?: string;
+		};
+		assistant2Id?: string;
+	}) {
+		const sessionRoot = temporaryDirectory("pi-cache-db-session-");
+		const storageDir = temporaryDirectory("pi-cache-db-ledger-");
+		const bodiesDir = join(
+			import.meta.dir,
+			"test-fixtures",
+			"cache-bust-bodies",
+			"pi-llm-debugging",
+		);
+		const sessionId = options.sessionId;
+		const a2Id = options.assistant2Id ?? "a2";
+
+		writeJsonl(sessionRoot, "--project--", "session.jsonl", [
+			{ type: "session", id: sessionId },
+			assistant("a1", "2026-09-04T10:00:00Z", {
+				input: 20,
+				cacheRead: 10_000,
+				cacheWrite: 0,
+			}),
+			assistant(a2Id, "2026-09-04T10:00:02Z", {
+				input: 20,
+				cacheRead: 100,
+				cacheWrite: 0,
+			}),
+		]);
+
+		capturePiServedArray(sessionId, [{ role: "user", content: "before" }], {
+			storageDir,
+			now: new Date("2026-09-04T09:59:59Z"),
+		});
+		capturePiServedArray(sessionId, [{ role: "user", content: "after" }], {
+			storageDir,
+			now: new Date("2026-09-04T10:00:01Z"),
+		});
+		flushPiServedArrayLedger();
+
+		const db = new Database(join(storageDir, "context.db"));
+		db.run(
+			"CREATE TABLE transform_decisions (session_id TEXT, harness TEXT, message_id TEXT, ts_ms INTEGER, decision TEXT, materialized INTEGER, materialize_reason TEXT, emergency INTEGER, dropped_tokens INTEGER, dropped_count INTEGER, input_tokens INTEGER)",
+		);
+		if (options.decisionRow) {
+			db.run(
+				"INSERT INTO transform_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				[
+					sessionId,
+					"pi",
+					options.decisionRow.messageId ?? a2Id,
+					options.decisionRow.tsMs,
+					options.decisionRow.decision,
+					0,
+					null,
+					0,
+					options.decisionRow.droppedTokens ?? 500,
+					options.decisionRow.droppedCount,
+					1_000,
+				],
+			);
+		}
+		db.close();
+
+		return { sessionRoot, storageDir, bodiesDir, sessionId };
+	}
+
+	test("attributes a bust request to the nearest-preceding MC pass row in context.db 1 s before request", () => {
+		const fixture = setupBustFixture({
+			sessionId: "pi-bust-1s-before",
+			decisionRow: {
+				tsMs: Date.parse("2026-09-04T10:00:01Z"), // 1s before 10:00:02Z request
+				decision: "execute",
+				droppedCount: 50,
+			},
+		});
+
+		const run = Bun.spawnSync([
+			process.execPath,
+			join(import.meta.dir, "analyze-pi-cache-busts.ts"),
+			"--session",
+			fixture.sessionId,
+			"--pi-dir",
+			fixture.sessionRoot,
+			"--ledger-dir",
+			fixture.storageDir,
+			"--bodies-dir",
+			fixture.bodiesDir,
+			"--all-rows",
+		]);
+
+		expect(run.exitCode).toBe(0);
+		const output = run.stdout.toString();
+		expect(output).toContain("accounted_drop_applied");
+		expect(output).not.toContain("no_mc_pass_row");
+	});
+
+	test("attributes to nearest-preceding pass even when Pi rows carry synthesized or detached message IDs", () => {
+		const fixture = setupBustFixture({
+			sessionId: "pi-bust-detached-id",
+			assistant2Id: "line-42", // synthesized / detached ID in JSONL
+			decisionRow: {
+				messageId: "turn-resolved-target", // different ID in transform_decisions
+				tsMs: Date.parse("2026-09-04T10:00:01Z"), // 1s before 10:00:02Z request
+				decision: "execute",
+				droppedCount: 16,
+			},
+		});
+
+		const run = Bun.spawnSync([
+			process.execPath,
+			join(import.meta.dir, "analyze-pi-cache-busts.ts"),
+			"--session",
+			fixture.sessionId,
+			"--pi-dir",
+			fixture.sessionRoot,
+			"--ledger-dir",
+			fixture.storageDir,
+			"--bodies-dir",
+			fixture.bodiesDir,
+			"--all-rows",
+		]);
+
+		expect(run.exitCode).toBe(0);
+		const output = run.stdout.toString();
+		expect(output).toContain("accounted_drop_applied");
+		expect(output).not.toContain("no_mc_pass_row");
+	});
+
+	test("negative: reports no_mc_pass_row when no MC pass exists within the request's pass window", () => {
+		// Decision row is 60 seconds before request (outside the 30s pass window)
+		const fixture = setupBustFixture({
+			sessionId: "pi-bust-outside-window",
+			decisionRow: {
+				tsMs: Date.parse("2026-09-04T09:59:00Z"), // 62s before request
+				decision: "execute",
+				droppedCount: 50,
+			},
+		});
+
+		const run = Bun.spawnSync([
+			process.execPath,
+			join(import.meta.dir, "analyze-pi-cache-busts.ts"),
+			"--session",
+			fixture.sessionId,
+			"--pi-dir",
+			fixture.sessionRoot,
+			"--ledger-dir",
+			fixture.storageDir,
+			"--bodies-dir",
+			fixture.bodiesDir,
+			"--all-rows",
+		]);
+
+		expect(run.exitCode).toBe(0);
+		const output = run.stdout.toString();
+		expect(output).toContain("no_mc_pass_row");
+		expect(output).not.toContain("accounted_drop_applied");
 	});
 });

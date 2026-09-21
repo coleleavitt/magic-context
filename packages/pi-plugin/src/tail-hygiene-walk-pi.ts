@@ -2,13 +2,17 @@ import type { TagEntry } from "@magic-context/core/features/magic-context/types"
 import { estimateImageTokensFromDataUrl } from "@magic-context/core/hooks/magic-context/image-token-estimate";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import {
+	compareMeasuredTailPrefix,
+	freezeTailHygieneMeasurement,
 	stripChannel1ReminderSpans,
 	type TailHygieneBaseline,
 	type TailHygieneMeasurement,
 	type TailHygienePartKind,
 	type TailHygienePartMeasurement,
+	type TailHygienePrefixMismatch,
 } from "@magic-context/core/hooks/magic-context/tail-hygiene-walk";
 import { PI_CTX_REDUCE_KEEP } from "./heuristic-cleanup-pi";
+import { isPiSystemEntry } from "./system-entry-pi";
 
 const TAG_PREFIX = /^§(\d+)§\s*/;
 const SYNTHETIC_TODO_PREFIX = "mc_synthetic_todo_";
@@ -16,7 +20,7 @@ const MAX_CONTENT_MEMO_ENTRIES = 100_000;
 const MAX_CONTENT_MEMO_BYTES = 64 * 1024 * 1024;
 const contentMemo = new Map<
 	string,
-	{ hash: string; tokens: number; keyBytes: number }
+	{ hash: string; tokens: number | undefined; keyBytes: number }
 >();
 let contentMemoBytes = 0;
 const FNV1A_32_OFFSET = 0x811c9dc5;
@@ -92,13 +96,13 @@ function safeStableStringify(value: unknown): string {
 function memoizedContent(
 	kind: TailHygienePartKind,
 	content: string,
-): { hash: string; tokens: number } {
+): { hash: string; tokens: number | undefined } {
 	const key = `${kind}\0${content}`;
 	const cached = contentMemo.get(key);
 	if (cached) return cached;
 	const measured = {
 		hash: fnv1a32(key),
-		tokens: kind === "excluded" ? 0 : estimateTokens(content),
+		tokens: kind === "excluded" ? 0 : undefined,
 		keyBytes: key.length * 2 + 32,
 	};
 	contentMemo.set(key, measured);
@@ -117,7 +121,11 @@ function memoizedContent(
 }
 
 function memoizedTokens(kind: TailHygienePartKind, content: string): number {
-	return memoizedContent(kind, content).tokens;
+	const measured = memoizedContent(kind, content);
+	if (measured.tokens === undefined) {
+		measured.tokens = estimateTokens(content);
+	}
+	return measured.tokens;
 }
 
 function partHash(kind: TailHygienePartKind, content: string): string {
@@ -175,7 +183,11 @@ function isSyntheticMessage(
 	if (input.syntheticMessages?.has(message)) return true;
 	if (message.syntheticTodoMarker === true) return true;
 	const role = typeof message.role === "string" ? message.role : "";
-	return role === "system" || role === "custom" || role === "compactionSummary";
+	return (
+		isPiSystemEntry(message) ||
+		role === "custom" ||
+		role === "compactionSummary"
+	);
 }
 
 /**
@@ -437,6 +449,7 @@ function finalizeParts(
 	drafts: readonly DraftPart[],
 	pendingDropTagNumbers: ReadonlySet<number>,
 	protectedTagNumbers: ReadonlySet<number>,
+	newestMessagePartStart: number,
 ): TailHygieneMeasurement {
 	const visibleTags = new Map<number, TagEntry>();
 	for (const part of drafts) {
@@ -490,6 +503,10 @@ function finalizeParts(
 			parts.map((part) => `${part.key}:${part.contentHash}`).join("\0"),
 		),
 		parts,
+		newestMessagePartStart: Math.min(
+			Math.max(0, newestMessagePartStart),
+			parts.length,
+		),
 	};
 }
 
@@ -499,6 +516,7 @@ export function measurePiTailHygiene(
 	const { arcs, arcByPart, messageIds } = collectToolArcs(input);
 	const { messageTags, tagsByNumber } = attributeTags(input, arcs, messageIds);
 	const drafts: DraftPart[] = [];
+	let newestMessagePartStart = 0;
 
 	for (
 		let messageIndex = 0;
@@ -506,6 +524,8 @@ export function measurePiTailHygiene(
 		messageIndex += 1
 	) {
 		const raw = input.messages[messageIndex];
+		if (messageIndex === input.messages.length - 1)
+			newestMessagePartStart = drafts.length;
 		const messageKey = messageIds[messageIndex] ?? `pi-message:${messageIndex}`;
 		if (!isRecord(raw)) {
 			drafts.push(excludedDraft(`${messageKey}\0excluded`, raw));
@@ -649,45 +669,8 @@ export function measurePiTailHygiene(
 		drafts,
 		input.pendingDropTagNumbers ?? new Set<number>(),
 		input.protectedTagNumbers,
+		newestMessagePartStart,
 	);
-}
-
-function sameMeasuredPrefix(
-	baseline: readonly TailHygienePartMeasurement[],
-	current: readonly TailHygienePartMeasurement[],
-): { valid: boolean; boundaryAdvanceU: number; queuedDropDeltaU: number } {
-	if (current.length < baseline.length)
-		return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
-	let boundaryAdvanceU = 0;
-	let queuedDropDeltaU = 0;
-	for (let index = 0; index < baseline.length; index += 1) {
-		const before = baseline[index];
-		const after = current[index];
-		if (
-			before.key !== after.key ||
-			before.contentHash !== after.contentHash ||
-			before.kind !== after.kind ||
-			before.tokens !== after.tokens ||
-			before.tagNumber !== after.tagNumber ||
-			before.tagStatus !== after.tagStatus
-		) {
-			return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
-		}
-		if (!before.protected && after.protected)
-			return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
-		if (before.protected && !after.protected) {
-			if (after.tagStatus !== "active")
-				return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
-			boundaryAdvanceU += after.uTokens;
-		} else if (before.queuedForDrop !== after.queuedForDrop) {
-			if (before.tagStatus !== "active" || after.tagStatus !== "active")
-				return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
-			queuedDropDeltaU += after.uTokens - before.uTokens;
-		} else if (before.uTokens !== after.uTokens) {
-			return { valid: false, boundaryAdvanceU: 0, queuedDropDeltaU: 0 };
-		}
-	}
-	return { valid: true, boundaryAdvanceU, queuedDropDeltaU };
 }
 
 export function refreshPiTailHygieneBaseline(
@@ -699,37 +682,29 @@ export function refreshPiTailHygieneBaseline(
 ): TailHygieneBaseline {
 	const measured = measurePiTailHygiene(input);
 	const now = input.now ?? Date.now();
-	if (!input.cacheBusting && input.previous?.generationInvalidated) {
-		return { ...input.previous, contentSignature: measured.contentSignature };
-	}
-	if (input.cacheBusting || !input.previous) {
-		return {
-			baselineU: measured.u,
-			baselineT: measured.t,
-			turnDeltaU: 0,
-			turnDeltaT: 0,
-			baselineGeneration: (input.previous?.baselineGeneration ?? 0) + 1,
-			computedAt: now,
-			evaluable: true,
-			generationInvalidated: false,
-			baselineParts: measured.parts,
-			contentSignature: measured.contentSignature,
-			channel1PostReduceGrace: input.previous?.channel1PostReduceGrace,
-		};
-	}
+	const refrozen = (
+		mismatch?: TailHygienePrefixMismatch,
+	): TailHygieneBaseline => ({
+		...freezeTailHygieneMeasurement(measured),
+		baselineGeneration: (input.previous?.baselineGeneration ?? 0) + 1,
+		computedAt: now,
+		evaluable: true,
+		generationInvalidated: false,
+		contentSignature: measured.contentSignature,
+		channel1PostReduceGrace: input.previous?.channel1PostReduceGrace,
+		lastPrefixMismatch: mismatch,
+	});
+	if (input.cacheBusting || !input.previous) return refrozen();
 
-	const prefix = sameMeasuredPrefix(
+	const prefix = compareMeasuredTailPrefix(
 		input.previous.baselineParts,
 		measured.parts,
 	);
-	if (!prefix.valid) {
-		return {
-			...input.previous,
-			evaluable: false,
-			generationInvalidated: true,
-			contentSignature: measured.contentSignature,
-		};
-	}
+	// A defer pass cannot attribute this change to an append, and this walk measures
+	// the rendered tail rather than producing wire bytes, so re-measure instead of
+	// holding the stale baseline until the next cache-busting pass. Holding left the
+	// reclaim reminders unevaluable for as long as the session went without a bust.
+	if (!prefix.valid) return refrozen(prefix.mismatch);
 	let turnDeltaT = 0;
 	// Queue membership is an action-state delta: it reduces the actionable token
 	// backlog while the frozen baseline and still-rendered token total remain unchanged.
@@ -741,7 +716,10 @@ export function refreshPiTailHygieneBaseline(
 	) {
 		const part = measured.parts[index];
 		turnDeltaT += part.tokens;
-		if (part.kind !== "toolOutput") turnDeltaU += part.uTokens;
+		// Tool-output tokens are not reclaimable while their parts are protected. As new
+		// outputs extend the measured tail, include outputs that have aged out of protection.
+		if (part.kind !== "toolOutput" || !part.protected)
+			turnDeltaU += part.uTokens;
 	}
 	return {
 		...input.previous,
@@ -750,6 +728,7 @@ export function refreshPiTailHygieneBaseline(
 		evaluable: true,
 		generationInvalidated: false,
 		contentSignature: measured.contentSignature,
+		lastPrefixMismatch: undefined,
 	};
 }
 

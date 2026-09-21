@@ -8,6 +8,8 @@
  * concurrently while memory-mutating tasks serialize. See lease.ts + the A+B spec.
  */
 
+import type { CurateMemoryCategory } from "./curate-category-rotation";
+
 export const CANONICAL_DREAM_TASKS = [
     // map-memories runs BEFORE verify (it records the file mappings verify gates
     // on) and shares the memory lease, so it leads the canonical order.
@@ -27,12 +29,110 @@ export const CANONICAL_DREAM_TASKS = [
 
 export type DreamTaskName = (typeof CANONICAL_DREAM_TASKS)[number];
 
+/**
+ * How a Dreamer task reaches its result, which is what decides whether a host
+ * without a tool loop can run it:
+ *  - "tool-loop": the task drives an agent that must call tools between model
+ *    turns (reading files, searching, writing memories through `ctx_memory`).
+ *  - "single-shot": one or more no-tool completions whose entire answer is the
+ *    returned text. Any transport that can deliver a prompt and return text runs
+ *    these, including a hidden completion carrier.
+ *  - "host-only": no model call at all. The task is database work done in this
+ *    process, so it needs no completion transport whatsoever.
+ */
+export type DreamTaskTransport = "tool-loop" | "single-shot" | "host-only";
+
+export interface DreamTaskCapability {
+    /** True only when the task cannot finish without a tool loop. */
+    requiresTools: boolean;
+    transport: DreamTaskTransport;
+    /**
+     * What the tool loop is needed FOR, as one clause a user can read. Present
+     * only on tool-loop tasks, where it becomes the named per-task reason shown
+     * when a host refuses the task instead of a single anonymous "filtered" list.
+     */
+    toolLoopPurpose?: string;
+}
+
+export const DREAM_TASK_CAPABILITIES: Record<DreamTaskName, DreamTaskCapability> = {
+    // A single manifest is not a tool-free task: mapping and verification need
+    // read-only tools to inspect backing code before they can change memory state.
+    "map-memories": {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs read-only file tools to locate the code each memory describes",
+    },
+    verify: {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs read-only file tools to re-check each memory against the code",
+    },
+    "verify-broad": {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs read-only file tools to re-check each memory against the code",
+    },
+    curate: {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs the ctx_memory tool to apply its merge and archive decisions",
+    },
+    // mural/compress-cues.ts is a zero-tool transform; its child transport
+    // still needs substitution before the generate executor can dispatch it.
+    "compress-cues": { requiresTools: false, transport: "single-shot" },
+    "classify-memories": { requiresTools: false, transport: "single-shot" },
+    retrospective: {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs search tools to investigate the friction it finds in past sessions",
+    },
+    "maintain-docs": {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs file read and write tools to update project documentation",
+    },
+    // The evaluator is a no-tool compiler plus a no-tool confirmation prompt; the
+    // generated check runs in the local capability sandbox, never as model tools.
+    "evaluate-smart-notes": { requiresTools: false, transport: "single-shot" },
+    // The reviewer reads candidate text and answers with JSON; the host applies it.
+    "review-user-memories": { requiresTools: false, transport: "single-shot" },
+    // Promotion clusters existing candidates and writes rows. It calls no model.
+    "promote-primers": { requiresTools: false, transport: "host-only" },
+    "refresh-primers": {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs read-only investigation tools to answer each standing question",
+    },
+};
+
+/** Tasks a host without a tool loop cannot run, in canonical order. */
+export function toolLoopDreamTasks(): DreamTaskName[] {
+    return CANONICAL_DREAM_TASKS.filter((task) => DREAM_TASK_CAPABILITIES[task].requiresTools);
+}
+
+/**
+ * One line per refused task, naming the task, the stable code and what the tool
+ * loop is needed for. A user reading /ctx-dream or /ctx-status output should be
+ * able to tell which specific task is unavailable and why, rather than seeing a
+ * single anonymous "unsupported" list.
+ */
+export function formatUnsupportedDreamTasks(tasks: readonly DreamTaskName[], code: string): string {
+    return tasks
+        .map((task) => {
+            const purpose = DREAM_TASK_CAPABILITIES[task].toolLoopPurpose;
+            return `- ${task}: unavailable on this host (${code})${purpose ? ` — ${purpose}` : ""}`;
+        })
+        .join("\n");
+}
+
 /** Cheap, read-only work counts for one Dreamer task. */
 export interface DreamTaskBacklog {
     /** Items selected by the task's current backlog predicate. */
     pending: number;
     /** Total items in the task's candidate pool. */
     total: number;
+    /** Curate's one-category scope for this run/window. */
+    category?: CurateMemoryCategory;
 }
 
 /** Backlog counts keyed by canonical task name. */
@@ -47,7 +147,57 @@ export function formatDreamTaskBacklogs(
         .filter((task) => backlogs[task] !== undefined)
         .map((task) => {
             const backlog = backlogs[task];
+            if (task === "curate" && backlog?.category) {
+                return `- curate: ${backlog.category} (${backlog.pending})`;
+            }
             return `- ${task}: ${backlog?.pending ?? 0} pending / ${backlog?.total ?? 0} total`;
+        })
+        .join("\n");
+}
+
+/** One dreamer task whose last scheduled run failed. */
+export interface DreamTaskFailureState {
+    task: string;
+    /** The scheduler's recorded failure text. */
+    error: string;
+    /** Epoch ms of the last run that SUCCEEDED, or null if none ever has. A failed run
+     *  never advances `last_run_at`, so this says how long the task has been stuck, not
+     *  when it last failed — the scheduler keeps no failure timestamp. */
+    lastSucceededAt: number | null;
+    /** Consecutive retries queued so far; reset once the retry cap pushes the task to
+     *  its next cron slot, so a long-running failure oscillates rather than climbs. */
+    retryCount: number;
+}
+
+/** How much of a scheduler failure message a status line carries before eliding. */
+const FAILURE_TEXT_BUDGET = 180;
+
+function sinceLabel(lastSucceededAt: number | null, now: number): string {
+    if (lastSucceededAt === null || lastSucceededAt <= 0) return "never succeeded";
+    const hours = Math.max(0, Math.floor((now - lastSucceededAt) / 3_600_000));
+    if (hours < 1) return "last succeeded under an hour ago";
+    if (hours < 48) return `last succeeded ${hours}h ago`;
+    return `last succeeded ${Math.floor(hours / 24)}d ago`;
+}
+
+/**
+ * One line per failing task, shared by the status surfaces.
+ *
+ * The elapsed time is measured from the last SUCCESS, not the last failure: a failed
+ * run deliberately does not advance `last_run_at`, so that is the only timestamp the
+ * scheduler keeps and "stuck since" is what a reader needs anyway.
+ */
+export function formatDreamTaskFailures(
+    failures: readonly DreamTaskFailureState[],
+    now: number = Date.now(),
+): string {
+    return failures
+        .map((failure) => {
+            const error =
+                failure.error.length > FAILURE_TEXT_BUDGET
+                    ? `${failure.error.slice(0, FAILURE_TEXT_BUDGET)}…`
+                    : failure.error;
+            return `- ${failure.task}: failing (${sinceLabel(failure.lastSucceededAt, now)}) — ${error}`;
         })
         .join("\n");
 }
@@ -58,6 +208,8 @@ export interface DreamTaskProgress {
     processed: number;
     total: number;
     startedAt: number;
+    /** Curate's one-category scope. */
+    category?: CurateMemoryCategory;
     /** Update/archive verdicts refused by host-side verification safety gates during the current run. */
     refused?: number;
 }
@@ -69,6 +221,7 @@ export interface DreamTaskRunBacklog {
     pendingAtEnd: number;
     totalAtEnd: number;
     processed: number;
+    category?: CurateMemoryCategory;
 }
 
 /** Use the decrease in the persisted backlog between the start and end snapshots as the per-run progress count, clamped to zero when the backlog does not decrease. */

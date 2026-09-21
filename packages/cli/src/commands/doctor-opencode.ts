@@ -11,6 +11,10 @@ import {
     stripRemovedAgentConfig,
 } from "@magic-context/core/config/removed-agent-config";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
+import {
+    formatDreamerTickFailure,
+    getDreamerTickFailure,
+} from "@magic-context/core/features/magic-context/dreamer/tick-failure";
 import type { LocalEmbeddingRuntime } from "@magic-context/core/features/magic-context/memory/embedding-local";
 import {
     type EmbeddingProbeOutcome,
@@ -27,6 +31,11 @@ import {
     listShadowBackfillStalls,
 } from "@magic-context/core/features/magic-context/shadow-backfill-state";
 import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
+import {
+    AUTO_UPDATE_CHECK_STATE_FILENAME,
+    isUpdaterPinnedSpec,
+    readAutoUpdateCheckState,
+} from "@magic-context/core/shared/auto-update-provenance";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
 import {
@@ -38,8 +47,10 @@ import {
     formatOpenCodeDbDoctorLine,
     type OpenCodeDbPathResolution,
     openCodeDbPathExists,
+    openCodeHostGenerationFromVersion,
     resolveOpenCodeDbPath,
 } from "@magic-context/core/shared/opencode-db-path";
+import { Database } from "@magic-context/core/shared/sqlite";
 import { ensureTuiPluginEntry } from "@magic-context/core/shared/tui-config";
 import { parse, stringify } from "comment-json";
 import {
@@ -78,6 +89,7 @@ import {
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION as PLUGIN_ENTRY_WITH_VERSION,
     OPENCODE_PLUGIN_NAME as PLUGIN_NAME,
 } from "../lib/opencode-plugin-cache";
+import { pluginConfigKeyFor, readPluginEntries } from "../lib/opencode-plugin-registration";
 import { inspectPinnedOpenCodePluginSchemaFences } from "../lib/opencode-plugin-schema-fence";
 import { detectConfigPaths } from "../lib/paths";
 import { confirm, intro, log, outro, selectOne, spinner, text } from "../lib/prompts";
@@ -93,7 +105,19 @@ import {
 } from "../lib/storage-versions";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
 import { reportAuthorityMarkers } from "./doctor-authority";
+import {
+    formatDanglingCompartmentBoundary,
+    listDanglingCompartmentBoundaries,
+} from "./doctor-compartment-boundaries";
+import { reportUnresolvedHarnessRelabel } from "./doctor-harness-relabel";
 import { clearPluginCache } from "./doctor-opencode-cache";
+import {
+    countPendingCoordinateRebases,
+    formatPendingCoordinateRebases,
+    formatUnresolvedCompartmentSession,
+    listUnresolvedCompartments,
+    supportsCoordinateGenerationReporting,
+} from "./doctor-store-generation";
 
 const CLI_PACKAGE_NAME = "@cortexkit/magic-context";
 
@@ -251,6 +275,17 @@ function getSelfVersion(): string {
 export function isPinnedOpenCodePluginSpecifier(specifier: string): boolean {
     if (specifier === PLUGIN_NAME || specifier === PLUGIN_ENTRY_WITH_VERSION) return false;
     return specifier.startsWith(`${PLUGIN_NAME}@`);
+}
+
+export function describeAutoUpdateStall(
+    specifier: string,
+    autoUpdateEnabled: boolean,
+    storageDir = getMagicContextStorageDir(),
+): string | null {
+    if (!autoUpdateEnabled || !isPinnedOpenCodePluginSpecifier(specifier)) return null;
+    const state = readAutoUpdateCheckState(join(storageDir, AUTO_UPDATE_CHECK_STATE_FILENAME));
+    const owner = isUpdaterPinnedSpec(state, specifier) ? "updater" : "you";
+    return `auto-update: stalled — config pinned to ${specifier} (by ${owner})`;
 }
 
 export function getUserNpmrcPath(): string {
@@ -752,6 +787,9 @@ export async function runDoctor(
         authorityDb = openExistingContextDatabase(authorityDbPath, { readonly: true });
         if (authorityDb) {
             await reportAuthorityMarkers({ db: authorityDb, info: log.info, warn });
+            // Sessions whose OpenCode harness label the v87 repair could not verify
+            // because no OpenCode store was readable when it ran.
+            reportUnresolvedHarnessRelabel({ db: authorityDb, warn, detail: log.warn });
         } else {
             log.info("Authority: no context database found");
         }
@@ -800,9 +838,86 @@ export async function runDoctor(
         );
     }
 
-    const openCodeDbCheck = describeOpenCodeDatabaseDoctorCheck(resolveOpenCodeDbPath());
+    const hostGeneration = openCodeHostGenerationFromVersion(activeInstallation.version);
+    const openCodeDbResolution = resolveOpenCodeDbPath(hostGeneration);
+    const openCodeDbCheck = describeOpenCodeDatabaseDoctorCheck(openCodeDbResolution);
     if (openCodeDbCheck.ok) pass(openCodeDbCheck.message);
     else fail(openCodeDbCheck.message);
+
+    if (openCodeDbCheck.ok) {
+        let contextDb: ReturnType<typeof openExistingContextDatabase> = null;
+        let sessionDb: Database | null = null;
+        try {
+            contextDb = openExistingContextDatabase(authorityDbPath, { readonly: true });
+            if (contextDb) {
+                sessionDb = new Database(openCodeDbResolution.path, {
+                    readonly: true,
+                    fileMustExist: true,
+                });
+                // Only a parsed version identifies the host; Desktop installs report
+                // "unknown" (which maps to v1), so leave those to store detection.
+                const dangling = listDanglingCompartmentBoundaries(
+                    contextDb,
+                    sessionDb,
+                    /\d/.test(activeInstallation.version) ? hostGeneration : undefined,
+                    (line) => log.info(line),
+                );
+                if (dangling.length === 0) {
+                    pass("Compartment boundary ids resolve in the OpenCode session store");
+                } else {
+                    warn(`${dangling.length} compartment(s) have dangling OpenCode boundary ids`);
+                    for (const boundary of dangling) {
+                        log.warn(`  ${formatDanglingCompartmentBoundary(boundary)}`);
+                    }
+                }
+
+                // Read-only view of the store-projection rebase: what the next
+                // open would re-anchor, and what an earlier open could not.
+                // Doctor never rebases; the plugin owns that on its own pass.
+                if (!supportsCoordinateGenerationReporting(contextDb)) {
+                    log.info(
+                        "Store projection check: this context database predates the coordinate columns",
+                    );
+                } else if (!/\d/.test(activeInstallation.version)) {
+                    log.info(
+                        "Store projection check: OpenCode reported no version, so the running projection is unknown",
+                    );
+                } else {
+                    const pendingRebases = countPendingCoordinateRebases(contextDb, hostGeneration);
+                    const pendingLine = formatPendingCoordinateRebases(
+                        pendingRebases,
+                        hostGeneration,
+                    );
+                    if (pendingRebases.changed + pendingRebases.unrecorded === 0) {
+                        pass(pendingLine);
+                    } else {
+                        log.info(pendingLine);
+                    }
+
+                    const unresolved = listUnresolvedCompartments(contextDb);
+                    if (unresolved.total === 0) {
+                        pass("No compartment is excluded from range recovery by a store change");
+                    } else {
+                        warn(
+                            `${unresolved.total} compartment(s) across ${unresolved.sessions} session(s) could not be re-anchored and are excluded from range recovery`,
+                        );
+                        for (const session of unresolved.top) {
+                            log.warn(`  ${formatUnresolvedCompartmentSession(session)}`);
+                        }
+                    }
+                }
+            } else {
+                log.info("Compartment boundary check: no context database found");
+            }
+        } catch (error) {
+            warn(
+                `Compartment boundary check unavailable: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        } finally {
+            sessionDb?.close();
+            contextDb?.close();
+        }
+    }
 
     // 1b. CLI vs npm latest
     const selfVersion = getSelfVersion();
@@ -828,6 +943,7 @@ export async function runDoctor(
     }
 
     // 3. Check magic-context.jsonc exists + parses + loads through schema
+    let autoUpdateEnabled = true;
     if (existsSync(paths.magicContextConfig)) {
         pass(`Magic Context config: ${paths.magicContextConfig}`);
         // 3a. Validate JSONC parses (with config-variable substitution)
@@ -858,6 +974,7 @@ export async function runDoctor(
         // load and report them without bailing on the doctor run.
         try {
             const result = loadPluginConfig(process.cwd());
+            autoUpdateEnabled = result.auto_update !== false;
             const warnings = result.configWarnings ?? [];
             if (warnings.length > 0) {
                 warn(
@@ -1099,6 +1216,13 @@ export async function runDoctor(
     }
 
     // 4. Check plugin is in opencode.json
+    const reportedAutoUpdateStalls = new Set<string>();
+    const reportAutoUpdateStall = (specifier: string): void => {
+        const message = describeAutoUpdateStall(specifier, autoUpdateEnabled);
+        if (!message || reportedAutoUpdateStalls.has(message)) return;
+        reportedAutoUpdateStalls.add(message);
+        warn(message);
+    };
     if (paths.opencodeConfigFormat !== "none") {
         try {
             const raw = readFileSync(paths.opencodeConfig, "utf-8");
@@ -1111,13 +1235,25 @@ export async function runDoctor(
             // tuples (or stripping options) would silently drop user config.
             // matchesPluginEntry / isDevPathPluginEntry are imported from
             // ../adapters/opencode and accept both strings and tuples.
-            const rawPlugins: unknown[] = Array.isArray(config?.plugin) ? config.plugin : [];
-            const existingIdx = rawPlugins.findIndex(
-                (entry) => matchesPluginEntry(entry, PLUGIN_NAME) || isDevPathPluginEntry(entry),
+            // OpenCode 2 loads the legacy `plugin` array and its native `plugins`
+            // array together, so an entry under either key is a live registration
+            // and a fresh entry must go under the running host's own key.
+            const registrationKey = pluginConfigKeyFor(hostGeneration);
+            const allEntries = readPluginEntries(config);
+            const found = allEntries.find(
+                ({ entry }) =>
+                    matchesPluginEntry(entry, PLUGIN_NAME) || isDevPathPluginEntry(entry),
             );
+            // The array doctor edits: the one holding the existing entry, else the
+            // host generation's own key for a fresh registration.
+            const targetKey = found?.key ?? registrationKey;
+            const rawPlugins: unknown[] = Array.isArray(config?.[targetKey])
+                ? (config[targetKey] as unknown[])
+                : [];
+            const existingIdx = found ? found.index : -1;
             if (
-                rawPlugins.some(
-                    (entry) =>
+                allEntries.some(
+                    ({ entry }) =>
                         isLocalPathPluginEntry(entry) &&
                         String(entry).includes("magic-context") &&
                         !isDevPathPluginEntry(entry),
@@ -1158,7 +1294,8 @@ export async function runDoctor(
                     const isPinned = isPinnedOpenCodePluginSpecifier(oldEntryStr);
 
                     if (isPinned && !options.force) {
-                        // Warn but don't change — user intentionally pinned
+                        reportAutoUpdateStall(oldEntryStr);
+                        // Without --force, doctor reports pin ownership but leaves the config unchanged.
                         warn(
                             `Plugin pinned to ${oldEntryStr} in ${configName} — use 'doctor --force' to upgrade`,
                         );
@@ -1174,7 +1311,7 @@ export async function runDoctor(
                         } else {
                             rawPlugins[existingIdx] = PLUGIN_ENTRY_WITH_VERSION;
                         }
-                        config.plugin = rawPlugins;
+                        config[targetKey] = rawPlugins;
                         writeFileAtomic(paths.opencodeConfig, `${stringify(config, null, 2)}\n`);
                         pass(
                             `Upgraded plugin entry in ${configName}: ${oldEntryStr} → ${PLUGIN_ENTRY_WITH_VERSION}`,
@@ -1186,7 +1323,7 @@ export async function runDoctor(
                 // Auto-add plugin entry — preserves comments AND every existing
                 // tuple/options entry the user already had.
                 rawPlugins.push(PLUGIN_ENTRY_WITH_VERSION);
-                config.plugin = rawPlugins;
+                config[targetKey] = rawPlugins;
                 writeFileAtomic(paths.opencodeConfig, `${stringify(config, null, 2)}\n`);
                 pass(`Added plugin to ${configName}`);
                 fixed++;
@@ -1250,79 +1387,89 @@ export async function runDoctor(
         }
     }
 
-    // 6. Check tui.json
-    const tuiAdded = ensureTuiPluginEntry();
-    if (tuiAdded) {
-        pass("Added TUI sidebar plugin to tui.json");
-        warn("Restart OpenCode to see the sidebar");
-        fixed++;
-    } else if (existsSync(paths.tuiConfig)) {
-        // Check for pinned version in tui config. Same tuple/dev-path rules
-        // as the main opencode config — preserve every entry shape on write.
-        try {
-            const tuiRaw = readFileSync(paths.tuiConfig, "utf-8");
-            const tuiConfig = parse(tuiRaw) as Record<string, unknown>;
-            const tuiRawPlugins: unknown[] = Array.isArray(tuiConfig?.plugin)
-                ? tuiConfig.plugin
-                : [];
-            const tuiIdx = tuiRawPlugins.findIndex(
-                (entry) => matchesPluginEntry(entry, PLUGIN_NAME) || isDevPathPluginEntry(entry),
-            );
-            if (
-                tuiRawPlugins.some(
+    // 6. Check tui.json. OpenCode 2 loads the sidebar from the plugin entry itself
+    // (its host resolves a `tui` entrypoint next to `server`), so tui.json is a
+    // 1.x-only surface and writing it on a 2.x host would register nothing.
+    if (hostGeneration === "v2") {
+        pass("TUI sidebar loads from the plugin entry on OpenCode 2 (tui.json not used)");
+    } else {
+        const tuiAdded = ensureTuiPluginEntry();
+        if (tuiAdded) {
+            pass("Added TUI sidebar plugin to tui.json");
+            warn("Restart OpenCode to see the sidebar");
+            fixed++;
+        } else if (existsSync(paths.tuiConfig)) {
+            // Check for pinned version in tui config. Same tuple/dev-path rules
+            // as the main opencode config — preserve every entry shape on write.
+            try {
+                const tuiRaw = readFileSync(paths.tuiConfig, "utf-8");
+                const tuiConfig = parse(tuiRaw) as Record<string, unknown>;
+                const tuiRawPlugins: unknown[] = Array.isArray(tuiConfig?.plugin)
+                    ? tuiConfig.plugin
+                    : [];
+                const tuiIdx = tuiRawPlugins.findIndex(
                     (entry) =>
-                        isLocalPathPluginEntry(entry) &&
-                        String(entry).includes("magic-context") &&
-                        !isDevPathPluginEntry(entry),
-                )
-            ) {
-                warn(
-                    "An unverifiable local TUI plugin path was ignored because its package name is not Magic Context",
+                        matchesPluginEntry(entry, PLUGIN_NAME) || isDevPathPluginEntry(entry),
+                );
+                if (
+                    tuiRawPlugins.some(
+                        (entry) =>
+                            isLocalPathPluginEntry(entry) &&
+                            String(entry).includes("magic-context") &&
+                            !isDevPathPluginEntry(entry),
+                    )
+                ) {
+                    warn(
+                        "An unverifiable local TUI plugin path was ignored because its package name is not Magic Context",
+                    );
+                }
+                const tuiEntryAsString = (entry: unknown): string => {
+                    if (typeof entry === "string") return entry;
+                    if (Array.isArray(entry) && typeof entry[0] === "string") return entry[0];
+                    return "";
+                };
+                if (tuiIdx >= 0) {
+                    const tuiEntry = tuiRawPlugins[tuiIdx];
+                    const tuiEntryStr = tuiEntryAsString(tuiEntry);
+                    if (isDevPathPluginEntry(tuiEntry)) {
+                        pass(`TUI sidebar plugin configured (dev path: ${tuiEntryStr})`);
+                    } else {
+                        const tuiPinned = isPinnedOpenCodePluginSpecifier(tuiEntryStr);
+                        if (tuiPinned && !options.force) {
+                            reportAutoUpdateStall(tuiEntryStr);
+                            warn(
+                                `TUI plugin pinned to ${tuiEntryStr} — use 'doctor --force' to upgrade`,
+                            );
+                        } else if (tuiPinned && options.force) {
+                            // Preserve tuple options when upgrading.
+                            if (Array.isArray(tuiEntry) && tuiEntry.length >= 1) {
+                                const replacement = [...tuiEntry];
+                                replacement[0] = PLUGIN_ENTRY_WITH_VERSION;
+                                tuiRawPlugins[tuiIdx] = replacement;
+                            } else {
+                                tuiRawPlugins[tuiIdx] = PLUGIN_ENTRY_WITH_VERSION;
+                            }
+                            tuiConfig.plugin = tuiRawPlugins;
+                            writeFileAtomic(paths.tuiConfig, `${stringify(tuiConfig, null, 2)}\n`);
+                            pass(
+                                `Upgraded TUI plugin: ${tuiEntryStr} → ${PLUGIN_ENTRY_WITH_VERSION}`,
+                            );
+                            fixed++;
+                        } else {
+                            pass("TUI sidebar plugin configured");
+                        }
+                    }
+                } else {
+                    fail("TUI sidebar plugin is missing after the repair attempt");
+                }
+            } catch (error) {
+                fail(
+                    `Could not verify TUI sidebar config: ${error instanceof Error ? error.message : String(error)}`,
                 );
             }
-            const tuiEntryAsString = (entry: unknown): string => {
-                if (typeof entry === "string") return entry;
-                if (Array.isArray(entry) && typeof entry[0] === "string") return entry[0];
-                return "";
-            };
-            if (tuiIdx >= 0) {
-                const tuiEntry = tuiRawPlugins[tuiIdx];
-                const tuiEntryStr = tuiEntryAsString(tuiEntry);
-                if (isDevPathPluginEntry(tuiEntry)) {
-                    pass(`TUI sidebar plugin configured (dev path: ${tuiEntryStr})`);
-                } else {
-                    const tuiPinned = isPinnedOpenCodePluginSpecifier(tuiEntryStr);
-                    if (tuiPinned && !options.force) {
-                        warn(
-                            `TUI plugin pinned to ${tuiEntryStr} — use 'doctor --force' to upgrade`,
-                        );
-                    } else if (tuiPinned && options.force) {
-                        // Preserve tuple options when upgrading.
-                        if (Array.isArray(tuiEntry) && tuiEntry.length >= 1) {
-                            const replacement = [...tuiEntry];
-                            replacement[0] = PLUGIN_ENTRY_WITH_VERSION;
-                            tuiRawPlugins[tuiIdx] = replacement;
-                        } else {
-                            tuiRawPlugins[tuiIdx] = PLUGIN_ENTRY_WITH_VERSION;
-                        }
-                        tuiConfig.plugin = tuiRawPlugins;
-                        writeFileAtomic(paths.tuiConfig, `${stringify(tuiConfig, null, 2)}\n`);
-                        pass(`Upgraded TUI plugin: ${tuiEntryStr} → ${PLUGIN_ENTRY_WITH_VERSION}`);
-                        fixed++;
-                    } else {
-                        pass("TUI sidebar plugin configured");
-                    }
-                }
-            } else {
-                fail("TUI sidebar plugin is missing after the repair attempt");
-            }
-        } catch (error) {
-            fail(
-                `Could not verify TUI sidebar config: ${error instanceof Error ? error.message : String(error)}`,
-            );
+        } else {
+            fail("Could not create or verify the TUI sidebar config");
         }
-    } else {
-        fail("Could not create or verify the TUI sidebar config");
     }
 
     // 7. Check user memories + dreamer compatibility.
@@ -1458,6 +1605,9 @@ export async function runDoctor(
                 for (const stall of listShadowBackfillStalls(db)) {
                     warn(formatShadowBackfillStall(stall));
                 }
+                const tickFailure = getDreamerTickFailure(db);
+                if (tickFailure) warn(formatDreamerTickFailure(tickFailure));
+                else pass("Background maintenance completed its last pass");
             } finally {
                 db.close();
             }

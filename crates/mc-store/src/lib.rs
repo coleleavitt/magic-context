@@ -2731,6 +2731,191 @@ const MIGRATIONS: &[Migration] = &[
         BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
         "#,
     },
+    Migration {
+        version: 54,
+        // Agent-visible ids on host-backed harnesses belong to context.db. The module keeps
+        // that acknowledged identity separately from source provenance so module-authored rows
+        // can remain hostless until their changefeed row has been mirrored. Older binaries
+        // ignore this nullable column when opening a store created by this migration.
+        statements: r#"
+        ALTER TABLE mc_memories ADD COLUMN host_row_id INTEGER;
+        CREATE INDEX IF NOT EXISTS idx_mc_memories_host_row_id
+            ON mc_memories(host_row_id);
+
+        DROP TRIGGER IF EXISTS mc_memories_feed_insert;
+        DROP TRIGGER IF EXISTS mc_memories_feed_update;
+        DROP TRIGGER IF EXISTS mc_memories_feed_delete;
+        CREATE TRIGGER mc_memories_feed_insert AFTER INSERT ON mc_memories BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('memories', 'insert', NEW.id,
+                json_object(
+                    'id', NEW.id, 'project_path', NEW.project_path, 'category', NEW.category,
+                    'content', NEW.content, 'normalized_hash', NEW.normalized_hash,
+                    'importance', NEW.importance, 'scope', NEW.scope, 'shareable', NEW.shareable,
+                    'source_session_id', NEW.source_session_id, 'source_type', NEW.source_type,
+                    'seen_count', NEW.seen_count, 'retrieval_count', NEW.retrieval_count,
+                    'first_seen_at', NEW.first_seen_at, 'created_at', NEW.created_at,
+                    'updated_at', NEW.updated_at, 'last_seen_at', NEW.last_seen_at,
+                    'last_retrieved_at', NEW.last_retrieved_at, 'status', NEW.status,
+                    'expires_at', NEW.expires_at, 'verification_status', NEW.verification_status,
+                    'verified_at', NEW.verified_at, 'classified_at', NEW.classified_at,
+                    'superseded_by_memory_id', NEW.superseded_by_memory_id, 'merged_from', NEW.merged_from,
+                    'metadata_json', NEW.metadata_json, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id, 'mural_cue', NEW.mural_cue,
+                    'mural_cue_hash', NEW.mural_cue_hash, 'mural_cue_at', NEW.mural_cue_at,
+                    'mural_cue_rejection_count', NEW.mural_cue_rejection_count,
+                    'host_row_id', NEW.host_row_id), NEW.normalized_hash);
+        END;
+        CREATE TRIGGER mc_memories_feed_update AFTER UPDATE ON mc_memories
+        WHEN NEW.id IS NOT OLD.id OR NEW.project_path IS NOT OLD.project_path
+          OR NEW.category IS NOT OLD.category OR NEW.content IS NOT OLD.content
+          OR NEW.normalized_hash IS NOT OLD.normalized_hash OR NEW.importance IS NOT OLD.importance
+          OR NEW.scope IS NOT OLD.scope OR NEW.shareable IS NOT OLD.shareable
+          OR NEW.source_session_id IS NOT OLD.source_session_id OR NEW.source_type IS NOT OLD.source_type
+          OR NEW.seen_count IS NOT OLD.seen_count OR NEW.retrieval_count IS NOT OLD.retrieval_count
+          OR NEW.first_seen_at IS NOT OLD.first_seen_at OR NEW.created_at IS NOT OLD.created_at
+          OR NEW.updated_at IS NOT OLD.updated_at OR NEW.last_seen_at IS NOT OLD.last_seen_at
+          OR NEW.last_retrieved_at IS NOT OLD.last_retrieved_at OR NEW.status IS NOT OLD.status
+          OR NEW.expires_at IS NOT OLD.expires_at OR NEW.verification_status IS NOT OLD.verification_status
+          OR NEW.verified_at IS NOT OLD.verified_at OR NEW.classified_at IS NOT OLD.classified_at
+          OR NEW.superseded_by_memory_id IS NOT OLD.superseded_by_memory_id
+          OR NEW.merged_from IS NOT OLD.merged_from OR NEW.metadata_json IS NOT OLD.metadata_json
+          OR NEW.context_store_uuid IS NOT OLD.context_store_uuid
+          OR NEW.context_row_id IS NOT OLD.context_row_id
+          OR NEW.mural_cue IS NOT OLD.mural_cue OR NEW.mural_cue_hash IS NOT OLD.mural_cue_hash
+          OR NEW.mural_cue_at IS NOT OLD.mural_cue_at
+          OR NEW.mural_cue_rejection_count IS NOT OLD.mural_cue_rejection_count
+        BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('memories', 'update', NEW.id,
+                json_object(
+                    'id', NEW.id, 'project_path', NEW.project_path, 'category', NEW.category,
+                    'content', NEW.content, 'normalized_hash', NEW.normalized_hash,
+                    'importance', NEW.importance, 'scope', NEW.scope, 'shareable', NEW.shareable,
+                    'source_session_id', NEW.source_session_id, 'source_type', NEW.source_type,
+                    'seen_count', NEW.seen_count, 'retrieval_count', NEW.retrieval_count,
+                    'first_seen_at', NEW.first_seen_at, 'created_at', NEW.created_at,
+                    'updated_at', NEW.updated_at, 'last_seen_at', NEW.last_seen_at,
+                    'last_retrieved_at', NEW.last_retrieved_at, 'status', NEW.status,
+                    'expires_at', NEW.expires_at, 'verification_status', NEW.verification_status,
+                    'verified_at', NEW.verified_at, 'classified_at', NEW.classified_at,
+                    'superseded_by_memory_id', NEW.superseded_by_memory_id, 'merged_from', NEW.merged_from,
+                    'metadata_json', NEW.metadata_json, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id, 'mural_cue', NEW.mural_cue,
+                    'mural_cue_hash', NEW.mural_cue_hash, 'mural_cue_at', NEW.mural_cue_at,
+                    'mural_cue_rejection_count', NEW.mural_cue_rejection_count,
+                    'host_row_id', NEW.host_row_id), NEW.normalized_hash);
+        END;
+        CREATE TRIGGER mc_memories_feed_delete AFTER DELETE ON mc_memories BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('memories', 'tombstone', OLD.id,
+                json_object(
+                    'id', OLD.id, 'project_path', OLD.project_path, 'category', OLD.category,
+                    'content', OLD.content, 'normalized_hash', OLD.normalized_hash,
+                    'importance', OLD.importance, 'scope', OLD.scope, 'shareable', OLD.shareable,
+                    'source_session_id', OLD.source_session_id, 'source_type', OLD.source_type,
+                    'seen_count', OLD.seen_count, 'retrieval_count', OLD.retrieval_count,
+                    'first_seen_at', OLD.first_seen_at, 'created_at', OLD.created_at,
+                    'updated_at', OLD.updated_at, 'last_seen_at', OLD.last_seen_at,
+                    'last_retrieved_at', OLD.last_retrieved_at, 'status', OLD.status,
+                    'expires_at', OLD.expires_at, 'verification_status', OLD.verification_status,
+                    'verified_at', OLD.verified_at, 'classified_at', OLD.classified_at,
+                    'superseded_by_memory_id', OLD.superseded_by_memory_id, 'merged_from', OLD.merged_from,
+                    'metadata_json', OLD.metadata_json, 'context_store_uuid', OLD.context_store_uuid,
+                    'context_row_id', OLD.context_row_id, 'mural_cue', OLD.mural_cue,
+                    'mural_cue_hash', OLD.mural_cue_hash, 'mural_cue_at', OLD.mural_cue_at,
+                    'mural_cue_rejection_count', OLD.mural_cue_rejection_count,
+                    'host_row_id', OLD.host_row_id), OLD.normalized_hash);
+        END;
+        "#,
+    },
+    Migration {
+        version: 55,
+        // Grow-mostly per-session state moves out of the `meta` JSON blob and into rows.
+        //
+        // A SQLite row is rewritten whole on every UPDATE, so the cost of a commit is set by
+        // the size of the record it touches, not by the size of the change. `meta` held a map
+        // keyed by message id that grows with the conversation and whose existing entries never
+        // change, so appending one entry rewrote megabytes. As rows, a pass writes only the
+        // entries that actually differ.
+        //
+        // `mc_served_output_fingerprints` is keyed by position because the served vector is
+        // rebuilt each pass and compared element-wise; the stable prefix then costs nothing.
+        //
+        // `mc_cache_state_digest` records the hashes of the blob columns as they were last
+        // written, together with the row_version they belong to. A writer that bumps
+        // row_version without refreshing the digest leaves it merely untrusted, never wrong:
+        // readers compare the recorded row_version first and fall back to reading the blobs.
+        statements: r#"
+        CREATE TABLE IF NOT EXISTS mc_block_identities (
+            session_id TEXT NOT NULL,
+            mid        TEXT NOT NULL,
+            identities TEXT NOT NULL,
+            PRIMARY KEY (session_id, mid)
+        );
+        CREATE TABLE IF NOT EXISTS mc_served_output_fingerprints (
+            session_id     TEXT NOT NULL,
+            position       INTEGER NOT NULL,
+            block_id       TEXT NOT NULL,
+            content_hash   TEXT NOT NULL,
+            serialized_len INTEGER NOT NULL,
+            PRIMARY KEY (session_id, position)
+        );
+        CREATE TABLE IF NOT EXISTS mc_cache_state_digest (
+            session_id  TEXT PRIMARY KEY,
+            row_version INTEGER NOT NULL,
+            core_hash   TEXT NOT NULL,
+            meta_hash   TEXT NOT NULL
+        );
+
+        -- json_each over a missing path yields no rows, so absent keys need no guard.
+        INSERT OR REPLACE INTO mc_block_identities (session_id, mid, identities)
+        SELECT state.session_id, entry.key, entry.value
+          FROM mc_cache_state AS state,
+               json_each(json_extract(state.meta, '$.block_identity_by_mid')) AS entry;
+
+        INSERT OR REPLACE INTO mc_served_output_fingerprints
+               (session_id, position, block_id, content_hash, serialized_len)
+        SELECT state.session_id,
+               entry.key,
+               json_extract(entry.value, '$.block_id'),
+               json_extract(entry.value, '$.content_hash'),
+               json_extract(entry.value, '$.serialized_len')
+          FROM mc_cache_state AS state,
+               json_each(json_extract(state.meta, '$.served_output_fingerprint')) AS entry;
+
+        UPDATE mc_cache_state
+           SET meta = json_remove(meta, '$.block_identity_by_mid', '$.served_output_fingerprint')
+         WHERE json_type(meta, '$.block_identity_by_mid') = 'object'
+            OR json_type(meta, '$.served_output_fingerprint') = 'array';
+        "#,
+    },
+    Migration {
+        version: 56,
+        // Re-shape the digest row around what it is actually for.
+        //
+        // v55 stored hashes of the two blob columns so a commit could tell whether they had
+        // changed without reading them. Comparing the bytes directly in SQL turned out to be
+        // both cheaper and unconditionally sound, so the hashes are gone.
+        //
+        // What is left needs a digest, and it is the expensive comparison: establishing that a
+        // session's block identities and served fingerprints are unchanged otherwise means
+        // reading and re-serializing every stored row. `row_state_fingerprint` covers both
+        // collections, so the common pass proves they did not change with one small read.
+        //
+        // The `row_version` beside it is the trust fence, unchanged in spirit from v55: a
+        // writer that bumps row_version without refreshing this row leaves it untrusted rather
+        // than wrong, and the next commit falls back to the full comparison. The table is a
+        // pure cache, so dropping and rebuilding it loses nothing.
+        statements: "
+        DROP TABLE IF EXISTS mc_cache_state_digest;
+        CREATE TABLE mc_cache_state_digest (
+            session_id           TEXT PRIMARY KEY,
+            row_version          INTEGER NOT NULL,
+            row_state_fingerprint TEXT NOT NULL
+        );
+    ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -3274,6 +3459,73 @@ fn serialize_interesting_scheduler_observation(
     .map_err(|error| McStoreError::Serde(error.to_string()))
 }
 
+const REQUEST_TRACE_HISTORY_LIMIT: usize = 32;
+// Reuse the existing scheduler metadata JSON instead of adding a schema column. The carrier
+// is intentionally not a scheduler record: its missing timestamp keeps incident queries blind
+// to it, while the loader extracts it before deserializing scheduler observations.
+const REQUEST_TRACE_CARRIER_DECISION: &str = "__request_trace_history__";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassRequestTrace {
+    pub attempt_id: String,
+    pub received_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+    pub outcome: String,
+}
+
+fn pass_trace_meta_parts(
+    raw: &str,
+) -> Result<(Vec<Value>, Vec<PassRequestTrace>), serde_json::Error> {
+    let mut entries: Vec<Value> = serde_json::from_str(raw)?;
+    let carrier_index = entries.iter().rposition(|entry| {
+        entry.get("scheduler_decision").and_then(Value::as_str)
+            == Some(REQUEST_TRACE_CARRIER_DECISION)
+    });
+    let request_history = carrier_index
+        .map(|index| entries.remove(index))
+        .and_then(|carrier| carrier.get("request_history").cloned())
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    Ok((entries, request_history))
+}
+
+fn pass_trace_meta_json(
+    mut scheduler_interesting_history: Vec<Value>,
+    request_history: &[PassRequestTrace],
+) -> Result<String, serde_json::Error> {
+    scheduler_interesting_history.push(serde_json::json!({
+        "scheduler_decision": REQUEST_TRACE_CARRIER_DECISION,
+        "request_history": request_history,
+    }));
+    serde_json::to_string(&scheduler_interesting_history)
+}
+
+fn mutate_pass_request_history(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    mutate: impl FnOnce(&mut Vec<PassRequestTrace>),
+) -> rusqlite::Result<()> {
+    let raw = conn.query_row(
+        "SELECT scheduler_interesting_history FROM mc_pass_trace WHERE session_id = ?1",
+        params![session_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    let (scheduler_history, mut request_history) = pass_trace_meta_parts(&raw)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    mutate(&mut request_history);
+    if request_history.len() > REQUEST_TRACE_HISTORY_LIMIT {
+        request_history.drain(..request_history.len() - REQUEST_TRACE_HISTORY_LIMIT);
+    }
+    let meta = pass_trace_meta_json(scheduler_history, &request_history)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    conn.execute(
+        "UPDATE mc_pass_trace SET scheduler_interesting_history = ?2 WHERE session_id = ?1",
+        params![session_id, meta],
+    )?;
+    Ok(())
+}
+
 /// Durable receive/complete/reject breadcrumbs for one session's transform passes.
 /// Stored separately from `mc_cache_state` so a rejected pass can still leave a readable
 /// trail without advancing the cache row_version.
@@ -3291,6 +3543,8 @@ pub struct PassTrace {
     pub last_divergence: Option<String>,
     /// Oldest-to-newest bounded history of accepted scheduler decisions and latch state.
     pub scheduler_history: Vec<PassSchedulerObservation>,
+    /// Oldest-to-newest bounded history of module receipt and terminal outcomes.
+    pub request_history: Vec<PassRequestTrace>,
 }
 
 /// A validated historian fact that may become a project memory. Validation owns
@@ -4109,7 +4363,13 @@ pub struct ModuleMeta {
     /// Ordered block identity vectors keyed by producer message id. Each vector stores
     /// the block kind and a fingerprint of the canonical reduction-accounting bytes, so
     /// a later request that changes a live message's block layout fails closed.
-    #[serde(default)]
+    ///
+    /// Persisted as one row per message id in `mc_block_identities`, NOT inside the meta
+    /// blob: the map grows with the conversation and its existing entries never change, so
+    /// keeping it in the blob made every commit rewrite the whole history to append one
+    /// entry. `skip` keeps it out of the serialized blob; the store hydrates it on load and
+    /// writes only the entries that differ on commit.
+    #[serde(skip)]
     pub block_identity_by_mid: BTreeMap<String, Vec<BlockIdentity>>,
     /// Number of accepted live-tail identity changes. Covered and frozen identities still
     /// reject, but OpenCode may legitimately rewrite an uncovered queued message in place.
@@ -4173,6 +4433,10 @@ pub struct ModuleMeta {
     /// Baseline calculated by one shared tail walk so both nudge channels use the same measurements.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail_hygiene_baseline: Option<TailHygieneBaseline>,
+    /// Tag rows first discovered after their block was served remain hidden until an independent
+    /// cache-busting pass. A genuinely new physical tail renders its tag immediately.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub pending_tag_block_ids: BTreeSet<String>,
     /// Auto-search decisions targeting a previously served block remain hidden until an
     /// independent cache-busting pass. A genuinely new physical tail renders immediately and
     /// never enters this set.
@@ -4259,7 +4523,11 @@ pub struct ModuleMeta {
     pub last_committed_pass_at_ms: i64,
     /// Fingerprints of the blocks most recently served to the provider. The vector is exactly
     /// the served block set for that pass, so it stays bounded by the output size.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Persisted as one row per position in `mc_served_output_fingerprints`, NOT inside the
+    /// meta blob. The vector is rebuilt every pass but its leading positions almost never
+    /// move, so per-position rows let a pass write only the entries that changed.
+    #[serde(skip)]
     pub served_output_fingerprint: Vec<ServedBlockFingerprint>,
     /// Revert and shadow-hydration generations that produced the served CK fingerprints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4553,7 +4821,10 @@ pub struct M1RevisionSnapshot {
 /// A project memory row projected for rendering into the prompt.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoredMemory {
+    /// Module-local primary key used for storage and mutation-log joins.
     pub id: i64,
+    /// Agent-visible context.db id acknowledged by a host-backed harness.
+    pub host_row_id: Option<i64>,
     pub project_path: String,
     pub category: String,
     pub content: String,
@@ -4566,6 +4837,10 @@ pub struct StoredMemory {
     /// of memory corrections (a superseded memory renders as "X → Y").
     pub superseded_by_memory_id: Option<i64>,
     pub updated_at: i64,
+    /// Advanced when exact content is observed again.
+    pub last_seen_at: Option<i64>,
+    /// Advanced when verification confirms the memory.
+    pub verified_at: Option<i64>,
 }
 
 /// A complete `mc_memories` row for tool-side guards and lossless mutations. The render
@@ -4574,6 +4849,7 @@ pub struct StoredMemory {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoredMemoryFull {
     pub id: i64,
+    pub host_row_id: Option<i64>,
     pub project_path: String,
     pub category: String,
     pub content: String,
@@ -4644,6 +4920,7 @@ pub const MEMORY_FEED_COLUMNS: &[&str] = &[
     "mural_cue_hash",
     "mural_cue_at",
     "mural_cue_rejection_count",
+    "host_row_id",
 ];
 
 /// Inputs for an additive ctx_memory write. Duplicate detection follows the plugin's
@@ -4878,6 +5155,12 @@ pub struct ChangefeedPage {
     pub rows: Vec<ChangefeedRow>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMemoryIdentityAck {
+    pub module_row_id: i64,
+    pub host_row_id: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DreamTaskCommandRow {
     pub response_json: String,
@@ -5038,6 +5321,8 @@ pub enum RecordWrapupCommandOutcome {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleMemoryRow {
     pub id: i64,
+    /// State-sync memory ids originate in context.db and are already host-visible.
+    pub host_row_id: Option<i64>,
     pub project_path: String,
     pub category: String,
     pub content: String,
@@ -5279,6 +5564,18 @@ pub enum McStoreError {
         write_project: String,
         domain: String,
     },
+    /// A commit arrived with no block identities for a session that still has some.
+    ///
+    /// The row-stored parts of `ModuleMeta` are filled in by the store on load. A caller
+    /// that read the session some other way, or built a `ModuleMeta` from scratch, hands
+    /// over an empty map that is indistinguishable from "every identity was removed", and
+    /// applying it as a replacement would delete the session's whole identity history.
+    /// Deliberate resets clear the rows through their own path instead of committing an
+    /// empty map, so this is always a caller bug and never a state the store should apply.
+    UnhydratedBlockIdentities {
+        session_id: String,
+        stored: usize,
+    },
 }
 
 impl std::fmt::Display for McStoreError {
@@ -5337,6 +5634,11 @@ impl std::fmt::Display for McStoreError {
             } => write!(
                 f,
                 "{domain} facade route {route_project_root} is authority-managed as {authority_project}, but the write used {write_project}"
+            ),
+            McStoreError::UnhydratedBlockIdentities { session_id, stored } => write!(
+                f,
+                "session {session_id} commit carries no block identities but {stored} are stored; \
+                 the committed meta was never hydrated by the store"
             ),
         }
     }
@@ -5478,6 +5780,7 @@ enum MappingTxnOutcome {
 enum CommitOutcome {
     Committed(u64),
     CasConflict(u64),
+    UnhydratedBlockIdentities(usize),
 }
 
 enum AuthorityFinishDrainOutcome {
@@ -5891,6 +6194,38 @@ pub enum NoteDismissOutcome {
     AlreadyDismissed,
 }
 
+/// This error may contain internal module-store row ids. Transaction-scoped callers must convert
+/// those ids to host-visible memory identities before exposing the error to an agent, so
+/// host-backed harnesses do not display internal database ids directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FacadeMemoryMutationError {
+    Storage(String),
+    Unavailable { id: i64 },
+    DuplicateContent { id: i64, host_id: Option<i64> },
+    InvalidMerge,
+}
+
+impl FacadeMemoryMutationError {
+    fn storage(error: impl std::fmt::Display) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
+impl std::fmt::Display for FacadeMemoryMutationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Storage(error) => f.write_str(error),
+            Self::Unavailable { id } => write!(f, "memory {id} was not found"),
+            Self::DuplicateContent { id, .. } => {
+                write!(f, "memory content already exists as ID {id}")
+            }
+            Self::InvalidMerge => f.write_str("memories could not be merged"),
+        }
+    }
+}
+
+impl std::error::Error for FacadeMemoryMutationError {}
+
 /// Transaction-scoped ports used by the module facade. Every method operates on the transaction
 /// owned by `with_facade_command`, so the mutation and its response ledger row commit together.
 pub struct FacadeMutationTxn<'a> {
@@ -5956,34 +6291,38 @@ impl<'a> FacadeMutationTxn<'a> {
         content: &str,
         category: Option<&str>,
         now_ms: i64,
-    ) -> Result<Option<StoredMemoryFull>, String> {
-        let Some(memory) = load_memory_full_tx(self.tx, id).map_err(|error| error.to_string())?
+    ) -> Result<StoredMemoryFull, FacadeMemoryMutationError> {
+        let Some(memory) =
+            load_memory_full_tx(self.tx, id).map_err(FacadeMemoryMutationError::storage)?
         else {
-            return Ok(None);
+            return Err(FacadeMemoryMutationError::Unavailable { id });
         };
         if memory.project_path != project_path
             || memory.superseded_by_memory_id.is_some()
             || !matches!(memory.status.as_str(), "active" | "permanent")
         {
-            return Ok(None);
+            return Err(FacadeMemoryMutationError::Unavailable { id });
         }
         let target_category = category.unwrap_or(&memory.category);
         let normalized_hash = compute_normalized_memory_hash(content);
-        let duplicate_id = self
+        let duplicate = self
             .tx
             .query_row(
-                "SELECT id FROM mc_memories
+                "SELECT id, host_row_id FROM mc_memories
                   WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
                   LIMIT 1",
                 params![project_path, target_category, normalized_hash],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
             )
             .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some(duplicate_id) = duplicate_id.filter(|duplicate_id| *duplicate_id != id) {
-            return Err(format!(
-                "memory content already exists as ID {duplicate_id}"
-            ));
+            .map_err(FacadeMemoryMutationError::storage)?;
+        if let Some((duplicate_id, host_id)) =
+            duplicate.filter(|(duplicate_id, _)| *duplicate_id != id)
+        {
+            return Err(FacadeMemoryMutationError::DuplicateContent {
+                id: duplicate_id,
+                host_id,
+            });
         }
         self.tx
             .execute(
@@ -6001,7 +6340,7 @@ impl<'a> FacadeMutationTxn<'a> {
                   WHERE id = ?5",
                 params![content, target_category, normalized_hash, now_ms, id],
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(FacadeMemoryMutationError::storage)?;
         append_memory_mutation_tx(
             self.tx,
             MemoryMutationAppend {
@@ -6014,8 +6353,10 @@ impl<'a> FacadeMutationTxn<'a> {
                 queued_at: now_ms,
             },
         )
-        .map_err(|error| error.to_string())?;
-        load_memory_full_tx(self.tx, id).map_err(|error| error.to_string())
+        .map_err(FacadeMemoryMutationError::storage)?;
+        load_memory_full_tx(self.tx, id)
+            .map_err(FacadeMemoryMutationError::storage)?
+            .ok_or(FacadeMemoryMutationError::Unavailable { id })
     }
 
     pub fn archive_memories(
@@ -6024,19 +6365,19 @@ impl<'a> FacadeMutationTxn<'a> {
         ids: &[i64],
         reason: Option<&str>,
         now_ms: i64,
-    ) -> Result<Option<Vec<i64>>, String> {
+    ) -> Result<Vec<i64>, FacadeMemoryMutationError> {
         let mut memories = Vec::with_capacity(ids.len());
         for id in ids {
             let Some(memory) =
-                load_memory_full_tx(self.tx, *id).map_err(|error| error.to_string())?
+                load_memory_full_tx(self.tx, *id).map_err(FacadeMemoryMutationError::storage)?
             else {
-                return Ok(None);
+                return Err(FacadeMemoryMutationError::Unavailable { id: *id });
             };
             if memory.project_path != project_path
                 || memory.superseded_by_memory_id.is_some()
                 || !matches!(memory.status.as_str(), "active" | "permanent" | "archived")
             {
-                return Ok(None);
+                return Err(FacadeMemoryMutationError::Unavailable { id: *id });
             }
             memories.push(memory);
         }
@@ -6055,14 +6396,14 @@ impl<'a> FacadeMutationTxn<'a> {
                           WHERE id = ?3",
                         params![metadata_json, now_ms, memory.id],
                     )
-                    .map_err(|error| error.to_string())?;
+                    .map_err(FacadeMemoryMutationError::storage)?;
             } else {
                 self.tx
                     .execute(
                         "UPDATE mc_memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
                         params![now_ms, memory.id],
                     )
-                    .map_err(|error| error.to_string())?;
+                    .map_err(FacadeMemoryMutationError::storage)?;
             }
             append_memory_mutation_tx(
                 self.tx,
@@ -6076,10 +6417,10 @@ impl<'a> FacadeMutationTxn<'a> {
                     queued_at: now_ms,
                 },
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(FacadeMemoryMutationError::storage)?;
             archived.push(memory.id);
         }
-        Ok(Some(archived))
+        Ok(archived)
     }
 
     pub fn merge_memories_canonical(
@@ -6089,15 +6430,16 @@ impl<'a> FacadeMutationTxn<'a> {
         merged_content: &str,
         source_session_id: Option<&str>,
         now_ms: i64,
-    ) -> Result<Option<(StoredMemoryFull, Vec<i64>)>, String> {
+    ) -> Result<(StoredMemoryFull, Vec<i64>), FacadeMemoryMutationError> {
         if ids.len() < 2 {
-            return Ok(None);
+            return Err(FacadeMemoryMutationError::InvalidMerge);
         }
         let mut rows = Vec::with_capacity(ids.len());
         for id in ids {
-            let Some(row) = load_memory_full_tx(self.tx, *id).map_err(|error| error.to_string())?
+            let Some(row) =
+                load_memory_full_tx(self.tx, *id).map_err(FacadeMemoryMutationError::storage)?
             else {
-                return Ok(None);
+                return Err(FacadeMemoryMutationError::Unavailable { id: *id });
             };
             if row.project_path != project_path
                 || row.superseded_by_memory_id.is_some()
@@ -6106,30 +6448,30 @@ impl<'a> FacadeMutationTxn<'a> {
                     .first()
                     .is_some_and(|first: &StoredMemoryFull| first.category != row.category)
             {
-                return Ok(None);
+                return Err(FacadeMemoryMutationError::Unavailable { id: *id });
             }
             rows.push(row);
         }
 
         let category = rows[0].category.clone();
         let normalized_hash = compute_normalized_memory_hash(merged_content);
-        let matching_id = self
+        let matching = self
             .tx
             .query_row(
-                "SELECT id FROM mc_memories
+                "SELECT id, host_row_id FROM mc_memories
                   WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
                   LIMIT 1",
                 params![project_path, category, normalized_hash],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
             )
             .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some(id) = matching_id.filter(|id| !ids.contains(id)) {
-            return Err(format!("memory content already exists as ID {id}"));
+            .map_err(FacadeMemoryMutationError::storage)?;
+        if let Some((id, host_id)) = matching.filter(|(id, _)| !ids.contains(id)) {
+            return Err(FacadeMemoryMutationError::DuplicateContent { id, host_id });
         }
 
-        let created_canonical = matching_id.is_none();
-        let target_id = if let Some(id) = matching_id {
+        let created_canonical = matching.is_none();
+        let target_id = if let Some((id, _)) = matching {
             id
         } else {
             self.insert_memory(InsertMemoryInput {
@@ -6143,18 +6485,16 @@ impl<'a> FacadeMutationTxn<'a> {
                 expires_at: None,
                 metadata_json: None,
                 now_ms,
-            })?
+            })
+            .map_err(FacadeMemoryMutationError::Storage)?
         };
         let source_ids = ids
             .iter()
             .copied()
             .filter(|id| *id != target_id)
             .collect::<Vec<_>>();
-        let Some(mut merged) =
-            self.merge_memories(project_path, target_id, &source_ids, merged_content, now_ms)?
-        else {
-            return Ok(None);
-        };
+        let mut merged =
+            self.merge_memories(project_path, target_id, &source_ids, merged_content, now_ms)?;
 
         if created_canonical {
             // The TypeScript-compatible merge path inserts the new canonical row with
@@ -6173,7 +6513,7 @@ impl<'a> FacadeMutationTxn<'a> {
                       WHERE id = ?4",
                     params![seen_count, retrieval_count, merged_from, target_id],
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(FacadeMemoryMutationError::storage)?;
             self.tx
                 .execute(
                     "DELETE FROM mc_memory_mutation_log
@@ -6184,12 +6524,12 @@ impl<'a> FacadeMutationTxn<'a> {
                       )",
                     params![project_path, target_id, now_ms],
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(FacadeMemoryMutationError::storage)?;
             merged = load_memory_full_tx(self.tx, target_id)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "canonical memory disappeared during merge".to_string())?;
+                .map_err(FacadeMemoryMutationError::storage)?
+                .ok_or(FacadeMemoryMutationError::Unavailable { id: target_id })?;
         }
-        Ok(Some((merged, source_ids)))
+        Ok((merged, source_ids))
     }
 
     pub fn merge_memories(
@@ -6199,17 +6539,17 @@ impl<'a> FacadeMutationTxn<'a> {
         source_ids: &[i64],
         merged_content: &str,
         now_ms: i64,
-    ) -> Result<Option<StoredMemoryFull>, String> {
+    ) -> Result<StoredMemoryFull, FacadeMemoryMutationError> {
         let Some(target) =
-            load_memory_full_tx(self.tx, target_id).map_err(|error| error.to_string())?
+            load_memory_full_tx(self.tx, target_id).map_err(FacadeMemoryMutationError::storage)?
         else {
-            return Ok(None);
+            return Err(FacadeMemoryMutationError::Unavailable { id: target_id });
         };
         if target.project_path != project_path
             || target.superseded_by_memory_id.is_some()
             || !matches!(target.status.as_str(), "active" | "permanent")
         {
-            return Ok(None);
+            return Err(FacadeMemoryMutationError::Unavailable { id: target_id });
         }
         let mut unique_sources = source_ids.to_vec();
         unique_sources.sort_unstable();
@@ -6218,40 +6558,38 @@ impl<'a> FacadeMutationTxn<'a> {
             || unique_sources.len() != source_ids.len()
             || unique_sources.binary_search(&target_id).is_ok()
         {
-            return Ok(None);
+            return Err(FacadeMemoryMutationError::InvalidMerge);
         }
         let mut source_rows = Vec::with_capacity(unique_sources.len());
         for source_id in unique_sources {
-            let Some(source) =
-                load_memory_full_tx(self.tx, source_id).map_err(|error| error.to_string())?
+            let Some(source) = load_memory_full_tx(self.tx, source_id)
+                .map_err(FacadeMemoryMutationError::storage)?
             else {
-                return Ok(None);
+                return Err(FacadeMemoryMutationError::Unavailable { id: source_id });
             };
             if source.project_path != project_path
                 || source.category != target.category
                 || source.superseded_by_memory_id.is_some()
                 || !matches!(source.status.as_str(), "active" | "permanent")
             {
-                return Ok(None);
+                return Err(FacadeMemoryMutationError::Unavailable { id: source_id });
             }
             source_rows.push(source);
         }
         let normalized_hash = compute_normalized_memory_hash(merged_content);
-        let duplicate_id = self
+        let duplicate = self
             .tx
             .query_row(
-                "SELECT id FROM mc_memories
+                "SELECT id, host_row_id FROM mc_memories
                   WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
                   LIMIT 1",
                 params![project_path, target.category, normalized_hash],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
             )
             .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some(duplicate_id) = duplicate_id.filter(|duplicate_id| *duplicate_id != target_id) {
-            return Err(format!(
-                "memory content already exists as ID {duplicate_id}"
-            ));
+            .map_err(FacadeMemoryMutationError::storage)?;
+        if let Some((id, host_id)) = duplicate.filter(|(id, _)| *id != target_id) {
+            return Err(FacadeMemoryMutationError::DuplicateContent { id, host_id });
         }
         let mut affected = Vec::with_capacity(source_rows.len() + 1);
         affected.push(target.clone());
@@ -6277,7 +6615,7 @@ impl<'a> FacadeMutationTxn<'a> {
                       WHERE id = ?3",
                     params![target_id, now_ms, source.id],
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(FacadeMemoryMutationError::storage)?;
             append_memory_mutation_tx(
                 self.tx,
                 MemoryMutationAppend {
@@ -6290,7 +6628,7 @@ impl<'a> FacadeMutationTxn<'a> {
                     queued_at: now_ms,
                 },
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(FacadeMemoryMutationError::storage)?;
         }
         self.tx
             .execute(
@@ -6316,7 +6654,7 @@ impl<'a> FacadeMutationTxn<'a> {
                     target_id,
                 ],
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(FacadeMemoryMutationError::storage)?;
         append_memory_mutation_tx(
             self.tx,
             MemoryMutationAppend {
@@ -6329,8 +6667,10 @@ impl<'a> FacadeMutationTxn<'a> {
                 queued_at: now_ms,
             },
         )
-        .map_err(|error| error.to_string())?;
-        load_memory_full_tx(self.tx, target_id).map_err(|error| error.to_string())
+        .map_err(FacadeMemoryMutationError::storage)?;
+        load_memory_full_tx(self.tx, target_id)
+            .map_err(FacadeMemoryMutationError::storage)?
+            .ok_or(FacadeMemoryMutationError::Unavailable { id: target_id })
     }
 
     pub fn set_memory_verification(
@@ -7737,7 +8077,7 @@ impl McStore {
         self.state_load_query_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let row = self.inner.with_conn(|conn| {
-            Ok(conn
+            let state = conn
                 .query_row(
                     "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
                     params![session_id],
@@ -7749,7 +8089,20 @@ impl McStore {
                         ))
                     },
                 )
-                .ok())
+                .ok();
+            // The row-stored parts of the meta are read on the same connection, so a caller
+            // never sees a blob from before a concurrent commit paired with identities from
+            // after it.
+            match state {
+                None => Ok(None),
+                Some((rv, core_json, meta_json)) => Ok(Some((
+                    rv,
+                    core_json,
+                    meta_json,
+                    load_block_identities_tx(conn, session_id)?,
+                    load_served_output_fingerprints_tx(conn, session_id)?,
+                ))),
+            }
         })?;
 
         match row {
@@ -7758,13 +8111,18 @@ impl McStore {
                 meta: ModuleMeta::default(),
                 row_version: None,
             }),
-            Some((rv, core_json, meta_json)) => Ok(LoadedState {
-                core: serde_json::from_str(&core_json)
-                    .map_err(|e| McStoreError::Serde(e.to_string()))?,
-                meta: serde_json::from_str(&meta_json)
-                    .map_err(|e| McStoreError::Serde(e.to_string()))?,
-                row_version: Some(rv),
-            }),
+            Some((rv, core_json, meta_json, identities, served)) => {
+                let mut meta: ModuleMeta = serde_json::from_str(&meta_json)
+                    .map_err(|e| McStoreError::Serde(e.to_string()))?;
+                meta.block_identity_by_mid = identities;
+                meta.served_output_fingerprint = served;
+                Ok(LoadedState {
+                    core: serde_json::from_str(&core_json)
+                        .map_err(|e| McStoreError::Serde(e.to_string()))?,
+                    meta,
+                    row_version: Some(rv),
+                })
+            }
         }
     }
 
@@ -7826,23 +8184,28 @@ impl McStore {
                 )
                 .optional()?;
             let loaded = match state {
-                Some((row_version, core_json, meta_json)) => LoadedState {
-                    core: serde_json::from_str(&core_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            1,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    meta: serde_json::from_str(&meta_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    row_version: Some(row_version),
-                },
+                Some((row_version, core_json, meta_json)) => {
+                    let mut meta: ModuleMeta =
+                        serde_json::from_str(&meta_json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    hydrate_meta_row_state(&transaction, session_id, &mut meta)?;
+                    LoadedState {
+                        core: serde_json::from_str(&core_json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                        meta,
+                        row_version: Some(row_version),
+                    }
+                }
                 None => LoadedState {
                     core: CoreState::default(),
                     meta: ModuleMeta::default(),
@@ -7957,23 +8320,28 @@ impl McStore {
                 )
                 .optional()?;
             let loaded = match state {
-                Some((row_version, core_json, meta_json)) => LoadedState {
-                    core: serde_json::from_str(&core_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            1,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    meta: serde_json::from_str(&meta_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    row_version: Some(row_version),
-                },
+                Some((row_version, core_json, meta_json)) => {
+                    let mut meta: ModuleMeta =
+                        serde_json::from_str(&meta_json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    hydrate_meta_row_state(&transaction, session_id, &mut meta)?;
+                    LoadedState {
+                        core: serde_json::from_str(&core_json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                        meta,
+                        row_version: Some(row_version),
+                    }
+                }
                 None => LoadedState {
                     core: CoreState::default(),
                     meta: ModuleMeta::default(),
@@ -8028,7 +8396,7 @@ impl McStore {
                 .query_row(
                     "SELECT last_received_at_ms, last_completed_at_ms, last_reject_error,
                             last_reject_at_ms, reject_count, receive_count, first_divergence,
-                            last_divergence, scheduler_history
+                            last_divergence, scheduler_history, scheduler_interesting_history
                        FROM mc_pass_trace WHERE session_id = ?1",
                     params![session_id],
                     |row| {
@@ -8051,6 +8419,15 @@ impl McStore {
                                     Box::new(error),
                                 )
                             })?,
+                            request_history: pass_trace_meta_parts(&row.get::<_, String>(9)?)
+                                .map(|(_, history)| history)
+                                .map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        9,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                })?,
                         })
                     },
                 )
@@ -8069,10 +8446,15 @@ impl McStore {
         Ok(snapshot)
     }
 
-    /// Record that the module accepted a transform request for this session. This is a
-    /// plain one-statement UPSERT outside the fenced cache-state transaction so the
-    /// observability write never contends with or extends the pass commit.
-    pub fn trace_pass_received(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
+    /// Record that the module accepted a transform request for this session. The count and
+    /// bounded metadata-ring writes stay outside the fenced cache-state transaction, so
+    /// observability never changes pass CAS semantics.
+    pub fn trace_pass_received(
+        &self,
+        session_id: &str,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<(), McStoreError> {
         self.inner.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO mc_pass_trace (
@@ -8091,6 +8473,14 @@ impl McStore {
                      first_divergence = NULL",
                 params![session_id, now_ms],
             )?;
+            mutate_pass_request_history(conn, session_id, |history| {
+                history.push(PassRequestTrace {
+                    attempt_id: attempt_id.to_string(),
+                    received_at_ms: now_ms,
+                    completed_at_ms: None,
+                    outcome: "received".to_string(),
+                });
+            })?;
             Ok(())
         })?;
         Ok(())
@@ -8171,7 +8561,12 @@ impl McStore {
     /// Record that a transform request finished successfully. This remains outside the
     /// fenced cache-state transaction so a pass completion breadcrumb cannot alter CAS
     /// semantics or hold the commit transaction open longer than the cache write itself.
-    pub fn trace_pass_completed(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
+    pub fn trace_pass_completed(
+        &self,
+        session_id: &str,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<(), McStoreError> {
         self.inner.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO mc_pass_trace (
@@ -8188,6 +8583,16 @@ impl McStore {
                      last_completed_at_ms = excluded.last_completed_at_ms",
                 params![session_id, now_ms],
             )?;
+            mutate_pass_request_history(conn, session_id, |history| {
+                if let Some(request) = history
+                    .iter_mut()
+                    .rev()
+                    .find(|request| request.attempt_id == attempt_id)
+                {
+                    request.completed_at_ms = Some(now_ms);
+                    request.outcome = "completed".to_string();
+                }
+            })?;
             Ok(())
         })?;
         Ok(())
@@ -8195,11 +8600,12 @@ impl McStore {
 
     /// Record the last rejected transform for a session. The error string is capped so
     /// the durable diagnostic stays readable even if an upstream failure produces a huge
-    /// message. Like the other trace writes, this is a single plain UPSERT outside the
-    /// fenced cache-state transaction.
+    /// message. Like the other trace writes, this stays outside the fenced cache-state
+    /// transaction.
     pub fn trace_pass_rejected(
         &self,
         session_id: &str,
+        attempt_id: &str,
         error: &str,
         now_ms: i64,
     ) -> Result<(), McStoreError> {
@@ -8222,6 +8628,16 @@ impl McStore {
                      reject_count = mc_pass_trace.reject_count + 1",
                 params![session_id, error, now_ms],
             )?;
+            mutate_pass_request_history(conn, session_id, |history| {
+                if let Some(request) = history
+                    .iter_mut()
+                    .rev()
+                    .find(|request| request.attempt_id == attempt_id)
+                {
+                    request.completed_at_ms = Some(now_ms);
+                    request.outcome = "rejected".to_string();
+                }
+            })?;
             Ok(())
         })?;
         Ok(())
@@ -8240,7 +8656,8 @@ impl McStore {
                      receive_count,
                      first_divergence,
                      last_divergence,
-                     scheduler_history
+                     scheduler_history,
+                     scheduler_interesting_history
                    FROM mc_pass_trace
                  WHERE session_id = ?1",
                 params![session_id],
@@ -8263,6 +8680,15 @@ impl McStore {
                                 )
                             },
                         )?,
+                        request_history: pass_trace_meta_parts(&r.get::<_, String>(9)?)
+                            .map(|(_, history)| history)
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    9,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
                     })
                 },
             )
@@ -9925,6 +10351,7 @@ impl McStore {
             serde_json::to_string(core).map_err(|e| McStoreError::Serde(e.to_string()))?;
         let meta_json =
             serde_json::to_string(meta).map_err(|e| McStoreError::Serde(e.to_string()))?;
+        let fingerprint = row_state_fingerprint(meta);
         let scheduler_observation_json = scheduler_observation
             .map(serialize_scheduler_observation)
             .transpose()?;
@@ -10031,17 +10458,71 @@ impl McStore {
                 }
             }
 
-            // INSERT-or-UPDATE in the same fenced txn (bootstrap has no row to UPDATE).
-            tx.execute(
-                "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
-                  VALUES (?1, ?2, ?3, ?4, ?5)
-                  ON CONFLICT(session_id) DO UPDATE SET
-                      row_version = excluded.row_version,
-                      core_state  = excluded.core_state,
-                      meta        = excluded.meta,
-                      last_activity_at = excluded.last_activity_at",
-                params![session_id, next as i64, core_json, meta_json, current_time_ms()],
-            )?;
+            // Refuse before the diff runs rather than treating an unhydrated meta as a
+            // request to delete the session's identity history.
+            if let Some(stored) = refuse_unhydrated_block_identities_tx(tx, session_id, meta)? {
+                return Ok(CommitOutcome::UnhydratedBlockIdentities(stored));
+            }
+
+            // The grow-mostly parts of the meta are rows, so a pass writes only the entries
+            // that differ instead of re-serializing the whole history to append one. Finding
+            // WHICH entries differ means reading every stored row, so a pass that changed
+            // none of them proves that from its fingerprint and skips the comparison
+            // entirely; that is the common case and it must not cost a walk of the session.
+            let row_state_unchanged =
+                row_state_digest_matches_tx(tx, session_id, current, &fingerprint)?;
+            let row_state_writes = if row_state_unchanged {
+                0
+            } else {
+                sync_block_identities_tx(tx, session_id, &meta.block_identity_by_mid)?
+                    + sync_served_output_fingerprints_tx(
+                        tx,
+                        session_id,
+                        &meta.served_output_fingerprint,
+                    )?
+            };
+
+            // Overlay decisions (a minted tag, a hint, a marker, a consumed drop) are durable
+            // changes in their own tables and are serialized by this same row_version, so a
+            // pass carrying any of them must take the bump even when its blobs are unchanged.
+            // The overlay frontier is excluded on purpose: it is a monotone MAX, so two
+            // writers cannot disagree about it.
+            let decision_writes = !overlays.tag_mints.is_empty()
+                || !overlays.temporal_marks.is_empty()
+                || overlays.rewrite_temporal_marks
+                || overlays.user_hint.is_some()
+                || overlays.channel1_append.is_some()
+                || !consumed_drop_ids.is_empty()
+                || !first_applied_command_ids.is_empty();
+
+            // SQLite rewrites a whole record on UPDATE, so writing an unchanged blob column
+            // costs as much as changing it. A pass whose durable state is byte-identical to
+            // what is already stored therefore leaves the row, and its row_version, alone.
+            let blobs_changed =
+                !cache_state_blobs_unchanged(tx, session_id, &core_json, &meta_json)?;
+            let accepted_version = if blobs_changed || row_state_writes > 0 || decision_writes {
+                // INSERT-or-UPDATE in the same fenced txn (bootstrap has no row to UPDATE).
+                tx.execute(
+                    "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
+                      VALUES (?1, ?2, ?3, ?4, ?5)
+                      ON CONFLICT(session_id) DO UPDATE SET
+                          row_version = excluded.row_version,
+                          core_state  = excluded.core_state,
+                          meta        = excluded.meta,
+                          last_activity_at = excluded.last_activity_at",
+                    params![session_id, next as i64, core_json, meta_json, current_time_ms()],
+                )?;
+                record_row_state_digest_tx(tx, session_id, next as i64, &fingerprint)?;
+                next
+            } else {
+                // Nothing moved, so the digest now describes the version the session is
+                // already at. Recording it here is what lets the pass after an untrusted
+                // digest take the fast path again.
+                if !row_state_unchanged {
+                    record_row_state_digest_tx(tx, session_id, current.max(0), &fingerprint)?;
+                }
+                current.max(0) as u64
+            };
             // Every accepted transform owns the current-pass value: stable passes write NULL
             // rather than leaving an older divergence looking like a present observation.
             tx.execute(
@@ -10256,12 +10737,18 @@ impl McStore {
                     params![session_id, drop_id],
                 )?;
             }
-            Ok(CommitOutcome::Committed(next))
+            Ok(CommitOutcome::Committed(accepted_version))
         })?;
 
         match outcome {
             CommitOutcome::Committed(v) => Ok(v),
             CommitOutcome::CasConflict(found) => Err(McStoreError::CasConflict { expected, found }),
+            CommitOutcome::UnhydratedBlockIdentities(stored) => {
+                Err(McStoreError::UnhydratedBlockIdentities {
+                    session_id: session_id.to_string(),
+                    stored,
+                })
+            }
         }
     }
 
@@ -10919,12 +11406,13 @@ impl McStore {
                             return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
                         }
                     };
-                    let meta = match serde_json::from_str(meta_json) {
+                    let mut meta: ModuleMeta = match serde_json::from_str(meta_json) {
                         Ok(meta) => meta,
                         Err(error) => {
                             return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
                         }
                     };
+                    hydrate_meta_row_state(tx, request.target_key, &mut meta)?;
                     (core, meta)
                 }
                 None => (CoreState::default(), ModuleMeta::default()),
@@ -11151,7 +11639,10 @@ impl McStore {
                 Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
             };
             let source_meta: ModuleMeta = match serde_json::from_str(&source_meta_json) {
-                Ok(meta) => meta,
+                Ok(mut meta) => {
+                    hydrate_meta_row_state(tx, &source_key, &mut meta)?;
+                    meta
+                }
                 Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
             };
             let prior_last = source_meta.newest_live_ordinal;
@@ -11367,6 +11858,10 @@ impl McStore {
                     params![request.target_key],
                 )?;
             }
+            // The target is about to adopt the source's state wholesale, so its own row-stored
+            // meta goes first. This is the explicit clear: a descent really does mean "remove
+            // what is there", which a commit carrying an empty map never does.
+            clear_meta_row_state_tx(tx, request.target_key)?;
             // Session notes follow the descended conversation key. Do not copy smart notes:
             // their project-wide visibility is independent of one lineage's retained history.
             let note_projects = {
@@ -11474,6 +11969,15 @@ impl McStore {
                 "INSERT INTO mc_overlay_frontiers (session_id, max_seen_ordinal)
                  SELECT ?1, max_seen_ordinal
                    FROM mc_overlay_frontiers WHERE session_id = ?2",
+                params![request.target_key, source_key],
+            )?;
+            // The descended target adopts the source's meta, so its block identities come
+            // with it. The served fingerprints deliberately do not: the target starts with an
+            // empty served set, matching the cleared field above.
+            tx.execute(
+                "INSERT INTO mc_block_identities (session_id, mid, identities)
+                 SELECT ?1, mid, identities
+                   FROM mc_block_identities WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
             tx.execute(
@@ -11765,6 +12269,9 @@ impl McStore {
                 "DELETE FROM mc_historian_side_channel_outbox WHERE session_id = ?1",
                 params![session_id],
             )?;
+            // The reset writes a default ModuleMeta, which used to blank the identity map and
+            // the served fingerprints along with it. They are rows now, so drop them here.
+            clear_meta_row_state_tx(tx, session_id)?;
             let next_version = current as u64 + 1;
             tx.execute(
                 "UPDATE mc_cache_state
@@ -12026,6 +12533,58 @@ impl McStore {
         Ok(row)
     }
 
+    /// Record context.db ids acknowledged by a host mirror. The visibility marker makes a
+    /// memory rendered without an id eligible for reconsideration during the next correction pass.
+    pub fn acknowledge_host_memory_ids(
+        &self,
+        project_path: &str,
+        acknowledgements: &[HostMemoryIdentityAck],
+    ) -> Result<usize, McStoreError> {
+        self.inner
+            .with_conn_fenced(|tx| {
+                let mut changed = 0usize;
+                for acknowledgement in acknowledgements {
+                    let row = tx
+                        .query_row(
+                            "SELECT project_path, host_row_id FROM mc_memories WHERE id = ?1",
+                            params![acknowledgement.module_row_id],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+                        )
+                        .optional()?;
+                    let Some((row_project, current_host_id)) = row else {
+                        continue;
+                    };
+                    if row_project != project_path {
+                        return Err(rusqlite::Error::InvalidParameterName(format!(
+                            "memory {} belongs to a different project",
+                            acknowledgement.module_row_id
+                        )));
+                    }
+                    if current_host_id == Some(acknowledgement.host_row_id) {
+                        continue;
+                    }
+                    tx.execute(
+                        "UPDATE mc_memories SET host_row_id = ?1 WHERE id = ?2",
+                        params![acknowledgement.host_row_id, acknowledgement.module_row_id],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO mc_memory_mutation_log(
+                         project_path, mutation_type, target_memory_id, category, queued_at
+                     ) VALUES (?1, 'update', ?2, ?3, ?4)",
+                        params![
+                            project_path,
+                            acknowledgement.module_row_id,
+                            MEMORY_VISIBILITY_MUTATION_CATEGORY,
+                            current_time_ms(),
+                        ],
+                    )?;
+                    changed += 1;
+                }
+                Ok(changed)
+            })
+            .map_err(Into::into)
+    }
+
     /// Load multiple memory rows by id through the same workspace-visibility predicate the
     /// m0 render path uses. Missing ids are silently absent from the result; rows that the
     /// caller's project identity cannot see (own project always visible; foreign member
@@ -12062,7 +12621,7 @@ impl McStore {
         let mut binds = id_binds;
         binds.extend(visibility_binds);
         let sql = format!(
-            "SELECT id, project_path, category, content, normalized_hash, importance, scope,
+            "SELECT id, host_row_id, project_path, category, content, normalized_hash, importance, scope,
                     shareable, source_session_id, source_type, seen_count, retrieval_count,
                     first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
                     status, expires_at, verification_status, verified_at, classified_at,
@@ -12679,13 +13238,16 @@ impl McStore {
                     "historian firing has no selected-range content identities".to_string(),
                 ));
             }
-            if let Some(changed) = predicate.selected_range_identities.iter().find(|selected| {
-                meta.block_identity_by_mid.get(&selected.mid) != Some(&selected.block_identities)
-            }) {
-                return Ok(PublishTxnOutcome::FenceRejected(format!(
-                    "selected historian message {} changed after firing",
-                    changed.mid
-                )));
+            // Only the selected messages are looked up: the identities are rows now, so the
+            // fence costs a handful of point reads instead of parsing the session's whole map.
+            for selected in &predicate.selected_range_identities {
+                let stored = block_identities_for_mid_tx(tx, session_id, &selected.mid)?;
+                if stored.as_ref() != Some(&selected.block_identities) {
+                    return Ok(PublishTxnOutcome::FenceRejected(format!(
+                        "selected historian message {} changed after firing",
+                        selected.mid
+                    )));
+                }
             }
 
             if meta.revert_epoch != request.expected_revert_epoch {
@@ -13190,8 +13752,8 @@ impl McStore {
     ) -> Result<Vec<StoredMemory>, McStoreError> {
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, project_path, category, content, importance, status, expires_at,
-                        superseded_by_memory_id, updated_at
+                "SELECT id, host_row_id, project_path, category, content, importance, status, expires_at,
+                        superseded_by_memory_id, updated_at, last_seen_at, verified_at
                  FROM mc_memories
                  WHERE project_path = ?1
                    AND status IN ('active', 'permanent')
@@ -13202,20 +13764,88 @@ impl McStore {
                 .query_map(params![project_path, now_ms], |r| {
                     Ok(StoredMemory {
                         id: r.get(0)?,
-                        project_path: r.get(1)?,
-                        category: r.get(2)?,
-                        content: r.get(3)?,
-                        importance: r.get(4)?,
-                        status: r.get(5)?,
-                        expires_at: r.get(6)?,
-                        superseded_by_memory_id: r.get(7)?,
-                        updated_at: r.get(8)?,
+                        host_row_id: r.get(1)?,
+                        project_path: r.get(2)?,
+                        category: r.get(3)?,
+                        content: r.get(4)?,
+                        importance: r.get(5)?,
+                        status: r.get(6)?,
+                        expires_at: r.get(7)?,
+                        superseded_by_memory_id: r.get(8)?,
+                        updated_at: r.get(9)?,
+                        last_seen_at: r.get(10)?,
+                        verified_at: r.get(11)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(mapped)
         })?;
         Ok(rows)
+    }
+
+    pub fn module_memory_ids_for_host_ids(
+        &self,
+        project_paths: &[String],
+        host_ids: &[i64],
+    ) -> Result<HashMap<i64, i64>, McStoreError> {
+        if project_paths.is_empty() || host_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let project_placeholders = std::iter::repeat_n("?", project_paths.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let id_placeholders = std::iter::repeat_n("?", host_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT host_row_id, id FROM mc_memories
+              WHERE project_path IN ({project_placeholders})
+                AND host_row_id IN ({id_placeholders})"
+        );
+        let mut binds = project_paths
+            .iter()
+            .cloned()
+            .map(rusqlite::types::Value::from)
+            .collect::<Vec<_>>();
+        binds.extend(host_ids.iter().copied().map(rusqlite::types::Value::from));
+        self.inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(&sql)?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<Result<HashMap<_, _>, _>>()?;
+                Ok(rows)
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn host_memory_ids_for_module_ids(
+        &self,
+        module_ids: &[i64],
+    ) -> Result<HashMap<i64, i64>, McStoreError> {
+        if module_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", module_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, host_row_id FROM mc_memories
+              WHERE id IN ({placeholders}) AND host_row_id IS NOT NULL"
+        );
+        self.inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(&sql)?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(module_ids.iter()), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<Result<HashMap<_, _>, _>>()?;
+                Ok(rows)
+            })
+            .map_err(Into::into)
     }
 
     /// The coalesced memory corrections to render as the delta across the workspace union.
@@ -13452,8 +14082,8 @@ impl McStore {
 
         let rows = self.inner.with_conn(|conn| {
             let sql = format!(
-                "SELECT id, {path_column}, category, content, importance, status, expires_at,
-                        superseded_by_memory_id, updated_at
+"SELECT id, host_row_id, {path_column}, category, content, importance, status, expires_at,
+                         superseded_by_memory_id, updated_at, last_seen_at, verified_at
                    FROM {table}
                   WHERE {pool_filter}
                   ORDER BY COALESCE(importance, 50) DESC, id ASC"
@@ -13463,14 +14093,17 @@ impl McStore {
                 .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
                     Ok(StoredMemory {
                         id: r.get(0)?,
-                        project_path: r.get(1)?,
-                        category: r.get(2)?,
-                        content: r.get(3)?,
-                        importance: r.get(4)?,
-                        status: r.get(5)?,
-                        expires_at: r.get(6)?,
-                        superseded_by_memory_id: r.get(7)?,
-                        updated_at: r.get(8)?,
+                        host_row_id: r.get(1)?,
+                        project_path: r.get(2)?,
+                        category: r.get(3)?,
+                        content: r.get(4)?,
+                        importance: r.get(5)?,
+                        status: r.get(6)?,
+                        expires_at: r.get(7)?,
+                        superseded_by_memory_id: r.get(8)?,
+                        updated_at: r.get(9)?,
+                        last_seen_at: r.get(10)?,
+                        verified_at: r.get(11)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -13501,8 +14134,8 @@ impl McStore {
                 now_ms,
             );
             let sql = format!(
-                "SELECT id, {path_column}, category, content, importance, status, expires_at,
-                        superseded_by_memory_id, updated_at
+"SELECT id, host_row_id, {path_column}, category, content, importance, status, expires_at,
+                         superseded_by_memory_id, updated_at, last_seen_at, verified_at
                    FROM {table}
                   WHERE {pool_filter}
                   ORDER BY COALESCE(importance, 50) DESC, id ASC"
@@ -13512,14 +14145,17 @@ impl McStore {
                 .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
                     Ok(StoredMemory {
                         id: row.get(0)?,
-                        project_path: row.get(1)?,
-                        category: row.get(2)?,
-                        content: row.get(3)?,
-                        importance: row.get(4)?,
-                        status: row.get(5)?,
-                        expires_at: row.get(6)?,
-                        superseded_by_memory_id: row.get(7)?,
-                        updated_at: row.get(8)?,
+                        host_row_id: row.get(1)?,
+                        project_path: row.get(2)?,
+                        category: row.get(3)?,
+                        content: row.get(4)?,
+                        importance: row.get(5)?,
+                        status: row.get(6)?,
+                        expires_at: row.get(7)?,
+                        superseded_by_memory_id: row.get(8)?,
+                        updated_at: row.get(9)?,
+                        last_seen_at: row.get(10)?,
+                        verified_at: row.get(11)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -15800,8 +16436,8 @@ impl McStore {
                                 ELSE MAX(classified_at, ?21)
                             END,
                             superseded_by_memory_id=?22, merged_from=?23, metadata_json=?24,
-                            context_store_uuid=?25, context_row_id=?26
-                      WHERE id=?28",
+                            context_store_uuid=?25, context_row_id=?26, host_row_id=?28
+                      WHERE id=?29",
                 )?;
                 let mut memory_upsert = tx.prepare(
                     "INSERT INTO mc_memories
@@ -15809,9 +16445,9 @@ impl McStore {
                          source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
                          created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at,
                          verification_status, verified_at, classified_at, superseded_by_memory_id,
-                         merged_from, metadata_json, context_store_uuid, context_row_id)
+                         merged_from, metadata_json, context_store_uuid, context_row_id, host_row_id)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+                             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
                      ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
                         project_path=excluded.project_path, category=excluded.category,
                         content=excluded.content, normalized_hash=excluded.normalized_hash,
@@ -15832,8 +16468,9 @@ impl McStore {
                             WHEN excluded.classified_at IS NULL THEN classified_at
                             ELSE MAX(classified_at, excluded.classified_at)
                         END,
-                        superseded_by_memory_id=excluded.superseded_by_memory_id,
-                        merged_from=excluded.merged_from, metadata_json=excluded.metadata_json",
+                         superseded_by_memory_id=excluded.superseded_by_memory_id,
+                         merged_from=excluded.merged_from, metadata_json=excluded.metadata_json,
+                         host_row_id=excluded.host_row_id",
                 )?;
                 let mut memory_by_source = tx.prepare(
                     "SELECT id FROM mc_memories
@@ -15967,6 +16604,7 @@ impl McStore {
                             context_store_uuid,
                             prepared_row.source_row_id,
                             i64::from(force_incoming_content),
+                            prepared_row.source_row_id,
                             selected_id,
                         ])?;
                     } else {
@@ -15996,6 +16634,7 @@ impl McStore {
                             text("merged_from"),
                             text("metadata_json"),
                             context_store_uuid,
+                            prepared_row.source_row_id,
                             prepared_row.source_row_id,
                         ])?;
                     }
@@ -16270,6 +16909,69 @@ impl McStore {
             }
             Ok(module_row_ids)
         })
+    }
+
+    /// Return the newest sequence available to a domain mirror consumer.
+    pub fn changefeed_head(&self, domain: &str) -> Result<i64, McStoreError> {
+        validate_authority_domain(domain)?;
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed WHERE domain = ?1",
+                    params![domain],
+                    |row| row.get(0),
+                )
+            })
+            .map_err(Into::into)
+    }
+
+    /// Return the latest complete feed snapshot for one live memory without advancing a
+    /// consumer cursor. Host adapters use this bounded path to obtain a freshly written row's
+    /// context.db id before replying; the ordinary cursor drain may replay it idempotently.
+    pub fn pull_memory_changefeed_row(
+        &self,
+        module_row_id: i64,
+    ) -> Result<Option<ChangefeedRow>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT feed_seq, domain, op, module_row_id, full_row_snapshot, content_hash
+                       FROM mc_changefeed
+                      WHERE domain = 'memories' AND module_row_id = ?1 AND op != 'tombstone'
+                      ORDER BY feed_seq DESC LIMIT 1",
+                    params![module_row_id],
+                    |row| {
+                        let snapshot: String = row.get(4)?;
+                        Ok(ChangefeedRow {
+                            feed_seq: row.get(0)?,
+                            domain: row.get(1)?,
+                            op: row.get(2)?,
+                            module_row_id: row.get(3)?,
+                            full_row_snapshot: serde_json::from_str(&snapshot).map_err(
+                                |error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        4,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(error),
+                                    )
+                                },
+                            )?,
+                            content_hash: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()
+            })
+            .map_err(Into::into)
+    }
+
+    /// Count current module-owned memory rows for mirror-health discrimination.
+    pub fn live_memory_row_count(&self) -> Result<i64, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM mc_memories", [], |row| row.get(0))
+            })
+            .map_err(Into::into)
     }
 
     /// Pull a bounded, ordered feed page. The cursor is a global feed sequence;
@@ -16555,7 +17257,7 @@ fn replace_authority_memories_tx(
                         verification_status = ?20, verified_at = ?21, classified_at = ?22,
                         superseded_by_memory_id = ?23, merged_from = ?24, metadata_json = ?25,
                         mural_cue = ?26, mural_cue_hash = ?27, mural_cue_at = ?28,
-                        mural_cue_rejection_count = ?29
+                        mural_cue_rejection_count = ?29, host_row_id = ?30
                   WHERE id = ?1",
                 params![
                     existing_id,
@@ -16587,6 +17289,7 @@ fn replace_authority_memories_tx(
                     memory.mural_cue_hash.as_deref(),
                     memory.mural_cue_at,
                     memory.mural_cue_rejection_count,
+                    memory.host_row_id.or(Some(memory.id)),
                 ],
             )?;
             continue;
@@ -16597,9 +17300,9 @@ fn replace_authority_memories_tx(
                 scope, shareable, source_session_id, source_type, seen_count, retrieval_count,
                 first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
                 status, expires_at, verification_status, verified_at, classified_at,
-                 superseded_by_memory_id, merged_from, metadata_json, mural_cue, mural_cue_hash,
-                 mural_cue_at, mural_cue_rejection_count)
-              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)
+                  superseded_by_memory_id, merged_from, metadata_json, mural_cue, mural_cue_hash,
+                  mural_cue_at, mural_cue_rejection_count, host_row_id)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30)
              ON CONFLICT(id) DO UPDATE SET
                 project_path = excluded.project_path,
                 category = excluded.category,
@@ -16627,8 +17330,9 @@ fn replace_authority_memories_tx(
                  metadata_json = excluded.metadata_json,
                  mural_cue = excluded.mural_cue,
                  mural_cue_hash = excluded.mural_cue_hash,
-                 mural_cue_at = excluded.mural_cue_at,
-                 mural_cue_rejection_count = excluded.mural_cue_rejection_count
+                  mural_cue_at = excluded.mural_cue_at,
+                  mural_cue_rejection_count = excluded.mural_cue_rejection_count,
+                  host_row_id = excluded.host_row_id
                ON CONFLICT(project_path, category, normalized_hash) DO UPDATE SET
                  content = excluded.content,
                  importance = excluded.importance,
@@ -16653,8 +17357,9 @@ fn replace_authority_memories_tx(
                  metadata_json = excluded.metadata_json,
                  mural_cue = excluded.mural_cue,
                  mural_cue_hash = excluded.mural_cue_hash,
-                 mural_cue_at = excluded.mural_cue_at,
-                 mural_cue_rejection_count = excluded.mural_cue_rejection_count",
+                  mural_cue_at = excluded.mural_cue_at,
+                  mural_cue_rejection_count = excluded.mural_cue_rejection_count,
+                  host_row_id = excluded.host_row_id",
             params![
                 memory.id,
                 &memory.project_path,
@@ -16685,6 +17390,7 @@ fn replace_authority_memories_tx(
                 memory.mural_cue_hash.as_deref(),
                 memory.mural_cue_at,
                 memory.mural_cue_rejection_count,
+                memory.host_row_id.or(Some(memory.id)),
             ],
         )?;
     }
@@ -17260,7 +17966,7 @@ fn promote_facts_tx(
 }
 
 const MEMORY_FULL_SELECT_COLUMNS: &str =
-    "SELECT id, project_path, category, content, normalized_hash, importance, scope,
+    "SELECT id, host_row_id, project_path, category, content, normalized_hash, importance, scope,
             shareable, source_session_id, source_type, seen_count, retrieval_count,
             first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
             status, expires_at, verification_status, verified_at, classified_at,
@@ -17269,7 +17975,7 @@ const MEMORY_FULL_SELECT_COLUMNS: &str =
             mural_cue_rejection_count";
 
 const MEMORY_FULL_SELECT_BY_ID: &str =
-    "SELECT id, project_path, category, content, normalized_hash, importance, scope,
+    "SELECT id, host_row_id, project_path, category, content, normalized_hash, importance, scope,
             shareable, source_session_id, source_type, seen_count, retrieval_count,
             first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at,
             status, expires_at, verification_status, verified_at, classified_at,
@@ -17281,40 +17987,41 @@ const MEMORY_FULL_SELECT_BY_ID: &str =
 fn stored_memory_full_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemoryFull> {
     Ok(StoredMemoryFull {
         id: r.get(0)?,
-        project_path: r.get(1)?,
-        category: r.get(2)?,
-        content: r.get(3)?,
-        normalized_hash: r.get(4)?,
-        importance: r.get::<_, Option<i64>>(5)?.map(|v| v as i32),
-        scope: r.get(6)?,
-        shareable: r.get::<_, i64>(7)? as i32,
-        source_session_id: r.get(8)?,
-        source_type: r.get(9)?,
-        seen_count: r.get::<_, Option<i64>>(10)?.unwrap_or(0),
-        retrieval_count: r.get::<_, Option<i64>>(11)?.unwrap_or(0),
-        first_seen_at: r.get(12)?,
-        created_at: r.get(13)?,
-        updated_at: r.get(14)?,
-        last_seen_at: r.get(15)?,
-        last_retrieved_at: r.get(16)?,
+        host_row_id: r.get(1)?,
+        project_path: r.get(2)?,
+        category: r.get(3)?,
+        content: r.get(4)?,
+        normalized_hash: r.get(5)?,
+        importance: r.get::<_, Option<i64>>(6)?.map(|v| v as i32),
+        scope: r.get(7)?,
+        shareable: r.get::<_, i64>(8)? as i32,
+        source_session_id: r.get(9)?,
+        source_type: r.get(10)?,
+        seen_count: r.get::<_, Option<i64>>(11)?.unwrap_or(0),
+        retrieval_count: r.get::<_, Option<i64>>(12)?.unwrap_or(0),
+        first_seen_at: r.get(13)?,
+        created_at: r.get(14)?,
+        updated_at: r.get(15)?,
+        last_seen_at: r.get(16)?,
+        last_retrieved_at: r.get(17)?,
         status: r
-            .get::<_, Option<String>>(17)?
+            .get::<_, Option<String>>(18)?
             .unwrap_or_else(|| "active".to_string()),
-        expires_at: r.get(18)?,
+        expires_at: r.get(19)?,
         verification_status: r
-            .get::<_, Option<String>>(19)?
+            .get::<_, Option<String>>(20)?
             .unwrap_or_else(|| "unverified".to_string()),
-        verified_at: r.get(20)?,
-        classified_at: r.get(21)?,
-        superseded_by_memory_id: r.get(22)?,
-        merged_from: r.get(23)?,
-        metadata_json: r.get(24)?,
-        context_store_uuid: r.get(25)?,
-        context_row_id: r.get(26)?,
-        mural_cue: r.get(27)?,
-        mural_cue_hash: r.get(28)?,
-        mural_cue_at: r.get(29)?,
-        mural_cue_rejection_count: r.get::<_, Option<i64>>(30)?.unwrap_or(0),
+        verified_at: r.get(21)?,
+        classified_at: r.get(22)?,
+        superseded_by_memory_id: r.get(23)?,
+        merged_from: r.get(24)?,
+        metadata_json: r.get(25)?,
+        context_store_uuid: r.get(26)?,
+        context_row_id: r.get(27)?,
+        mural_cue: r.get(28)?,
+        mural_cue_hash: r.get(29)?,
+        mural_cue_at: r.get(30)?,
+        mural_cue_rejection_count: r.get::<_, Option<i64>>(31)?.unwrap_or(0),
     })
 }
 
@@ -17408,6 +18115,7 @@ fn memory_feed_snapshot(memory: &StoredMemoryFull, mapping: Value, mapping_origi
         "mural_cue_hash": memory.mural_cue_hash,
         "mural_cue_at": memory.mural_cue_at,
         "mural_cue_rejection_count": memory.mural_cue_rejection_count,
+        "host_row_id": memory.host_row_id,
         "mapping": mapping,
         "mapping_origin": mapping_origin,
     })
@@ -17447,6 +18155,405 @@ fn mural_cue_content_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn serde_to_sql_error(error: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+}
+
+/// Read the block identities a session owns, keyed by producer message id.
+///
+/// These live in `mc_block_identities` rather than in the meta blob; see the field comment
+/// on [`ModuleMeta::block_identity_by_mid`] for why.
+fn load_block_identities_tx(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> rusqlite::Result<BTreeMap<String, Vec<BlockIdentity>>> {
+    let mut statement = conn
+        .prepare_cached("SELECT mid, identities FROM mc_block_identities WHERE session_id = ?1")?;
+    let mut rows = statement.query(params![session_id])?;
+    let mut identities = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let mid: String = row.get(0)?;
+        let json: String = row.get(1)?;
+        let vector: Vec<BlockIdentity> = serde_json::from_str(&json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        identities.insert(mid, vector);
+    }
+    Ok(identities)
+}
+
+/// Read one message's stored block identities without parsing the rest of the session's map.
+fn block_identities_for_mid_tx(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    mid: &str,
+) -> rusqlite::Result<Option<Vec<BlockIdentity>>> {
+    let json = conn
+        .query_row(
+            "SELECT identities FROM mc_block_identities WHERE session_id = ?1 AND mid = ?2",
+            params![session_id, mid],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match json {
+        None => Ok(None),
+        Some(json) => serde_json::from_str(&json).map(Some).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        }),
+    }
+}
+
+/// Read the fingerprints of the blocks last served to the provider, in served order.
+fn load_served_output_fingerprints_tx(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> rusqlite::Result<Vec<ServedBlockFingerprint>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT block_id, content_hash, serialized_len FROM mc_served_output_fingerprints
+          WHERE session_id = ?1 ORDER BY position ASC",
+    )?;
+    let rows = statement
+        .query_map(params![session_id], |row| {
+            Ok(ServedBlockFingerprint {
+                block_id: row.get(0)?,
+                content_hash: row.get(1)?,
+                serialized_len: row.get::<_, i64>(2)?.max(0) as usize,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Fill in the parts of a loaded `ModuleMeta` that are stored as rows instead of blob keys.
+/// Every reader that uses those fields must call this; readers that only touch blob scalars
+/// deliberately skip it and pay nothing for state they never look at.
+fn hydrate_meta_row_state(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    meta: &mut ModuleMeta,
+) -> rusqlite::Result<()> {
+    meta.block_identity_by_mid = load_block_identities_tx(conn, session_id)?;
+    meta.served_output_fingerprint = load_served_output_fingerprints_tx(conn, session_id)?;
+    Ok(())
+}
+
+/// Persist `desired` by writing only the entries that differ from what is already stored.
+/// Returns how many rows were inserted, updated, or deleted.
+fn sync_block_identities_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    desired: &BTreeMap<String, Vec<BlockIdentity>>,
+) -> rusqlite::Result<usize> {
+    let mut stored: HashMap<String, String> = HashMap::new();
+    {
+        let mut statement = tx.prepare_cached(
+            "SELECT mid, identities FROM mc_block_identities WHERE session_id = ?1",
+        )?;
+        let mut rows = statement.query(params![session_id])?;
+        while let Some(row) = rows.next()? {
+            stored.insert(row.get(0)?, row.get(1)?);
+        }
+    }
+
+    let mut written = 0usize;
+    for (mid, vector) in desired {
+        let json = serde_json::to_string(vector).map_err(serde_to_sql_error)?;
+        if stored.remove(mid).as_deref() == Some(json.as_str()) {
+            continue;
+        }
+        tx.prepare_cached(
+            "INSERT INTO mc_block_identities (session_id, mid, identities)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id, mid) DO UPDATE SET identities = excluded.identities",
+        )?
+        .execute(params![session_id, mid, json])?;
+        written += 1;
+    }
+    for mid in stored.keys() {
+        written += tx
+            .prepare_cached("DELETE FROM mc_block_identities WHERE session_id = ?1 AND mid = ?2")?
+            .execute(params![session_id, mid])?;
+    }
+    Ok(written)
+}
+
+/// Persist `desired` by position, writing only the positions whose fingerprint changed.
+/// Returns how many rows were inserted, updated, or deleted.
+fn sync_served_output_fingerprints_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    desired: &[ServedBlockFingerprint],
+) -> rusqlite::Result<usize> {
+    let stored = load_served_output_fingerprints_tx(tx, session_id)?;
+    let mut written = 0usize;
+    for (position, fingerprint) in desired.iter().enumerate() {
+        if stored.get(position) == Some(fingerprint) {
+            continue;
+        }
+        tx.prepare_cached(
+            "INSERT INTO mc_served_output_fingerprints
+                 (session_id, position, block_id, content_hash, serialized_len)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id, position) DO UPDATE SET
+                 block_id = excluded.block_id,
+                 content_hash = excluded.content_hash,
+                 serialized_len = excluded.serialized_len",
+        )?
+        .execute(params![
+            session_id,
+            position as i64,
+            fingerprint.block_id,
+            fingerprint.content_hash,
+            fingerprint.serialized_len as i64
+        ])?;
+        written += 1;
+    }
+    if stored.len() > desired.len() {
+        written += tx
+            .prepare_cached(
+                "DELETE FROM mc_served_output_fingerprints
+                  WHERE session_id = ?1 AND position >= ?2",
+            )?
+            .execute(params![session_id, desired.len() as i64])?;
+    }
+    Ok(written)
+}
+
+/// Count the rows a session has under `table`.
+fn meta_row_state_count_tx(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    session_id: &str,
+) -> rusqlite::Result<usize> {
+    let count: i64 = tx.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as usize)
+}
+
+/// Report how many identities a session has when the commit carries none, so the caller can
+/// refuse instead of deleting them.
+///
+/// An empty map means one of two opposite things: every identity was removed, or the meta was
+/// never hydrated. The store cannot tell them apart from the value alone, and guessing wrong
+/// erases a session's whole identity history without an error. So the implicit path refuses,
+/// and the two places that really do reset a session call [`clear_meta_row_state_tx`].
+///
+/// The check is on the identities alone. They are append-only in practice and no pass empties
+/// them, whereas the served fingerprints are genuinely rebuilt each pass and may legitimately
+/// come out empty. An unhydrated meta has both empty, so checking the identities catches it
+/// and stops the commit before the served rows are touched either.
+fn refuse_unhydrated_block_identities_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    meta: &ModuleMeta,
+) -> rusqlite::Result<Option<usize>> {
+    if !meta.block_identity_by_mid.is_empty() {
+        return Ok(None);
+    }
+    let stored = meta_row_state_count_tx(tx, "mc_block_identities", session_id)?;
+    Ok((stored > 0).then_some(stored))
+}
+
+/// Drop every row-stored part of a session's meta. This is the explicit clear: the paths that
+/// reset a session to a default `ModuleMeta` used to wipe these fields by rewriting the blob,
+/// and they say so by calling this rather than by committing an empty map.
+fn clear_meta_row_state_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM mc_block_identities WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    tx.execute(
+        "DELETE FROM mc_served_output_fingerprints WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    Ok(())
+}
+
+/// Whether `mc_cache_state` already holds exactly these blob bytes for the session.
+///
+/// The comparison is pushed into SQLite so it is a `memcmp` over pages the same pass has
+/// already read, rather than a hash of several megabytes of freshly serialized JSON. It reads
+/// the stored bytes every time and is therefore unconditionally correct: there is no cached
+/// answer here that could go stale.
+///
+/// This depends on `core_state` and `meta` comparing under SQLite's default BINARY collation,
+/// which is a byte comparison. Neither column declares a `COLLATE`, and adding one — NOCASE
+/// in particular — would silently turn this into a looser comparison and let a genuinely
+/// changed blob look unchanged. Any collation added to those columns has to come with a
+/// change here.
+fn cache_state_blobs_unchanged(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    core_json: &str,
+    meta_json: &str,
+) -> rusqlite::Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT core_state = ?2 AND meta = ?3 FROM mc_cache_state WHERE session_id = ?1",
+            params![session_id, core_json, meta_json],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// Fingerprint the two collections that live in rows rather than in the blob.
+///
+/// Every field is length-prefixed, so no two different maps can produce the same byte stream
+/// by running their contents together. Nothing is serialized to JSON: the point of this
+/// function is to be much cheaper than the row comparison it lets a pass skip.
+///
+/// The bytes are gathered into one buffer and hashed in a single call rather than fed to the
+/// hasher field by field. A session with ten thousand message ids has tens of thousands of
+/// fields, and at that count the per-call overhead of the hasher costs several times more
+/// than hashing the bytes does.
+///
+/// The result is `identities:served:bytes:hash`, not the hash alone. The three counts are
+/// already computed by the walk above, so they cost nothing, and carrying them means the
+/// only comparison anyone can write — string equality on the whole token — checks them too.
+/// A hash collision would have to coincide with matching entry counts AND a matching total
+/// length to be mistaken for equality. They are part of the value rather than columns beside
+/// it precisely so that a later reader cannot compare the hash and forget the rest.
+fn row_state_fingerprint(meta: &ModuleMeta) -> String {
+    fn push_field(buffer: &mut Vec<u8>, value: &str) {
+        buffer.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        buffer.extend_from_slice(value.as_bytes());
+    }
+
+    // Roughly what a message id plus one identity vector occupies, so the common session
+    // fills the buffer without regrowing it.
+    let mut buffer = Vec::with_capacity(
+        128 * (meta.block_identity_by_mid.len() + meta.served_output_fingerprint.len()) + 64,
+    );
+    buffer.extend_from_slice(&(meta.block_identity_by_mid.len() as u64).to_le_bytes());
+    for (mid, identities) in &meta.block_identity_by_mid {
+        push_field(&mut buffer, mid);
+        buffer.extend_from_slice(&(identities.len() as u64).to_le_bytes());
+        for identity in identities {
+            push_field(&mut buffer, &identity.kind_tag);
+            push_field(&mut buffer, &identity.byte_fingerprint);
+        }
+    }
+    buffer.extend_from_slice(&(meta.served_output_fingerprint.len() as u64).to_le_bytes());
+    for served in &meta.served_output_fingerprint {
+        push_field(&mut buffer, &served.block_id);
+        push_field(&mut buffer, &served.content_hash);
+        buffer.extend_from_slice(&(served.serialized_len as u64).to_le_bytes());
+    }
+
+    format!(
+        "{}:{}:{}:{:032x}",
+        meta.block_identity_by_mid.len(),
+        meta.served_output_fingerprint.len(),
+        buffer.len(),
+        row_state_hash_128(&buffer)
+    )
+}
+
+/// A 128-bit content hash for [`row_state_fingerprint`].
+///
+/// Deliberately not SHA-256. This value is only ever compared against one the same code
+/// wrote for the same session moments earlier, so it is a consistency check on our own data
+/// rather than a boundary anyone can attack, and it runs on every transform pass fleet-wide.
+/// SHA-256 has no hardware path in this build and measures around 200 MB/s, which made
+/// hashing a large session's identities cost more than serializing the whole cache state.
+///
+/// Two independent accumulators are mixed differently and concatenated, and each is
+/// avalanched at the end so a one-bit change in the input reaches every output bit. A
+/// collision would let one pass skip writing identity rows that had in fact changed, leaving
+/// them stale until the next change; at 128 bits that is not a risk worth paying SHA-256 per
+/// pass to avoid.
+fn row_state_hash_128(bytes: &[u8]) -> u128 {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    const MURMUR_C1: u64 = 0xff51_afd7_ed55_8ccd;
+    const MURMUR_C2: u64 = 0xc4ce_b9fe_1a85_ec53;
+
+    let mut a: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut b: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mix = |word: u64, a: &mut u64, b: &mut u64| {
+        *a = (*a ^ word).wrapping_mul(FNV_PRIME);
+        *b = b.rotate_left(31).wrapping_add(word).wrapping_mul(MURMUR_C1);
+        *b ^= *b >> 33;
+    };
+
+    let (words, remainder) = bytes.as_chunks::<8>();
+    for word in words {
+        mix(u64::from_le_bytes(*word), &mut a, &mut b);
+    }
+    // The trailing partial word carries the total length, so inputs that differ only by
+    // trailing zero bytes cannot land on the same value.
+    let mut tail = [0u8; 8];
+    tail[..remainder.len()].copy_from_slice(remainder);
+    mix(
+        u64::from_le_bytes(tail) ^ (bytes.len() as u64),
+        &mut a,
+        &mut b,
+    );
+
+    a ^= a >> 33;
+    a = a.wrapping_mul(MURMUR_C2);
+    a ^= a >> 29;
+    b ^= b >> 32;
+    b = b.wrapping_mul(MURMUR_C2);
+    b ^= b >> 31;
+    (u128::from(a) << 64) | u128::from(b)
+}
+
+/// Whether the session's row-stored collections already hold exactly this content.
+///
+/// A true answer lets the commit skip reading and re-serializing every stored row, which is
+/// the whole cost of a pass that changed nothing. The digest is trusted only when it records
+/// the `row_version` the session is actually at: any writer that bumps the version without
+/// refreshing this row — an older binary during a rollback window, for instance — leaves the
+/// digest untrusted rather than wrong, and the caller falls back to the full comparison.
+fn row_state_digest_matches_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    current_row_version: i64,
+    fingerprint: &str,
+) -> rusqlite::Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT row_version = ?2 AND row_state_fingerprint = ?3
+               FROM mc_cache_state_digest WHERE session_id = ?1",
+            params![session_id, current_row_version, fingerprint],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
+fn record_row_state_digest_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    row_version: i64,
+    fingerprint: &str,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO mc_cache_state_digest (session_id, row_version, row_state_fingerprint)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(session_id) DO UPDATE SET
+             row_version = excluded.row_version,
+             row_state_fingerprint = excluded.row_state_fingerprint",
+        params![session_id, row_version, fingerprint],
+    )?;
+    Ok(())
 }
 
 fn set_memory_mural_cue_tx(
@@ -18407,8 +19514,560 @@ mod tests {
         assert_eq!(loaded.core.boundary_id, "b1");
         assert_eq!(loaded.meta, meta);
 
-        let v2 = store.commit("ses_a", Some(1), &core, &meta).unwrap();
+        // The second commit changes the state it writes. A byte-identical re-commit is a
+        // different contract and is covered by
+        // `commit_with_unchanged_state_does_not_rewrite_the_cache_row`.
+        let changed_meta = ModuleMeta {
+            m1_revision: 1,
+            ..meta.clone()
+        };
+        let v2 = store
+            .commit("ses_a", Some(1), &core, &changed_meta)
+            .unwrap();
         assert_eq!(v2, 2);
+    }
+
+    /// Bytes SQLite has appended to the write-ahead log. This is the quantity the storage
+    /// layout is about: a commit costs whatever region it rewrites, not whatever it meant to
+    /// change, and the WAL is where that region actually lands on disk.
+    fn wal_bytes(dir: &std::path::Path) -> u64 {
+        std::fs::metadata(dir.join("store.db-wal"))
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+    }
+
+    fn checkpoint_wal(store: &McStore) {
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn identity_map(count: usize) -> BTreeMap<String, Vec<BlockIdentity>> {
+        (0..count)
+            .map(|index| {
+                (
+                    format!("m{index:06}"),
+                    vec![BlockIdentity {
+                        kind_tag: "text".to_string(),
+                        byte_fingerprint: format!("{index:064x}"),
+                    }],
+                )
+            })
+            .collect()
+    }
+
+    /// Seed a session with `map_size` block identities, then commit a pass that adds exactly
+    /// one more. Returns the bytes that second commit wrote.
+    fn wal_bytes_to_append_one_identity(map_size: usize) -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let core = CoreState::default();
+        let mut meta = ModuleMeta {
+            block_identity_by_mid: identity_map(map_size),
+            ..ModuleMeta::default()
+        };
+        let version = store.commit("ses", None, &core, &meta).unwrap();
+        assert!(
+            dir.path().join("store.db-wal").exists(),
+            "this measurement reads WAL growth, so the store must be journaling to a WAL"
+        );
+
+        // Drop the seeding write so the delta below contains only the second commit.
+        checkpoint_wal(&store);
+        let before = wal_bytes(dir.path());
+
+        meta.block_identity_by_mid.insert(
+            "m999999".to_string(),
+            vec![BlockIdentity {
+                kind_tag: "text".to_string(),
+                byte_fingerprint: "appended".to_string(),
+            }],
+        );
+        store.commit("ses", Some(version), &core, &meta).unwrap();
+        let written = wal_bytes(dir.path()).saturating_sub(before);
+
+        assert_eq!(
+            store.load("ses").unwrap().meta.block_identity_by_mid,
+            meta.block_identity_by_mid,
+            "the appended identity must survive the round trip"
+        );
+        written
+    }
+
+    #[test]
+    fn a_pass_appending_one_identity_does_not_pay_for_the_whole_map() {
+        // The cost of appending one entry must be set by the entry, not by how much history
+        // sits next to it. Holding the change fixed and varying only the size of the map it
+        // lands in is what separates "wrote one row" from "rewrote the region".
+        let small = wal_bytes_to_append_one_identity(500);
+        let large = wal_bytes_to_append_one_identity(5_000);
+        assert!(
+            large <= small + 16_384,
+            "appending one identity wrote {large} bytes into a 5000-entry map and {small} \
+             bytes into a 500-entry map; the cost is scaling with the map"
+        );
+    }
+
+    #[test]
+    fn commit_with_unchanged_state_does_not_rewrite_the_cache_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let core = CoreState {
+            boundary_id: "b1".to_string(),
+            ..CoreState::default()
+        };
+        let meta = ModuleMeta {
+            initialized: true,
+            // A body large enough that rewriting the row is unmistakable in the WAL.
+            last_todo_state: Some("t".repeat(400_000)),
+            ..ModuleMeta::default()
+        };
+        let version = store.commit("ses", None, &core, &meta).unwrap();
+        assert!(
+            dir.path().join("store.db-wal").exists(),
+            "this measurement reads WAL growth, so the store must be journaling to a WAL"
+        );
+
+        checkpoint_wal(&store);
+        let before = wal_bytes(dir.path());
+
+        let again = store.commit("ses", Some(version), &core, &meta).unwrap();
+        let written = wal_bytes(dir.path()).saturating_sub(before);
+
+        assert_eq!(
+            again, version,
+            "a commit that changes nothing must leave the row_version where it was"
+        );
+        assert!(
+            written < 65_536,
+            "re-committing byte-identical state wrote {written} bytes; the row was rewritten"
+        );
+        let reloaded = store.load("ses").unwrap();
+        assert_eq!(reloaded.meta, meta);
+        assert_eq!(reloaded.core, core);
+        assert_eq!(reloaded.row_version, Some(version));
+    }
+
+    #[test]
+    fn commit_refuses_an_unhydrated_meta_instead_of_deleting_the_identity_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let core = CoreState::default();
+        let seeded = ModuleMeta {
+            initialized: true,
+            block_identity_by_mid: identity_map(12),
+            served_output_fingerprint: vec![ServedBlockFingerprint {
+                block_id: "m000000#0".to_string(),
+                content_hash: "hash".to_string(),
+                serialized_len: 7,
+            }],
+            ..ModuleMeta::default()
+        };
+        let version = store.commit("ses", None, &core, &seeded).unwrap();
+
+        // What a caller that never went through the store's hydration hands over: the blob
+        // fields are all present, the row-stored ones are empty.
+        let unhydrated = ModuleMeta {
+            initialized: true,
+            last_render_config: "changed".to_string(),
+            ..ModuleMeta::default()
+        };
+        let result = store.commit("ses", Some(version), &core, &unhydrated);
+
+        // The surviving data is asserted first and on its own. If the refusal is ever removed
+        // the commit succeeds, and this is the assertion that has to report what that cost.
+        let reloaded = store.load("ses").unwrap();
+        assert_eq!(
+            reloaded.meta.block_identity_by_mid,
+            seeded.block_identity_by_mid,
+            "the commit deleted {} of {} stored block identities",
+            seeded.block_identity_by_mid.len() - reloaded.meta.block_identity_by_mid.len(),
+            seeded.block_identity_by_mid.len()
+        );
+        assert_eq!(
+            reloaded.meta.served_output_fingerprint, seeded.served_output_fingerprint,
+            "the commit also dropped the served fingerprints"
+        );
+        assert_eq!(
+            reloaded.row_version,
+            Some(version),
+            "a refused commit must not move the row_version"
+        );
+        assert_eq!(reloaded.meta.last_render_config, seeded.last_render_config);
+
+        let error = result.expect_err("an unhydrated commit must be refused, not applied");
+        match &error {
+            McStoreError::UnhydratedBlockIdentities { session_id, stored } => {
+                assert_eq!(session_id, "ses");
+                assert_eq!(*stored, 12);
+            }
+            other => panic!("expected an unhydrated-identities refusal, got {other:?}"),
+        }
+        assert!(
+            error.to_string().contains("ses"),
+            "the refusal must name the session: {error}"
+        );
+    }
+
+    #[test]
+    fn a_commit_may_still_empty_the_served_fingerprints_on_its_own() {
+        // Only the identities are guarded. The served vector is rebuilt from scratch every
+        // pass, so a pass that serves nothing legitimately commits an empty one.
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let core = CoreState::default();
+        let mut meta = ModuleMeta {
+            block_identity_by_mid: identity_map(4),
+            served_output_fingerprint: vec![ServedBlockFingerprint {
+                block_id: "m000000#0".to_string(),
+                content_hash: "hash".to_string(),
+                serialized_len: 7,
+            }],
+            ..ModuleMeta::default()
+        };
+        let version = store.commit("ses", None, &core, &meta).unwrap();
+
+        meta.served_output_fingerprint.clear();
+        let next = store.commit("ses", Some(version), &core, &meta).unwrap();
+        assert!(next > version);
+
+        let reloaded = store.load("ses").unwrap();
+        assert!(reloaded.meta.served_output_fingerprint.is_empty());
+        assert_eq!(
+            reloaded.meta.block_identity_by_mid,
+            meta.block_identity_by_mid
+        );
+    }
+
+    #[test]
+    fn recomp_reset_clears_the_row_state_it_used_to_blank_through_the_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let meta = ModuleMeta {
+            block_identity_by_mid: identity_map(6),
+            served_output_fingerprint: vec![ServedBlockFingerprint {
+                block_id: "m000000#0".to_string(),
+                content_hash: "hash".to_string(),
+                serialized_len: 7,
+            }],
+            ..ModuleMeta::default()
+        };
+        let version = store
+            .commit("ses", None, &CoreState::default(), &meta)
+            .unwrap();
+
+        store
+            .reset_session_for_recomp("ses", Some(version))
+            .unwrap();
+
+        let reloaded = store.load("ses").unwrap();
+        assert!(
+            reloaded.meta.block_identity_by_mid.is_empty(),
+            "a deliberate reset still clears the identities"
+        );
+        assert!(reloaded.meta.served_output_fingerprint.is_empty());
+    }
+
+    /// Do to the store exactly what a rolled-back binary does: it knows nothing about the
+    /// identity rows or the digest, so it bumps `row_version` and rewrites the blob on its
+    /// own, re-minting a map into the blob that no longer matches the rows.
+    fn simulate_pre_v55_binary_commit(store: &McStore, session_id: &str, blob_identities: usize) {
+        store
+            .inner
+            .with_conn(|conn| {
+                let meta_json: String = conn.query_row(
+                    "SELECT meta FROM mc_cache_state WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                let mut meta: Value = serde_json::from_str(&meta_json).unwrap();
+                let minted = identity_map(blob_identities);
+                meta.as_object_mut().unwrap().insert(
+                    "block_identity_by_mid".to_string(),
+                    serde_json::to_value(&minted).unwrap(),
+                );
+                conn.execute(
+                    "UPDATE mc_cache_state
+                        SET row_version = row_version + 1, meta = ?2
+                      WHERE session_id = ?1",
+                    params![session_id, serde_json::to_string(&meta).unwrap()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn meta_with_identities(entries: &[(&str, &str, &str)]) -> ModuleMeta {
+        ModuleMeta {
+            block_identity_by_mid: entries
+                .iter()
+                .map(|(mid, kind_tag, byte_fingerprint)| {
+                    (
+                        (*mid).to_string(),
+                        vec![BlockIdentity {
+                            kind_tag: (*kind_tag).to_string(),
+                            byte_fingerprint: (*byte_fingerprint).to_string(),
+                        }],
+                    )
+                })
+                .collect(),
+            ..ModuleMeta::default()
+        }
+    }
+
+    /// Split `identities:served:bytes:hash` into the scalars the widening added and the hash
+    /// they back up.
+    fn fingerprint_parts(fingerprint: &str) -> (String, String) {
+        let (scalars, hash) = fingerprint
+            .rsplit_once(':')
+            .expect("a fingerprint carries its scalars ahead of the hash");
+        (scalars.to_string(), hash.to_string())
+    }
+
+    fn fingerprint_byte_length(scalars: &str) -> String {
+        scalars
+            .rsplit_once(':')
+            .expect("the scalars carry the total byte length last")
+            .1
+            .to_string()
+    }
+
+    #[test]
+    fn a_row_state_fingerprint_separates_maps_by_content_count_and_length() {
+        // Same number of entries, same total length, one byte of content different. Neither
+        // scalar can tell these apart, so this half is the hash doing its job.
+        let left = meta_with_identities(&[("m1", "text", "aaaa"), ("m2", "text", "bbbb")]);
+        let right = meta_with_identities(&[("m1", "text", "aaab"), ("m2", "text", "bbbb")]);
+        let (left_scalars, left_hash) = fingerprint_parts(&row_state_fingerprint(&left));
+        let (right_scalars, right_hash) = fingerprint_parts(&row_state_fingerprint(&right));
+        assert_eq!(
+            left_scalars, right_scalars,
+            "this pair is constructed to agree on every count and on the total length"
+        );
+        assert_ne!(
+            left_hash, right_hash,
+            "maps differing only in content must not share a fingerprint"
+        );
+        assert_ne!(row_state_fingerprint(&left), row_state_fingerprint(&right));
+
+        // Different number of entries, identical total length. Each entry costs 32 bytes of
+        // framing plus its content, so one entry carrying 32 more content bytes than two
+        // entries carry between them lands on the same total.
+        let one_entry = meta_with_identities(&[("a", "t", &"x".repeat(36))]);
+        let two_entries = meta_with_identities(&[("a", "t", "u"), ("b", "t", "u")]);
+        let (one_scalars, _) = fingerprint_parts(&row_state_fingerprint(&one_entry));
+        let (two_scalars, _) = fingerprint_parts(&row_state_fingerprint(&two_entries));
+        assert_eq!(
+            fingerprint_byte_length(&one_scalars),
+            fingerprint_byte_length(&two_scalars),
+            "this pair is constructed to agree on the total length"
+        );
+        assert_ne!(
+            one_scalars, two_scalars,
+            "the entry count must separate maps the total length cannot"
+        );
+        assert_ne!(
+            row_state_fingerprint(&one_entry),
+            row_state_fingerprint(&two_entries)
+        );
+    }
+
+    #[test]
+    fn a_rollback_window_cannot_leave_a_digest_claiming_the_rows_are_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let core = CoreState::default();
+        let mut meta = ModuleMeta {
+            block_identity_by_mid: identity_map(5),
+            ..ModuleMeta::default()
+        };
+        store.commit("ses", None, &core, &meta).unwrap();
+
+        // The rollback window: an older binary commits without touching the rows or the
+        // digest, leaving a digest that still records the pre-rollback row_version.
+        simulate_pre_v55_binary_commit(&store, "ses", 2);
+
+        // Hydration reads the rows, not the map the old binary left in the blob.
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(
+            loaded.meta.block_identity_by_mid, meta.block_identity_by_mid,
+            "the rows are the truth after a rollback window, not the re-minted blob"
+        );
+
+        // A commit that really does add an identity must still be applied. If the stale
+        // digest were trusted, the comparison that finds the new entry would be skipped.
+        meta.block_identity_by_mid.insert(
+            "m999999".to_string(),
+            vec![BlockIdentity {
+                kind_tag: "text".to_string(),
+                byte_fingerprint: "after-rollback".to_string(),
+            }],
+        );
+        store
+            .commit("ses", loaded.row_version, &core, &meta)
+            .unwrap();
+
+        let after = store.load("ses").unwrap();
+        assert_eq!(
+            after.meta.block_identity_by_mid, meta.block_identity_by_mid,
+            "the identity added after the rollback window must be persisted"
+        );
+        assert_eq!(after.meta.block_identity_by_mid.len(), 6);
+    }
+
+    #[test]
+    fn a_stale_digest_still_converges_when_the_rows_already_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let core = CoreState::default();
+        let meta = ModuleMeta {
+            block_identity_by_mid: identity_map(5),
+            ..ModuleMeta::default()
+        };
+        store.commit("ses", None, &core, &meta).unwrap();
+        simulate_pre_v55_binary_commit(&store, "ses", 2);
+
+        // The first commit back on the new binary still rewrites the blob once, because the
+        // old binary re-added a `block_identity_by_mid` key that this binary does not write.
+        // That is the convergence pass.
+        let rolled_back = store.load("ses").unwrap();
+        let converged = store
+            .commit(
+                "ses",
+                rolled_back.row_version,
+                &rolled_back.core,
+                &rolled_back.meta,
+            )
+            .unwrap();
+        assert_eq!(
+            converged,
+            rolled_back.row_version.unwrap() + 1,
+            "the convergence pass rewrites the blob the old binary left behind"
+        );
+
+        // The pass after it is the steady one: same state, nothing to write, no bump.
+        let loaded = store.load("ses").unwrap();
+        let unchanged = store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        assert_eq!(
+            unchanged,
+            loaded.row_version.unwrap(),
+            "a commit that changes nothing must not move the row_version"
+        );
+
+        let digest = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT row_version, row_state_fingerprint FROM mc_cache_state_digest
+                      WHERE session_id = 'ses'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            digest.0,
+            loaded.row_version.unwrap() as i64,
+            "the digest must be refreshed to the version the session is actually at"
+        );
+        assert_eq!(digest.1, row_state_fingerprint(&loaded.meta));
+        assert_eq!(
+            store.load("ses").unwrap().meta.block_identity_by_mid,
+            meta.block_identity_by_mid
+        );
+    }
+
+    #[test]
+    fn migration_55_moves_a_legacy_blob_map_into_rows_without_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+
+        let identities = identity_map(64);
+        let served = (0..16)
+            .map(|index| ServedBlockFingerprint {
+                block_id: format!("m{index:04}#0"),
+                content_hash: format!("{index:064x}"),
+                serialized_len: index * 37 + 1,
+            })
+            .collect::<Vec<_>>();
+
+        // A row exactly as a pre-migration binary wrote it: both collections inside the blob,
+        // nothing in the side tables.
+        let mut legacy_meta = serde_json::json!({
+            "initialized": true,
+            "last_render_config": "cfg",
+            "coverage_ordinal": 42,
+            "revert_epoch": 3,
+        });
+        legacy_meta["block_identity_by_mid"] = serde_json::to_value(&identities).unwrap();
+        legacy_meta["served_output_fingerprint"] = serde_json::to_value(&served).unwrap();
+        let legacy_meta_json = serde_json::to_string(&legacy_meta).unwrap();
+        let legacy_core_json = serde_json::to_string(&CoreState {
+            boundary_id: "b1".to_string(),
+            ..CoreState::default()
+        })
+        .unwrap();
+
+        let migration_55 = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 55)
+            .expect("migration 55 is bundled")
+            .statements;
+
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO mc_cache_state
+                         (session_id, row_version, core_state, meta, last_activity_at)
+                     VALUES ('legacy', 7, ?1, ?2, 100)",
+                    params![legacy_core_json, legacy_meta_json],
+                )?;
+                // Replay the bundled migration against the legacy row. These are the exact
+                // statements `McStore::open` runs when it upgrades an existing database, not a
+                // re-implementation of them.
+                conn.execute_batch(migration_55)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let loaded = store.load("legacy").unwrap();
+        assert_eq!(
+            loaded.meta.block_identity_by_mid, identities,
+            "every block identity must survive the move into rows"
+        );
+        assert_eq!(
+            loaded.meta.served_output_fingerprint, served,
+            "the served fingerprints must survive the move, in order"
+        );
+        assert_eq!(loaded.meta.coverage_ordinal, Some(42));
+        assert_eq!(loaded.meta.revert_epoch, 3);
+        assert_eq!(loaded.meta.last_render_config, "cfg");
+        assert!(loaded.meta.initialized);
+        assert_eq!(loaded.core.boundary_id, "b1");
+        assert_eq!(loaded.row_version, Some(7));
+
+        let stored_meta = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT meta FROM mc_cache_state WHERE session_id = 'legacy'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert!(
+            !stored_meta.contains("block_identity_by_mid")
+                && !stored_meta.contains("served_output_fingerprint"),
+            "the migrated blob must no longer carry the moved collections: {stored_meta}"
+        );
     }
 
     #[test]
@@ -18865,8 +20524,14 @@ mod tests {
             .commit("ses", initial.row_version, &initial.core, &initial.meta)
             .unwrap();
         let stale = store.load("ses").unwrap();
+        // Advance past `stale` with a commit that really changes the state. A byte-identical
+        // commit no longer moves the row_version, so it would leave `stale` current.
+        let advanced_meta = ModuleMeta {
+            m1_revision: stale.meta.m1_revision + 1,
+            ..stale.meta.clone()
+        };
         store
-            .commit("ses", stale.row_version, &stale.core, &stale.meta)
+            .commit("ses", stale.row_version, &stale.core, &advanced_meta)
             .unwrap();
 
         let tags = [McTagRow {
@@ -20165,13 +21830,17 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let long_error = "é".repeat(2_500);
 
-        store.trace_pass_received("trace", 11).unwrap();
-        store.trace_pass_received("trace", 12).unwrap();
-        store.trace_pass_rejected("trace", &long_error, 21).unwrap();
+        store.trace_pass_received("trace", "attempt-1", 11).unwrap();
+        store.trace_pass_received("trace", "attempt-2", 12).unwrap();
         store
-            .trace_pass_rejected("trace", "second error", 22)
+            .trace_pass_rejected("trace", "attempt-1", &long_error, 21)
             .unwrap();
-        store.trace_pass_completed("trace", 31).unwrap();
+        store
+            .trace_pass_rejected("trace", "attempt-1", "second error", 22)
+            .unwrap();
+        store
+            .trace_pass_completed("trace", "attempt-2", 31)
+            .unwrap();
 
         let trace = store.load_pass_trace("trace").unwrap().unwrap();
         assert_eq!(trace.last_received_at_ms, 12);
@@ -20180,6 +21849,23 @@ mod tests {
         assert_eq!(trace.last_reject_at_ms, Some(22));
         assert_eq!(trace.reject_count, 2);
         assert_eq!(trace.receive_count, 2);
+        assert_eq!(
+            trace.request_history,
+            vec![
+                PassRequestTrace {
+                    attempt_id: "attempt-1".to_string(),
+                    received_at_ms: 11,
+                    completed_at_ms: Some(22),
+                    outcome: "rejected".to_string(),
+                },
+                PassRequestTrace {
+                    attempt_id: "attempt-2".to_string(),
+                    received_at_ms: 12,
+                    completed_at_ms: Some(31),
+                    outcome: "completed".to_string(),
+                },
+            ]
+        );
 
         let defer = PassSchedulerObservation {
             timestamp_ms: 32,
@@ -20239,7 +21925,7 @@ mod tests {
         assert_eq!(bounded.last().unwrap().timestamp_ms, 256);
 
         store
-            .trace_pass_rejected("trace-cap", &long_error, 41)
+            .trace_pass_rejected("trace-cap", "attempt-cap", &long_error, 41)
             .unwrap();
         let capped = store.load_pass_trace("trace-cap").unwrap().unwrap();
         assert_eq!(
@@ -22500,6 +24186,26 @@ mod tests {
                 "project mural",
                 "SELECT data_url, content_hash FROM mc_project_mural_artifacts \
                  WHERE project_path = 'git:plan'",
+            ),
+            (
+                "block identities",
+                "SELECT mid, identities FROM mc_block_identities \
+                 WHERE session_id = 'plan-session'",
+            ),
+            (
+                "block identity fence",
+                "SELECT identities FROM mc_block_identities \
+                 WHERE session_id = 'plan-session' AND mid = 'm1'",
+            ),
+            (
+                "served output fingerprints",
+                "SELECT block_id, content_hash, serialized_len FROM mc_served_output_fingerprints \
+                 WHERE session_id = 'plan-session' ORDER BY position ASC",
+            ),
+            (
+                "cache state digest",
+                "SELECT row_version, row_state_fingerprint FROM mc_cache_state_digest \
+                 WHERE session_id = 'plan-session'",
             ),
         ];
 
@@ -28203,8 +29909,8 @@ mod shadow_tests {
                             "new canonical content",
                             Some("canonical-session"),
                             2,
-                        )?
-                        .expect("valid same-category merge");
+                        )
+                        .map_err(|error| error.to_string())?;
                     Ok(serde_json::to_vec(&(canonical.id, superseded)).unwrap())
                 },
             )

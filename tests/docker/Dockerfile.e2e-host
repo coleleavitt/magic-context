@@ -16,7 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     python3 \
     build-essential \
+    procps \
+    lsof \
     && rm -rf /var/lib/apt/lists/*
+
+# procps and lsof: the OpenCode 2 harness proves isolation by inspecting the
+# child process group's open files (pgrep/ps/lsof), the same tools the GitHub
+# runner has; without them every OpenCode 2 scenario fails before setup.
 
 # The host behavior suite launches the real OpenCode server and Pi process. Keep
 # both runtimes in the image instead of relying on anything installed on the
@@ -28,9 +34,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && node --version \
     && bun --version
 
-RUN curl -fsSL https://opencode.ai/install | bash \
-    && install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode \
-    && opencode --version
+COPY install-opencode.sh /usr/local/bin/install-opencode.sh
+RUN install-opencode.sh \
+    && install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode
 
 # Pi's package is installed globally so the e2e runner can resolve the same CLI
 # entry point that a normal user installation provides. Its per-user settings

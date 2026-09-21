@@ -1,4 +1,5 @@
 import type { Database } from "../../../shared/sqlite";
+import type { DreamTaskFailureState } from "./task-registry";
 
 /**
  * Per-task dreamer scheduling state (Dreamer v2). One row per (project, task):
@@ -25,11 +26,11 @@ export interface TaskScheduleStateRow {
     lastStatus: "completed" | "failed" | "skipped" | null;
     lastError: string | null;
     retryCount: number;
-    /** LEGACY/INERT: the old verify commit watermark. Verify now gates per-memory
-     *  on each memory's own `verified_at` (map records the file→memory mapping
-     *  first), so no global commit watermark is written. Column kept (v43) to
-     *  avoid a DROP-COLUMN migration; field kept for a faithful round-trip. Do
-     *  NOT read it for new logic. */
+    /** Task-local JSON state. Stored in the legacy/inert `last_checked_commit`
+     * column, whose verify watermark was retired, so task cursors need no schema
+     * migration. Undefined on writes preserves the stored value. */
+    taskStateJson?: string | null;
+    /** @deprecated Compatibility alias for the retired verify watermark column. */
     lastCheckedCommit?: string | null;
     /** Start of the currently open verify-broad cycle, or null when the cycle
      *  is closed. This field reuses an existing database column from schema
@@ -67,6 +68,7 @@ function toRow(r: RawRow): TaskScheduleStateRow {
         lastStatus: (r.last_status as TaskScheduleStateRow["lastStatus"]) ?? null,
         lastError: r.last_error,
         retryCount: r.retry_count ?? 0,
+        taskStateJson: r.last_checked_commit ?? null,
         lastCheckedCommit: r.last_checked_commit ?? null,
         lastBroadRunAt: r.last_broad_run_at ?? null,
         retrospectiveWatermarkMs: r.retrospective_watermark_ms ?? null,
@@ -99,6 +101,30 @@ export function getTaskScheduleStatesForProject(
         )
         .all(projectPath)
         .map(toRow);
+}
+
+/**
+ * Every dreamer task whose last scheduled run failed, in task order.
+ *
+ * The scheduler has always written `last_error`, but only the dashboard displayed it, so
+ * a task could fail on its schedule for weeks while the only in-session signal was a
+ * backlog count that never fell. The status surfaces read this to say so out loud.
+ */
+export function getFailingDreamTasks(db: Database, projectPath: string): DreamTaskFailureState[] {
+    return db
+        .prepare<[string], RawRow>(
+            `SELECT ${SELECT_COLUMNS} FROM task_schedule_state
+              WHERE project_path = ? AND last_status = 'failed'
+                AND last_error IS NOT NULL AND last_error <> ''
+              ORDER BY task`,
+        )
+        .all(projectPath)
+        .map((row) => ({
+            task: row.task,
+            error: row.last_error ?? "",
+            lastSucceededAt: row.last_run_at,
+            retryCount: row.retry_count ?? 0,
+        }));
 }
 
 /**
@@ -211,10 +237,24 @@ export function writeTaskScheduleState(db: Database, row: TaskScheduleStateRow):
         row.lastStatus,
         row.lastError,
         row.retryCount,
-        row.lastCheckedCommit ?? null,
+        row.taskStateJson ?? row.lastCheckedCommit ?? null,
         row.lastBroadRunAt ?? null,
         row.retrospectiveWatermarkMs ?? null,
     );
+}
+
+/** Persist only a task's JSON state without disturbing schedule/retry fields. */
+export function writeTaskStateJson(
+    db: Database,
+    projectPath: string,
+    task: string,
+    taskStateJson: string,
+): void {
+    db.prepare(
+        `INSERT INTO task_schedule_state (project_path, task, last_checked_commit)
+         VALUES (?, ?, ?)
+         ON CONFLICT(project_path, task) DO UPDATE SET last_checked_commit = excluded.last_checked_commit`,
+    ).run(projectPath, task, taskStateJson);
 }
 
 /**

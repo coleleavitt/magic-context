@@ -64,7 +64,7 @@ import { updateCompactionMarkerAfterPublication } from "./compaction-marker-mana
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
-import type { CompartmentRunnerDeps } from "./compartment-runner-types";
+import type { HiddenCompartmentRunnerDeps } from "./compartment-runner-types";
 import {
     buildHistorianFailureNotice,
     HISTORIAN_BOUNDARY_HEALING_SLACK,
@@ -75,7 +75,10 @@ import {
 import { clearInjectionCache, renderMemoryBlock } from "./inject-compartments";
 import { onNoteTrigger } from "./note-nudger";
 import { persistFilteredNoise } from "./persist-filtered-noise";
-import { producerWindowFailureReason } from "./producer-window-guard";
+import {
+    fitAtomicHistorianSourceToProducerWindow,
+    producerWindowFailureReason,
+} from "./producer-window-guard";
 import {
     createDefaultBoundarySnapshotForTests,
     describeBoundaryDiagnostics,
@@ -88,6 +91,7 @@ import {
 import {
     getRawSessionTagKeysThrough,
     hasRawMessageProvider,
+    readRawSessionMessageOrdinalById,
     readSessionChunk,
 } from "./read-session-chunk";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
@@ -108,12 +112,51 @@ function shouldSuppressHistorianAlert(sessionId: string): boolean {
     return false;
 }
 
+export interface DanglingPublicationBoundary {
+    sequence: number;
+    side: "start" | "end";
+    messageId: string;
+}
+
+/** Re-resolve the message IDs recorded in the historian snapshot immediately before
+ * publishing so concurrent history changes cannot persist stale boundaries. */
+export function findDanglingPublicationBoundary(
+    sessionId: string,
+    compartments: ReadonlyArray<{
+        sequence: number;
+        startMessageId: string;
+        endMessageId: string;
+    }>,
+    resolveOrdinal: (
+        sessionId: string,
+        messageId: string,
+    ) => number | null = readRawSessionMessageOrdinalById,
+): DanglingPublicationBoundary | null {
+    for (const compartment of compartments) {
+        if (resolveOrdinal(sessionId, compartment.startMessageId) === null) {
+            return {
+                sequence: compartment.sequence,
+                side: "start",
+                messageId: compartment.startMessageId,
+            };
+        }
+        if (resolveOrdinal(sessionId, compartment.endMessageId) === null) {
+            return {
+                sequence: compartment.sequence,
+                side: "end",
+                messageId: compartment.endMessageId,
+            };
+        }
+    }
+    return null;
+}
+
 /** Clean up module-level session state on session deletion. */
 export function clearHistorianAlertState(sessionId: string): void {
     lastHistorianAlertBySession.delete(sessionId);
 }
 
-export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<void> {
+export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Promise<void> {
     const {
         client,
         db,
@@ -148,7 +191,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 : null;
         recordHistorianRun(db, {
             sessionId,
-            harness: "opencode",
+            harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
             subagentInvocationId: invocationId,
             runKind: telemetry.runKind ?? "incremental",
             status: telemetry.status ?? "failed",
@@ -408,14 +451,28 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             rollbackDrainReservation();
             return;
         }
+        const fittedAtomicSource = chunk.oversizeAtomicUnit
+            ? fitAtomicHistorianSourceToProducerWindow({
+                  text: chunk.text,
+                  resultBoundaries: chunk.toolResultBoundaries,
+                  contextLimitTokens: deps.historianContextLimit,
+                  maxOutputTokens: deps.historianMaxOutputTokens ?? 32_000,
+              })
+            : null;
         const chunkText = chunk.oversizeAtomicUnit
-            ? chunk.text
+            ? (fittedAtomicSource?.text ?? chunk.text)
             : truncateHistorianInputIfNeeded(chunk.text, historianChunkTokens);
         const producerSourceTokens = estimateTokens(chunkText);
         if (boundarySnapshot.oversizeAtomicUnit || chunk.oversizeAtomicUnit) {
             sessionLog(
                 sessionId,
                 `historian oversize admission: range=${chunk.startIndex}-${chunk.endIndex} rawComponentTokens=${boundarySnapshot.diagnostics?.head.completedFence.tokenMass ?? "unknown"} perRunCap=${perRunCap} producerSourceTokens=${producerSourceTokens} historianChunkTokens=${historianChunkTokens}; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
+            );
+        }
+        if (fittedAtomicSource && fittedAtomicSource.removedTokens > 0) {
+            sessionLog(
+                sessionId,
+                `historian pathological component split: range=${chunk.startIndex}-${chunk.endIndex} resultBoundary=${fittedAtomicSource.splitBoundaryOrdinal ?? "midpoint"} removedTokens=${fittedAtomicSource.removedTokens} producerSourceTokens=${producerSourceTokens} producerInputLimitTokens=${fittedAtomicSource.producerInputLimitTokens ?? "unknown"}`,
             );
         }
         const producerWindowFailure = producerWindowFailureReason({
@@ -491,7 +548,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         });
 
         // Intentional: session.get failure is non-fatal — we fall back to deps.directory
-        const parentSessionResponse = await client.session
+        const parentSessionResponse = await client?.session
             .get({ path: { id: sessionId } })
             .catch(() => null);
         const parentSession = normalizeSDKResponse(
@@ -516,6 +573,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         retainDrainReservationForRetryThrottle = true;
         const validatedPass = await runValidatedHistorianPass({
             client,
+            hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
             db,
             parentSessionId: sessionId,
             sessionDirectory,
@@ -525,6 +583,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             sequenceOffset,
             dumpLabelBase: `incremental-${sessionId}-${chunk.startIndex}-${chunk.endIndex}`,
             timeoutMs: historianTimeoutMs,
+            maxOutputTokens: deps.historianMaxOutputTokens,
             model: deps.model,
             fallbackModelId: deps.fallbackModelId,
             fallbackModels: deps.fallbackModels,
@@ -703,6 +762,19 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             lastCompartmentEnd,
             { db },
         );
+        const danglingBoundary = findDanglingPublicationBoundary(sessionId, newCompartments);
+        if (danglingBoundary) {
+            const reason = `compartment boundary disappeared before publication (sequence=${danglingBoundary.sequence} side=${danglingBoundary.side} missing_id=${danglingBoundary.messageId})`;
+            telemetry.failureReason = `publish-boundary: ${reason}`;
+            sessionLog(
+                sessionId,
+                `historian publish refused: sequence=${danglingBoundary.sequence} side=${danglingBoundary.side} missing_id=${danglingBoundary.messageId}; raw snapshot changed during the historian run`,
+            );
+            const failCount = incrementHistorianFailure(db, sessionId, reason);
+            await notifyHistorianIssue(buildHistorianFailureNotice(failCount, reason));
+            rollbackDrainReservation();
+            return;
+        }
         let published = false;
         const transactionStartedAt = performance.now();
         db.exec("BEGIN IMMEDIATE");
@@ -796,11 +868,15 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             if (!isWrapupInProgress(db, sessionId)) clearEmergencyRecovery(db, sessionId);
             drainReservation = null;
             if (deferMarkerApplication && lastNewEndMessageId) {
-                setPendingCompactionMarkerState(db, sessionId, {
-                    ordinal: lastCompartmentEnd,
-                    endMessageId: lastNewEndMessageId,
-                    publishedAt: Date.now(),
-                });
+                (deps.compactionMarkerStrategy?.setPending ?? setPendingCompactionMarkerState)(
+                    db,
+                    sessionId,
+                    {
+                        ordinal: lastCompartmentEnd,
+                        endMessageId: lastNewEndMessageId,
+                        publishedAt: Date.now(),
+                    },
+                );
             }
             db.exec("COMMIT");
             published = true;
@@ -836,7 +912,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         if (deferMarkerApplication) {
             deps.onDeferredMarkerPending?.(sessionId);
         } else {
-            updateCompactionMarkerAfterPublication(
+            (deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication)(
                 db,
                 sessionId,
                 lastCompartmentEnd,
@@ -985,7 +1061,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 const stored = insertPrimerCandidates(db, [
                     {
                         projectPath: promotionProjectIdentity,
-                        harness: "opencode",
+                        harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
                         sessionId,
                         question: candidate.question,
                         sourceCompartmentStart: startC?.startMessage,

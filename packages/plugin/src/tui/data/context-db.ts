@@ -246,31 +246,66 @@ export async function requestRecomp(sessionId: string): Promise<boolean> {
     }
 }
 
-/** Run `/ctx-session-upgrade` for the session (full recomp + once-per-project
- *  memory migration). Fired from the upgrade dialog's "Run upgrade now" action. */
-export async function requestUpgrade(sessionId: string): Promise<boolean> {
+/** Start a manual `/ctx-dream` run (optionally one named task) via RPC. The
+ *  server starts the pass in the background and pushes the summary when done. */
+export async function requestDream(sessionId: string, task?: string): Promise<boolean> {
     if (!rpcClient) return false;
     try {
-        const result = await rpcClient.call<{ ok: boolean }>("upgrade", { sessionId });
+        const result = await rpcClient.call<{ ok: boolean }>("dream", {
+            sessionId,
+            ...(task ? { task } : {}),
+        });
         return result.ok ?? false;
     } catch {
         return false;
     }
 }
 
-/** Mark the upgrade reminder dismissed (the user made an explicit Confirm/Cancel
- *  choice), setting the durable stamp so the FRESH dialog won't re-show. Resume
- *  prompts are staging-driven and unaffected. */
-export async function dismissUpgradeReminder(sessionId: string): Promise<boolean> {
-    if (!rpcClient) return false;
+/** What a command RPC reports back: finished text, an acknowledgement that
+ *  background work started (no text yet), or the failure. */
+export type CommandRpcResult =
+    | { ok: true; message?: string; started?: boolean }
+    | { ok: false; error?: string };
+
+async function callCommandRpc(
+    method: string,
+    params: Record<string, unknown>,
+): Promise<CommandRpcResult> {
+    if (!rpcClient) return { ok: false };
     try {
-        const result = await rpcClient.call<{ ok: boolean }>("dismiss-upgrade-reminder", {
-            sessionId,
-        });
-        return result.ok ?? false;
-    } catch {
-        return false;
+        const result = await rpcClient.call<CommandRpcResult>(method, params);
+        return result.ok === true
+            ? result
+            : { ok: false, error: (result as { error?: string }).error };
+    } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
+}
+
+/** Run `/ctx-flush` for the session: apply the queued operations now. */
+export async function requestFlush(sessionId: string): Promise<CommandRpcResult> {
+    return callCommandRpc("flush", { sessionId });
+}
+
+/** Start `/ctx-wrapup`: compact the older live tail, keeping the newest N raw. */
+export async function requestWrapup(
+    sessionId: string,
+    messagesToKeep: number,
+): Promise<CommandRpcResult> {
+    return callCommandRpc("wrapup", { sessionId, messagesToKeep });
+}
+
+/** `/ctx-embed`: read coverage, or start/pause the history embedding drain. */
+export async function requestEmbed(
+    sessionId: string,
+    action: "status" | "start" | "pause",
+    directory?: string,
+): Promise<CommandRpcResult> {
+    return callCommandRpc("embed", {
+        sessionId,
+        action,
+        ...(directory ? { directory } : {}),
+    });
 }
 
 /** Resolve global toast duration from server config via RPC. */

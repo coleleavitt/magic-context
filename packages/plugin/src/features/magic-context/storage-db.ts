@@ -104,7 +104,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 84;
+export const LATEST_SUPPORTED_VERSION = 88;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema
@@ -946,7 +946,7 @@ export function initializeDatabase(
       tag_id INTEGER,
       session_id TEXT,
       content TEXT,
-      created_at INTEGER,
+      created_at INTEGER, -- epoch ms; Date.now() on source writes, preserved on session clones
       harness TEXT NOT NULL DEFAULT 'opencode',
       PRIMARY KEY(session_id, tag_id)
     );
@@ -970,7 +970,7 @@ export function initializeDatabase(
       p1_embedding BLOB,
       p1_embedding_model_id TEXT,
       legacy INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode',
       UNIQUE(session_id, sequence)
     );
@@ -989,7 +989,7 @@ export function initializeDatabase(
       model_id TEXT NOT NULL,
       dims INTEGER NOT NULL,
       vector BLOB NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       UNIQUE(compartment_id, model_id, window_index)
     );
     CREATE INDEX IF NOT EXISTS idx_cce_session ON compartment_chunk_embeddings(session_id);
@@ -1012,7 +1012,7 @@ export function initializeDatabase(
       kind TEXT NOT NULL,
       at_compartment INTEGER,
       fields_json TEXT NOT NULL DEFAULT '{}',
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
     CREATE INDEX IF NOT EXISTS idx_compartment_events_session
@@ -1041,7 +1041,7 @@ export function initializeDatabase(
       session_id TEXT NOT NULL,
       category TEXT NOT NULL,
       content TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
@@ -1060,7 +1060,7 @@ export function initializeDatabase(
       source_message_time INTEGER NOT NULL,
       question_embedding BLOB,
       question_embedding_model_id TEXT,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       UNIQUE(project_path, harness, session_id, source_start_message_id, source_end_message_id)
     );
     CREATE INDEX IF NOT EXISTS idx_primer_candidates_project_time
@@ -1083,7 +1083,7 @@ export function initializeDatabase(
       answer_refreshed_at INTEGER,
       source_candidate_ids TEXT NOT NULL DEFAULT '[]',
       source_candidate_provenance TEXT,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_primers_project_status_observed
@@ -1196,7 +1196,7 @@ export function initializeDatabase(
       job_id TEXT,
       cursor TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
-      created_at INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT 0, -- epoch ms (Date.now())
       updated_at INTEGER NOT NULL DEFAULT 0,
       UNIQUE(session_id, request_key)
     );
@@ -1237,7 +1237,7 @@ export function initializeDatabase(
       shadow_epoch INTEGER NOT NULL DEFAULT 0,
       corpus_hash TEXT NOT NULL DEFAULT '',
       coverage_json TEXT NOT NULL DEFAULT '{}',
-      created_at INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT 0, -- epoch ms (Date.now())
       UNIQUE(dedup_key, cohort_key)
     );
     CREATE INDEX IF NOT EXISTS idx_embedding_measurement_session
@@ -1508,6 +1508,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       last_response_time INTEGER,
       cache_ttl TEXT,
       counter INTEGER DEFAULT 0,
+      tags_version INTEGER NOT NULL DEFAULT 0,
       last_nudge_tokens INTEGER DEFAULT 0,
       last_nudge_band TEXT DEFAULT '',
       last_nudge_undropped INTEGER DEFAULT 0,
@@ -1660,7 +1661,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       importance_avg REAL,
       discarded_last INTEGER NOT NULL DEFAULT 0,
       legacy INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL -- epoch ms (Date.now())
     );
     CREATE INDEX IF NOT EXISTS idx_historian_runs_session
       ON historian_runs(session_id, created_at DESC);
@@ -1692,6 +1693,50 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
 
     CREATE INDEX IF NOT EXISTS idx_tags_session_tag_number ON tags(session_id, tag_number);
     CREATE INDEX IF NOT EXISTS idx_tags_session_message_id ON tags(session_id, message_id);
+
+    -- Clone/import paths can write tags before session bootstrap. Keep trigger-created
+    -- metadata rows aligned with the explicit defaults in ensureSessionMetaRow.
+    CREATE TRIGGER IF NOT EXISTS tags_version_ai AFTER INSERT ON tags BEGIN
+      INSERT INTO session_meta(
+        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+        system_prompt_hash, cleared_reasoning_through_tag
+      ) VALUES(NEW.session_id, NEW.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0)
+      ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS tags_version_ad AFTER DELETE ON tags BEGIN
+      INSERT INTO session_meta(
+        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+        system_prompt_hash, cleared_reasoning_through_tag
+      ) VALUES(OLD.session_id, OLD.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0)
+      ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS tags_version_au
+    AFTER UPDATE OF session_id, message_id, tag_number, type, tool_owner_message_id, status ON tags BEGIN
+      INSERT INTO session_meta(
+        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+        system_prompt_hash, cleared_reasoning_through_tag
+      ) VALUES(OLD.session_id, OLD.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0)
+      ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+      INSERT INTO session_meta(
+        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+        system_prompt_hash, cleared_reasoning_through_tag
+      )
+      SELECT NEW.session_id, NEW.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0
+      WHERE NEW.session_id != OLD.session_id
+      ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+    END;
     CREATE INDEX IF NOT EXISTS idx_pending_ops_session ON pending_ops(session_id);
     CREATE INDEX IF NOT EXISTS idx_pending_ops_session_tag_id ON pending_ops(session_id, tag_id);
     CREATE INDEX IF NOT EXISTS idx_source_contents_session ON source_contents(session_id);
@@ -1713,7 +1758,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       importance INTEGER NOT NULL DEFAULT 50,
       episode_type TEXT,
       pass_number INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode',
       UNIQUE(session_id, sequence)
     );
@@ -1724,7 +1769,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       category TEXT NOT NULL,
       content TEXT NOT NULL,
       pass_number INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
 
@@ -1823,6 +1868,16 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "historian_last_failure_at", "INTEGER DEFAULT NULL");
     ensureColumn(db, "session_meta", "system_prompt_hash", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "cleared_reasoning_through_tag", "INTEGER DEFAULT 0");
+    // The tags_version_* triggers above are DURABLE schema: their bodies write this
+    // column on every tag write, and SQLite re-resolves a trigger body whenever it
+    // reparses the schema (any ALTER TABLE ... RENAME does). A database whose
+    // session_meta predates the column therefore carries a trigger that cannot be
+    // compiled, and the migration chain that would eventually add the column has to
+    // get past its own table rebuilds first — the embedding rebuild dropped
+    // memory_embeddings and then could not rename its replacement into place. Heal
+    // the column here, alongside every other column those trigger bodies name, so
+    // the schema is always compilable before any migration runs.
+    ensureColumn(db, "session_meta", "tags_version", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "tool_reclaim_watermark", "INTEGER DEFAULT 0");
     ensureColumn(db, "session_meta", "stripped_placeholder_ids", "TEXT DEFAULT ''");
     // Frozen replay watermark for the stale-ctx_reduce strip: message ids whose
@@ -2044,6 +2099,17 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "upgrade_reminder_count", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_mural_hash", "TEXT");
+    // v88 (issue 492). The OpenCode host store exists in two projections and a
+    // user can move between them in both directions, which renumbers the
+    // positional ordinals every saved coordinate is expressed in. These columns
+    // record which projection a session's coordinates were last derived against
+    // and which compartments could not be re-derived from a surviving message id.
+    // coordinate_generation is deliberately NULLABLE with no default: NULL means
+    // "never recorded", which is not the same as either projection.
+    ensureColumn(db, "session_meta", "coordinate_generation", "TEXT");
+    ensureColumn(db, "session_meta", "coordinate_rebase_notice", "TEXT");
+    ensureColumn(db, "compartments", "rebase_status", "TEXT NOT NULL DEFAULT 'ok'");
+    ensureColumn(db, "recomp_compartments", "rebase_status", "TEXT NOT NULL DEFAULT 'ok'");
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS project_state (

@@ -6,11 +6,13 @@ import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import {
+    getFailingDreamTasks,
     getMostRecentTaskRunAt,
     getTaskScheduleState,
     getTaskScheduleStatesForProject,
     seedTaskScheduleState,
     writeTaskScheduleState,
+    writeTaskStateJson,
 } from "./storage-task-schedule";
 
 let db: Database | null = null;
@@ -70,6 +72,26 @@ describe("task_schedule_state storage", () => {
         expect(row?.schedule).toBe("0 3 * * *");
     });
 
+    it("stores task JSON state in the retired verify watermark column without changing schedule fields", () => {
+        db = freshDb();
+        seedTaskScheduleState(db, "git:abc", "curate", 1000, 500, "0 4 * * *");
+
+        writeTaskStateJson(
+            db,
+            "git:abc",
+            "curate",
+            JSON.stringify({ curate: { cursor: 2, activeCategory: "CONSTRAINTS" } }),
+        );
+
+        const row = getTaskScheduleState(db, "git:abc", "curate");
+        expect(JSON.parse(row?.taskStateJson ?? "null")).toEqual({
+            curate: { cursor: 2, activeCategory: "CONSTRAINTS" },
+        });
+        expect(row?.nextDueAt).toBe(1000);
+        expect(row?.lastRunAt).toBe(500);
+        expect(row?.schedule).toBe("0 4 * * *");
+    });
+
     it("persists a disabled task as next_due_at = NULL", () => {
         db = freshDb();
         seedTaskScheduleState(db, "git:abc", "maintain-docs", null, null, "");
@@ -94,6 +116,81 @@ describe("task_schedule_state storage", () => {
         expect(row?.lastStatus).toBe("failed");
         expect(row?.lastError).toBe("model not found");
         expect(row?.retryCount).toBe(2);
+    });
+
+    it("reports only the tasks whose last run failed, scoped by project", () => {
+        db = freshDb();
+        writeTaskScheduleState(db, {
+            projectPath: "git:abc",
+            task: "classify-memories",
+            lastRunAt: 5_000,
+            nextDueAt: 9_000,
+            schedule: "0 3 * * *",
+            lastStatus: "failed",
+            lastError: "Rust classify module failed: producer busy",
+            retryCount: 2,
+        });
+        writeTaskScheduleState(db, {
+            projectPath: "git:abc",
+            task: "verify",
+            lastRunAt: 6_000,
+            nextDueAt: 9_000,
+            schedule: "0 3 * * *",
+            lastStatus: "completed",
+            lastError: null,
+            retryCount: 0,
+        });
+        writeTaskScheduleState(db, {
+            projectPath: "git:other",
+            task: "curate",
+            lastRunAt: null,
+            nextDueAt: 9_000,
+            schedule: "0 3 * * *",
+            lastStatus: "failed",
+            lastError: "other project",
+            retryCount: 1,
+        });
+
+        expect(getFailingDreamTasks(db, "git:abc")).toEqual([
+            {
+                task: "classify-memories",
+                error: "Rust classify module failed: producer busy",
+                lastSucceededAt: 5_000,
+                retryCount: 2,
+            },
+        ]);
+    });
+
+    it("does not report a succeeded task that still carries older error text", () => {
+        // Legacy rows put non-failure detail in `last_error` (the dashboard renders such a
+        // value neutrally for the same reason), so the status is what decides, not the text.
+        db = freshDb();
+        writeTaskScheduleState(db, {
+            projectPath: "git:abc",
+            task: "verify-broad",
+            lastRunAt: 7_000,
+            nextDueAt: 9_000,
+            schedule: "0 3 * * *",
+            lastStatus: "completed",
+            lastError: "verify-broad: processed 12 (verified 12); 0 remain",
+            retryCount: 0,
+        });
+        expect(getFailingDreamTasks(db, "git:abc")).toEqual([]);
+    });
+
+    it("does not report a failed row whose error text was never recorded", () => {
+        db = freshDb();
+        writeTaskScheduleState(db, {
+            projectPath: "git:abc",
+            task: "curate",
+            lastRunAt: null,
+            nextDueAt: 9_000,
+            schedule: "0 3 * * *",
+            lastStatus: "failed",
+            lastError: null,
+            retryCount: 1,
+        });
+        expect(getFailingDreamTasks(db, "git:abc")).toEqual([]);
     });
 
     it("lists rows for a project, scoped by project", () => {

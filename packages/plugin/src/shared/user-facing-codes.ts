@@ -7,6 +7,11 @@ export const USER_FACING_FAILURES = {
         sentence: "History compression could not finish this turn.",
         action: "It will retry automatically.",
     },
+    hidden_cleanup_unbound: {
+        code: "MC-H02",
+        sentence: "Some finished background sessions could not be removed from this host.",
+        action: "They are removed automatically the next time Magic Context runs inside a registered OpenCode service.",
+    },
     recomp_unavailable: {
         code: "MC-R01",
         sentence: "History compression could not be rebuilt.",
@@ -46,6 +51,17 @@ export const USER_FACING_FAILURES = {
         code: "MC-D07",
         sentence: "Memory maintenance could not finish.",
         action: "Run /ctx-dream again.",
+    },
+    dreamer_tick_blocked: {
+        code: "MC-D09",
+        sentence:
+            "Background maintenance is not running: its last pass stopped before it reached the scheduled tasks.",
+        action: "It is retried automatically; if it keeps happening, check the Magic Context log for the stage that stopped and run `npx @cortexkit/magic-context doctor`.",
+    },
+    dream_task_needs_tool_loop: {
+        code: "MC-D08",
+        sentence: "Some memory maintenance tasks need a tool loop this host does not provide.",
+        action: "The remaining tasks still run; the listed ones are skipped on this host.",
     },
     embedding_substitution_rejected: {
         code: "MC-E01",
@@ -120,7 +136,7 @@ export const USER_FACING_FAILURES = {
     configuration_warning: {
         code: "MC-S03",
         sentence: "Some configuration settings could not be applied.",
-        action: "Fix the configuration warning shown in /ctx-status diagnostics, then restart.",
+        action: "Fix the configuration warning shown in /ctx-status, then restart.",
     },
     status_log_unavailable: {
         code: "MC-S04",
@@ -157,11 +173,6 @@ export const USER_FACING_FAILURES = {
         sentence: "Partial history compression is not available in the current mode.",
         action: "Run /ctx-recomp without a range.",
     },
-    session_upgrade_unavailable: {
-        code: "MC-C07",
-        sentence: "Session upgrade is not available in the current mode.",
-        action: "Run /ctx-recomp instead.",
-    },
     smart_note_conditions_unavailable: {
         code: "MC-C08",
         sentence: "Conditional notes are not available in the current mode.",
@@ -176,6 +187,26 @@ export const USER_FACING_FAILURES = {
         code: "MC-C10",
         sentence: "Magic Context is temporarily unavailable.",
         action: "Retry in a moment.",
+    },
+    memory_mirror_stalled: {
+        code: "MC-M01",
+        sentence: "Memory synchronization stopped before the host mirror caught up.",
+        action: "Send another message to resume it, or run `ck doctor drain-authority`.",
+    },
+    memory_authority_mismatch: {
+        code: "MC-M02",
+        sentence: "Memory authority is inconsistent between the host and module.",
+        action: "Run `ck doctor drain-authority` before changing Rust mode.",
+    },
+    rust_mode_unsupported: {
+        code: "MC-S06",
+        sentence: "Experimental Rust transform mode is not available on this OpenCode host.",
+        action: 'Magic Context is running its TypeScript mode instead; set `transform_mode` to "ts" to stop requesting Rust.',
+    },
+    dreamer_task_failing: {
+        code: "MC-S05",
+        sentence: "A background maintenance task keeps failing on its schedule.",
+        action: "Check the Magic Context log for the failing task and its error.",
     },
 } as const;
 
@@ -203,7 +234,6 @@ export type CapabilityRefusal =
     | "note_access"
     | "context_cleanup"
     | "partial_history"
-    | "session_upgrade"
     | "smart_note_condition"
     | "history_compression"
     | "context_service";
@@ -215,7 +245,6 @@ const CAPABILITY_FAILURES: Record<CapabilityRefusal, UserFacingFailureKey> = {
     note_access: "note_access_unavailable",
     context_cleanup: "context_cleanup_paused",
     partial_history: "partial_history_unavailable",
-    session_upgrade: "session_upgrade_unavailable",
     smart_note_condition: "smart_note_conditions_unavailable",
     history_compression: "history_compression_paused",
     context_service: "context_service_unavailable",

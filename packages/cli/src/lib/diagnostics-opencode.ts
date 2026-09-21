@@ -19,9 +19,12 @@ import {
     getProjectMagicContextHistorianDir,
 } from "@magic-context/core/shared/data-path";
 import {
+    assertOpenCodeStoreGeneration,
     formatOpenCodeDbDoctorLine,
     type OpenCodeDbPathResolution,
+    type OpenCodeHostGeneration,
     openCodeDbPathExists,
+    openCodeHostGenerationFromVersion,
     resolveOpenCodeDbPath,
 } from "@magic-context/core/shared/opencode-db-path";
 import { parse as parseJsonc } from "comment-json";
@@ -34,6 +37,7 @@ import {
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION,
     OPENCODE_PLUGIN_NAME,
 } from "./opencode-plugin-cache";
+import { readPluginEntries } from "./opencode-plugin-registration";
 import { type ConfigPaths, detectConfigPaths, getMagicContextHistorianDir } from "./paths";
 import { sanitizeConfigValue, sanitizeDiagnosticText, sanitizePathString } from "./redaction";
 
@@ -292,7 +296,8 @@ function readConfig(path: string): { value: Record<string, unknown> | null; erro
 }
 
 function configHasPluginEntry(config: Record<string, unknown> | null): boolean {
-    const plugins = Array.isArray(config?.plugin) ? config.plugin : [];
+    // Both keys: OpenCode 2 loads `plugin` and `plugins` together.
+    const plugins = readPluginEntries(config).map(({ entry }) => entry);
     return plugins.some((entry) => {
         if (typeof entry !== "string") return false;
         if (entry === OPENCODE_PLUGIN_NAME) return true;
@@ -532,6 +537,7 @@ export function collectRecentSessionsFromDatabase(
  */
 async function collectRecentSessions(
     resolution: OpenCodeDbPathResolution,
+    hostGeneration: OpenCodeHostGeneration,
 ): Promise<RecentSessionSummary[]> {
     const opencodeDbPath = resolution.path;
     if (!openCodeDbPathExists(resolution)) return [];
@@ -561,6 +567,7 @@ async function collectRecentSessions(
     let db: (RecentSessionDatabase & { close: () => void }) | null = null;
     try {
         db = new DatabaseClass(opencodeDbPath, { readonly: true });
+        assertOpenCodeStoreGeneration(db, hostGeneration, opencodeDbPath);
         return collectRecentSessionsFromDatabase(db);
     } catch {
         return [];
@@ -806,11 +813,12 @@ export async function collectDiagnostics(): Promise<DiagnosticReport> {
                 `(${error instanceof Error ? error.message : String(error)})`,
         );
     }
-    const conflictResult = detectConflicts(process.cwd(), { compactionEnabled });
-    const openCodeDatabaseResolution = resolveOpenCodeDbPath();
-    const recentSessions = await collectRecentSessions(openCodeDatabaseResolution);
     const opencodeInstallations = describeOpenCodeInstallations(detectOpenCodeInstallations());
     const activeInstallation = opencodeInstallations[0];
+    const hostGeneration = openCodeHostGenerationFromVersion(activeInstallation?.version);
+    const conflictResult = detectConflicts(process.cwd(), { compactionEnabled, hostGeneration });
+    const openCodeDatabaseResolution = resolveOpenCodeDbPath(hostGeneration);
+    const recentSessions = await collectRecentSessions(openCodeDatabaseResolution, hostGeneration);
     let openCodeInstallKind: "cli" | "desktop" | "none" = "none";
     if (activeInstallation) openCodeInstallKind = activeInstallation.kind;
 

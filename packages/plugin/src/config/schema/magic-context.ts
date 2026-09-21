@@ -18,6 +18,11 @@ export const EXECUTE_THRESHOLD_CAP_MESSAGE =
 export const DEFAULT_HISTORIAN_TIMEOUT_MS = 600_000;
 export const DEFAULT_HISTORY_BUDGET_PERCENTAGE = 0.15;
 
+// Minimum absolute token floor for protected_tokens. Kept as a named constant so
+// the schema's `.min()` and the loader's below-minimum warning share ONE source
+// of truth — the loader must not duplicate the literal 4000.
+export const PROTECTED_TOKENS_MIN = 4000;
+
 export const DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
 
 // Re-exported from the (DB-free) task registry so the schema and the runtime
@@ -157,7 +162,7 @@ export const PER_HARNESS_MIGRATION_INVENTORY = {
         migrated_execution: ["model", "fallback_models", "variant", "thinking_level"],
     },
     task: {
-        retained: ["schedule", "promotion_threshold"],
+        retained: ["schedule", "promotion_threshold", "recency_days"],
         migrated_execution: [
             "model",
             "fallback_models",
@@ -513,6 +518,15 @@ const ReviewUserMemoriesTaskConfigSchema = DreamTaskBaseConfigSchema.extend({
 const PromotePrimersTaskConfigSchema = DreamTaskBaseConfigSchema.extend({
     promotion_threshold: PrimerPromotionThresholdSchema,
 });
+const RetrospectiveTaskConfigSchema = DreamTaskBaseConfigSchema.extend({
+    recency_days: z
+        .number()
+        .int()
+        .min(1)
+        .max(3650)
+        .default(30)
+        .describe("retrospective: collect source messages from only the most recent N days"),
+});
 export type DreamTaskConfig = z.infer<typeof DreamTaskConfigSchema>;
 
 /** Default schedule per task. Preserves v1 behavior: verify runs nightly;
@@ -567,8 +581,8 @@ export const DreamTasksSchema = z
         "classify-memories": DreamTaskBaseConfigSchema.default(() =>
             DreamTaskBaseConfigSchema.parse(defaultTaskConfig("classify-memories")),
         ),
-        retrospective: DreamTaskBaseConfigSchema.default(() =>
-            DreamTaskBaseConfigSchema.parse(defaultTaskConfig("retrospective")),
+        retrospective: RetrospectiveTaskConfigSchema.default(() =>
+            RetrospectiveTaskConfigSchema.parse(defaultTaskConfig("retrospective")),
         ),
         "maintain-docs": DreamTaskBaseConfigSchema.default(() =>
             DreamTaskBaseConfigSchema.parse(defaultTaskConfig("maintain-docs")),
@@ -926,7 +940,7 @@ export interface MagicContextConfig {
      *  Graduated from `experimental.temporal_awareness`; default: true. */
     temporal_awareness: boolean;
     /** Debug: when true, keep the child sessions Magic Context spawns for its
-     *  own subagents (historian, dreamer, memory-migration) instead
+     *  own subagents (historian, dreamer) instead
      *  of deleting them on success. For short-term inspection/data collection;
      *  kept sessions accumulate until manually cleared. Default false. */
     keep_subagents: boolean;
@@ -1113,10 +1127,10 @@ export const MagicContextConfigSchema = z
             .union([z.string(), z.object({ default: z.string() }).catchall(z.string())])
             .default("5m")
             .describe(
-                'How long Magic Context assumes the provider\'s cached prefix stays valid. This is MC\'s own deferral gate — it does not change the provider\'s actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "model-id": "10m" }). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
+                'How long Magic Context assumes the provider\'s cached prefix stays valid. This is MC\'s own deferral gate — it does not change the provider\'s actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard, then default). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
             ),
         prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe(
-            "Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. On OpenCode and Pi, per-model routing applies to the guidance block only: tool descriptions are registered once per process, so they follow the default preset (a v1 plugin-surface limitation; per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes).",
+            "Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. OpenCode 1.x, Pi, and OMP register tool descriptions once per process (they follow the default preset). OpenCode 2 rewrites the five ctx_* descriptions per request from the draft model.",
         ),
         output_reserve: z
             .union([
@@ -1166,7 +1180,7 @@ export const MagicContextConfigSchema = z
         protected_tokens: z
             .number()
             .int()
-            .min(4000)
+            .min(PROTECTED_TOKENS_MIN)
             .max(1_000_000)
             .optional()
             .describe(
@@ -1312,7 +1326,7 @@ export const MagicContextConfigSchema = z
             .boolean()
             .default(false)
             .describe(
-                "Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect.",
+                "Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect.",
             ),
         debug_rpc: z
             .boolean()
@@ -1332,7 +1346,7 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(true)
                     .describe(
-                        "When false, Magic Context stops managing the context window and keeps its knowledge layer: memory and docs/user-profile/key-files injection through additive m[0]/m[1], raw-message FTS indexing, dreamer, notes, ctx_search, ctx_expand, ctx_memory, and /ctx-embed remain available. MC's historian/compartment preparation, tagging, markers, pruning, folding, drops, strips, splicing, synthetic context-management todos, temporal markers, nudges, and fail-closed blocking stop; ctx_expand remains a knowledge-surface tool. fail_closed_blocking is inert: a transform failure passes the input messages through without blocking or cancelling. This setting does not enable native compaction: OpenCode's compaction.auto / compaction.prune or Pi's equivalent owns the window, or nothing does. MC's compaction.enabled in magic-context.jsonc is distinct from OpenCode's compaction.auto / compaction.prune in opencode.jsonc; they are different files and different owners. On the first turn after disabling, a long session may trigger one native compaction cycle; MC removes only its own marker boundary, leaves native boundaries and stored compartments intact, and does no pre-trimming mitigation. Marker cleanup is lazy per session, so an unresumed session is cleaned when it is next resumed. If compaction is enabled again, run /ctx-wrapup when the historian is runnable to catch up. OpenCode peer verification against v1.18.4 confirms native compaction covers child sessions: subagents receive additive memory/docs injection and no MC reclaim in this mode, so keep subagent tasks small or leave compaction.enabled on for long subagent runs. This is boot-resolved and requires a process restart; project-tier compaction.enabled is stripped so a cloned repository cannot disable the user's setting. The sidebar reports raw usage as Context: <pct>% · native compaction or Context: <pct>% · no active compaction and does not show an MC execute-threshold fill. /ctx-wrapup, /ctx-recomp, /ctx-flush, and /ctx-session-upgrade refuse without context-management side effects; /ctx-embed remains functional. Raw content hidden by a native boundary before Magic Context's first pass is not retroactively indexed.",
+                        "When false, Magic Context stops managing the context window and keeps its knowledge layer: memory and docs/user-profile/key-files injection through additive m[0]/m[1], raw-message FTS indexing, dreamer, notes, ctx_search, ctx_expand, ctx_memory, and /ctx-embed remain available. MC's historian/compartment preparation, tagging, markers, pruning, folding, drops, strips, splicing, synthetic context-management todos, temporal markers, nudges, and fail-closed blocking stop; ctx_expand remains a knowledge-surface tool. fail_closed_blocking is inert: a transform failure passes the input messages through without blocking or cancelling. This setting does not enable native compaction: OpenCode's compaction.auto / compaction.prune or Pi's equivalent owns the window, or nothing does. MC's compaction.enabled in magic-context.jsonc is distinct from OpenCode's compaction.auto / compaction.prune in opencode.jsonc; they are different files and different owners. On the first turn after disabling, a long session may trigger one native compaction cycle; MC removes only its own marker boundary, leaves native boundaries and stored compartments intact, and does no pre-trimming mitigation. Marker cleanup is lazy per session, so an unresumed session is cleaned when it is next resumed. If compaction is enabled again, run /ctx-wrapup when the historian is runnable to catch up. OpenCode peer verification against v1.18.4 confirms native compaction covers child sessions: subagents receive additive memory/docs injection and no MC reclaim in this mode, so keep subagent tasks small or leave compaction.enabled on for long subagent runs. This is boot-resolved and requires a process restart; project-tier compaction.enabled is stripped so a cloned repository cannot disable the user's setting. The sidebar reports raw usage as Context: <pct>% · native compaction or Context: <pct>% · no active compaction and does not show an MC execute-threshold fill. /ctx-wrapup, /ctx-recomp, and /ctx-flush refuse without context-management side effects; /ctx-embed remains functional. Raw content hidden by a native boundary before Magic Context's first pass is not retroactively indexed.",
                     ),
             })
             .default({ enabled: true })

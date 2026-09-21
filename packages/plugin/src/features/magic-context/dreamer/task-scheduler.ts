@@ -18,7 +18,9 @@ import {
 } from "./storage-task-schedule";
 import { evaluateTaskGate, getDreamTaskBacklogs } from "./task-gates";
 import {
+    CANONICAL_DREAM_TASKS,
     compareTaskOrder,
+    type DreamTaskBacklog,
     type DreamTaskBacklogMap,
     type DreamTaskName,
     leaseKeyFor,
@@ -42,6 +44,8 @@ export interface DreamTaskRuntimeConfig {
     timeoutMinutes: number;
     /** review-user-memories */
     promotionThreshold?: number;
+    /** retrospective source lookback; old rows are skipped by advancing its content watermark. */
+    retrospectiveRecencyDays?: number;
 }
 
 export interface TaskExecOutcome {
@@ -55,9 +59,13 @@ export interface TaskExecOutcome {
     failureDetail?: string;
     /** Successful task detail surfaced by a manual `/ctx-dream` run. */
     detail?: string;
+    /** Run-local backlog when a task's scope differs from its next scheduled scope. */
+    backlog?: DreamTaskBacklog;
     schedulePatch?: {
         /** retrospective content watermark (max message ts scanned this run). */
         retrospectiveWatermarkMs?: number | null;
+        /** Task-local JSON state committed only after successful execution. */
+        taskStateJson?: string;
     };
 }
 
@@ -165,15 +173,10 @@ export function planDueTasks(
     tasks: readonly DreamTaskRuntimeConfig[],
     now: number,
 ): DueTask[] {
-    // GC retired task rows: improve, consolidate, and archive-stale were replaced
-    // by verify/curate, while render-mural was removed when the scheduler switched
-    // to its deterministic task set. Since `tasks` contains the full canonical set,
-    // any stored row outside it is obsolete. Cheap and idempotent.
-    const pruned = pruneNonCanonicalTaskRows(
-        db,
-        projectIdentity,
-        tasks.map((t) => t.task),
-    );
+    // GC retired task rows against the canonical registry, never the caller's
+    // execution list. Capability-filtered callers must not delete durable
+    // schedules and watermarks for canonical tasks they cannot run.
+    const pruned = pruneNonCanonicalTaskRows(db, projectIdentity, CANONICAL_DREAM_TASKS);
     if (pruned > 0) {
         log(`[dreamer] pruned ${pruned} retired task row(s) for ${projectIdentity}`);
     }
@@ -201,23 +204,25 @@ function advanceAfterRun(
     status: "completed" | "failed" | "skipped",
     error: string | null,
     schedulePatch?: TaskExecOutcome["schedulePatch"],
+    startedAt?: number,
 ): void {
     writeTaskScheduleState(db, {
         projectPath: projectIdentity,
         task: due.config.task,
-        // last_run_at means "last SUCCESSFUL run" — the cutoff for "changed since"
-        // gates (maintain-docs). A failed or skipped run did NOT process the
-        // work, so the cutoff must NOT advance past it (mirrors v1, where
-        // last_dream_at only advanced when a task succeeded).
+        // last_run_at = the start of the last SUCCESSFUL run — the cutoff for
+        // "changed since" gates. A message/compartment that landed DURING the run
+        // (after the start) is newer than the cutoff, so it re-triggers the gate next
+        // slot instead of being silently skipped. Failed/skipped runs never advance it.
         lastRunAt:
             status === "completed"
-                ? finishedAt
+                ? (startedAt ?? finishedAt)
                 : readLastRunAt(db, projectIdentity, due.config.task),
         nextDueAt: nextDueAtMs(due.config.schedule, finishedAt, due.scheduledAt),
         schedule: due.config.schedule,
         lastStatus: status,
         lastError: error,
         retryCount: 0,
+        taskStateJson: schedulePatch?.taskStateJson,
         retrospectiveWatermarkMs: schedulePatch?.retrospectiveWatermarkMs,
     });
 }
@@ -245,6 +250,7 @@ function recordTransientFailure(
     due: DueTask,
     finishedAt: number,
     error: string | null,
+    schedulePatch?: TaskExecOutcome["schedulePatch"],
 ): void {
     const prior = getTaskScheduleState(db, projectIdentity, due.config.task);
     const retryCount = (prior?.retryCount ?? 0) + 1;
@@ -261,6 +267,8 @@ function recordTransientFailure(
             lastStatus: "failed",
             lastError: error,
             retryCount: 0,
+            taskStateJson: schedulePatch?.taskStateJson,
+            retrospectiveWatermarkMs: schedulePatch?.retrospectiveWatermarkMs,
         });
     } else {
         // Hot-retry: keep next_due_at so the timer re-attempts next tick — but a
@@ -278,6 +286,8 @@ function recordTransientFailure(
             lastStatus: "failed",
             lastError: error,
             retryCount,
+            taskStateJson: schedulePatch?.taskStateJson,
+            retrospectiveWatermarkMs: schedulePatch?.retrospectiveWatermarkMs,
         });
     }
 }
@@ -290,7 +300,7 @@ interface DomainGroupCallbacks {
      * up. Scheduled ticks leave this unset (the next tick retries anyway).
      */
     leaseWaitMs?: number;
-    onRan?: (task: DreamTaskName, detail?: string) => void;
+    onRan?: (task: DreamTaskName, detail?: string, backlog?: DreamTaskBacklog) => void;
     onFailed?: (task: DreamTaskName, error?: string) => void;
     onBusy?: (task: DreamTaskName) => void;
 }
@@ -363,6 +373,7 @@ async function runDomainGroup(
             }
 
             let outcome: TaskExecOutcome;
+            const startedAt = Date.now();
             try {
                 outcome = await executor(due.config, {
                     db,
@@ -385,10 +396,18 @@ async function runDomainGroup(
                     "completed",
                     null,
                     outcome.schedulePatch,
+                    startedAt,
                 );
-                cb?.onRan?.(due.config.task, outcome.detail);
+                cb?.onRan?.(due.config.task, outcome.detail, outcome.backlog);
             } else if (outcome.transient) {
-                recordTransientFailure(db, projectIdentity, due, finishedAt, outcome.error ?? null);
+                recordTransientFailure(
+                    db,
+                    projectIdentity,
+                    due,
+                    finishedAt,
+                    outcome.error ?? null,
+                    outcome.schedulePatch,
+                );
                 cb?.onFailed?.(due.config.task, outcome.failureDetail ?? outcome.error);
             } else {
                 advanceAfterRun(
@@ -398,6 +417,7 @@ async function runDomainGroup(
                     finishedAt,
                     "failed",
                     outcome.error ?? null,
+                    outcome.schedulePatch,
                 );
                 cb?.onFailed?.(due.config.task, outcome.failureDetail ?? outcome.error);
             }
@@ -505,6 +525,7 @@ export async function runManualDream(
     }
 
     const groups = new Map<string, DueTask[]>();
+    const runLocalBacklogs: DreamTaskBacklogMap = {};
     for (const d of gated) {
         const kind = leaseKindFor(d.config.task);
         const arr = groups.get(kind) ?? [];
@@ -517,9 +538,10 @@ export async function runManualDream(
             runDomainGroup({ ...deps, executor: deps.executor }, group, {
                 forceGate,
                 leaseWaitMs: MANUAL_RUN_LEASE_WAIT_MS,
-                onRan: (t, detail) => {
+                onRan: (t, detail, backlog) => {
                     result.ran.push(t);
                     if (detail) result.details?.push(detail);
+                    if (backlog) runLocalBacklogs[t] = backlog;
                 },
                 onFailed: (task, error) => {
                     result.failed.push(task);
@@ -529,7 +551,10 @@ export async function runManualDream(
             }),
         ),
     );
-    result.backlogAfter = getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames);
+    result.backlogAfter = {
+        ...getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames),
+        ...runLocalBacklogs,
+    };
     return result;
 }
 

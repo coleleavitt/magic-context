@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { computeProtectionWindow } from "@magic-context/core/features/magic-context/protection-window";
@@ -15,6 +16,7 @@ import {
 	decideChannel1,
 	evaluateChannel2,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
+import * as formattingModule from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { PI_CTX_REDUCE_KEEP } from "./heuristic-cleanup-pi";
 import {
 	assertPiTailHygieneContentUnchanged,
@@ -465,6 +467,70 @@ describe("Pi baseline persistence and defer deltas", () => {
 		);
 	});
 
+	it("counts an appended tool output after it ages out of the protected suffix", () => {
+		const baseMessages = [textMessage("user", "base text")];
+		const baseTags = [tag(1, "base:p0", "message")];
+		const reminder =
+			"\n\n<system-reminder>\nHousekeeping backlog: spent tool outputs are reclaimable.\n</system-reminder>";
+		const appended = toolArc(
+			"tool-delta",
+			"call-delta",
+			"read",
+			{ path: "new" },
+			`${"reclaimable tool output ".repeat(1_000)}${reminder}`,
+		);
+		const messages = [...baseMessages, ...appended.messages];
+		const tags = [...baseTags, { ...appended.tag, tagNumber: 2 }];
+		const stableId = withStableIds(messages, [
+			"base",
+			"tool-delta",
+			"tool-delta-result",
+		]);
+		const sha256 = (value: unknown): string =>
+			createHash("sha256").update(JSON.stringify(value)).digest("hex");
+		const prefixSha = sha256(baseMessages);
+		const servedArraySha = sha256(messages);
+		const baseline = refreshPiTailHygieneBaseline({
+			messages: baseMessages,
+			tags: baseTags,
+			protectedTagNumbers: new Set([1]),
+			stableId: withStableIds(baseMessages, ["base"]),
+			cacheBusting: true,
+		});
+		const protectedDefer = refreshPiTailHygieneBaseline({
+			messages,
+			tags,
+			protectedTagNumbers: new Set([1, 2]),
+			stableId,
+			cacheBusting: false,
+			previous: baseline,
+		});
+		const agedDefer = refreshPiTailHygieneBaseline({
+			messages,
+			tags,
+			protectedTagNumbers: new Set([1]),
+			stableId,
+			cacheBusting: false,
+			previous: protectedDefer,
+		});
+		const measuredAged = measurePiTailHygiene({
+			messages,
+			tags,
+			protectedTagNumbers: new Set([1]),
+			stableId,
+		});
+
+		expect(effectivePiTailHygiene(protectedDefer).u).toBe(0);
+		expect(effectivePiTailHygiene(agedDefer)).toEqual({
+			u: measuredAged.u,
+			t: measuredAged.t,
+		});
+		expect(sha256(baseMessages)).toBe(prefixSha);
+		expect(sha256(messages)).toBe(servedArraySha);
+		expect(JSON.stringify(baseMessages)).not.toContain("Housekeeping backlog");
+		expect(JSON.stringify(messages.at(-1))).toContain("Housekeeping backlog");
+	});
+
 	it("advances the protection boundary additively without changing generation", () => {
 		const before = [
 			textMessage("user", "old mass ".repeat(2_000)),
@@ -503,38 +569,155 @@ describe("Pi baseline persistence and defer deltas", () => {
 		expect(defer.baselineGeneration).toBe(baseline.baselineGeneration);
 	});
 
-	it("marks prior-part mutation NOT EVALUABLE until a bust rewalk", () => {
-		const original = [textMessage("user", "original")];
-		const changed = [textMessage("user", "changed")];
+	it("re-measures a prior-part mutation on the defer pass that finds it", () => {
+		// The newest message is never frozen, so the mutated message needs one after
+		// it to land inside the frozen prefix that a defer pass compares.
+		const newest = textMessage("assistant", "newest turn");
+		const original = [textMessage("user", "original"), newest];
+		const changed = [textMessage("user", "changed and then some"), newest];
 		const tags = [tag(1, "m:p0", "message")];
+		const ids = ["m", "newest"];
 		const baseline = refreshPiTailHygieneBaseline({
 			messages: original,
 			tags,
 			protectedTagNumbers: new Set(),
-			stableId: withStableIds(original, ["m"]),
+			stableId: withStableIds(original, ids),
 			cacheBusting: true,
 		});
-		const invalidated = refreshPiTailHygieneBaseline({
+		const remeasured = refreshPiTailHygieneBaseline({
 			messages: changed,
 			tags,
 			protectedTagNumbers: new Set(),
-			stableId: withStableIds(changed, ["m"]),
+			stableId: withStableIds(changed, ids),
 			cacheBusting: false,
 			previous: baseline,
 		});
-		expect(invalidated.evaluable).toBe(false);
-		expect(invalidated.generationInvalidated).toBe(true);
-		expect(evaluateChannel2(invalidated).evaluable).toBe(false);
-		const refreshed = refreshPiTailHygieneBaseline({
+		const measured = measurePiTailHygiene({
 			messages: changed,
 			tags,
 			protectedTagNumbers: new Set(),
-			stableId: withStableIds(changed, ["m"]),
-			cacheBusting: true,
-			previous: invalidated,
+			stableId: withStableIds(changed, ids),
 		});
-		expect(refreshed.evaluable).toBe(true);
-		expect(refreshed.baselineGeneration).toBe(baseline.baselineGeneration + 1);
+		// Named, then measured on this same pass rather than held until a bust.
+		expect(remeasured.lastPrefixMismatch).toMatchObject({
+			partIndex: 0,
+			messageId: "m",
+			field: "contentHash",
+		});
+		expect(remeasured.evaluable).toBe(true);
+		expect(remeasured.generationInvalidated).toBe(false);
+		expect(remeasured.baselineGeneration).toBe(baseline.baselineGeneration + 1);
+		expect(evaluateChannel2(remeasured).evaluable).toBe(true);
+		expect(effectivePiTailHygiene(remeasured)).toEqual({
+			u: measured.u,
+			t: measured.t,
+		});
+		const steady = refreshPiTailHygieneBaseline({
+			messages: changed,
+			tags,
+			protectedTagNumbers: new Set(),
+			stableId: withStableIds(changed, ids),
+			cacheBusting: false,
+			previous: remeasured,
+		});
+		// One invalidation event, one diagnostic.
+		expect(steady.lastPrefixMismatch).toBeUndefined();
+		expect(steady.baselineGeneration).toBe(remeasured.baselineGeneration);
+	});
+
+	it("fires Channel 1 inside a long defer window after a mid-window mismatch", () => {
+		const narration = {
+			type: "text",
+			text: `${"narration text ".repeat(9_000)}\n\n`,
+		};
+		const messages: object[] = [
+			textMessage("user", "prompt text ".repeat(9_000)),
+			{ role: "assistant", content: [narration] },
+		];
+		const ids = ["prompt", "narration"];
+		const tags: TagEntry[] = [];
+		let arcs = 0;
+		const appendArc = (): void => {
+			arcs += 1;
+			const callId = `call-${arcs}`;
+			messages.push(
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: callId,
+							name: "read",
+							arguments: { path: `file-${arcs}` },
+						},
+					],
+				},
+				{
+					role: "toolResult",
+					toolCallId: callId,
+					toolName: "read",
+					content: [
+						{
+							type: "text",
+							text: `${"tool output row ".repeat(4_400)}${arcs}`,
+						},
+					],
+				},
+			);
+			ids.push(`arc-${arcs}`, `arc-${arcs}-result`);
+			tags.push(
+				tag(arcs, callId, "tool", {
+					toolName: "read",
+					toolOwnerMessageId: `arc-${arcs}`,
+				}),
+			);
+		};
+		appendArc();
+		appendArc();
+
+		let baseline: ReturnType<typeof refreshPiTailHygieneBaseline> | undefined;
+		let lastNudgeUndropped = 0;
+		let lastNudgeLevel: "" | "gentle" | "firm" | "urgent" = "";
+		const reasons: string[] = [];
+		const fires: number[] = [];
+		const diagnosed: number[] = [];
+		for (let pass = 1; pass <= 11; pass += 1) {
+			if (pass > 1) appendArc();
+			// A historical assistant part loses its trailing blank line after it was
+			// already measured into the frozen prefix.
+			if (pass === 3) narration.text = narration.text.replace(/\n\n$/, "");
+			baseline = refreshPiTailHygieneBaseline({
+				messages,
+				tags,
+				protectedTagNumbers:
+					pass < 3
+						? new Set(tags.map((entry) => entry.tagNumber))
+						: new Set([arcs]),
+				stableId: withStableIds(messages, ids),
+				cacheBusting: pass === 1,
+				previous: baseline,
+			});
+			const decision = decideChannel1({
+				...baseline,
+				lastNudgeUndropped,
+				lastNudgeLevel,
+				hasRecentReduce: false,
+			});
+			lastNudgeUndropped = decision.nextLastNudge;
+			lastNudgeLevel = decision.nextLastNudgeLevel;
+			reasons.push(decision.verdictReason);
+			if (decision.fire) fires.push(pass);
+			if (baseline.lastPrefixMismatch) diagnosed.push(pass);
+		}
+
+		expect(reasons.slice(0, 2)).toEqual([
+			"reclaimable-below-floor",
+			"reclaimable-below-floor",
+		]);
+		expect(reasons).not.toContain("baseline-unevaluable");
+		expect(fires[0]).toBeGreaterThanOrEqual(3);
+		expect(fires[0]).toBeLessThanOrEqual(5);
+		expect(diagnosed).toEqual([3]);
 	});
 
 	it("detects a byte mutation after the final walk", () => {
@@ -839,6 +1022,188 @@ describe("TS/Pi/module differential hygiene corpus", () => {
 	});
 });
 
+describe("Pi image content memoization", () => {
+	it("hashes raw and prefixed user/tool images without text-tokenizing their payloads", () => {
+		const rawPayload = "A".repeat(3 * 1024 * 1024);
+		const prefixedPayload = `data:image/png;base64,${rawPayload}`;
+		const messages = [
+			{
+				role: "user",
+				content: [{ type: "image", data: rawPayload, mimeType: "image/png" }],
+			},
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "image-call",
+						name: "read",
+						arguments: { path: "image-fixture" },
+					},
+				],
+			},
+			{
+				role: "toolResult",
+				toolCallId: "image-call",
+				toolName: "read",
+				content: [
+					{ type: "image", data: prefixedPayload, mimeType: "image/png" },
+				],
+			},
+		];
+		const tokenizer = spyOn(formattingModule, "estimateTokens");
+		try {
+			const stableId = withStableIds(messages, [
+				"user-image",
+				"tool-owner",
+				"tool-result",
+			]);
+			const tags = [
+				tag(1, "user-image:file0", "file"),
+				tag(2, "image-call", "tool", { toolOwnerMessageId: "tool-owner" }),
+			];
+			const baseline = measurePiTailHygiene({
+				messages,
+				tags,
+				protectedTagNumbers: new Set(),
+				stableId,
+			});
+			const measured = measurePiTailHygiene({
+				messages,
+				tags,
+				protectedTagNumbers: new Set([2]),
+				pendingDropTagNumbers: new Set([1]),
+				stableId,
+			});
+			const imageParts = measured.parts.filter(
+				(part) => part.kind === "file" || part.kind === "toolOutput",
+			);
+			const imagePayloadCalls = tokenizer.mock.calls.filter(
+				([content]) =>
+					typeof content === "string" && content.includes(rawPayload),
+			);
+
+			expect(imagePayloadCalls).toHaveLength(0);
+			expect(imageParts.map(({ kind, tokens }) => ({ kind, tokens }))).toEqual([
+				{ kind: "file", tokens: 1200 },
+				{ kind: "toolOutput", tokens: 1200 },
+			]);
+			expect(measured.t).toBe(baseline.t);
+			expect(measured.u).toBe(0);
+			expect(baseline.contentSignature).toBe(measured.contentSignature);
+			expect(measured.contentSignature).toBe("721a4413");
+			expect(measured.parts.find((part) => part.tagNumber === 1)).toMatchObject(
+				{
+					queuedForDrop: true,
+					protected: false,
+				},
+			);
+			expect(
+				measured.parts
+					.filter((part) => part.tagNumber === 2)
+					.every((part) => part.protected && part.uTokens === 0),
+			).toBe(true);
+		} finally {
+			tokenizer.mockRestore();
+		}
+	});
+
+	it("counts a tool-output key once when an image hash is requested first", () => {
+		const content = `data:image/png;base64,${"B".repeat(64)}`;
+		const messages = [
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "hash-first-call",
+						name: "read",
+						arguments: { path: "hash-first" },
+					},
+				],
+			},
+			{
+				role: "toolResult",
+				toolCallId: "hash-first-call",
+				toolName: "read",
+				content: [
+					{ type: "image", data: content, mimeType: "image/png" },
+					{ type: "text", text: content },
+				],
+			},
+		];
+		const expectedTextTokens = formattingModule.estimateTokens(content);
+		const tokenizer = spyOn(formattingModule, "estimateTokens");
+		try {
+			const measured = measurePiTailHygiene({
+				messages,
+				tags: [
+					tag(3, "hash-first-call", "tool", {
+						toolOwnerMessageId: "hash-first-owner",
+					}),
+				],
+				protectedTagNumbers: new Set(),
+				stableId: withStableIds(messages, [
+					"hash-first-owner",
+					"hash-first-result",
+				]),
+			});
+			const textCalls = tokenizer.mock.calls.filter(
+				([value]) => value === content,
+			);
+			const toolOutputParts = measured.parts.filter(
+				(part) => part.kind === "toolOutput",
+			);
+
+			expect(textCalls).toHaveLength(1);
+			expect(toolOutputParts.map((part) => part.tokens)).toEqual([
+				1200,
+				expectedTextTokens,
+			]);
+		} finally {
+			tokenizer.mockRestore();
+		}
+	});
+
+	it("caches a genuine zero and keeps excluded content out of the tokenizer", () => {
+		const zeroContent = "pi-zero-token-fixture";
+		const excludedContent = "pi-excluded-fixture";
+		const tokenizer = spyOn(
+			formattingModule,
+			"estimateTokens",
+		).mockImplementation((content) => (content === zeroContent ? 0 : 1));
+		try {
+			const messages = [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: zeroContent },
+						{ type: "thinking", thinking: excludedContent },
+					],
+				},
+			];
+			const input = {
+				messages,
+				tags: [tag(4, "zero:p0", "message")],
+				protectedTagNumbers: new Set<number>(),
+				stableId: withStableIds(messages, ["zero"]),
+			};
+			const first = measurePiTailHygiene(input);
+			const second = measurePiTailHygiene(input);
+			expect(first.parts.find((part) => part.kind === "text")?.tokens).toBe(0);
+			expect(second.parts.find((part) => part.kind === "text")?.tokens).toBe(0);
+			expect(
+				tokenizer.mock.calls.filter(([value]) => value === zeroContent),
+			).toHaveLength(1);
+			expect(
+				tokenizer.mock.calls.filter(([value]) => value === excludedContent),
+			).toHaveLength(0);
+		} finally {
+			tokenizer.mockRestore();
+		}
+	});
+});
+
 describe("Pi hygiene walk performance", () => {
 	it("memoized 250k-token rendered tail walks are cheap relative to the cold walk", () => {
 		const messages = [textMessage("user", "token ".repeat(250_000))];
@@ -855,19 +1220,21 @@ describe("Pi hygiene walk performance", () => {
 			});
 			return performance.now() - start;
 		};
-		const p95Of = (samples: number[]) => {
+		const medianOf = (samples: number[]) => {
 			const sorted = [...samples].sort((left, right) => left - right);
-			return (
-				sorted[Math.ceil(sorted.length * 0.95) - 1] ?? Number.POSITIVE_INFINITY
-			);
+			return sorted[Math.floor(sorted.length / 2)] ?? Number.POSITIVE_INFINITY;
 		};
 		// The content memo is keyed on the rendered text, so a walk over unchanged
 		// content must skip tokenization while a walk over fresh content pays it.
 		// A shared CI runner cannot promise an absolute millisecond budget (the
 		// memoized walk read 2.7ms locally and 19ms on a loaded runner), so the
 		// invariant is the ratio between the unmemoized and memoized walks measured
-		// in the same process, which load scales equally. The absolute ceiling is
-		// kept behind MC_PERF_GATE for machines that opt into wall-clock budgets.
+		// in the same process, which load scales equally. The ratio compares
+		// medians: a p95 over a 2ms memoized walk is one scheduler stall away from
+		// any value (a release gate at load 46 read memoized p95 57ms against
+		// unmemoized 143ms), while the median of 25 samples is not. The absolute
+		// ceiling is kept behind MC_PERF_GATE for machines that opt into wall-clock
+		// budgets.
 		const base = "token ".repeat(250_000);
 		const unmemoized: number[] = [];
 		for (let iteration = 0; iteration < 8; iteration += 1) {
@@ -877,12 +1244,13 @@ describe("Pi hygiene walk performance", () => {
 		const memoized: number[] = [];
 		for (let iteration = 0; iteration < 25; iteration += 1)
 			memoized.push(walk(base));
-		const unmemoizedP95 = p95Of(unmemoized);
-		const p95 = p95Of(memoized);
+		const unmemoizedMedian = medianOf(unmemoized);
+		const memoizedMedian = medianOf(memoized);
 		console.log(
-			`pi-tail-hygiene-walk 250k-token unmemoized p95=${unmemoizedP95.toFixed(3)}ms memoized p95=${p95.toFixed(3)}ms`,
+			`pi-tail-hygiene-walk 250k-token unmemoized p50=${unmemoizedMedian.toFixed(3)}ms memoized p50=${memoizedMedian.toFixed(3)}ms`,
 		);
-		expect(p95).toBeLessThan(unmemoizedP95 / 5);
-		if (process.env.MC_PERF_GATE === "1") expect(p95).toBeLessThan(15);
+		expect(memoizedMedian).toBeLessThan(unmemoizedMedian / 5);
+		if (process.env.MC_PERF_GATE === "1")
+			expect(memoizedMedian).toBeLessThan(15);
 	});
 });

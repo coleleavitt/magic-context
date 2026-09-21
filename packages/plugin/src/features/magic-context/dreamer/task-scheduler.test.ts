@@ -171,6 +171,35 @@ describe("task-scheduler — planDueTasks", () => {
         expect(getTaskScheduleState(db, PROJECT, "curate")).not.toBeNull();
     });
 
+    it("prunes against the canonical set, not the caller's filtered list", () => {
+        db = freshDb();
+        const nextDueAt = Date.now() + 60_000;
+        // A canonical task omitted by a host capability filter must retain its
+        // durable schedule coordinates and incremental watermarks.
+        writeTaskScheduleState(db, {
+            projectPath: PROJECT,
+            task: "map-memories",
+            lastRunAt: 1234,
+            nextDueAt,
+            schedule: "0 3 * * *",
+            lastStatus: "completed",
+            lastError: null,
+            retryCount: 0,
+            lastCheckedCommit: "abc",
+            retrospectiveWatermarkMs: 99,
+        });
+        planDueTasks(
+            db,
+            PROJECT,
+            [cfg("verify", "0 3 * * *"), cfg("curate", "0 4 * * 0")],
+            Date.now(),
+        );
+        const preserved = getTaskScheduleState(db, PROJECT, "map-memories");
+        expect(preserved?.lastRunAt).toBe(1234);
+        expect(preserved?.nextDueAt).toBe(nextDueAt);
+        expect(preserved?.retrospectiveWatermarkMs).toBe(99);
+    });
+
     it("deleteTaskScheduleRowsForProject removes ALL rows for an orphaned project only", () => {
         db = freshDb();
         const orphan = "dir:deadworktree";
@@ -324,6 +353,31 @@ describe("task-scheduler — runDueTasksForProject", () => {
         expect(state?.nextDueAt).toBeGreaterThan(now);
     });
 
+    it("advances last_run_at from the run START on completion (not completion time)", async () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const now = Date.now();
+        const tasks = [cfg("verify", "0 3 * * *")];
+        planDueTasks(db, PROJECT, tasks, now);
+        forceDue(db, "verify", now);
+
+        // Slow executor: a long run makes the start↔finish gap visible, so the
+        // assertion can discriminate run-start from run-completion advancement.
+        const executor = async (): Promise<TaskExecOutcome> => {
+            await new Promise((r) => setTimeout(r, 200));
+            return { status: "completed" };
+        };
+        const before = Date.now();
+        await runDueTasksForProject({ db, projectIdentity: PROJECT, tasks, executor, now });
+        const after = Date.now();
+        const state = getTaskScheduleState(db, PROJECT, "verify");
+        expect(state?.lastStatus).toBe("completed");
+        // last_run_at reflects the run START (~before), not the completion (~after):
+        // a message landing mid-run is newer than the cutoff and re-triggers next slot.
+        expect(state?.lastRunAt).toBeGreaterThanOrEqual(before);
+        expect(state?.lastRunAt).toBeLessThan(after - 150);
+    });
+
     it("skips a due task whose gate fails (no active memories) and advances it", async () => {
         db = freshDb();
         // No memories → verify gate fails.
@@ -349,6 +403,31 @@ describe("task-scheduler — runDueTasksForProject", () => {
         const state = getTaskScheduleState(db, PROJECT, "verify");
         expect(state?.lastStatus).toBe("skipped");
         expect(state?.nextDueAt).toBeGreaterThan(now);
+    });
+
+    it("failed runs persist retrospective recovery state without moving last_run_at", async () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const now = Date.now();
+        const tasks = [cfg("curate", "0 3 * * *")];
+        planDueTasks(db, PROJECT, tasks, now);
+        forceDue(db, "curate", now);
+
+        const executor = async (): Promise<TaskExecOutcome> => ({
+            status: "failed",
+            transient: true,
+            error: "prompt is too long",
+            schedulePatch: {
+                retrospectiveWatermarkMs: 1700000000000,
+                taskStateJson: JSON.stringify({ retrospectiveOverflow: { failures: 2 } }),
+            },
+        });
+        await runDueTasksForProject({ db, projectIdentity: PROJECT, tasks, executor, now });
+
+        const state = getTaskScheduleState(db, PROJECT, "curate");
+        expect(state?.lastRunAt).toBeNull();
+        expect(state?.retrospectiveWatermarkMs).toBe(1700000000000);
+        expect(state?.taskStateJson).toContain("retrospectiveOverflow");
     });
 
     it("completed runs persist the retrospective content watermark patch", async () => {

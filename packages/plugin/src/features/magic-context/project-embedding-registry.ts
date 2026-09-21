@@ -1981,6 +1981,14 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<ShadowBack
             db,
             "memory",
         );
+        // The provider call above can take seconds (or minutes on a cold model
+        // load). unregisterProjectShadowEmbedding may have retired this shadow
+        // while we were waiting, so re-check the live registration before
+        // writing any vectors.
+        const live = shadowRegistrations.get(item.projectIdentity);
+        if (!live || live.generation !== registration.generation) {
+            return { writes: 0, refusalReason: "registration_retired_during_embed" };
+        }
         let writes = 0;
         let hashGuardRejected = false;
         db.transaction(() => {
@@ -2035,6 +2043,11 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<ShadowBack
             db,
             "commit",
         );
+        // Re-check after the provider round-trip; see the memory scope above.
+        const live = shadowRegistrations.get(item.projectIdentity);
+        if (!live || live.generation !== registration.generation) {
+            return { writes: 0, refusalReason: "registration_retired_during_embed" };
+        }
         let writes = 0;
         db.transaction(() => {
             for (const row of rows) {
@@ -2113,6 +2126,11 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<ShadowBack
         })),
     );
     const embedded = await embedShadowItems(registration, items, db, "chunk");
+    // Re-check after the provider round-trip; see the memory scope above.
+    const live = shadowRegistrations.get(item.projectIdentity);
+    if (!live || live.generation !== registration.generation) {
+        return { writes: 0, refusalReason: "registration_retired_during_embed" };
+    }
     let writes = 0;
     let partialVectorSet = false;
     for (const item of prepared) {
@@ -2182,14 +2200,31 @@ async function runShadowWorker(): Promise<void> {
             shadowQueue.unshift(item);
             break;
         }
+        // A worker item may outlive its registration: retirement or a re-arm can
+        // land while the provider call is in flight. Publishing the outcome then
+        // re-creates state that retirement just cleared, and the stall detector
+        // reads that map — so a retired item's refusal could be attributed to a
+        // freshly re-armed registration and stop its backfill. Only record the
+        // outcome when the registration this item started under is still live.
+        const generationAtStart = shadowRegistrations.get(item.projectIdentity)?.generation;
+        const isStillCurrent = (): boolean =>
+            generationAtStart !== undefined &&
+            shadowRegistrations.get(item.projectIdentity)?.generation === generationAtStart;
         try {
             const outcome = await processShadowQueueItem(item);
-            shadowBackfillLastWriteOutcomes.set(`${item.projectIdentity}:${item.scope}`, outcome);
+            if (isStillCurrent()) {
+                shadowBackfillLastWriteOutcomes.set(
+                    `${item.projectIdentity}:${item.scope}`,
+                    outcome,
+                );
+            }
         } catch (error) {
-            shadowBackfillLastWriteOutcomes.set(`${item.projectIdentity}:${item.scope}`, {
-                writes: 0,
-                refusalReason: "provider_returned_no_vectors",
-            });
+            if (isStillCurrent()) {
+                shadowBackfillLastWriteOutcomes.set(`${item.projectIdentity}:${item.scope}`, {
+                    writes: 0,
+                    refusalReason: "provider_returned_no_vectors",
+                });
+            }
             log("[magic-context] Synapse shadow write failed:", error);
         }
         processed += item.ids.length;
@@ -2230,6 +2265,29 @@ export function registerProjectInObservationMode(
     disposeProvider(prior?.provider ?? null);
 
     return snapshotFor(registration);
+}
+
+export function unregisterProjectShadowEmbedding(projectIdentity: string): void {
+    const shadow = shadowRegistrations.get(projectIdentity);
+    shadowRegistrations.delete(projectIdentity);
+    dbForShadowQueue.delete(projectIdentity);
+    pendingShadowBackfills.delete(projectIdentity);
+    for (let index = shadowQueue.length - 1; index >= 0; index -= 1) {
+        if (shadowQueue[index].projectIdentity === projectIdentity) shadowQueue.splice(index, 1);
+    }
+    for (const scope of ["memory", "commit", "chunk"] as const) {
+        const key = `${projectIdentity}:${scope}`;
+        shadowBackfillLastIds.delete(key);
+        shadowBackfillStopReasons.delete(key);
+        shadowBackfillLastWriteOutcomes.delete(key);
+    }
+    // Production always constructs a distinct shadow instance, but a test factory
+    // (or a future cache) can hand out the same object as the primary. Disposing
+    // that shared instance would take the primary lane down with the shadow.
+    const primaryProvider = projectRegistrations.get(projectIdentity)?.provider ?? null;
+    if (shadow?.provider && shadow.provider !== primaryProvider) {
+        disposeProvider(shadow.provider);
+    }
 }
 
 export function unregisterProjectEmbedding(projectIdentity: string): void {

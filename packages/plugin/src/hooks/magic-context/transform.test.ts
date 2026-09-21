@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
 import {
     replaceAllCompartmentState,
     replaceAllCompartments,
@@ -25,6 +26,7 @@ import {
     getLastNudgeUndropped,
     getOrCreateSessionMeta,
     getOverflowState,
+    getPendingCompactionMarkerState,
     getPendingOps,
     getTagById,
     getTagsBySession,
@@ -36,6 +38,7 @@ import {
     recordOverflowDetected,
     setChannel1NudgeState,
     setLastNudgeUndropped,
+    setPendingCompactionMarkerState,
     updateCavemanDepth,
     updateSessionMeta,
     updateTagDropMode,
@@ -43,7 +46,9 @@ import {
 } from "../../features/magic-context/storage";
 import {
     getEmergencyInputSample,
+    type getPersistedCompactionMarkerState,
     setEmergencyDropSample,
+    setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
 import { recordToolDefinition } from "../../features/magic-context/tool-definition-tokens";
@@ -58,7 +63,9 @@ import * as loggerModule from "../../shared/logger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { getSlot, resetLkgSlotsForTest } from "./lkg-slot";
+import type { MarkerUpdateOutcome } from "./compaction-marker-manager";
+import { injectM0M1 } from "./inject-compartments";
+import { captureSlot, getSlot, resetLkgSlotsForTest } from "./lkg-slot";
 import { __ignoredNotificationTest } from "./send-session-notification";
 import { clearMessageTokensCache, createTransform } from "./transform";
 
@@ -90,6 +97,9 @@ type TestMessage = {
         providerID?: string;
         modelID?: string;
         tools?: Record<string, unknown>;
+        finish?: string;
+        time?: { created: number; completed: number };
+        summary?: boolean;
     };
     parts: TestPart[];
 };
@@ -154,6 +164,672 @@ function toolOutput(message: TestMessage, index: number): string {
 }
 
 describe("createTransform", () => {
+    it.each([
+        "soft-execute",
+        "explicit-flush",
+        "force-band",
+        "published-history",
+    ])("adopts scoped tool sweeping only on a priced pass and preserves reasoning-only replay (%s)", async (kind) => {
+        useTempDataHome("context-transform-scoped-sweep-");
+        const sessionId = "ses-scoped-sweep";
+        const db = openDatabase();
+        const historyRefreshSessions = new Set<string>();
+        const deferredHistoryRefreshSessions = new Set<string>();
+        const contextUsageMap = new Map<string, { usage: ContextUsage; updatedAt: number }>();
+        let decision: "execute" | "defer" = "defer";
+        const makeTransform = () =>
+            createTransform({
+                tagger: createTagger(),
+                scheduler: { shouldExecute: () => decision },
+                contextUsageMap,
+                db,
+                historyRefreshSessions,
+                deferredHistoryRefreshSessions,
+                pendingMaterializationSessions: new Set(),
+                lastHeuristicsTurnId: new Map(),
+                clearReasoningAge: 1000,
+                protectedTokens: 0,
+                historianRunnable: false,
+                liveModelBySession: new Map([
+                    [sessionId, { providerID: "anthropic", modelID: "claude-opus-5" }],
+                ]),
+            });
+        let transform = makeTransform();
+        const source: TestMessage[] = [
+            {
+                info: { id: "sweep-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "start" }],
+            },
+            {
+                info: { id: "sweep-tool", role: "assistant" },
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "bash",
+                        callID: "sweep-call",
+                        state: { status: "completed", output: "spent result" },
+                    },
+                ],
+            },
+            ...Array.from(
+                { length: 24 },
+                (_, index): TestMessage => ({
+                    info: { id: `sweep-filler-${index}`, role: index % 2 ? "assistant" : "user" },
+                    parts: [{ type: "text", text: `unchanged ${index}` }],
+                }),
+            ),
+            {
+                info: {
+                    id: "sweep-thinking",
+                    role: "assistant",
+                    finish: "stop",
+                    time: { created: 1, completed: 2 },
+                },
+                parts: [
+                    { type: "step-start", text: "" },
+                    { type: "reasoning", text: "signed reasoning only" },
+                    { type: "step-finish", text: "" },
+                ],
+            },
+            {
+                info: { id: "sweep-notice", role: "user" },
+                parts: [
+                    {
+                        type: "text",
+                        text: "<system-reminder>[BACKGROUND BASH COMPLETED]</system-reminder>",
+                    },
+                ],
+            },
+        ];
+        const run = async () => {
+            const output = { messages: structuredClone(source) };
+            await transform({}, output);
+            return output.messages;
+        };
+        await run();
+        const tool = getTagsBySession(db, sessionId).find((tag) => tag.type === "tool");
+        expect(tool).toBeDefined();
+        updateTagStatus(db, sessionId, tool!.tagNumber, "dropped");
+        updateTagDropMode(db, sessionId, tool!.tagNumber, "full");
+        const legacy = await run();
+        expect(legacy.some((message) => message.info.id === "sweep-thinking")).toBe(false);
+        const sha = (value: unknown) =>
+            createHash("sha256").update(JSON.stringify(value)).digest("hex");
+        const capture = (label: string, messages: TestMessage[], previous: TestMessage[]) => {
+            const index =
+                Array.from(
+                    { length: Math.max(messages.length, previous.length) },
+                    (_, i) => i,
+                ).find((i) => JSON.stringify(messages[i]) !== JSON.stringify(previous[i])) ?? -1;
+            console.log(`SCOPED_GATE ${label} sha256=${sha(messages)} first_divergence=${index}`);
+        };
+        capture("legacy-1", legacy, legacy);
+        for (let pass = 2; pass <= 3; pass++) {
+            const replay = await run();
+            capture(`legacy-${pass}`, replay, legacy);
+            expect(sha(replay)).toBe(sha(legacy));
+        }
+        const marker = () =>
+            String(
+                (
+                    db
+                        .prepare(
+                            "SELECT merged_reasoning_stripped_ids AS ids FROM session_meta WHERE session_id = ?",
+                        )
+                        .get(sessionId) as { ids: string }
+                ).ids,
+            ).includes("@tool-sweep-scoped");
+        expect(marker()).toBe(false);
+        if (kind === "soft-execute") decision = "execute";
+        if (kind === "explicit-flush") historyRefreshSessions.add(sessionId);
+        if (kind === "force-band")
+            contextUsageMap.set(sessionId, {
+                usage: { percentage: 99, inputTokens: 190000 },
+                updatedAt: Date.now(),
+            });
+        if (kind === "published-history") {
+            // A published compartment plus a pending deferred-history signal:
+            // the next pass rebuilds the injected history head (m[0]) from that
+            // compartment. That rebuild changes bytes the session already paid
+            // to cache, which is what makes the pass cache-busting even though
+            // the scheduler is still deferring.
+            replaceAllCompartments(db, sessionId, [
+                {
+                    sequence: 0,
+                    startMessage: 1,
+                    endMessage: 2,
+                    startMessageId: "sweep-user",
+                    endMessageId: "sweep-tool",
+                    title: "Published history",
+                    content: "Historian published the opening of this session.",
+                },
+            ]);
+            deferredHistoryRefreshSessions.add(sessionId);
+            contextUsageMap.set(sessionId, {
+                usage: { percentage: 95, inputTokens: 190000 },
+                updatedAt: Date.now(),
+            });
+        }
+        const priced = await run();
+        capture(kind, priced, legacy);
+        if (kind === "published-history") {
+            // The publication is the fold this pass pays for: the covered
+            // opening is gone and the rendered compartment leads the array.
+            expect(JSON.stringify(priced[0])).toContain("<session-history>");
+            expect(priced.some((message) => message.info.id === "sweep-user")).toBe(false);
+            expect(priced.some((message) => message.info.id === "sweep-tool")).toBe(false);
+            // The dropped owner is spliced from the array that is SERVED, not
+            // only from the copy the tagger walked, so the following defer
+            // passes (which sweep the served array directly) replay it.
+            expect(priced.filter((message) => message.parts.length === 0)).toEqual([]);
+            console.log(
+                `SCOPED_GATE hard fold rematerialized m0; served rows=${priced.length}; empty shells=0`,
+            );
+        }
+        expect(
+            priced
+                .find((message) => message.info.id === "sweep-thinking")
+                ?.parts.some((part) => part.type === "reasoning"),
+        ).toBe(true);
+        expect(marker()).toBe(true);
+        decision = "defer";
+        historyRefreshSessions.clear();
+        deferredHistoryRefreshSessions.clear();
+        contextUsageMap.clear();
+        transform = makeTransform();
+        for (let pass = 1; pass <= 3; pass++) {
+            const replay = await run();
+            capture(`adopted-defer-${pass}`, replay, priced);
+            expect(sha(replay)).toBe(sha(priced));
+        }
+        source.push({
+            info: { id: "sweep-newest", role: "assistant" },
+            parts: [
+                { type: "reasoning", text: "new thinking" },
+                { type: "text", text: "new answer" },
+            ],
+        });
+        const replay = await run();
+        expect(sha(replay.slice(0, priced.length))).toBe(sha(priced));
+        expect(replay.some((message) => message.info.id === "sweep-tool")).toBe(false);
+    });
+    it("pre-adoption defer serves the sweep variant each session was last served", async () => {
+        useTempDataHome("context-transform-sweep-lkg-");
+        const db = openDatabase();
+        const makeTransform = (sessionId: string) =>
+            createTransform({
+                tagger: createTagger(),
+                scheduler: { shouldExecute: () => "defer" as const },
+                contextUsageMap: new Map(),
+                db,
+                historyRefreshSessions: new Set(),
+                pendingMaterializationSessions: new Set(),
+                lastHeuristicsTurnId: new Map(),
+                clearReasoningAge: 1000,
+                protectedTokens: 0,
+                historianRunnable: false,
+                liveModelBySession: new Map([
+                    [sessionId, { providerID: "anthropic", modelID: "claude-opus-5" }],
+                ]),
+            });
+        const sourceFor = (sessionId: string): TestMessage[] => [
+            {
+                info: { id: "lkg-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "start" }],
+            },
+            {
+                info: { id: "lkg-tool", role: "assistant" },
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "bash",
+                        callID: "lkg-call",
+                        state: { status: "completed", output: "spent result" },
+                    },
+                ],
+            },
+            ...Array.from(
+                { length: 24 },
+                (_, index): TestMessage => ({
+                    info: { id: `lkg-filler-${index}`, role: index % 2 ? "assistant" : "user" },
+                    parts: [{ type: "text", text: `unchanged ${index}` }],
+                }),
+            ),
+            {
+                info: {
+                    id: "lkg-thinking",
+                    role: "assistant",
+                    finish: "stop",
+                    time: { created: 1, completed: 2 },
+                },
+                parts: [
+                    { type: "step-start", text: "" },
+                    { type: "reasoning", text: "signed reasoning only" },
+                    { type: "step-finish", text: "" },
+                ],
+            },
+            {
+                info: { id: "lkg-notice", role: "user" },
+                parts: [
+                    {
+                        type: "text",
+                        text: "<system-reminder>[BACKGROUND BASH COMPLETED]</system-reminder>",
+                    },
+                ],
+            },
+        ];
+        const sha = (value: unknown) =>
+            createHash("sha256").update(JSON.stringify(value)).digest("hex");
+        const marker = (sessionId: string) =>
+            String(
+                (
+                    db
+                        .prepare(
+                            "SELECT merged_reasoning_stripped_ids AS ids FROM session_meta WHERE session_id = ?",
+                        )
+                        .get(sessionId) as { ids: string }
+                ).ids,
+            ).includes("@tool-sweep-scoped");
+        // Both arms replay the same history on a pass that may not change bytes.
+        // They differ only in what the durable snapshot says was served last.
+        const runArm = async (sessionId: string, lastServedKeepsReasoning: boolean) => {
+            const source = sourceFor(sessionId);
+            const transform = makeTransform(sessionId);
+            const run = async () => {
+                const output = { messages: structuredClone(source) };
+                await transform({}, output);
+                return output.messages;
+            };
+            await run();
+            const tool = getTagsBySession(db, sessionId).find((tag) => tag.type === "tool");
+            expect(tool).toBeDefined();
+            updateTagStatus(db, sessionId, tool!.tagNumber, "dropped");
+            updateTagDropMode(db, sessionId, tool!.tagNumber, "full");
+            const legacy = await run();
+            expect(legacy.some((message) => message.info.id === "lkg-thinking")).toBe(false);
+            expect(marker(sessionId)).toBe(false);
+            const lastServed = lastServedKeepsReasoning
+                ? legacy.flatMap((message) =>
+                      message.info.id === "lkg-notice"
+                          ? [
+                                {
+                                    info: { id: "lkg-thinking", role: "assistant" },
+                                    parts: [{ type: "reasoning", text: "signed reasoning only" }],
+                                },
+                                message,
+                            ]
+                          : [message],
+                  )
+                : legacy;
+            expect(
+                captureSlot(sessionId, {
+                    jsonPrefix: JSON.stringify(lastServed),
+                    inputIdSeq: ["lkg-user"],
+                    inputContentDigests: ["seeded-last-served"],
+                    lastInputMessageId: "lkg-user",
+                    modelKey: "anthropic/claude-opus-5",
+                    providerKey: "anthropic",
+                    capturedAt: Date.now(),
+                }),
+            ).toBe(true);
+            return { legacy, replay: await run() };
+        };
+
+        const old = await runArm("ses-sweep-lkg-old", false);
+        const scoped = await runArm("ses-sweep-lkg-scoped", true);
+        console.log(`SCOPED_GATE lkg replay old=${sha(old.replay)} scoped=${sha(scoped.replay)}`);
+        // Served-under-legacy session keeps being served the legacy array.
+        expect(sha(old.replay)).toBe(sha(old.legacy));
+        expect(old.replay.some((message) => message.info.id === "lkg-thinking")).toBe(false);
+        expect(marker("ses-sweep-lkg-old")).toBe(false);
+        // Served-under-scoped session gets its reasoning-only turn back — that
+        // is a replay of its own bytes — and records the adoption.
+        expect(
+            scoped.replay
+                .find((message) => message.info.id === "lkg-thinking")
+                ?.parts.some((part) => part.type === "reasoning"),
+        ).toBe(true);
+        expect(marker("ses-sweep-lkg-scoped")).toBe(true);
+        expect(sha(old.replay)).not.toBe(sha(scoped.replay));
+    });
+    async function runMarkerBoundaryFixture(options: {
+        name: string;
+        deleteBoundary?: boolean;
+        sourceAlreadyHostTrimmed?: boolean;
+        sourceBoundaryMissing?: boolean;
+        applyOutcome?: "applied" | "retryable-failure" | "concurrent-winner";
+    }) {
+        useTempDataHome(`context-transform-marker-boundary-${options.name}-`);
+        const sessionId = `ses-marker-boundary-${options.name}`;
+        const directory = makeTempDir(`marker-boundary-project-${options.name}-`);
+        const db = openDatabase();
+        const baseCompartment = {
+            sequence: 0,
+            startMessage: 1,
+            endMessage: 1,
+            startMessageId: "base",
+            endMessageId: "base",
+            title: "Baseline",
+            content: "Baseline history",
+        };
+        const targetCompartment = {
+            sequence: 1,
+            startMessage: 2,
+            endMessage: 3,
+            startMessageId: "middle",
+            endMessageId: "assistant-boundary",
+            title: "Advanced",
+            content: "Advanced history",
+        };
+        const startsAlreadyCovered =
+            options.sourceAlreadyHostTrimmed === true || options.sourceBoundaryMissing === true;
+        replaceAllCompartments(
+            db,
+            sessionId,
+            startsAlreadyCovered ? [baseCompartment, targetCompartment] : [baseCompartment],
+        );
+        injectM0M1({
+            db,
+            sessionId,
+            state: getOrCreateSessionMeta(db, sessionId),
+            projectDirectory: directory,
+            injectDocs: false,
+            memoryEnabled: false,
+        });
+
+        let decision: "execute" | "defer" = "defer";
+        const deferredHistoryRefreshSessions = new Set<string>();
+        const reconciledStates: Array<ReturnType<typeof getPersistedCompactionMarkerState>> = [];
+        const applyDeferred = mock(
+            (
+                markerDb: typeof db,
+                markerSessionId: string,
+                pending: { ordinal: number; endMessageId: string; publishedAt: number },
+            ): MarkerUpdateOutcome => {
+                if (options.applyOutcome === "retryable-failure") {
+                    return { kind: "retryable-failure", error: new Error("persist failed") };
+                }
+                if (options.applyOutcome === "concurrent-winner") {
+                    setPersistedCompactionMarkerState(markerDb, markerSessionId, {
+                        boundaryMessageId: "winner-user",
+                        summaryMessageId: "winner-summary",
+                        compactionPartId: "winner-compaction",
+                        summaryPartId: "winner-part",
+                        boundaryOrdinal: pending.ordinal + 1,
+                        targetEndMessageId: "winner-target",
+                    });
+                    return { kind: "already-current" };
+                }
+                return { kind: "applied", markerOrdinal: pending.ordinal };
+            },
+        );
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: () => decision },
+            contextUsageMap: new Map<string, { usage: ContextUsage; updatedAt: number }>([
+                [
+                    sessionId,
+                    { usage: { percentage: 30, inputTokens: 60_000 }, updatedAt: Date.now() },
+                ],
+            ]),
+            db,
+            directory,
+            injectDocs: false,
+            memoryConfig: { enabled: false, injectionBudgetTokens: 0, autoPromote: false },
+            historyRefreshSessions: new Set(),
+            deferredHistoryRefreshSessions,
+            pendingMaterializationSessions: new Set(),
+            lastHeuristicsTurnId: new Map(),
+            clearReasoningAge: 1000,
+            protectedTokens: 0,
+            historianRunnable: false,
+            compactionMarkerStrategy: {
+                applyDeferred,
+                reconcile: (_messages, state) => {
+                    reconciledStates.push(state);
+                    return false;
+                },
+            },
+        });
+        const source = (): TestMessage[] => [
+            {
+                info: { id: "base", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "base" }],
+            },
+            {
+                info: { id: "middle", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "middle" }],
+            },
+            {
+                info: { id: "assistant-boundary", role: "assistant" },
+                parts: options.deleteBoundary
+                    ? [
+                          {
+                              type: "tool",
+                              tool: "bash",
+                              callID: "boundary-call",
+                              state: { status: "completed", output: "spent" },
+                          },
+                      ]
+                    : [{ type: "text", text: "assistant boundary" }],
+            },
+            {
+                info: { id: "tail", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "retained tail" }],
+            },
+        ];
+
+        if (options.deleteBoundary) {
+            await transform({}, { messages: structuredClone(source()) });
+            const boundaryTag = getTagsBySession(db, sessionId).find(
+                (tag) => tag.messageId === "boundary-call",
+            );
+            expect(boundaryTag).toBeDefined();
+            updateTagStatus(db, sessionId, boundaryTag!.tagNumber, "dropped");
+            updateTagDropMode(db, sessionId, boundaryTag!.tagNumber, "full");
+        }
+        if (!startsAlreadyCovered) {
+            replaceAllCompartments(db, sessionId, [baseCompartment, targetCompartment]);
+        }
+        if (options.sourceAlreadyHostTrimmed) {
+            setPersistedCompactionMarkerState(db, sessionId, {
+                boundaryMessageId: "marker-user",
+                summaryMessageId: "marker-summary",
+                compactionPartId: "marker-compaction",
+                summaryPartId: "marker-summary-part",
+                boundaryOrdinal: 3,
+                targetEndMessageId: "assistant-boundary",
+            });
+        }
+        setPendingCompactionMarkerState(db, sessionId, {
+            ordinal: 3,
+            endMessageId: "assistant-boundary",
+            publishedAt: 1,
+        });
+        deferredHistoryRefreshSessions.add(sessionId);
+        decision = "execute";
+        const messages = options.sourceAlreadyHostTrimmed
+            ? [
+                  {
+                      info: {
+                          id: "marker-summary",
+                          role: "assistant",
+                          sessionID: sessionId,
+                          summary: true,
+                      },
+                      parts: [{ type: "text", text: "marker" }],
+                  },
+                  source()[3]!,
+              ]
+            : options.sourceBoundaryMissing
+              ? [source()[3]!]
+              : source();
+        await transform({}, { messages });
+        return {
+            applyDeferred,
+            db,
+            deferredHistoryRefreshSessions,
+            messages,
+            reconciledStates,
+            sessionId,
+        };
+    }
+
+    it("trims through a boundary deleted by tool replay before draining the marker", async () => {
+        const result = await runMarkerBoundaryFixture({ name: "deleted", deleteBoundary: true });
+        expect(result.applyDeferred).toHaveBeenCalledTimes(1);
+        expect(result.messages.map((message) => message.info.id).filter(Boolean)).toEqual(["tail"]);
+        expect(getPendingCompactionMarkerState(result.db, result.sessionId)).toBeNull();
+        expect(result.deferredHistoryRefreshSessions.has(result.sessionId)).toBe(false);
+    });
+
+    it("accepts an already host-trimmed boundary only when the source carries its marker", async () => {
+        const result = await runMarkerBoundaryFixture({
+            name: "already-host-trimmed",
+            sourceAlreadyHostTrimmed: true,
+        });
+        expect(result.applyDeferred).toHaveBeenCalledTimes(1);
+        expect(getPendingCompactionMarkerState(result.db, result.sessionId)).toBeNull();
+        expect(result.messages.some((message) => message.info.id === "assistant-boundary")).toBe(
+            false,
+        );
+    });
+
+    it("refuses marker drain when the immutable source lacks the pending boundary", async () => {
+        const result = await runMarkerBoundaryFixture({
+            name: "missing-source",
+            sourceBoundaryMissing: true,
+        });
+        expect(result.applyDeferred).not.toHaveBeenCalled();
+        expect(getPendingCompactionMarkerState(result.db, result.sessionId)).not.toBeNull();
+        expect(result.deferredHistoryRefreshSessions.has(result.sessionId)).toBe(true);
+    });
+
+    it("trims an assistant-ended seam in canonical source order", async () => {
+        const result = await runMarkerBoundaryFixture({ name: "assistant-seam" });
+        expect(result.applyDeferred).toHaveBeenCalledTimes(1);
+        expect(result.messages.map((message) => message.info.id).filter(Boolean)).toEqual(["tail"]);
+    });
+
+    it("reconciles the concurrent marker winner after a proven trim", async () => {
+        const result = await runMarkerBoundaryFixture({
+            name: "concurrent-winner",
+            applyOutcome: "concurrent-winner",
+        });
+        expect(result.applyDeferred).toHaveBeenCalledTimes(1);
+        expect(result.reconciledStates.at(-1)?.boundaryOrdinal).toBe(4);
+        expect(getPendingCompactionMarkerState(result.db, result.sessionId)).toBeNull();
+    });
+
+    it("preserves marker and refresh signals when persistence fails after a proven trim", async () => {
+        const result = await runMarkerBoundaryFixture({
+            name: "persistence-failure",
+            applyOutcome: "retryable-failure",
+        });
+        expect(result.applyDeferred).toHaveBeenCalledTimes(1);
+        expect(getPendingCompactionMarkerState(result.db, result.sessionId)).not.toBeNull();
+        expect(result.deferredHistoryRefreshSessions.has(result.sessionId)).toBe(true);
+    });
+
+    it("holds completed reasoning-only assistants after demotion on defer", async () => {
+        useTempDataHome("context-transform-reasoning-only-demotion-");
+        const sessionId = "ses-reasoning-only-demotion";
+        let decision: "execute" | "defer" = "execute";
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: () => decision },
+            liveModelBySession: new Map([
+                [sessionId, { providerID: "anthropic", modelID: "claude-opus-5" }],
+            ]),
+            contextUsageMap: new Map(),
+            db: openDatabase(),
+            historyRefreshSessions: new Set(),
+            pendingMaterializationSessions: new Set(),
+            lastHeuristicsTurnId: new Map(),
+            clearReasoningAge: 50,
+            protectedTokens: 0,
+            historianRunnable: false,
+        });
+        const messages: TestMessage[] = [
+            {
+                info: {
+                    id: "user",
+                    role: "user",
+                    sessionID: sessionId,
+                    providerID: "anthropic",
+                    modelID: "claude-opus-5",
+                },
+                parts: [{ type: "text", text: "start" }],
+            },
+            {
+                info: { id: "previous", role: "assistant" },
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "bash",
+                        callID: "previous-call",
+                        state: { status: "completed", output: "done" },
+                    },
+                ],
+            },
+            {
+                info: {
+                    id: "msg_0bedb7d8f001FvFOQdZoGqywkr",
+                    role: "assistant",
+                    providerID: "anthropic",
+                    modelID: "claude-opus-5",
+                    finish: "stop",
+                    time: { created: 1789908450703, completed: 1789908461333 },
+                },
+                parts: [
+                    { type: "step-start", text: "" },
+                    { type: "reasoning", text: "signed reasoning only" },
+                    { type: "step-finish", text: "" },
+                ],
+            },
+            {
+                info: { id: "notice", role: "user" },
+                parts: [
+                    {
+                        type: "text",
+                        text: "<system-reminder>[BACKGROUND BASH COMPLETED]</system-reminder>",
+                    },
+                ],
+            },
+        ];
+        const a = { messages: structuredClone(messages) };
+        await transform({}, a);
+        decision = "defer";
+        messages.push({
+            info: { id: "newest", role: "assistant" },
+            parts: [
+                { type: "reasoning", text: "new thinking" },
+                {
+                    type: "tool",
+                    tool: "bash",
+                    callID: "new-call",
+                    state: { status: "completed", output: "done" },
+                },
+            ],
+        });
+        const b = { messages: structuredClone(messages) };
+        await transform({}, b);
+        const target = (output: typeof a) =>
+            output.messages.find((m) => m.info.id === "msg_0bedb7d8f001FvFOQdZoGqywkr");
+        expect(target(a)?.parts.some((p) => p.type === "reasoning")).toBe(true);
+        expect(target(b)).toEqual(target(a));
+        expect(target(b)?.parts).toEqual([
+            { type: "text", text: "" },
+            { type: "reasoning", text: "signed reasoning only" },
+            { type: "text", text: "" },
+        ]);
+        const sha = (value: unknown) =>
+            createHash("sha256").update(JSON.stringify(value)).digest("hex");
+        expect(sha(b.messages.slice(0, a.messages.length))).toBe(sha(a.messages));
+        expect(b.messages.findIndex((m) => m.info.id === "notice")).toBe(
+            b.messages.findIndex((m) => m.info.id === "msg_0bedb7d8f001FvFOQdZoGqywkr") + 1,
+        );
+    });
     it("logs both nudge gate verdicts on every evaluable TypeScript pass", async () => {
         useTempDataHome("context-transform-nudge-observability-");
         const sessionId = "ses-nudge-observability";
@@ -578,15 +1254,27 @@ describe("createTransform", () => {
 
         const rows = db
             .prepare(
-                `SELECT message_id, materialize_reason
+                `SELECT message_id, decision, materialize_reason
                    FROM transform_decisions
                   WHERE session_id = ?
                   ORDER BY rowid`,
             )
-            .all(sessionId) as Array<{ message_id: string; materialize_reason: string | null }>;
+            .all(sessionId) as Array<{
+            message_id: string;
+            decision: string;
+            materialize_reason: string | null;
+        }>;
         expect(rows).toEqual([
-            { message_id: "decision-response-a", materialize_reason: "first_render" },
-            { message_id: "decision-response-b", materialize_reason: "model_change" },
+            {
+                message_id: "decision-response-a",
+                decision: "execute",
+                materialize_reason: "first_render",
+            },
+            {
+                message_id: "decision-response-b",
+                decision: "execute",
+                materialize_reason: "model_change",
+            },
         ]);
         expect(rows[0]?.materialize_reason).not.toBe(rows[1]?.materialize_reason);
     });
@@ -1469,7 +2157,7 @@ describe("createTransform", () => {
         expect(messages[2].parts).toEqual([{ type: "text", text: "" }]);
     });
 
-    it("applies pending drop operations when scheduler executes", async () => {
+    it("applies pending drop operations on an explicit flush", async () => {
         //#given
         useTempDataHome("context-transform-ops-");
         const shouldExecute = mock<Scheduler["shouldExecute"]>(() => "defer");
@@ -1478,6 +2166,7 @@ describe("createTransform", () => {
             string,
             import("./ctx-reduce-nudge").Channel1State
         >();
+        const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
             tagger: createTagger(),
             scheduler,
@@ -1489,7 +2178,7 @@ describe("createTransform", () => {
             ]),
             db: openDatabase(),
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(),
+            pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -1523,7 +2212,9 @@ describe("createTransform", () => {
             });
         }
         queuePendingOp(db, "ses-1", 1, "drop");
+        pendingMaterializationSessions.add("ses-1");
         queuePendingOp(db, "ses-1", 2, "drop");
+        pendingMaterializationSessions.add("ses-1");
         shouldExecute.mockImplementation(() => "execute");
 
         const secondPass: TestMessage[] = [
@@ -1868,6 +2559,7 @@ describe("createTransform", () => {
         const scheduler: Scheduler = { shouldExecute: mock(() => "execute" as const) };
         const db = openDatabase();
         updateSessionMeta(db, "ses-sub-drop", { isSubagent: true });
+        const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
             tagger: createTagger(),
             scheduler,
@@ -1879,7 +2571,7 @@ describe("createTransform", () => {
             ]),
             db,
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(),
+            pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -1898,6 +2590,7 @@ describe("createTransform", () => {
 
         await transform({}, { messages: firstPass });
         queuePendingOp(db, "ses-sub-drop", 2, "drop", Date.now());
+        pendingMaterializationSessions.add("ses-sub-drop");
 
         const secondPass: TestMessage[] = [
             {
@@ -2124,6 +2817,7 @@ describe("createTransform", () => {
         let decision: "defer" | "execute" = "defer";
         const scheduler: Scheduler = { shouldExecute: mock(() => decision) };
         const db = openDatabase();
+        const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
             tagger: createTagger(),
             scheduler,
@@ -2135,7 +2829,7 @@ describe("createTransform", () => {
             ]),
             db,
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(),
+            pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -2185,6 +2879,7 @@ describe("createTransform", () => {
         );
         expect(firstTag?.tagNumber).toBe(1);
         queuePendingOp(db, sessionId, 1, "drop");
+        pendingMaterializationSessions.add(sessionId);
 
         decision = "execute";
         await transform({}, { messages });
@@ -2329,6 +3024,7 @@ describe("createTransform", () => {
         useTempDataHome("context-transform-multipart-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "execute" as const) };
         const tagger = createTagger();
+        const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
             tagger,
             scheduler,
@@ -2340,7 +3036,7 @@ describe("createTransform", () => {
             ]),
             db: openDatabase(),
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(),
+            pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -2369,6 +3065,7 @@ describe("createTransform", () => {
 
         const db = openDatabase();
         queuePendingOp(db, "ses-multi", 1, "drop");
+        pendingMaterializationSessions.add("ses-multi");
 
         const secondPass: TestMessage[] = [
             {
@@ -2395,6 +3092,7 @@ describe("createTransform", () => {
         useTempDataHome("context-transform-thinking-");
         const shouldExecute = mock<Scheduler["shouldExecute"]>(() => "defer");
         const scheduler: Scheduler = { shouldExecute };
+        const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
             tagger: createTagger(),
             scheduler,
@@ -2406,7 +3104,7 @@ describe("createTransform", () => {
             ]),
             db: openDatabase(),
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(),
+            pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -2433,6 +3131,7 @@ describe("createTransform", () => {
         const db = openDatabase();
         const assistantTextTag = 2;
         queuePendingOp(db, "ses-think", assistantTextTag, "drop");
+        pendingMaterializationSessions.add("ses-think");
         shouldExecute.mockImplementation(() => "execute");
 
         const secondPass: TestMessage[] = [
@@ -3825,7 +4524,7 @@ describe("live transform protected-token window", () => {
             ]),
             db,
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(),
+            pendingMaterializationSessions: new Set([options.sessionId]),
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: options.protectedTokens,

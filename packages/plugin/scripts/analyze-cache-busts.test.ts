@@ -71,6 +71,10 @@ function bodyWithBreakpointMessage(text: string): unknown {
     };
 }
 
+function bodyWithModelAndBreakpoint(model: string, text: string): unknown {
+    return { model, ...(bodyWithBreakpointMessage(text) as object) };
+}
+
 function bodyWithTail(text: string, tailBreakpoint = false): unknown {
     const tail = { type: "text", text } as { type: string; text: string; cache_control?: unknown };
     if (tailBreakpoint) tail.cache_control = { type: "ephemeral" };
@@ -118,6 +122,121 @@ function snapshotsFor(dir: string, session: string) {
 }
 
 describe("analyze-cache-bust dump discovery", () => {
+    test("classifies an Anthropic zero read and wire-model swap as a provider full miss", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-provider-full-miss-"));
+        tempDirs.push(dir);
+        const session = "ses_brocaFullMiss";
+        const previousAt = "2026-09-20T16:25:56.000Z";
+        const currentAt = "2026-09-20T16:26:06.000Z";
+        writeDump(
+            dir,
+            "2026-09-20T16-25-56-000Z-000001-ses_brocaFullMiss",
+            previousAt,
+            session,
+            bodyWithModelAndBreakpoint("claude-opus-5", "cached prefix"),
+            responseUsage({ input_tokens: 4_855, cache_read_input_tokens: 589_294 }),
+        );
+        writeDump(
+            dir,
+            "2026-09-20T16-26-06-000Z-000002-ses_brocaFullMiss",
+            currentAt,
+            session,
+            bodyWithModelAndBreakpoint("claude-opus-4-8", "provider fallback"),
+            responseUsage({
+                input_tokens: 4_855,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 589_294,
+            }),
+        );
+
+        const rows = __test.analyzeSnapshots(snapshotsFor(dir, session), [
+            {
+                timestampMs: Date.parse(currentAt),
+                decision: "defer",
+                canonicalDecision: "defer",
+                materialized: false,
+                materializeReason: null,
+                emergency: false,
+                droppedTokens: 0,
+                droppedCount: 0,
+                inputTokens: 4_855,
+                flush: false,
+                source: "fixture",
+            },
+        ]);
+
+        expect(rows[1]?.divergenceClass).toBe("provider_full_miss");
+        expect(rows[1]?.previous?.wireModel).toBe("claude-opus-5");
+        expect(rows[1]?.current.wireModel).toBe("claude-opus-4-8");
+
+        const run = Bun.spawnSync([
+            process.execPath,
+            join(import.meta.dir, "analyze-cache-busts.ts"),
+            "--session",
+            session,
+            "--dir",
+            dir,
+            "--all-rows",
+        ]);
+        expect(run.exitCode).toBe(0);
+        expect(run.stdout.toString()).toContain(
+            "wireModel=claude-opus-5 → claude-opus-4-8",
+        );
+    });
+
+    test("skips an unmetered pass as a baseline for the next real short-read bust", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-usage-missing-baseline-"));
+        tempDirs.push(dir);
+        const session = "ses_usageMissingBaseline";
+        const body = bodyWithBreakpointMessage("changed");
+        writeDump(
+            dir,
+            "2026-09-20T16-00-00-000Z-000001-ses_usageMissingBaseline",
+            "2026-09-20T16:00:00.000Z",
+            session,
+            body,
+            responseUsage({ input_tokens: 100, cache_read_input_tokens: 20_000 }),
+        );
+        writeDump(
+            dir,
+            "2026-09-20T16-00-01-000Z-000002-ses_usageMissingBaseline",
+            "2026-09-20T16:00:01.000Z",
+            session,
+            bodyWithBreakpointMessage("in flight"),
+            responseUsage({ input_tokens: 0, cache_read_input_tokens: 0 }),
+        );
+        writeDump(
+            dir,
+            "2026-09-20T16-00-02-000Z-000003-ses_usageMissingBaseline",
+            "2026-09-20T16:00:02.000Z",
+            session,
+            bodyWithBreakpointMessage("short read"),
+            responseUsage({ input_tokens: 100, cache_read_input_tokens: 100 }),
+        );
+
+        const rows = __test.analyzeSnapshots(snapshotsFor(dir, session), [
+            {
+                timestampMs: Date.parse("2026-09-20T16:00:02.000Z"),
+                decision: "defer",
+                canonicalDecision: "defer",
+                materialized: false,
+                materializeReason: null,
+                emergency: false,
+                droppedTokens: 0,
+                droppedCount: 0,
+                inputTokens: 100,
+                flush: false,
+                source: "fixture",
+            },
+        ]);
+
+        expect(rows[1]?.verdict).toBe("UNMETERED");
+        expect(rows[1]?.divergenceClass).toBe("usage_missing");
+        expect(rows[2]?.prevTotal).toBe(20_100);
+        expect(rows[2]?.verdict).toBe("BUST");
+        expect(rows[2]?.divergenceClass).toBe("unaccounted_defer_pass");
+    });
+
     test("reminder strip golden agrees with the Rust block-strip parser", () => {
         const fixture = JSON.parse(
             readFileSync(
@@ -690,5 +809,118 @@ describe("analyze-cache-bust provider meter verdicts", () => {
         expect(row.verdict).toBe("UNMETERED");
         expect(row.byteVerdict).toBe("BUST");
         expect(row.meterVsBytes).toBe("UNMETERED");
+    });
+});
+
+describe("analyze-cache-bust rotating billing header", () => {
+    // Redacted from three consecutive captured Anthropic requests. The content is
+    // replaced; the shape that produced the defect is kept: a three-block system
+    // whose first block is the auth plugin's per-request billing header, a head
+    // message carrying cache_control breakpoints, two messages appended per
+    // request, and the tail cache_control marker moving onto the newest message
+    // each time.
+    const fixtureRoot = join(
+        import.meta.dir,
+        "test-fixtures",
+        "cache-bust-bodies",
+        "anthropic-billing-header",
+    );
+    const fixtureJson = (file: string): Record<string, unknown> =>
+        JSON.parse(readFileSync(join(fixtureRoot, file), "utf8")) as Record<string, unknown>;
+
+    function billingHeaderSession(): { dir: string; session: string } {
+        const dir = mkdtempSync(join(tmpdir(), "cache-bust-billing-header-"));
+        tempDirs.push(dir);
+        const session = "ses_billingHeaderRotation";
+        for (const [index, timestamp] of [
+            [1, "2026-09-21T12:26:17.760Z"],
+            [2, "2026-09-21T12:26:31.108Z"],
+            [3, "2026-09-21T12:32:32.610Z"],
+        ] as const) {
+            writeDump(
+                dir,
+                `${timestamp.replaceAll(":", "-").replace(".", "-")}-00000${index}-${session}`,
+                timestamp,
+                session,
+                fixtureJson(`00${index}-request.json`),
+                fixtureJson(`00${index}-response.json`),
+            );
+        }
+        return { dir, session };
+    }
+
+    test("the fixture really does rotate the header, so the normalization is load-bearing", () => {
+        const headerText = (file: string): string =>
+            ((fixtureJson(file).system as Array<{ text: string }>)[0] as { text: string }).text;
+
+        expect(headerText("002-request.json")).not.toBe(headerText("003-request.json"));
+        expect(headerText("002-request.json")).toContain("x-anthropic-billing-header:");
+        // Both `cch` and `cc_prev_req` move; `cc_prompt_id` moves across an idle gap.
+        for (const field of ["cch=", "cc_prev_req=req_", "cc_prompt_id="]) {
+            expect(headerText("002-request.json").split(field)[1]).not.toBe(
+                headerText("003-request.json").split(field)[1],
+            );
+        }
+    });
+
+    test("an appended-tail request over a rotated header is STABLE, not a byte bust", () => {
+        const { dir, session } = billingHeaderSession();
+
+        const row = __test.analyzeSnapshots(snapshotsFor(dir, session))[1];
+
+        expect(row.verdict).toBe("STABLE");
+        expect(row.byteVerdict).toBe("STABLE");
+        expect(row.meterVsBytes).toBe("AGREE");
+        // The first divergence is the appended tail, not the rotating system row.
+        expect(row.divergenceIndex).toBe(252);
+        expect(row.current.segments[row.divergenceIndex].role).toBe("assistant");
+    });
+
+    test("a short read over an unchanged reusable prefix is provider-side latency", () => {
+        const { dir, session } = billingHeaderSession();
+
+        const row = __test.analyzeSnapshots(snapshotsFor(dir, session))[2];
+
+        expect(row.verdict).toBe("LATENCY");
+        expect(row.byteVerdict).toBe("STABLE");
+        expect(row.meterVsBytes).toBe("LATENCY");
+        expect(row.divergenceClass).toBe("provider_short_read_identical_bytes");
+        // The tail cache_control marker moved from message 252 to message 254;
+        // the reusable prefix is still the one the previous request wrote.
+        expect(row.divergenceIndex).toBe(254);
+        expect(row.current.usage?.cacheRead).toBe(285_161);
+    });
+
+    test("prints no bytes-BUST cell for the whole rotated-header run", () => {
+        const { dir, session } = billingHeaderSession();
+
+        const run = Bun.spawnSync([
+            process.execPath,
+            join(import.meta.dir, "analyze-cache-busts.ts"),
+            "--session",
+            session,
+            "--dir",
+            dir,
+            "--all-rows",
+        ]);
+
+        expect(run.exitCode).toBe(0);
+        const output = run.stdout.toString();
+        expect(output).not.toContain("(bytes BUST)");
+        expect(output).not.toContain("message[0] role=system");
+        expect(output).toContain("divergence-class: provider_short_read_identical_bytes");
+        expect(output).toContain("No metered busts across 3 request(s).");
+        expect(output).toContain("1 latency-only short read(s)");
+    });
+
+    test("normalizes the rotated header into one shared system-message identity", () => {
+        const [previous, current] = ["002-request.json", "003-request.json"].map(
+            (file) => normalizeRequestBody(fixtureJson(file), "anthropic").messages[0],
+        );
+
+        expect(previous.canonical).toContain("x-anthropic-billing-header: <rotating>");
+        expect(previous.canonical).not.toContain("cc_prev_req=req_0");
+        expect(current.hash).toBe(previous.hash);
+        expect(describeBodyPair([previous], [current])).toBeUndefined();
     });
 });

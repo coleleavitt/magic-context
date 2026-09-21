@@ -18,6 +18,15 @@ set -euo pipefail
 #   8. CI takes over: test → build → publish npm + GitHub release
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
+# The host and hermetic e2e lanes spawn `opencode serve` from PATH. The official
+# installer puts the binary under ~/.opencode/bin, which login shells add to PATH but
+# tool/daemon shells often do not (v0.42.6 r9: the same box that passed r8 lost the
+# entry when the tool daemon restarted). Prefer the ambient PATH; fall back to the
+# installer location before declaring it missing.
+if ! command -v opencode >/dev/null 2>&1 && [ -x "$HOME/.opencode/bin/opencode" ]; then
+  export PATH="$HOME/.opencode/bin:$PATH"
+fi
 VERSION=""
 DRY=""
 FORCE_E2E_HOST=0
@@ -147,11 +156,19 @@ run_package_tests() {
   fail_lines=$(printf '%s\n' "$output" | grep -cE "^ *[1-9][0-9]* fail" || true)
   echo "  [$label] test process exit=$status summary_pass_lines=$pass_lines summary_fail_lines=$fail_lines output_lines=$(printf '%s\n' "$output" | wc -l | tr -d ' ')"
   echo "$output"
-  if echo "$output" | grep -qE "[1-9][0-9]* fail"; then
+  # Decide from the counts computed above, never from `echo | grep -q`: under
+  # `set -o pipefail`, grep -q exits on its first match and closes the pipe while
+  # echo is still writing the remaining lines, echo dies with SIGPIPE (141), and
+  # the pipeline reports failure for a suite that printed "4851 pass" (v0.42.5 r1).
+  # `grep -c` consumes the whole stream, so the counts carry no such race.
+  # The counts above are anchored to Bun's summary lines (`^ *N pass` / `^ *N fail`);
+  # an unanchored "N fail" also matches test names such as "keeps below-95 failures",
+  # which the old grep -q form only hid because of the SIGPIPE race.
+  if [ "$fail_lines" -gt 0 ]; then
     echo "Error: $label tests failed (fail count > 0)"
     exit 1
   fi
-  if ! echo "$output" | grep -qE "[1-9][0-9]* pass"; then
+  if [ "$pass_lines" -eq 0 ]; then
     echo "Error: $label tests produced no passing-test summary (crash, timeout, or zero tests collected)"
     exit 1
   fi
@@ -216,12 +233,16 @@ run_e2e_group() {
   # This matches the dedicated test:rust-e2e script's serial invocation.
   output=$(cd "$E2E_DIR" && MC_E2E_MODE="$mode" NODE_ENV="" bun test --timeout 600000 --max-concurrency=1 $files 2>&1) || status=$?
   echo "$output"
-  if echo "$output" | grep -qE "[1-9][0-9]* fail"; then
+  # Same SIGPIPE-safe counting as run_package_tests (see the note there).
+  local e2e_fail e2e_pass
+  e2e_fail=$(printf '%s\n' "$output" | grep -cE "^ *[1-9][0-9]* fail" || true)
+  e2e_pass=$(printf '%s\n' "$output" | grep -cE "^ *[1-9][0-9]* pass" || true)
+  if [ "$e2e_fail" -gt 0 ]; then
     echo "Error: e2e ($mode/$label) failed (fail count > 0)"
     echo "  [e2e:$mode:$label:end] status=fail"
     return 1
   fi
-  if ! echo "$output" | grep -qE "[1-9][0-9]* pass"; then
+  if [ "$e2e_pass" -eq 0 ]; then
     echo "Error: e2e ($mode/$label) produced no passing-test summary (crash, timeout, or zero tests collected)"
     echo "  [e2e:$mode:$label:end] status=fail"
     return 1
@@ -388,8 +409,37 @@ bun scripts/version-sync.mjs "$VERSION"
 echo ""
 
 # Step 4: Commit (skip if versions were already at target)
+# Stage only what this script produced (the version sync and the regenerated
+# artifacts the lint step just checked). `git add -A` once swept unrelated files
+# edited in the checkout during the long gate phase into a release commit
+# (v0.42.4); anything else dirty at this point is a foreign change and aborts.
 echo "→ Committing version bump..."
-git add -A
+git add -- packages/plugin/package.json packages/pi-plugin/package.json packages/cli/package.json \
+  assets/magic-context.schema.json \
+  packages/plugin/src/hooks/magic-context/reference-seeds.generated.ts
+# Cargo.lock is the common dirty file here: the rust e2e lane builds against the
+# sibling subc checkout, so a sibling crate release that lands while the gates run
+# resolves into the lock. The gates just ran on that resolved graph, so the tested
+# artifact IS the drifted lock; committing it on its own (never folded into the
+# release commit) is what the deploy doctrine requires, and re-running two hours of
+# gates for a sibling patch bump the gates already exercised is pure waste. Only a
+# lock that still builds --locked qualifies; anything else dirty is foreign and aborts.
+unrelated="$(git status --porcelain --untracked-files=no | grep -v '^[MARC] ' || true)"
+if [ "$unrelated" = " M Cargo.lock" ]; then
+  echo "  Cargo.lock drifted during the gates (sibling crate release); verifying it builds --locked..."
+  if cargo build --locked --release -p mc-module >/dev/null 2>&1; then
+    versions="$(git diff Cargo.lock | grep -E '^[-+]version' | sed -E 's/^([-+])version = "([^"]+)"/\1\2/' | paste -sd' ' -)"
+    git commit -q -o Cargo.lock -m "cargo: reconcile lock to the sibling graph the release gates ran on (lock-only: ${versions})"
+    echo "  committed lock reconciliation: $(git log --oneline -1)"
+    unrelated=""
+  fi
+fi
+if [ -n "$unrelated" ]; then
+  echo "Error: unrelated modified files present at bump time; refusing to fold them into the release commit:"
+  echo "$unrelated"
+  git reset -q
+  exit 1
+fi
 if git diff --cached --quiet; then
   echo "  (no changes — version already at $VERSION)"
 else

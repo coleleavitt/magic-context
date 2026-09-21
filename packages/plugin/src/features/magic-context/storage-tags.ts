@@ -1072,8 +1072,9 @@ export function findAdoptableFallbackTags(
  * Race-safe migrate of a tag's `message_id` from a known old (fallback) value to
  * a new (real) value. The old value in the WHERE clause is the concurrency fence
  * (mirrors `adoptNullOwnerToolTag`'s NULL guard): if a sibling process already
- * migrated or re-keyed the row, `changes === 0` and the caller skips. Returns
- * true iff exactly this migration applied.
+ * migrated or re-keyed the row, `changes === 0` and the caller skips. Trigger
+ * writes may increase a positive count, so only zero versus nonzero is meaningful.
+ * Returns true iff exactly this migration applied.
  */
 export function adoptFallbackTagMessageId(
     db: Database,
@@ -1375,6 +1376,152 @@ function foldDuplicateIntoSurvivor(
     deleteFoldedDuplicateTag(db, sessionId, duplicate.tagNumber);
 }
 
+/** One message whose host projection now exposes fewer parts than it did when its tags were minted. */
+export interface ShrunkPartMessage {
+    messageId: string;
+    /** Number of parts the RUNNING host projection gives this message. */
+    partCount: number;
+}
+
+export interface MergedPartTagFoldResult {
+    /** Tags deleted because their part index no longer exists on the wire. */
+    foldedTagNumbers: number[];
+    /** Tags whose content id was moved down to `:p0` because no `:p0` tag existed. */
+    rekeyedTagNumbers: number[];
+    /** Queued `ctx_reduce` drops removed because the fold would have widened their target. */
+    discardedDropTagNumbers: number[];
+}
+
+interface PartTagRow extends PiFallbackFoldTagRow {
+    partIndex: number;
+}
+
+function readPartTagRows(db: Database, sessionId: string, messageId: string): PartTagRow[] {
+    const prefix = `${messageId}:p`;
+    return db
+        .prepare(
+            `SELECT tag_number AS tagNumber,
+                    message_id AS messageId,
+                    tool_owner_message_id AS toolOwnerMessageId,
+                    type,
+                    status,
+                    byte_size AS byteSize,
+                    reasoning_byte_size AS reasoningByteSize,
+                    input_byte_size AS inputByteSize,
+                    token_count AS tokenCount,
+                    input_token_count AS inputTokenCount,
+                    reasoning_token_count AS reasoningTokenCount
+             FROM tags
+             WHERE session_id = ?
+               AND type = 'message'
+               AND message_id LIKE ? ESCAPE '\\'
+             ORDER BY tag_number ASC`,
+        )
+        .all(sessionId, `${escapeLikePattern(messageId)}:p%`)
+        .filter(isPiFallbackFoldTagRow)
+        .flatMap((row) => {
+            // `<id>:p3` — anything that is not a plain part index (`:pfile`, a
+            // colon inside the id) is left alone rather than guessed at.
+            const suffix = row.messageId.startsWith(prefix)
+                ? row.messageId.slice(prefix.length)
+                : "";
+            if (!/^\d+$/.test(suffix)) return [];
+            return [{ ...row, partIndex: Number.parseInt(suffix, 10) }];
+        })
+        .sort((a, b) => a.partIndex - b.partIndex);
+}
+
+function tagNumbersWithQueuedDrop(
+    db: Database,
+    sessionId: string,
+    tagNumbers: readonly number[],
+): Set<number> {
+    if (tagNumbers.length === 0) return new Set();
+    const placeholders = tagNumbers.map(() => "?").join(", ");
+    const rows = db
+        .prepare(
+            `SELECT DISTINCT tag_id AS tagNumber
+             FROM pending_ops
+             WHERE session_id = ? AND operation = 'drop' AND tag_id IN (${placeholders})`,
+        )
+        .all(sessionId, ...tagNumbers) as Array<{ tagNumber?: unknown }>;
+    return new Set(
+        rows.flatMap((row) => (typeof row.tagNumber === "number" ? [row.tagNumber] : [])),
+    );
+}
+
+/**
+ * Re-seat message part tags after the host changed how many parts a message has.
+ *
+ * A message tag is keyed by the content id `<messageId>:p<index>`, where the
+ * index is the message's own part position. When the host rewrites a multi-part
+ * message into a single joined text part, every tag above the surviving index
+ * loses its target: the text it was minted for is now part of the first part's
+ * text. Those tags are folded into the first part's tag through the same
+ * merge/retarget path a duplicate tag takes, so the §N§ already shown to the
+ * model keeps its meaning and nothing is renumbered.
+ *
+ * A queued `ctx_reduce` drop is NOT carried across the fold unless every part
+ * tag of that message carries one. The user authorised removing one fragment;
+ * after the merge that same operation would remove the whole joined text, which
+ * is a larger deletion than the one they asked for. Those queue entries are
+ * removed and reported to the caller instead.
+ */
+export function foldShrunkPartTags(
+    db: Database,
+    sessionId: string,
+    messages: readonly ShrunkPartMessage[],
+): MergedPartTagFoldResult {
+    const result: MergedPartTagFoldResult = {
+        foldedTagNumbers: [],
+        rekeyedTagNumbers: [],
+        discardedDropTagNumbers: [],
+    };
+    for (const { messageId, partCount } of messages) {
+        const rows = readPartTagRows(db, sessionId, messageId);
+        if (rows.length === 0) continue;
+        const orphans = rows.filter((row) => row.partIndex >= partCount);
+        if (orphans.length === 0) continue;
+
+        const queued = tagNumbersWithQueuedDrop(
+            db,
+            sessionId,
+            rows.map((row) => row.tagNumber),
+        );
+        // Every fragment already queued for removal means the merged text is
+        // exactly what the user asked to drop; anything less would widen it.
+        if (queued.size > 0 && queued.size < rows.length) {
+            for (const tagNumber of queued) {
+                db.prepare(
+                    "DELETE FROM pending_ops WHERE session_id = ? AND tag_id = ? AND operation = 'drop'",
+                ).run(sessionId, tagNumber);
+                result.discardedDropTagNumbers.push(tagNumber);
+            }
+        }
+
+        let survivor = rows.find((row) => row.partIndex < partCount) ?? null;
+        if (survivor === null) {
+            // Nothing was tagged at a surviving index, so the lowest orphan keeps
+            // its tag number and moves down onto the part that remains.
+            const lowest = orphans[0];
+            if (!lowest) continue;
+            db.prepare(
+                "UPDATE tags SET message_id = ? WHERE session_id = ? AND tag_number = ? AND type = 'message'",
+            ).run(`${messageId}:p0`, sessionId, lowest.tagNumber);
+            result.rekeyedTagNumbers.push(lowest.tagNumber);
+            survivor = { ...lowest, messageId: `${messageId}:p0`, partIndex: 0 };
+        }
+        for (const orphan of orphans) {
+            if (orphan.tagNumber === survivor.tagNumber) continue;
+            foldDuplicateIntoSurvivor(db, sessionId, survivor, orphan);
+            result.foldedTagNumbers.push(orphan.tagNumber);
+        }
+    }
+    result.discardedDropTagNumbers.sort((a, b) => a - b);
+    result.foldedTagNumbers.sort((a, b) => a - b);
+    return result;
+}
+
 export function hasPiFallbackToolOwnerTags(db: Database, sessionId: string): boolean {
     const row = db
         .prepare(
@@ -1445,9 +1592,8 @@ export function adoptPiFallbackToolOwnerTag(
                    AND tool_owner_message_id = ?`,
             )
             .run(newOwnerMessageId, sessionId, tagNumber, callId, oldOwnerMessageId);
-        return (result.changes ?? 0) === 1
-            ? { action: "rekeyed", tagNumber }
-            : { action: "skipped" };
+        // Trigger writes can inflate changes, but zero still means this guard matched no row.
+        return (result.changes ?? 0) > 0 ? { action: "rekeyed", tagNumber } : { action: "skipped" };
     }
 
     if (existing.tagNumber === tagNumber) {
@@ -1500,9 +1646,8 @@ export function adoptPiFallbackMessageTag(
                    AND message_id = ?`,
             )
             .run(newRealMessageId, sessionId, tagNumber, oldFallbackMessageId);
-        return (result.changes ?? 0) === 1
-            ? { action: "rekeyed", tagNumber }
-            : { action: "skipped" };
+        // Trigger writes can inflate changes, but zero still means this guard matched no row.
+        return (result.changes ?? 0) > 0 ? { action: "rekeyed", tagNumber } : { action: "skipped" };
     }
 
     // A real-id row can appear after the adoption probe but before allocation.
@@ -1533,6 +1678,7 @@ export function markTagsCompactedByMessageIds(
     sessionId: string,
     messageIds: Iterable<string>,
 ): number {
+    // RETURNING counts top-level tag rows without including writes made by triggers.
     const update = db.prepare(
         `UPDATE tags
          SET status = 'compacted'
@@ -1543,19 +1689,20 @@ export function markTagsCompactedByMessageIds(
                OR message_id LIKE ? ESCAPE '\\'
                OR message_id LIKE ? ESCAPE '\\'
                OR tool_owner_message_id = ?
-           )`,
+           )
+         RETURNING id`,
     );
     return db.transaction(() => {
         let changed = 0;
         for (const messageId of new Set(messageIds)) {
             const escaped = escapeLikePattern(messageId);
-            changed += update.run(
+            changed += update.all(
                 sessionId,
                 messageId,
                 `${escaped}:p%`,
                 `${escaped}:file%`,
                 messageId,
-            ).changes;
+            ).length;
         }
         return changed;
     })();
@@ -2089,6 +2236,7 @@ export function getTopNBySize(db: Database, sessionId: string, n: number): TagEn
 const getToolTagNumberByOwnerStatements = new WeakMap<Database, PreparedStatement>();
 const getNullOwnerToolTagStatements = new WeakMap<Database, PreparedStatement>();
 const adoptNullOwnerToolTagStatements = new WeakMap<Database, PreparedStatement>();
+const getToolOwnerByTagIdStatements = new WeakMap<Database, PreparedStatement>();
 const deleteToolTagsByOwnerStatements = new WeakMap<Database, PreparedStatement>();
 
 function getGetToolTagNumberByOwnerStatement(db: Database): PreparedStatement {
@@ -2179,14 +2327,22 @@ function getAdoptNullOwnerToolTagStatement(db: Database): PreparedStatement {
     if (!stmt) {
         // NULL-guarded UPDATE: matches zero rows if another writer
         // (backfill or a concurrent runtime adoption) already populated
-        // owner. Caller MUST treat changes=0 as "race lost" and
-        // recover.
+        // owner.
         stmt = db.prepare(
             `UPDATE tags
              SET tool_owner_message_id = ?
              WHERE id = ? AND tool_owner_message_id IS NULL`,
         );
         adoptNullOwnerToolTagStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getToolOwnerByTagIdStatement(db: Database): PreparedStatement {
+    let stmt = getToolOwnerByTagIdStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare("SELECT tool_owner_message_id FROM tags WHERE id = ?");
+        getToolOwnerByTagIdStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -2198,11 +2354,25 @@ function getAdoptNullOwnerToolTagStatement(db: Database): PreparedStatement {
  * adopted between our SELECT and UPDATE).
  *
  * The NULL guard makes this concurrent-safe with both the backfill
- * pass and concurrent runtime adoptions in other plugin processes.
+ * pass and concurrent runtime adoptions in other plugin processes. The
+ * transaction verifies the owner value directly because trigger writes make
+ * the statement's numeric change count unsuitable as a claim result.
  */
 export function adoptNullOwnerToolTag(db: Database, rowId: number, ownerMsgId: string): boolean {
-    const result = getAdoptNullOwnerToolTagStatement(db).run(ownerMsgId, rowId);
-    return (result.changes ?? 0) === 1;
+    return db
+        .transaction(() => {
+            const before = getToolOwnerByTagIdStatement(db).get(rowId) as
+                | { tool_owner_message_id: string | null }
+                | undefined;
+            if (!before || before.tool_owner_message_id !== null) return false;
+
+            getAdoptNullOwnerToolTagStatement(db).run(ownerMsgId, rowId);
+            const after = getToolOwnerByTagIdStatement(db).get(rowId) as
+                | { tool_owner_message_id: string | null }
+                | undefined;
+            return after?.tool_owner_message_id === ownerMsgId;
+        })
+        .immediate();
 }
 
 /**
@@ -2304,7 +2474,8 @@ function getDeleteToolTagsByOwnerStatement(db: Database): PreparedStatement {
             `DELETE FROM tags
              WHERE session_id = ?
                AND type = 'tool'
-               AND tool_owner_message_id = ?`,
+               AND tool_owner_message_id = ?
+             RETURNING id`,
         );
         deleteToolTagsByOwnerStatements.set(db, stmt);
     }
@@ -2324,6 +2495,6 @@ function getDeleteToolTagsByOwnerStatement(db: Database): PreparedStatement {
  * deletion paths until adopted or backfilled.
  */
 export function deleteToolTagsByOwner(db: Database, sessionId: string, ownerMsgId: string): number {
-    const result = getDeleteToolTagsByOwnerStatement(db).run(sessionId, ownerMsgId);
-    return result.changes ?? 0;
+    // RETURNING contains only rows deleted by this statement, not writes made by triggers.
+    return getDeleteToolTagsByOwnerStatement(db).all(sessionId, ownerMsgId).length;
 }

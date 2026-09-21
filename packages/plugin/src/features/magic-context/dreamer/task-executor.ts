@@ -9,6 +9,10 @@ import {
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import type { DreamingTask } from "../../../config/schema/magic-context";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import {
+    type HiddenCompletionExecutor,
+    HiddenCompletionRefusal,
+} from "../../../hooks/magic-context/compartment-runner-types";
 import type { RawMessageProvider } from "../../../hooks/magic-context/read-session-chunk";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
@@ -16,11 +20,17 @@ import { extractLatestAssistantText } from "../../../shared/assistant-message-ex
 import { teardownChildSession } from "../../../shared/child-session-teardown";
 import { describeError } from "../../../shared/error-message";
 import { log } from "../../../shared/logger";
+import type { ModelInput } from "../../../shared/model-resolution";
+import { getSdkContextLimit } from "../../../shared/models-dev-cache";
 import { isRecord } from "../../../shared/record-type-guard";
 import { sanitizeDiagnosticText } from "../../../shared/redaction";
-import { modelBodyField } from "../../../shared/resolve-fallbacks";
+import {
+    modelBodyField,
+    parseProviderModel,
+    toModelEntry,
+} from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
-import { dreamFailureCode } from "../../../shared/user-facing-codes";
+import { dreamFailureCode, userFacingFailureCode } from "../../../shared/user-facing-codes";
 import { getCompartmentEvents } from "../compartment-events";
 import {
     getMemoriesByProject,
@@ -29,9 +39,16 @@ import {
     type Memory,
 } from "../memory";
 import { runCompressCues } from "../mural/compress-cues";
+import { detectOverflow } from "../overflow-detection";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
 import { type ClassifyModuleClient, runClassify } from "./classify";
+import {
+    beginCurateCategoryRun,
+    type CurateMemoryCategory,
+    curateCategoryForMemoryCategory,
+    curateTaskStateAfterSuccess,
+} from "./curate-category-rotation";
 import { takeCurateSafetyRefusalCount } from "./curate-memory-safety";
 import { evaluateSmartNotes } from "./evaluate-smart-notes";
 import { archiveExpiredMemories } from "./expire-memories";
@@ -88,6 +105,7 @@ import {
     type RetrospectivePromptEvent,
 } from "./task-prompts";
 import {
+    DREAM_TASK_CAPABILITIES,
     type DreamTaskName,
     type DreamTaskProgress,
     type DreamTaskRunBacklog,
@@ -102,7 +120,10 @@ import type {
 import { runVerify } from "./verify";
 
 export interface DreamTaskExecutorDeps {
-    client: PluginContext["client"];
+    client?: PluginContext["client"];
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
+    /** Existing user session used by a completion-only host. */
+    parentSessionId?: string;
     /** Filesystem directory of the project this drain owns (NOT the identity). */
     sessionDirectory: string;
     /** Opens the OpenCode DB read-only (for the key-files candidate scan). The
@@ -133,6 +154,8 @@ export interface DreamTaskExecutorDeps {
     retinaHandoff?: boolean;
     /** Process-local progress callback for user-facing status displays; it never reads from or writes to the prompt/result cache. */
     onProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
+    /** Optional callback for tests and host integrations to resolve the smallest usable input window across child model attempts. */
+    resolveRetrospectiveUsableInputTokens?: (models: readonly ModelInput[]) => number | undefined;
     moduleClient?: ClassifyModuleClient & {
         authorityStatus?: (args: {
             context_store_uuid: string;
@@ -162,7 +185,8 @@ function dreamRunFailureDetail(error: unknown): DreamRunFailureDetail {
     const described = describeError(error);
     const message = described.brief;
     const providerFailure =
-        error instanceof Error && error.name === "DreamerProviderOutputFailureError";
+        error instanceof HiddenCompletionRefusal ||
+        (error instanceof Error && error.name === "DreamerProviderOutputFailureError");
     return {
         failure_class: providerFailure
             ? "provider_error"
@@ -295,8 +319,33 @@ function formatCurateMemoryOperations(actions: readonly string[]): string {
     return `curate: ${actions.length} memory ${noun} applied${actionDetail ? ` (${actionDetail})` : ""}`;
 }
 
+function requireDreamClient(client: PluginContext["client"] | undefined): PluginContext["client"] {
+    if (!client)
+        throw new HiddenCompletionRefusal(
+            "hidden_tools_unsupported",
+            "This dream task requires the child-session tool transport",
+            true,
+        );
+    return client;
+}
+
 /**
- * Build the TaskExecutor the v2 scheduler drives. The scheduler owns the keyed
+ * Pick the completion transport for a single-shot task: the hidden carrier when
+ * the host supplies one, otherwise the child-session client. Returning the
+ * fields as an object keeps the two transports mutually exclusive at the call
+ * site, so a carrier host never also opens a child session.
+ */
+function requireDreamTransport(deps: DreamTaskExecutorDeps): {
+    client?: PluginContext["client"];
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
+} {
+    if (deps.hiddenCompletionExecutor)
+        return { hiddenCompletionExecutor: deps.hiddenCompletionExecutor };
+    return { client: requireDreamClient(deps.client) };
+}
+
+/**
+ * Build the TaskExecutor the shared task scheduler drives. The scheduler owns the keyed
  * domain lease + holderId and hands them in; this executor runs one task's actual
  * work (LLM loop / specialized runner), renews the lease during the run, aborts
  * if the lease is lost, and writes one per-task dream_runs telemetry row.
@@ -313,10 +362,11 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
     let parentSessionIdPromise: Promise<string | undefined> | undefined;
 
     const resolveParentSessionId = (): Promise<string | undefined> => {
+        if (deps.hiddenCompletionExecutor) return Promise.resolve(deps.parentSessionId);
         if (!parentSessionIdPromise) {
             parentSessionIdPromise = (async () => {
                 try {
-                    const listResponse = await deps.client.session.list({
+                    const listResponse = await requireDreamClient(deps.client).session.list({
                         query: { directory: deps.sessionDirectory },
                     });
                     const sessions = shared.normalizeSDKResponse(
@@ -353,6 +403,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 processed: Math.max(0, processed),
                 total: backlogAtStart.pending,
                 startedAt,
+                ...(backlogAtStart.category ? { category: backlogAtStart.category } : {}),
                 ...(refused === undefined ? {} : { refused: Math.max(0, refused) }),
             });
         };
@@ -439,6 +490,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                                     pendingAtEnd: end.pending,
                                     totalAtEnd: end.total,
                                     processed,
+                                    ...(backlogAtStart.category
+                                        ? { category: backlogAtStart.category }
+                                        : {}),
                                 };
                                 return value;
                             })(),
@@ -481,6 +535,22 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         }
 
         try {
+            if (
+                deps.hiddenCompletionExecutor?.capabilities.tools === false &&
+                DREAM_TASK_CAPABILITIES[config.task].requiresTools
+            ) {
+                // Name the task and what its tool loop is for. A caller that only
+                // logs the message still records which specific task was refused
+                // and why, instead of one anonymous capability error.
+                const purpose = DREAM_TASK_CAPABILITIES[config.task].toolLoopPurpose;
+                throw new HiddenCompletionRefusal(
+                    "hidden_tools_unsupported",
+                    `${config.task} is unavailable on this host (${userFacingFailureCode(
+                        "dream_task_needs_tool_loop",
+                    )})${purpose ? `: it ${purpose}` : ""}`,
+                    true,
+                );
+            }
             if (config.task === "compress-cues") {
                 if (deps.mural?.enabled !== true) {
                     // Config-gated no-op, but say so: a silent "completed" here
@@ -496,6 +566,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 const result = await runCompressCues({
                     db,
                     client: deps.client,
+                    hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
                     projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
@@ -521,9 +592,11 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             }
 
             if (config.task === "review-user-memories") {
+                // Single-shot task: the reviewer answers with one JSON verdict, so a
+                // completion carrier serves it as well as a child-session client.
                 const result = await reviewUserMemories({
                     db,
-                    client: deps.client,
+                    ...requireDreamTransport(deps),
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
                     holderId,
@@ -545,7 +618,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             if (config.task === "map-memories") {
                 const result = await mapMemories({
                     db,
-                    client: deps.client,
+                    client: requireDreamClient(deps.client),
                     projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
@@ -592,7 +665,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 const memoryBefore = getMemoryCountsByStatus(db, projectIdentity);
                 const result = await runVerify({
                     db,
-                    client: deps.client,
+                    client: requireDreamClient(deps.client),
                     projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
@@ -675,6 +748,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 const result = await runClassify({
                     db,
                     client: deps.client,
+                    hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
                     projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
@@ -701,9 +775,11 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             }
 
             if (config.task === "promote-primers") {
+                // Host-only task: clustering and the promotion writes happen here,
+                // with no model call, so it must not demand a completion transport.
                 const result = await promotePrimers({
                     db,
-                    client: deps.client,
+                    ...(deps.client ? { client: deps.client } : {}),
                     projectIdentity,
                     sessionDirectory: deps.sessionDirectory,
                     holderId,
@@ -723,7 +799,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             if (config.task === "refresh-primers") {
                 const result = await refreshPrimers({
                     db,
-                    client: deps.client,
+                    client: requireDreamClient(deps.client),
                     projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
@@ -745,9 +821,11 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             }
 
             if (config.task === "evaluate-smart-notes") {
+                // Single-shot task: the compiler and the read-only confirmation are
+                // both no-tool prompts; the compiled check runs in the local sandbox.
                 const result = await evaluateSmartNotes({
                     db,
-                    client: deps.client,
+                    ...requireDreamTransport(deps),
                     projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
@@ -783,8 +861,18 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 return {
                     status: "completed",
                     schedulePatch:
-                        retro.retrospectiveWatermarkMs != null
-                            ? { retrospectiveWatermarkMs: retro.retrospectiveWatermarkMs }
+                        retro.retrospectiveWatermarkMs != null || retro.taskStateJson !== undefined
+                            ? {
+                                  ...(retro.retrospectiveWatermarkMs != null
+                                      ? {
+                                            retrospectiveWatermarkMs:
+                                                retro.retrospectiveWatermarkMs,
+                                        }
+                                      : {}),
+                                  ...(retro.taskStateJson !== undefined
+                                      ? { taskStateJson: retro.taskStateJson }
+                                      : {}),
+                              }
                             : undefined,
                 };
             }
@@ -801,7 +889,11 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 moduleRoute,
             });
         } catch (error) {
-            const { transient, brief } = classifyFailure(error);
+            const classified = classifyFailure(error);
+            const retrospectiveOverflow =
+                error instanceof RetrospectivePromptOverflowError ? error : null;
+            const transient = retrospectiveOverflow ? true : classified.transient;
+            const brief = classified.brief;
             const failure = dreamRunFailureDetail(error);
             recordRun("failed", brief, { failure });
             log(
@@ -812,6 +904,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 transient,
                 error: brief,
                 failureDetail: formatDreamRunFailure(failure),
+                ...(retrospectiveOverflow
+                    ? { schedulePatch: retrospectiveOverflow.schedulePatch }
+                    : {}),
             };
         } finally {
             deps.onProgress?.(null, config.task);
@@ -953,6 +1048,97 @@ function retrospectiveEventsForSessions(
     return events.sort((a, b) => a.createdAt - b.createdAt).slice(-20);
 }
 
+const RETROSPECTIVE_DEFAULT_USABLE_INPUT_TOKENS = 128_000;
+const RETROSPECTIVE_OVERFLOW_FAILURE_LIMIT = 2;
+const RETROSPECTIVE_MIN_RETRY_INPUT_TOKENS = 512;
+const RETROSPECTIVE_DAY_MS = 24 * 60 * 60 * 1000;
+
+interface RetrospectiveOverflowState {
+    watermarkMs: number;
+    failures: number;
+    nextUsableInputTokens: number;
+    abandonAfterMs: number;
+}
+
+class RetrospectivePromptOverflowError extends Error {
+    constructor(
+        message: string,
+        readonly schedulePatch: NonNullable<TaskExecOutcome["schedulePatch"]>,
+    ) {
+        super(message);
+        this.name = "DreamerProviderOutputFailureError";
+    }
+}
+
+function readRetrospectiveTaskState(taskStateJson: string | null | undefined): {
+    root: Record<string, unknown>;
+    overflow?: RetrospectiveOverflowState;
+} {
+    let root: Record<string, unknown> = {};
+    if (taskStateJson) {
+        try {
+            const parsed = JSON.parse(taskStateJson);
+            if (isRecord(parsed)) root = parsed;
+        } catch {
+            // A malformed task-local blob must not wedge retrospective progress.
+        }
+    }
+    const candidate = root.retrospectiveOverflow;
+    if (!isRecord(candidate)) return { root };
+    const { watermarkMs, failures, nextUsableInputTokens, abandonAfterMs } = candidate;
+    if (
+        typeof watermarkMs !== "number" ||
+        typeof failures !== "number" ||
+        typeof nextUsableInputTokens !== "number" ||
+        typeof abandonAfterMs !== "number"
+    ) {
+        return { root };
+    }
+    return {
+        root,
+        overflow: { watermarkMs, failures, nextUsableInputTokens, abandonAfterMs },
+    };
+}
+
+function writeRetrospectiveOverflowState(
+    root: Record<string, unknown>,
+    overflow: RetrospectiveOverflowState | null,
+): string {
+    const next = { ...root };
+    if (overflow) next.retrospectiveOverflow = overflow;
+    else delete next.retrospectiveOverflow;
+    return JSON.stringify(next);
+}
+
+function resolveRetrospectiveUsableInputTokens(
+    config: DreamTaskRuntimeConfig,
+    deps: DreamTaskExecutorDeps,
+): number {
+    const models: ModelInput[] = [];
+    if (config.model) models.push(config.model);
+    for (const fallback of config.fallbackModels ?? []) models.push(fallback);
+    const injected = deps.resolveRetrospectiveUsableInputTokens?.(models);
+    if (typeof injected === "number" && Number.isFinite(injected) && injected > 0) {
+        return Math.floor(injected);
+    }
+    if (models.length === 0) return RETROSPECTIVE_DEFAULT_USABLE_INPUT_TOKENS;
+
+    // The same prompt is attempted on every configured fallback. Admit against
+    // the smallest known usable input; an unknown catalog entry receives the
+    // historian's conservative 128K fallback rather than an unbounded prompt.
+    return Math.min(
+        ...models.map((model) => {
+            const entry = toModelEntry(model);
+            const parsed = entry ? parseProviderModel(entry.model) : null;
+            if (!parsed) return RETROSPECTIVE_DEFAULT_USABLE_INPUT_TOKENS;
+            return (
+                getSdkContextLimit(parsed.providerID, parsed.modelID) ??
+                RETROSPECTIVE_DEFAULT_USABLE_INPUT_TOKENS
+            );
+        }),
+    );
+}
+
 async function runRetrospectiveTask(
     config: DreamTaskRuntimeConfig,
     ctx: TaskExecutorContext,
@@ -963,7 +1149,10 @@ async function runRetrospectiveTask(
         invocationStartedAt: number;
         moduleRoute?: DreamerModuleRoute;
     },
-): Promise<{ retrospectiveWatermarkMs: number | null }> {
+): Promise<{
+    retrospectiveWatermarkMs: number | null;
+    taskStateJson?: string;
+}> {
     const { db, projectIdentity, holderId, leaseKey } = ctx;
     const { deps, deadline, parent } = helpers;
     const provider = resolveRetrospectiveProvider(deps, db, projectIdentity);
@@ -974,20 +1163,39 @@ async function runRetrospectiveTask(
 
     // Content watermark (max message ts actually scanned) — NOT lastRunAt, which
     // is schedule-completion time and would skip a message that arrived mid-run.
-    const watermarkMs =
-        getTaskScheduleState(db, projectIdentity, config.task)?.retrospectiveWatermarkMs ?? 0;
+    const scheduleState = getTaskScheduleState(db, projectIdentity, config.task);
+    const watermarkMs = scheduleState?.retrospectiveWatermarkMs ?? 0;
+    const taskState = readRetrospectiveTaskState(scheduleState?.taskStateJson);
+    const activeOverflow =
+        taskState.overflow?.watermarkMs === watermarkMs ? taskState.overflow : undefined;
+    const baseUsableInputTokens = resolveRetrospectiveUsableInputTokens(config, deps);
+    const usableInputTokens = activeOverflow
+        ? Math.min(baseUsableInputTokens, activeOverflow.nextUsableInputTokens)
+        : baseUsableInputTokens;
+    const recencyDays = Math.max(1, Math.floor(config.retrospectiveRecencyDays ?? 30));
+    const recencyCutoffMs = helpers.invocationStartedAt - recencyDays * RETROSPECTIVE_DAY_MS;
 
     const scan = await readRetrospectiveScanWindow(
         provider,
         projectIdentity,
         watermarkMs,
         RETROSPECTIVE_OVERLAP_USER_LINES,
+        { usableInputTokens, recencyCutoffMs },
     );
+    const clearedTaskStateJson = activeOverflow
+        ? writeRetrospectiveOverflowState(taskState.root, null)
+        : undefined;
+    const completedWindow = (
+        retrospectiveWatermarkMs: number | null,
+    ): { retrospectiveWatermarkMs: number | null; taskStateJson?: string } => ({
+        retrospectiveWatermarkMs,
+        ...(clearedTaskStateJson ? { taskStateJson: clearedTaskStateJson } : {}),
+    });
     const messages = withGlobalOrdinals(scan.messages);
     const userMessages = messages.filter((message) => message.role === "user");
     if (userMessages.length === 0) {
         log("[dreamer] retrospective: no user messages in window");
-        return { retrospectiveWatermarkMs: scan.maxScannedTs };
+        return completedWindow(scan.maxScannedTs);
     }
 
     // Only POST-watermark user lines are genuinely new; the rest are the overlap
@@ -999,7 +1207,7 @@ async function runRetrospectiveTask(
     );
     if (postWatermarkOrdinals.size === 0) {
         log("[dreamer] retrospective: only overlap lines, nothing new");
-        return { retrospectiveWatermarkMs: scan.maxScannedTs };
+        return completedWindow(scan.maxScannedTs);
     }
 
     const abortController = new AbortController();
@@ -1019,7 +1227,7 @@ async function runRetrospectiveTask(
     let promptSettled = false;
     try {
         const createResponse = await createChildSessionWithFence({
-            client: deps.client,
+            client: requireDreamClient(deps.client),
             db,
             parentSessionId: parent ?? undefined,
             title: "magic-context-dream-retrospective",
@@ -1043,7 +1251,7 @@ async function runRetrospectiveTask(
             const remainingMs = Math.max(0, deadline - Date.now());
             promptSettled = false;
             const run = await shared.promptSyncWithValidatedOutputRetry(
-                deps.client,
+                requireDreamClient(deps.client),
                 {
                     path: { id: sessionId },
                     query: { directory: deps.sessionDirectory },
@@ -1060,7 +1268,9 @@ async function runRetrospectiveTask(
                     fallbackModels: config.fallbackModels,
                     callContext: "dreamer:retrospective",
                     fetchOutput: async () => {
-                        const messagesResponse = await deps.client.session.messages({
+                        const messagesResponse = await requireDreamClient(
+                            deps.client,
+                        ).session.messages({
                             path: { id: sessionId },
                             query: { directory: deps.sessionDirectory, limit: 50 },
                         });
@@ -1082,7 +1292,7 @@ async function runRetrospectiveTask(
         const finish = (
             run: { output: unknown[] } | null,
             watermark: number | null,
-        ): { retrospectiveWatermarkMs: number | null } => {
+        ): { retrospectiveWatermarkMs: number | null; taskStateJson?: string } => {
             if (parent && run) {
                 recordChildInvocation({
                     db,
@@ -1095,7 +1305,7 @@ async function runRetrospectiveTask(
                     messages: run.output,
                 });
             }
-            return { retrospectiveWatermarkMs: watermark };
+            return completedWindow(watermark);
         };
 
         // ── Turn 1: cheap LLM gate over U: lines only ──────────────────────
@@ -1230,10 +1440,49 @@ async function runRetrospectiveTask(
             `[dreamer] retrospective: flagged=${flagged.length} learnings=${learnings.length} memory=${applied.memoryWritten} observations=${applied.observationsInserted} dropped=${applied.observationsDropped} rejected=${applied.rejected.length}`,
         );
         return finish(deepenRun, scan.maxScannedTs);
+    } catch (error) {
+        if (!detectOverflow(error).isOverflow) throw error;
+
+        const failures = (activeOverflow?.failures ?? 0) + 1;
+        const abandonAfterMs = Math.max(
+            activeOverflow?.abandonAfterMs ?? watermarkMs,
+            scan.maxScannedTs,
+        );
+        const providerMessage = describeError(error).brief;
+        if (failures >= RETROSPECTIVE_OVERFLOW_FAILURE_LIMIT) {
+            const taskStateJson = writeRetrospectiveOverflowState(taskState.root, null);
+            log(
+                `[dreamer] retrospective: child rejected source window for size ${failures} times; advancing content watermark from ${watermarkMs} to ${abandonAfterMs} so the same window is not retried forever`,
+            );
+            throw new RetrospectivePromptOverflowError(
+                `retrospective prompt overflow; abandoned repeatedly rejected source window after ${failures} attempts: ${providerMessage}`,
+                { retrospectiveWatermarkMs: abandonAfterMs, taskStateJson },
+            );
+        }
+
+        const nextUsableInputTokens = Math.max(
+            RETROSPECTIVE_MIN_RETRY_INPUT_TOKENS,
+            Math.floor(usableInputTokens / 2),
+        );
+        const overflowState: RetrospectiveOverflowState = {
+            watermarkMs,
+            failures,
+            nextUsableInputTokens,
+            abandonAfterMs,
+        };
+        log(
+            `[dreamer] retrospective: child rejected ${scan.promptTokens}-token estimated prompt for size; retrying watermark=${watermarkMs} with usable input ${usableInputTokens} -> ${nextUsableInputTokens}`,
+        );
+        throw new RetrospectivePromptOverflowError(
+            `retrospective prompt overflow; retrying with a smaller source window: ${providerMessage}`,
+            {
+                taskStateJson: writeRetrospectiveOverflowState(taskState.root, overflowState),
+            },
+        );
     } finally {
         heartbeat.stop();
         await teardownChildSession({
-            client: deps.client,
+            client: requireDreamClient(deps.client),
             sessionId: childSessionId,
             sessionDirectory: deps.sessionDirectory,
             promptSettled,
@@ -1265,6 +1514,7 @@ async function runAgenticTask(
                 } | null;
                 progress?: string | null;
                 failure?: DreamRunFailureDetail;
+                backlogAfter?: { pending: number; total: number };
             },
         ) => void;
         computeMemoryDelta: (
@@ -1315,6 +1565,7 @@ async function runAgenticTask(
         // lease heartbeat starts and uses the same authority-specific archive path
         // as curate's ctx_memory operations.
         let curateMemories: ReturnType<typeof loadActiveMemoryPromptMemories> | undefined;
+        let curateCategory: CurateMemoryCategory | undefined;
         if (task === "curate") {
             expiredArchived = await archiveExpiredMemories({
                 db,
@@ -1325,12 +1576,21 @@ async function runAgenticTask(
                 moduleRoute: helpers.moduleRoute,
             });
             if (leaseLost) throw new Error("Dream lease lost during expired-memory archive");
-            curateMemories = loadActiveMemoryPromptMemories(db, projectIdentity);
-            log(
-                `[dreamer] curate pool: in_scope=${curateMemories.length} expired_archived=${expiredArchived}`,
+            const scope = beginCurateCategoryRun(
+                db,
+                projectIdentity,
+                loadActiveMemoryPromptMemories(db, projectIdentity),
             );
-            if (curateMemories.length === 0 && expiredArchived > 0) {
-                const progress = formatExpiredArchiveProgress(expiredArchived);
+            curateMemories = scope?.memories ?? [];
+            curateCategory = scope?.category;
+            log(
+                `[dreamer] curate pool: category=${curateCategory ?? "none"} in_scope=${curateMemories.length} expired_archived=${expiredArchived}`,
+            );
+            if (curateMemories.length === 0) {
+                const progress =
+                    expiredArchived > 0
+                        ? formatExpiredArchiveProgress(expiredArchived)
+                        : "curate: no populated project-memory category";
                 helpers.recordRun("completed", null, {
                     memoryChanges: helpers.computeMemoryDelta(memoryBefore),
                     progress,
@@ -1343,10 +1603,13 @@ async function runAgenticTask(
             projectPath: projectIdentity,
             lastDreamAt: lastRunAt ? String(lastRunAt) : null,
             existingDocs,
-            curate: curateMemories ? { memories: curateMemories } : undefined,
+            curate:
+                curateMemories && curateCategory
+                    ? { category: curateCategory, memories: curateMemories }
+                    : undefined,
         });
         const createResponse = await createChildSessionWithFence({
-            client: deps.client,
+            client: requireDreamClient(deps.client),
             db,
             parentSessionId: parent ?? undefined,
             title: `magic-context-dream-${task}`,
@@ -1365,7 +1628,7 @@ async function runAgenticTask(
 
         const remainingMs = Math.max(0, deadline - Date.now());
         const run = await shared.promptSyncWithValidatedOutputRetry(
-            deps.client,
+            requireDreamClient(deps.client),
             {
                 path: { id: sessionId },
                 query: { directory: docsDir },
@@ -1393,15 +1656,17 @@ async function runAgenticTask(
                 fallbackModels: config.fallbackModels,
                 callContext: `dreamer:${task}`,
                 fetchOutput: async () => {
-                    const messagesResponse = await deps.client.session.messages({
-                        path: { id: sessionId },
-                        query: {
-                            directory: docsDir,
-                            // Curate can use up to 150 steps, so its applied-operation
-                            // count must not be truncated to the newest 50 messages.
-                            ...(task === "curate" ? {} : { limit: 50 }),
+                    const messagesResponse = await requireDreamClient(deps.client).session.messages(
+                        {
+                            path: { id: sessionId },
+                            query: {
+                                directory: docsDir,
+                                // Curate can use up to 150 steps, so its applied-operation
+                                // count must not be truncated to the newest 50 messages.
+                                ...(task === "curate" ? {} : { limit: 50 }),
+                            },
                         },
-                    });
+                    );
                     return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
                         preferResponseOnMissingData: true,
                     });
@@ -1459,7 +1724,12 @@ async function runAgenticTask(
 
         const curateOutput =
             task === "curate" ? (run.validated as CurateValidatedOutput) : undefined;
+        const curateScopeProgress =
+            task === "curate" && curateCategory && curateMemories
+                ? `curate: ${curateCategory} (${curateMemories.length})`
+                : null;
         const progress = [
+            curateScopeProgress,
             expiredArchived > 0 ? formatExpiredArchiveProgress(expiredArchived) : null,
             curateOutput && curateOutput.memoryOperations.completedActions.length > 0
                 ? formatCurateMemoryOperations(curateOutput.memoryOperations.completedActions)
@@ -1468,16 +1738,47 @@ async function runAgenticTask(
         ]
             .filter((value): value is string => Boolean(value))
             .join("; ");
+        const curateCount =
+            task === "curate" && curateCategory
+                ? loadActiveMemoryPromptMemories(db, projectIdentity).filter(
+                      (memory) =>
+                          curateCategoryForMemoryCategory(memory.category) === curateCategory,
+                  ).length
+                : undefined;
+        const curateBacklog =
+            curateCount !== undefined && curateCategory
+                ? {
+                      pending: curateCount,
+                      total: curateCount,
+                      category: curateCategory,
+                  }
+                : undefined;
         helpers.recordRun("completed", null, {
             memoryChanges: helpers.computeMemoryDelta(memoryBefore),
             progress: progress || null,
+            backlogAfter: curateBacklog,
         });
-        return { status: "completed", ...(progress ? { detail: progress } : {}) };
+        return {
+            status: "completed",
+            ...(progress ? { detail: progress } : {}),
+            ...(curateBacklog ? { backlog: curateBacklog } : {}),
+            ...(curateCategory
+                ? {
+                      schedulePatch: {
+                          taskStateJson: curateTaskStateAfterSuccess(
+                              db,
+                              projectIdentity,
+                              curateCategory,
+                          ),
+                      },
+                  }
+                : {}),
+        };
     } finally {
         heartbeat.stop();
         if (childSessionId) takeCurateSafetyRefusalCount(childSessionId);
         await teardownChildSession({
-            client: deps.client,
+            client: requireDreamClient(deps.client),
             sessionId: childSessionId,
             sessionDirectory: docsDir,
             promptSettled,

@@ -90,6 +90,7 @@ export interface AuthorityModuleClient {
         project: string;
         projectRoot?: string;
         domain: AuthorityDomain;
+        sessionId?: string;
     }): Promise<{ authority: AuthorityStatus | null }>;
     authorityPrepare(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
     authorityDrain?(args: Record<string, unknown>): Promise<AuthorityDrainResponse>;
@@ -103,6 +104,15 @@ export interface AuthorityModuleClient {
         live_only?: boolean;
         projectRoot?: string;
     }): Promise<{ page: ChangefeedPage }>;
+    mirrorMemory?(args: {
+        module_row_id: number;
+        projectRoot?: string;
+    }): Promise<{ row: ChangefeedRow | null }>;
+    memoryIdentityAck?(args: {
+        project: string;
+        rows: Array<{ module_row_id: number; context_row_id: number }>;
+        projectRoot?: string;
+    }): Promise<{ acknowledged: number }>;
 }
 
 export interface ModuleNoteEvaluationBridge {
@@ -823,6 +833,16 @@ export async function drainAuthority(args: {
         if (finished.state !== "TS") {
             throw new Error("memory authority drain did not reactivate TypeScript ownership");
         }
+        if (args.domain === "memories") {
+            // These rows only describe the module-owned read model. Once TypeScript owns the
+            // project again they are not consulted, and retaining them can make a later mirror
+            // replay treat stale module identities as current.
+            withPrivilegedWriter(args.db, () => {
+                args.db
+                    .prepare("DELETE FROM mirror_live_memory_rows WHERE module_project = ?")
+                    .run(args.projectPath);
+            });
+        }
         // A project marker fences both authority domains. Remove it only after neither
         // domain remains module-owned; a one-domain drain must not reopen the other domain.
         const remaining = await Promise.all(
@@ -871,6 +891,61 @@ function chunkRowsForFrame<T>(rows: readonly T[]): T[][] {
     }
     if (current.length > 0) chunks.push(current);
     return chunks;
+}
+
+export interface MemoryMirrorStatus {
+    cursor: number;
+    cursorUpdatedAt: number | null;
+    cursorAgeMs: number | null;
+    liveRows: number;
+    feedHead: number | null;
+    pendingRows: number | null;
+    stalled: boolean;
+    code: "MC-M01" | null;
+}
+
+export const MEMORY_MIRROR_STALL_THRESHOLD_MS = 40_000;
+
+export function getMemoryMirrorStatus(
+    db: Database,
+    feedHead?: number | null,
+    nowMs = Date.now(),
+): MemoryMirrorStatus {
+    const cursorRow = db
+        .prepare("SELECT cursor, updated_at FROM mirror_cursors WHERE domain = 'memories'")
+        .get() as { cursor?: number; updated_at?: number } | undefined;
+    const liveRow = db.prepare("SELECT COUNT(*) AS count FROM mirror_live_memory_rows").get() as
+        | { count?: number }
+        | undefined;
+    const cursor = typeof cursorRow?.cursor === "number" ? cursorRow.cursor : 0;
+    const cursorUpdatedAt =
+        typeof cursorRow?.updated_at === "number" && cursorRow.updated_at > 0
+            ? cursorRow.updated_at
+            : null;
+    const cursorAgeMs =
+        cursorUpdatedAt === null ? null : Math.max(0, Math.floor(nowMs - cursorUpdatedAt));
+    const liveRows = typeof liveRow?.count === "number" ? liveRow.count : 0;
+    const resolvedFeedHead =
+        typeof feedHead === "number" && Number.isSafeInteger(feedHead) && feedHead >= 0
+            ? feedHead
+            : null;
+    const pendingRows = resolvedFeedHead === null ? null : Math.max(0, resolvedFeedHead - cursor);
+    const stalled =
+        liveRows > 0 &&
+        pendingRows !== null &&
+        pendingRows > 0 &&
+        cursorAgeMs !== null &&
+        cursorAgeMs >= MEMORY_MIRROR_STALL_THRESHOLD_MS;
+    return {
+        cursor,
+        cursorUpdatedAt,
+        cursorAgeMs,
+        liveRows,
+        feedHead: resolvedFeedHead,
+        pendingRows,
+        stalled,
+        code: stalled ? "MC-M01" : null,
+    };
 }
 
 export function getMirrorCursor(db: Database, domain: AuthorityDomain): number {
@@ -1258,6 +1333,40 @@ interface MirrorPageStatements {
     contextStoreUuid: string | null;
 }
 
+/**
+ * Projects whose host memory rows lost an embedding to a mirror-back page.
+ *
+ * A module-side edit reaches the host as a snapshot with a new content hash,
+ * and the mirror drops the stale embedding for that row (see `applyMemoryRow`).
+ * Nothing else notices: the row still renders and `get` still returns it, it
+ * just stops being semantically findable. Recording the project here lets the
+ * mirror's callers re-embed it while the module still holds authority, instead
+ * of waiting for authority to drain back to TypeScript.
+ *
+ * Kept in memory on purpose. The durable fact is the missing embedding row, and
+ * the ordinary unembedded-memory sweeps still find it after a restart; this set
+ * only makes the common case heal immediately.
+ */
+const memoryEmbeddingInvalidations = new WeakMap<Database, Set<string>>();
+
+function recordMemoryEmbeddingInvalidation(db: Database, projectPath: string): void {
+    if (!projectPath) return;
+    const pending = memoryEmbeddingInvalidations.get(db);
+    if (pending) pending.add(projectPath);
+    else memoryEmbeddingInvalidations.set(db, new Set([projectPath]));
+}
+
+/**
+ * Take the projects whose embeddings a mirror-back page invalidated, clearing
+ * the record. Callers that drain the mirror re-embed those projects.
+ */
+export function takeMemoryEmbeddingInvalidatedProjects(db: Database): string[] {
+    const pending = memoryEmbeddingInvalidations.get(db);
+    if (!pending || pending.size === 0) return [];
+    memoryEmbeddingInvalidations.delete(db);
+    return [...pending];
+}
+
 function ensureMemoryRepairState(db: Database): void {
     db.exec(`
         CREATE TABLE IF NOT EXISTS mirror_memory_repair_state (
@@ -1484,6 +1593,43 @@ function mirrorIdentity(
             )
         ).get(domain, moduleProject, moduleRowId) as { context_row_id: number } | undefined) ?? null
     );
+}
+
+export interface MemoryMirrorIdentity {
+    moduleProject: string;
+    moduleRowId: number;
+    contextRowId: number;
+}
+
+export function moduleMemoryIdentityForHostId(
+    db: Database,
+    contextRowId: number,
+): MemoryMirrorIdentity | null {
+    const row = db
+        .prepare(
+            `SELECT module_project, module_row_id, context_row_id
+               FROM mirror_identity
+              WHERE domain = 'memories' AND context_row_id = ?`,
+        )
+        .get(contextRowId) as
+        | { module_project: string; module_row_id: number; context_row_id: number }
+        | undefined;
+    return row
+        ? {
+              moduleProject: row.module_project,
+              moduleRowId: row.module_row_id,
+              contextRowId: row.context_row_id,
+          }
+        : null;
+}
+
+export function hostMemoryIdentityForModuleId(
+    db: Database,
+    moduleProject: string,
+    moduleRowId: number,
+): MemoryMirrorIdentity | null {
+    const row = mirrorIdentity(db, "memories", moduleProject, moduleRowId);
+    return row ? { moduleProject, moduleRowId, contextRowId: row.context_row_id } : null;
 }
 
 export interface MirroredNoteCompileFields {
@@ -1816,6 +1962,15 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
         : previousHash;
     if (previousHash !== appliedHash && appliedHash !== undefined) {
         statements.deleteMemoryEmbeddings.run(contextId);
+        // The vector described the old content and had to go. Flag the project so
+        // the drain's caller re-embeds the new content instead of leaving the row
+        // out of scored recall for as long as the module holds authority.
+        recordMemoryEmbeddingInvalidation(
+            db,
+            has("project_path")
+                ? rowString(projectedRow, "project_path")
+                : (existing?.project_path ?? moduleProject),
+        );
     }
     // Mapping snapshots replace the whole side table. An array is a durable mapping (an empty
     // array is the file-independent sentinel); null is a mapping tombstone and leaves no rows.
@@ -2043,6 +2198,29 @@ function applyNoteRow(db: Database, feed: ChangefeedRow, statements: MirrorPageS
     );
 }
 
+export function applyTargetedMemoryMirrorRow(args: {
+    db: Database;
+    row: ChangefeedRow;
+}): MemoryMirrorIdentity | null {
+    const { db, row } = args;
+    if (row.domain !== "memories" || row.op === "tombstone") {
+        throw new Error("targeted memory mirror requires a live memory row");
+    }
+    const project = rowString(row.full_row_snapshot, "project_path");
+    if (!project) throw new Error("memory feed snapshot has no project_path");
+    withPrivilegedWriter(db, () => {
+        db.transaction(() => {
+            ensureMemoryRepairState(db);
+            const statements = prepareMirrorPageStatements(db);
+            applyMemoryRow(db, row, statements);
+            translateMemoryReferences(statements);
+            repairNullClobberedMemoryRows(statements);
+            bumpDomainMutationEpoch(db, project, "memories");
+        }).immediate();
+    });
+    return hostMemoryIdentityForModuleId(db, project, row.module_row_id);
+}
+
 export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): number {
     const { db, page } = args;
     if (!AUTHORITY_DOMAINS.includes(page.domain)) throw new Error("unknown mirror domain");
@@ -2184,7 +2362,7 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
     return nextCursor;
 }
 
-type MirrorPullModuleClient = Pick<AuthorityModuleClient, "mirrorPull">;
+type MirrorPullModuleClient = Pick<AuthorityModuleClient, "mirrorPull" | "memoryIdentityAck">;
 
 export async function ensureLiveMemoryResnapshot(args: {
     db: Database;
@@ -2341,6 +2519,28 @@ async function pullAndApplyMirrorPageWithStatus(args: {
         limit,
     });
     const nextCursor = applyMirrorPage({ db: args.db, page: response.page });
+    if (args.domain === "memories" && args.module.memoryIdentityAck) {
+        const rowsByProject = new Map<
+            string,
+            Array<{ module_row_id: number; context_row_id: number }>
+        >();
+        for (const feed of response.page.rows) {
+            if (feed.domain !== "memories" || feed.op === "tombstone") continue;
+            const project = rowString(feed.full_row_snapshot, "project_path");
+            if (!project) continue;
+            const identity = mirrorIdentity(args.db, "memories", project, feed.module_row_id);
+            if (!identity) continue;
+            const rows = rowsByProject.get(project) ?? [];
+            rows.push({
+                module_row_id: feed.module_row_id,
+                context_row_id: identity.context_row_id,
+            });
+            rowsByProject.set(project, rows);
+        }
+        for (const [project, rows] of rowsByProject) {
+            await args.module.memoryIdentityAck({ project, rows });
+        }
+    }
     return {
         cursor: nextCursor,
         hasMore: response.page.has_more,
@@ -2428,7 +2628,9 @@ export function pullMemoryMirrorOnce(args: {
         db: args.db,
         module: args.module,
         domain: "memories",
-        limit: args.limit,
+        // A page is capped at 1,000 rows by both protocol peers. Using that cap keeps the
+        // bounded transform ride-along at at most 20 requests for a 20,000-row backlog.
+        limit: args.limit ?? 1000,
         pageBudget: args.pageBudget ?? TRANSFORM_MEMORY_MIRROR_PAGE_BUDGET,
     })
         .then((result) => ({ ...result, cuePoolVersion: result.cursor }))

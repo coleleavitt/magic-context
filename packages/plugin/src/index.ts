@@ -38,7 +38,10 @@ import {
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "./hooks/magic-context/compartment-prompt";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
-import { SubcModuleTransport } from "./hooks/magic-context/module-transport";
+import {
+    getDefaultSubcConnectionFile,
+    SubcModuleTransport,
+} from "./hooks/magic-context/module-transport";
 import { preloadTokenizer } from "./hooks/magic-context/read-session-formatting";
 import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
 import {
@@ -68,6 +71,7 @@ import {
 } from "./shared/conflict-detector";
 import { getMagicContextStorageDir } from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
+import { setHarness } from "./shared/harness";
 import { setKeepSubagents } from "./shared/keep-subagents";
 import { flushLogger, log } from "./shared/logger";
 import {
@@ -88,6 +92,7 @@ import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
 import { reloadWindowOverlay } from "./shared/window-geometry";
+import { setup } from "./v2/server";
 
 const BOOT_SERVER_DEADLINE_MS = 15_000;
 const RESOLVED_CONFIG_TIMEOUT_MS = 2_000;
@@ -106,6 +111,13 @@ const server: Plugin = async (ctx) => {
     // 500ms; a synchronous filesystem or SQLite stall before that timer fires
     // otherwise recreates the reporter's "no Magic Context lines" symptom.
     emitBootEnteringBreadcrumb(process.pid, ctx.directory, log, flushLogger);
+
+    // Lock the harness before the first database write. "opencode" is already
+    // the default, so this is a fence, not a change: if anything in this process
+    // has locked a different value first (the v2 setup lane running on a v1
+    // host), this throws at boot instead of letting the seat tag every
+    // session-scoped row under the wrong harness.
+    setHarness("opencode");
 
     const configStartedAt = performance.now();
     beginBootQuietPeriod();
@@ -278,13 +290,18 @@ const server: Plugin = async (ctx) => {
     const liveSessionState = createLiveSessionState();
     const rustModeModuleTransport =
         pluginConfig.transform_mode === "rust"
-            ? new SubcModuleTransport(pluginConfig.subc?.connection_file)
+            ? new SubcModuleTransport(
+                  pluginConfig.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+              )
             : undefined;
     const rustModeModuleClient: RustModeModuleClient | undefined = rustModeModuleTransport;
     // A durable Rust-deletion retry can outlive a config flip back to TypeScript,
     // so cleanup keeps a lazy transport even when new transforms no longer use Rust.
     const sessionCleanupModuleClient = pluginConfig.enabled
-        ? (rustModeModuleTransport ?? new SubcModuleTransport(pluginConfig.subc?.connection_file))
+        ? (rustModeModuleTransport ??
+          new SubcModuleTransport(
+              pluginConfig.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+          ))
         : undefined;
 
     const hooksPhase = await runBootPhaseWithinBudget(
@@ -1027,9 +1044,10 @@ const server: Plugin = async (ctx) => {
 // plugin load (this caused the 2026-06 hidden-agent load incident). The object
 // shape bypasses that scan entirely, eliminating the footgun class. The `./tui`
 // entry already uses this same `{ id, tui }` shape.
-const plugin: PluginModule = {
+const plugin: PluginModule & { setup: typeof setup } = {
     id: "opencode-magic-context",
     server,
+    setup,
 };
 
 export default plugin;

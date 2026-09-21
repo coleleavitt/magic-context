@@ -14,6 +14,7 @@ import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import {
     applyMirroredNoteCompileFields,
+    applyTargetedMemoryMirrorRow,
     drainMirrorPages,
     ensureContextStoreUuid,
     getModuleNoteEvaluationBridge,
@@ -34,12 +35,12 @@ import {
     clearHookInitFailure,
     recordHookInitFailure,
 } from "../../features/magic-context/fail-closed-block";
+import { reembedMirrorInvalidatedMemories } from "../../features/magic-context/memory/mirror-reembed";
 import {
     resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
 import {
-    embedSessionCompartmentChunks,
     embedUnembeddedMemoriesForProject,
     getEmbeddingCoverageStatus,
 } from "../../features/magic-context/project-embedding-registry";
@@ -61,6 +62,11 @@ import { getCurrentToolSetHash } from "../../features/magic-context/tool-definit
 import type { ContextUsage } from "../../features/magic-context/types";
 import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
+import {
+    moduleMemoryOperation,
+    translateHostMemoryIds,
+    translateModuleMemoryMutationReply,
+} from "../../plugin/memory-id-translation";
 import { buildStatusDetail } from "../../plugin/rpc-handlers";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
@@ -70,7 +76,6 @@ import { log } from "../../shared/logger";
 import { resolveHistorianModel } from "../../shared/model-resolution";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
-import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
 import type { Database } from "../../shared/sqlite";
 import { createMagicContextCommandHandler } from "./command-handler";
 import { clearToolPermissionDenied } from "./ctx-reduce-availability";
@@ -81,10 +86,14 @@ import {
 } from "./derive-budgets";
 import { createDroppedInputToolExecuteBeforeHook } from "./dropped-input-guard";
 import {
+    type EmbedHistoryDeps,
+    pauseEmbedHistoryDrain,
+    runEmbedHistoryDrain,
+} from "./embed-history-runner";
+import {
     autoEmbedAttemptedBySession,
     clearEmbedSessionState,
     embedPauseBySession,
-    embedRunStateBySession,
     getEmbedDrainUiStatus,
 } from "./embed-session-state";
 import { createEventHandler } from "./event-handler";
@@ -93,21 +102,16 @@ import {
     resolveExecuteThresholdDetail,
     resolveModelKey,
 } from "./event-resolvers";
-import { formatEmbedFailureSummary } from "./format-embed-failure";
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { createDbLkgPersistence } from "./lkg-persist";
 import { dropSlot, registerLkgPersistence } from "./lkg-slot";
-import { SubcModuleTransport } from "./module-transport";
+import { getDefaultSubcConnectionFile, SubcModuleTransport } from "./module-transport";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
-import {
-    runManagedRecomp,
-    runManagedUpgrade,
-    setRecompStarting,
-    setRecompTerminal,
-} from "./recomp-orchestrator";
+import { runManagedRecomp } from "./recomp-orchestrator";
 import type { RustModeModuleClient } from "./rust-mode-transform";
+import { createRustRefusalRecovery } from "./rust-refusal-recovery";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
 import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
@@ -129,7 +133,6 @@ import {
     sendStatusNotification,
 } from "./send-session-notification";
 import { createSystemPromptHashHandler } from "./system-prompt-hash";
-import { maybeSendUpgradeReminder } from "./upgrade-reminder";
 
 const DREAM_SCHEDULE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 // NOTE: lastScheduleCheckMs is intentionally inside createMagicContextHook (not module scope)
@@ -504,12 +507,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // never re-read the config path.
     const compactionOff = !isCompactionEnabled(deps.config);
 
-    // Shared context for the recomp/upgrade orchestrator. Both `/ctx-recomp` and
-    // `/ctx-session-upgrade` (command paths) build this so they run through the
-    // exact same runner as the RPC dialog paths — identical fallback, progress,
-    // and terminal state. `fallbackModelId` is resolved here with the OpenCode-DB
-    // recovery (resolveLiveModel) so the last-resort fallback model is known even
-    // when a command is invoked before the first transform pass populates the map.
+    // Shared context for the recomp orchestrator. The `/ctx-recomp` command path
+    // builds this so it runs through the exact same runner as the RPC dialog path
+    // — identical fallback, progress, and terminal state. `fallbackModelId` is
+    // resolved here with the OpenCode-DB recovery (resolveLiveModel) so the
+    // last-resort fallback model is known even when a command is invoked before
+    // the first transform pass populates the map.
     const buildManagedRecompCtx = (sessionId: string): ManagedRecompContext => ({
         client: deps.client,
         db,
@@ -547,7 +550,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         })(),
         historianTwoPass: deps.config.historian?.two_pass === true,
-        runMigration: deps.config.memory?.enabled !== false && !!historianModel?.model,
         // Option C privacy gate: behavioral observation candidates are collected
         // during historian runs only when the user has SCHEDULED the
         // review-user-memories task (schedule != ""). Replaces the v1
@@ -592,129 +594,25 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             systemPromptRefreshSessions.has(sid) ||
             pendingMaterializationSessions.has(sid),
     });
-    // /ctx-embed start: backfill THIS session's compartment chunk embeddings,
-    // reusing the recomp progress surface (sidebar + status bar) with kind="embed".
+    // /ctx-embed start/pause: backfill THIS session's compartment chunk
+    // embeddings, reusing the recomp progress surface (sidebar + status bar)
+    // with kind="embed". The drain itself lives in embed-history-runner so the
+    // RPC surface runs the same one.
+    const embedHistoryDeps: EmbedHistoryDeps = {
+        db,
+        resolveDirectory: (sessionId) => sessionDirectoryBySession.get(sessionId) ?? deps.directory,
+        memoryEnabled: deps.config.memory?.enabled !== false,
+        allowHomeProject: deps.config.allow_home_project,
+        recompProgressBySession,
+        onDirectoryResolved: maybeSendProjectIdentitySessionWarning,
+    };
     const executeEmbedHistory = async (
         sessionId: string,
         options?: { signal?: AbortSignal; silent?: boolean },
-    ): Promise<string> => {
-        if (deps.config.memory?.enabled === false) {
-            return "Memory is disabled for this project, so there is no semantic embedding to backfill.";
-        }
-        const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        // Idempotent start: if a drain is already running for this session, don't
-        // abort it and re-acquire — that races the just-released lease and returns
-        // "busy", killing the active run for nothing. Just report it's running.
-        const active = embedRunStateBySession.get(sessionId);
-        if (active && !active.signal.aborted && !options?.signal) {
-            return "Embedding is already running for this session.";
-        }
-        await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-        const sessionProjectIdentity = resolveProjectIdentityForSession(
-            directory,
-            deps.config.allow_home_project,
-        );
-        if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
-        maybeSendProjectIdentitySessionWarning(sessionId, directory);
-        embedPauseBySession.delete(sessionId);
-        const prior = embedRunStateBySession.get(sessionId);
-        if (prior) prior.abort();
-        const controller = new AbortController();
-        embedRunStateBySession.set(sessionId, controller);
-        const signal = options?.signal ?? controller.signal;
-        if (!options?.silent) {
-            setRecompStarting(
-                { recompProgressBySession } as LiveSessionState,
-                sessionId,
-                "Embedding history…",
-                "embed",
-            );
-        }
-        let runFailed = 0;
-        let outcome: Awaited<ReturnType<typeof embedSessionCompartmentChunks>>;
-        try {
-            outcome = await embedSessionCompartmentChunks(db, sessionProjectIdentity, sessionId, {
-                signal,
-                onProgress: ({ embedded, total }) => {
-                    const cur = recompProgressBySession.get(sessionId);
-                    if (cur?.phase !== "recomp") return;
-                    recompProgressBySession.set(sessionId, {
-                        ...cur,
-                        processedMessages: embedded,
-                        totalMessages: total,
-                        updatedAt: Date.now(),
-                    });
-                },
-            });
-        } finally {
-            // Always release the per-session controller, even if the drain threw
-            // (a release-time SQLite error, etc.) — otherwise a stale controller
-            // would make every later start return "already running".
-            if (embedRunStateBySession.get(sessionId) === controller) {
-                embedRunStateBySession.delete(sessionId);
-            }
-        }
-        if ("failed" in outcome) runFailed = outcome.failed;
-        const terminal = (phase: "done" | "skipped", message: string): string => {
-            if (!options?.silent) {
-                setRecompTerminal(
-                    { recompProgressBySession } as LiveSessionState,
-                    sessionId,
-                    phase,
-                    message,
-                );
-            }
-            return message;
-        };
-        switch (outcome.status) {
-            case "nothing":
-                return terminal("done", "All of this session's history is already embedded.");
-            case "disabled":
-                return terminal(
-                    "skipped",
-                    "No embedding provider is configured, so there is nothing to embed.",
-                );
-            case "busy":
-                return terminal(
-                    "skipped",
-                    "Embedding is already running for this project. Try again shortly.",
-                );
-            case "aborted": {
-                // A drain only aborts via user pause (or session teardown). Render
-                // it as the neutral "skipped" terminal — NOT "done", which the
-                // sidebar shows as a green "✓ Embed complete" that wrongly reads as
-                // finished.
-                const cov = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
-                const msg = `Paused at ${cov.session.embedded}/${cov.session.total} compartments embedded.`;
-                return terminal("skipped", msg);
-            }
-            case "stalled":
-                return terminal(
-                    "skipped",
-                    formatEmbedFailureSummary(outcome.embedded, outcome.remaining, outcome.failure),
-                );
-            default:
-                return terminal(
-                    "done",
-                    `Embedded ${outcome.embedded} compartment${outcome.embedded === 1 ? "" : "s"} of history for semantic search${runFailed > 0 ? ` (${runFailed} failed)` : ""}.`,
-                );
-        }
-    };
+    ): Promise<string> => runEmbedHistoryDrain(embedHistoryDeps, sessionId, options);
 
-    const pauseEmbedDrain = (sessionId: string): string => {
-        embedPauseBySession.add(sessionId);
-        const ctrl = embedRunStateBySession.get(sessionId);
-        if (ctrl) ctrl.abort();
-        const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        const sessionProjectIdentity = resolveProjectIdentityForSession(
-            directory,
-            deps.config.allow_home_project,
-        );
-        if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
-        maybeSendProjectIdentitySessionWarning(sessionId, directory);
-        const cov = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
-        return `Paused at ${cov.session.embedded}/${cov.session.total} compartments embedded.`;
-    };
+    const pauseEmbedDrain = (sessionId: string): string =>
+        pauseEmbedHistoryDrain(embedHistoryDeps, sessionId);
 
     const getEmbedStatusText = (sessionId: string): string => {
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
@@ -792,7 +690,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const authorityRecoveryModuleClient =
         deps.rustModeModuleClient ??
         (() => {
-            const transport = new SubcModuleTransport(deps.config.subc?.connection_file);
+            const transport = new SubcModuleTransport(
+                deps.config.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+            );
             const client: RustModeModuleClient = {
                 call: (args) => transport.call(args),
                 stateSyncCapabilities: (args) => transport.stateSyncCapabilities(args),
@@ -804,6 +704,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 authoritySeed: (args) => transport.authoritySeed(args),
                 authorityDrain: (args) => transport.authorityDrain(args),
                 mirrorPull: (args) => transport.mirrorPull(args),
+                mirrorMemory: (args) => transport.mirrorMemory(args),
+                memoryIdentityAck: (args) => transport.memoryIdentityAck(args),
                 getCompartmentsAfter: async (sessionId, afterSequence) => {
                     const response = await transport.call({
                         sessionId,
@@ -855,26 +757,60 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         })();
     const rustModeModuleClient =
         deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
-    const syncModuleDomain = async (domain: "memories" | "notes"): Promise<void> => {
+    const rustRefusalRecovery = rustModeModuleClient
+        ? createRustRefusalRecovery({
+              moduleClient: rustModeModuleClient,
+              client: deps.client,
+          })
+        : undefined;
+    const syncModuleDomain = async (
+        domain: "memories" | "notes",
+        pageBudget?: number,
+    ): Promise<void> => {
         if (!rustModeModuleClient?.mirrorPull) return;
         await drainMirrorPages({
             db,
             module: rustModeModuleClient,
             domain,
             limit: 1000,
+            pageBudget,
         });
     };
     const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
-    const syncModuleMemories = (): Promise<void> => syncModuleDomain("memories");
+    const syncModuleMemoryIdentity = async (
+        moduleProject: string,
+        moduleRowId: number,
+        projectRoot: string,
+    ): Promise<void> => {
+        if (!rustModeModuleClient?.mirrorMemory) return;
+        const { row } = await rustModeModuleClient.mirrorMemory({
+            module_row_id: moduleRowId,
+            projectRoot,
+        });
+        if (!row) return;
+        const identity = applyTargetedMemoryMirrorRow({ db, row });
+        if (!identity || !rustModeModuleClient.memoryIdentityAck) return;
+        await rustModeModuleClient.memoryIdentityAck({
+            project: moduleProject,
+            projectRoot,
+            rows: [
+                {
+                    module_row_id: moduleRowId,
+                    context_row_id: identity.contextRowId,
+                },
+            ],
+        });
+    };
     const rustToolBackends: RustToolBackends | undefined =
         deps.config.transform_mode === "rust" && rustModeModuleClient
             ? {
-                  authorityState: async ({ projectPath, projectRoot, domain }) => {
+                  authorityState: async ({ projectPath, projectRoot, sessionId, domain }) => {
                       if (!rustModeModuleClient.authorityStatus) return null;
                       const result = await rustModeModuleClient.authorityStatus({
                           context_store_uuid: ensureContextStoreUuid(db),
                           project: projectPath,
                           projectRoot,
+                          sessionId,
                           domain,
                       });
                       return result.authority?.state ?? null;
@@ -907,7 +843,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       filter,
                       limit,
                       offset,
-                      noteId,
+                      noteIds,
                   }) => {
                       const response = await rustModeModuleClient.call({
                           sessionId,
@@ -928,7 +864,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                   filter,
                                   limit,
                                   offset,
-                                  note_id: noteId,
+                                  note_ids: noteIds,
                               },
                           },
                       });
@@ -937,7 +873,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       await syncModuleNotes();
                       if (compileStatus && !moduleNoteResponseIsError(response)) {
                           const moduleRowId =
-                              action === "write" ? moduleNoteRowId(response) : (noteId ?? null);
+                              action === "write"
+                                  ? moduleNoteRowId(response)
+                                  : (noteIds?.[0] ?? null);
                           if (
                               moduleRowId === null ||
                               !applyMirroredNoteCompileFields({
@@ -969,7 +907,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       category,
                       ids,
                       reason,
+                      limit,
                   }) => {
+                      const hostIds = ids ?? [];
+                      const translatedIds = translateHostMemoryIds(db, hostIds);
+                      if ("error" in translatedIds) return translatedIds.error;
+                      const moduleIds = translatedIds.moduleIds;
                       const response = await rustModeModuleClient.call({
                           sessionId,
                           projectRoot,
@@ -981,23 +924,66 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                   action,
                                   content,
                                   category,
-                                  ids,
+                                  ids: moduleIds,
+                                  host_ids: hostIds,
+                                  memory_id_lane: "host",
                                   reason,
+                                  limit,
                                   memory_project: memoryProject,
                               },
                           },
                       });
-                      // Auto-search and local RPC/dashboard reads consume the mirror,
-                      // so publish the module mutation to that read model before return.
-                      await syncModuleMemories();
+                      // Pull the rows this call touched before anything reads the host
+                      // copy. A fresh canonical row can sit behind a large cursor backlog,
+                      // so the agent reply needs a bounded path to its host id; an edited
+                      // row needs its new content on the host before the embedding pass
+                      // below, or that pass embeds content the mirror is about to replace
+                      // and the replacement silently drops the vector. The ordinary memory
+                      // drain remains on the transform-pass cadence.
+                      const operation = moduleMemoryOperation(response);
+                      const touchedModuleRowIds = new Set<number>();
+                      if (action === "update" || action === "archive" || action === "merge") {
+                          for (const moduleId of moduleIds) touchedModuleRowIds.add(moduleId);
+                      }
+                      if (operation?.action === "write" && operation.module_id !== undefined) {
+                          touchedModuleRowIds.add(operation.module_id);
+                      }
+                      if (operation?.action === "merge") {
+                          if (operation.canonical_module_id !== undefined) {
+                              touchedModuleRowIds.add(operation.canonical_module_id);
+                          }
+                          for (const supersededId of operation.superseded_module_ids ?? []) {
+                              touchedModuleRowIds.add(supersededId);
+                          }
+                      }
+                      for (const moduleRowId of touchedModuleRowIds) {
+                          // One unpullable row (a merge source the module already
+                          // retired, say) must not skip the rows after it.
+                          try {
+                              await syncModuleMemoryIdentity(
+                                  memoryProject,
+                                  moduleRowId,
+                                  projectRoot,
+                              );
+                          } catch (error) {
+                              log("[magic-context] targeted memory mirror sync failed:", error);
+                          }
+                      }
                       if (
                           !moduleNoteResponseIsError(response) &&
-                          (action === "write" || action === "update" || action === "merge")
+                          (action === "write" ||
+                              action === "update" ||
+                              action === "archive" ||
+                              action === "merge")
                       ) {
                           // TypeScript memory writes queue embedding work immediately.
                           // The Rust path must do the same after publishing its memory.
                           void (async () => {
                               await ensureProjectRegisteredFromOpenCodeDirectory(projectRoot, db);
+                              // An edit that changed content left the host row without an
+                              // embedding when it mirrored back; re-embed before looking for
+                              // anything else still missing one.
+                              await reembedMirrorInvalidatedMemories(db);
                               const embedded = await embedUnembeddedMemoriesForProject(
                                   db,
                                   memoryProject,
@@ -1011,7 +997,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               log("[magic-context] mirrored memory embedding failed:", error);
                           });
                       }
-                      return response;
+                      return (
+                          translateModuleMemoryMutationReply({
+                              db,
+                              moduleProject: memoryProject,
+                              response,
+                              requestedHostIds: hostIds,
+                              requestedCategory: category,
+                          }) ?? response
+                      );
                   },
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>
                       getModuleNoteEvaluationBridge(evaluationProjectPath) !== undefined,
@@ -1102,6 +1096,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         scheduler: deps.scheduler,
         contextUsageMap,
         db,
+        // OpenCode 1 reads the `message`/`part` tables, so every ordinal this
+        // host derives is a position in the v1 projection.
+        storeGeneration: "v1",
         channel1StateBySession,
         channel2DirectiveTextBySession,
         protectedTokens: deps.config.protected_tokens,
@@ -1205,6 +1202,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         rustMemorySyncRequestedSessions,
         onRustModeParked: notifyRustModeParked,
         onRustModeProjectPrepared: ensureModuleNoteEvaluationBridge,
+        onRustEngineReconnectRefusal: (args) => rustRefusalRecovery?.arm(args),
     });
     const eventHandler = createEventHandler({
         contextUsageMap,
@@ -1238,6 +1236,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // Remove module-owned state before the context database drops the durable
         // session→project binding needed to retry a failed module deletion.
         onSessionDeleted: async (sessionId: string) => {
+            rustRefusalRecovery?.forget(sessionId);
             dropSlot(sessionId, "session-deleted");
             try {
                 await transform.clearRustSession(sessionId);
@@ -1384,13 +1383,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             systemPromptRefreshSessions.add(sessionId);
             pendingMaterializationSessions.add(sessionId);
         },
-        // E3 (recomp) + /ctx-session-upgrade: both run through the SHARED
-        // orchestrator (runManagedRecomp / runManagedUpgrade) so the command
-        // paths get identical model fallback + live progress + terminal state as
-        // the RPC dialog paths. Dogfood 2026-05-30: previously the command path
-        // had fallback but no progress (sidebar stuck on stale "failed") while
-        // the RPC dialog had progress but no fallback (failed on empty primary
-        // model). One runner closes both gaps.
+        // E3 (recomp) runs through the SHARED orchestrator (runManagedRecomp) so
+        // the command path gets identical model fallback + live progress +
+        // terminal state as the RPC dialog path. Dogfood 2026-05-30: previously
+        // the command path had fallback but no progress (sidebar stuck on stale
+        // "failed") while the RPC dialog had progress but no fallback (failed on
+        // empty primary model). One runner closes both gaps.
         executeWrapup: historianRunnable
             ? async (sessionId, options) =>
                   runManagedWrapup(buildManagedWrapupCtx(sessionId), sessionId, options)
@@ -1398,12 +1396,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         executeRecomp: historianRunnable
             ? async (sessionId, options) =>
                   runManagedRecomp(buildManagedRecompCtx(sessionId), sessionId, options)
-            : undefined,
-        // E3.2 — /ctx-session-upgrade: full recomp + once-per-project memory
-        // migration in one managed run. The command handler delivers the result.
-        runUpgrade: historianRunnable
-            ? async (sessionId: string) =>
-                  runManagedUpgrade(buildManagedRecompCtx(sessionId), sessionId)
             : undefined,
         executeEmbedHistory,
         pauseEmbedDrain,
@@ -1543,41 +1535,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             lastHeuristicsTurnId,
             commandHandler,
             cacheTtlConfig: deps.config.cache_ttl,
-            // E5 — only offer the upgrade reminder when historian can run (so
-            // /ctx-session-upgrade is actually actionable). Self-gates per session.
-            upgradeReminder: historianRunnable
-                ? (sessionId: string) =>
-                      maybeSendUpgradeReminder(
-                          {
-                              client: deps.client,
-                              db,
-                              sendStatusNotification,
-                              getNotificationParams: (sid) =>
-                                  getLiveNotificationParams(
-                                      sid,
-                                      liveModelBySession,
-                                      variantBySession,
-                                      agentBySession,
-                                      deps.config.toast_duration_ms,
-                                  ),
-                              isTuiConnected,
-                              pushTuiDialogAction: (sid, resume) =>
-                                  pushNotification(
-                                      "action",
-                                      resume
-                                          ? {
-                                                action: "show-upgrade-dialog",
-                                                resume: true,
-                                                stagedCount: resume.stagedCount,
-                                                stagedThrough: resume.stagedThrough,
-                                            }
-                                          : { action: "show-upgrade-dialog" },
-                                      sid,
-                                  ),
-                          },
-                          sessionId,
-                      )
-                : undefined,
         }),
         event: async (input: { event: { type: string; properties?: unknown } }) => {
             await eventHook(input);

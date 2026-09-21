@@ -47,6 +47,8 @@ import {
     resolveEpochFloorForPass,
 } from "../../features/magic-context/storage-meta-persisted";
 import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
+import type { CoordinateGeneration } from "../../features/magic-context/store-generation-rebase";
+import { rebaseSessionCoordinates } from "../../features/magic-context/store-generation-rebase";
 import type { Tagger } from "../../features/magic-context/tagger";
 import {
     clearOpenCodePendingTransformDecision,
@@ -97,6 +99,7 @@ import {
 import type { LiveModelBySession } from "./hook-handlers";
 import { assertNoInheritedMagicContextMarker } from "./inherited-compaction-marker-guard";
 import {
+    capturePrefixTrimSourceOrder,
     mustMaterialize,
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
@@ -128,6 +131,7 @@ import {
     stripClearedReasoning,
 } from "./strip-content";
 import { injectTemporalMarkers } from "./temporal-awareness";
+import { createPreAdoptionToolSweepResolver, useScopedToolSweep } from "./tool-sweep-policy";
 import { runCompartmentPhase } from "./transform-compartment-phase";
 import {
     contextUsagePassSnapshot,
@@ -145,6 +149,8 @@ import {
 } from "./transform-operations";
 import {
     abortSessionFailClosed,
+    type CompactionMarkerStrategy,
+    defaultCompactionMarkerStrategy,
     evaluateEmergencyFailClosed,
     runPostTransformPhase,
 } from "./transform-postprocess-phase";
@@ -526,6 +532,17 @@ export function scheduleTsAuthorityRecovery(args: {
 }
 
 export interface TransformDeps {
+    hiddenCompletionExecutor?: import("./compartment-runner-types").HiddenCompletionExecutor;
+    /** Host marker lifecycle; omission preserves OpenCode 1 marker writes and replay. */
+    compactionMarkerStrategy?: CompactionMarkerStrategy & {
+        setPending?: typeof import("../../features/magic-context/storage").setPendingCompactionMarkerState;
+        publish?: typeof import("./compaction-marker-manager").updateCompactionMarkerAfterPublication;
+    };
+    /** Host storage and cancellation adapters; omitted callbacks retain OpenCode 1 behavior. */
+    hostRawMessages?: typeof readRawSessionMessages;
+    hostProtectedTailBoundary?: typeof resolveOpenCodeProtectedTailBoundary;
+    hostModelFallback?: typeof findLastAssistantModelFromOpenCodeDb;
+    hostRefuse?: typeof abortSessionFailClosed;
     tagger: Tagger;
     scheduler: Scheduler;
     contextUsageMap: Map<
@@ -630,6 +647,7 @@ export interface TransformDeps {
      * delivery.
      */
     compactionOff?: boolean;
+    hostCleanupCompactionMarkers?: Parameters<typeof reconcileCompactionMode>[0]["cleanupMarkers"];
     getNotificationParams?: (
         sessionId: string,
     ) => import("./send-session-notification").NotificationParams;
@@ -664,7 +682,7 @@ export interface TransformDeps {
     sessionDirectoryBySession?: Map<string, string>;
     /**
      * Process-scoped set of Magic Context's OWN hidden child sessions
-     * (historian/dreamer/memory-migration), detected by title prefix
+     * (historian/dreamer), detected by title prefix
      * at `session.created`. When a session is in this set the transform returns
      * immediately (messages unmodified) — these children have their own fixed
      * agent identity and never use any MC feature, so even reduced-mode work
@@ -713,10 +731,39 @@ export interface TransformDeps {
     tsAuthorityRecoveryModuleClient?: RustModeModuleClient;
     onRustModeParked?: (sessionId: string, message: string) => void;
     onRustModeProjectPrepared?: (projectPath: string) => void;
+    onRustEngineReconnectRefusal?: (args: {
+        sessionId: string;
+        projectRoot: string;
+        refusedUserMessageId: string;
+        providerProvenEmergency: boolean;
+        compactionOff: boolean;
+    }) => void;
     rustMemorySyncRequestedSessions?: Set<string>;
+    /**
+     * Which projection of the OpenCode store this host serves. Supplied by the
+     * OpenCode 1 and OpenCode 2 hooks; omitted by every other harness, which
+     * keeps them (Pi in particular) out of the coordinate rebase entirely.
+     */
+    storeGeneration?: CoordinateGeneration;
+}
+
+export function resolveTransformHostSeams(
+    deps: Pick<
+        TransformDeps,
+        "hostRawMessages" | "hostProtectedTailBoundary" | "hostModelFallback" | "hostRefuse"
+    >,
+) {
+    return {
+        hostRawMessages: deps.hostRawMessages ?? readRawSessionMessages,
+        hostProtectedTailBoundary:
+            deps.hostProtectedTailBoundary ?? resolveOpenCodeProtectedTailBoundary,
+        hostModelFallback: deps.hostModelFallback ?? findLastAssistantModelFromOpenCodeDb,
+        hostRefuse: deps.hostRefuse ?? abortSessionFailClosed,
+    };
 }
 
 export function createTransform(deps: TransformDeps) {
+    const host = resolveTransformHostSeams(deps);
     const loadedSessions = new Set<string>();
     const rustModeTransform =
         deps.transformMode === "rust" && deps.rustModeModuleClient
@@ -726,6 +773,7 @@ export function createTransform(deps: TransformDeps) {
                   projectRoot: deps.rustModeProjectRoot,
                   notifyParked: deps.onRustModeParked,
                   onProjectPrepared: deps.onRustModeProjectPrepared,
+                  onEngineReconnectRefusal: deps.onRustEngineReconnectRefusal,
                   memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
                   allowAuthorityProtocolBypassForTests:
                       deps.rustModeAllowAuthorityProtocolBypassForTests,
@@ -768,8 +816,33 @@ export function createTransform(deps: TransformDeps) {
         logTransformTiming(sessionId, "findSessionId", startTime, `messages=${messages.length}`);
 
         const db = deps.db;
+
+        // Runs before anything reads a saved coordinate. Every ordinal this
+        // session stored is a position in the message list some host served; if
+        // the host in front of us serves a different projection of the same
+        // conversation, those positions must be re-derived from the surviving
+        // message ids first. Failing here must not take the chat down: the
+        // generation stamp is only written on success, so the next pass retries.
+        if (deps.storeGeneration !== undefined) {
+            try {
+                rebaseSessionCoordinates({
+                    db,
+                    sessionId,
+                    generation: deps.storeGeneration,
+                    readMessages: host.hostRawMessages,
+                });
+            } catch (error) {
+                passOutcome.record("store-generation-rebase-failure");
+                sessionLog(
+                    sessionId,
+                    "store projection rebase failed (retrying next pass):",
+                    error,
+                );
+            }
+        }
+
         if (deps.client !== undefined) {
-            scheduleReconciliation(db, sessionId, readRawSessionMessages);
+            scheduleReconciliation(db, sessionId, host.hostRawMessages);
         }
 
         const tUserMsg = performance.now();
@@ -789,7 +862,7 @@ export function createTransform(deps: TransformDeps) {
         }
         logTransformTiming(sessionId, "getOrCreateSessionMeta", tMeta);
 
-        // Magic Context's OWN hidden children (historian/dreamer/memory-migration)
+        // Magic Context's OWN hidden children (historian/dreamer)
         // are fully exempt from the transform. They have a
         // fixed agent identity + single-shot/bounded job and use zero MC
         // features, so even reduced-mode work (tagging, heuristic drops) is
@@ -838,6 +911,7 @@ export function createTransform(deps: TransformDeps) {
                 compactionOff,
                 historianRunnable: deps.historianRunnable !== false,
                 compartmentInProgress: sessionMeta.compartmentInProgress,
+                cleanupMarkers: deps.hostCleanupCompactionMarkers,
             });
             const hasTransitionEffects =
                 transition.recordToWrite !== null ||
@@ -1020,7 +1094,7 @@ export function createTransform(deps: TransformDeps) {
             fullFeatureMode &&
             !compactionOff &&
             historianRunnable &&
-            deps.client !== undefined &&
+            (deps.client !== undefined || deps.hiddenCompletionExecutor !== undefined) &&
             compartmentDirectory.length > 0;
         const fallbackModelId = deps.getFallbackModelId?.(sessionId);
 
@@ -1323,7 +1397,7 @@ export function createTransform(deps: TransformDeps) {
         // deliberately fall through to the live-usage path inside the resolver.
         let modelForBudget = deps.liveModelBySession?.get(sessionId);
         if (!modelForBudget) {
-            const recovered = findLastAssistantModelFromOpenCodeDb(sessionId);
+            const recovered = host.hostModelFallback(sessionId);
             if (recovered) {
                 modelForBudget = recovered;
                 // Seed the live map so the scheduler / notification / sidebar
@@ -1433,6 +1507,9 @@ export function createTransform(deps: TransformDeps) {
         //
         const historyRefreshExplicitBeforePrepare = deps.historyRefreshSessions.has(sessionId);
         const deferredHistoryWasPendingAtPassStart = deferredHistoryRefreshSessions.has(sessionId);
+        const prefixTrimSourceOrder = deferredHistoryWasPendingAtPassStart
+            ? capturePrefixTrimSourceOrder(messages)
+            : undefined;
         const earlyActiveRunBlocksMaterialization =
             (getActiveCompartmentRun(sessionId) !== undefined ||
                 sessionMeta.compartmentInProgress) &&
@@ -1473,7 +1550,7 @@ export function createTransform(deps: TransformDeps) {
         ): ProtectedTailBoundarySnapshot | null => {
             if (!canRunCompartments) return null;
             if (_boundarySnapshotCache === undefined || emergencyTailScale) {
-                const snapshot = resolveOpenCodeProtectedTailBoundary({
+                const snapshot = host.hostProtectedTailBoundary({
                     db,
                     sessionId: resolvedSessionId,
                     mode: "transform-force",
@@ -1519,7 +1596,7 @@ export function createTransform(deps: TransformDeps) {
             }
             if (
                 !canRunCompartments ||
-                !deps.client ||
+                (!deps.client && !deps.hiddenCompletionExecutor) ||
                 !boundarySnapshot ||
                 !hasRunnableCompartmentWindow(boundarySnapshot)
             ) {
@@ -1532,6 +1609,8 @@ export function createTransform(deps: TransformDeps) {
             updateSessionMeta(db, sessionId, { compartmentInProgress: true });
             startCompartmentAgent({
                 client: deps.client,
+                hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
+                compactionMarkerStrategy: deps.compactionMarkerStrategy,
                 db,
                 sessionId,
                 historianChunkTokens: deps.getHistorianChunkTokens?.() ?? 20_000,
@@ -1920,8 +1999,18 @@ export function createTransform(deps: TransformDeps) {
                     messagesBeforeInitialPrepare && hiddenMessagesAtCompactionSeam.length > 0
                         ? messagesBeforeInitialPrepare
                         : messages;
+                const canAdoptScopedToolSweep = isCacheBusting || canConsumeDeferredEarly;
+                // A pass that may not change bytes and has not adopted yet
+                // cannot pick a sweep from a default: which array this session
+                // was last served decides it. The resolver runs at finalize,
+                // where both candidate arrays exist.
+                const scopedToolSweep = useScopedToolSweep(db, sessionId, canAdoptScopedToolSweep)
+                    ? true
+                    : createPreAdoptionToolSweepResolver(db, sessionId);
                 const result = tagMessages(sessionId, messagesForTagging, deps.tagger, db, {
                     skipPrefixInjection,
+                    scopedToolSweep,
+                    servedMessages: messages,
                 });
                 targets = result.targets;
                 reasoningByMessage = result.reasoningByMessage;
@@ -2096,6 +2185,8 @@ export function createTransform(deps: TransformDeps) {
         const rawGetNotifParams = deps.getNotificationParams;
         const tCompartmentPhase = performance.now();
         const compartmentPhase = await runCompartmentPhase({
+            hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
+            compactionMarkerStrategy: deps.compactionMarkerStrategy,
             canRunCompartments,
             fullFeatureMode,
             compactionOff,
@@ -2267,6 +2358,8 @@ export function createTransform(deps: TransformDeps) {
 
         const tPostProcess = performance.now();
         const postTransformResult = await runPostTransformPhase({
+            compactionMarkerStrategy:
+                deps.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy,
             sessionId,
             db,
             messages,
@@ -2323,6 +2416,7 @@ export function createTransform(deps: TransformDeps) {
             protectedCount: protectionWindow.status.protectedCount,
             emergencyCeilingTokens,
             pendingCompartmentInjection,
+            prefixTrimSourceOrder,
             hiddenMessagesAtCompactionSeam,
             trimmedMessagesAtCompactionBoundary,
             didMutateFromFlushedStatuses,
@@ -2461,7 +2555,7 @@ export function createTransform(deps: TransformDeps) {
                     );
                 }
                 try {
-                    await abortSessionFailClosed(deps.client, sessionId);
+                    await host.hostRefuse(deps.client, sessionId);
                 } catch (error) {
                     sessionLog(
                         sessionId,

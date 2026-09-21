@@ -144,6 +144,39 @@ compartments that need upgrading.
 
 ---
 
+## 6b. `/ctx-status` is one view, built from one shared model
+
+`/ctx-status` takes no arguments on either harness and has no diagnostics mode:
+the summary/diagnostics split, the OpenCode dialog's `[ ] Diagnostics` checkbox
+and Pi's `[D]` toggle were all removed on 2026-09-20.
+
+**Shared:** `packages/plugin/src/shared/status-view.ts` owns the content — the
+title, the pressure headline, the window-derivation line, the coloured category
+breakdown, the `Hygiene` row, the seven sections (Tags, Reductions, Pending
+Queue, Context Details, Cache TTL, History Compression, Memory) in that order,
+and the warning block. Both harnesses build their view from it, so a row cannot
+exist on one and be missing on the other. Colours travel as semantic tones that
+each host resolves against its own theme; only the category palette is fixed
+hex, because it identifies a category across the status view and the sidebar.
+
+**OpenCode:** draws it with the Solid/OpenTUI dialog component
+(`src/tui/dialogs/status-dialog.tsx`), two columns when the terminal is at least
+76 columns wide and one column below that.
+
+**Pi:** draws the same model with its own line renderer, always in one column,
+and fills the breakdown bar with block characters in truecolor ANSI.
+
+Two live-run rows stay host-local because they report a run rather than status
+content, and each host has only its own: OpenCode keeps the recomp/upgrade
+progress block fed by its RPC progress snapshot, and Pi keeps a single `Upgrade`
+row (a detached run, or compartments awaiting `/ctx-session-upgrade`) because it
+has no sidebar to carry it. Pi's former `Work tokens`, `Counts`, `Historian`,
+`Active profile`, `Memory importance` and `Protected tokens` lines are gone;
+the protection-window value object behind the last one is unchanged and its
+protected-tag count is drawn as the shared `Protected tags` row.
+
+---
+
 ## 6a. Project-identity dubious-ownership warnings
 
 **OpenCode:** when git refuses a repository as dubious ownership, the shared
@@ -414,15 +447,15 @@ OpenCode gates m[1] recompute on `isCacheBustingPass` (`shouldApplyPendingOps ||
 
 ---
 
-## 11b. Recomp / upgrade run detached in the background (mechanism differs, behaviour matches)
+## 11b. Recomp runs detached in the background (mechanism differs, behaviour matches)
 
-`/ctx-recomp` and `/ctx-session-upgrade` run DETACHED on both harnesses — the
-REPL/TUI stays responsive while the multi-pass historian recomp runs — but the
-mechanism differs because the process models differ:
+`/ctx-recomp` runs DETACHED on both harnesses — the REPL/TUI stays responsive
+while the multi-pass historian recomp runs — but the mechanism differs because
+the process models differ:
 
-- **OpenCode** runs `void runManagedRecomp(...)` / `void runManagedUpgrade(...)`
-  in its separate server process; the TUI client keeps accepting input and shows
-  a live progress bar via RPC polling.
+- **OpenCode** runs `void runManagedRecomp(...)` in its separate server process;
+  the TUI client keeps accepting input and shows a live progress bar via RPC
+  polling.
 - **Pi** is a single-process REPL where the command handler IS the turn, so an
   inline `await` froze all input. Pi instead spawns the recomp via
   `spawnPiRecompRun` (mirroring `spawnPiHistorianRun`): the handler returns
@@ -469,10 +502,10 @@ from the presence of legacy compartments at render time
 (`current.upgradeState !== snapshotMarkers.upgradeState`).
 
 This is **parity**, not a divergence. (Earlier revisions of this doc described
-Pi's marker as a pinned constant — that is stale: Pi gained its own legacy→v2
-`/ctx-session-upgrade` flow and the marker was made dynamic to refold m[0] when a
-session crosses from legacy to upgraded. Pi's detached recomp/upgrade —
-divergence #11b — additionally re-signals materialization through its own path.)
+Pi's marker as a pinned constant — that is stale: the marker was made dynamic so
+m[0] refolds when a recomp rebuilds a session's legacy compartments into the
+current layout. Pi's detached recomp — divergence #11b — additionally re-signals
+materialization through its own path.)
 
 ---
 
@@ -1018,7 +1051,69 @@ Both harness twins now pre-execute a due fold off-wire and feed the shared `fold
 
 Workspace fingerprints preserve the distinction between SQL `NULL` (not workspaced) and a non-empty hash. The compare normalizes only nullish values to `null`; it does not coerce `NULL` to `""`. A legacy zero-length fingerprint would therefore trigger one self-healing fold whose write stores the current `null`, not a per-pass loop.
 
-## Provider context-edit ownership guard and host hook ordering
+## 33. Dropped-input refusal is registered on Pi's event bus
+
+**OpenCode:** The adapter receives tool execution through the host tool hook and
+can reject copied `§N§` drop placeholders before the shell tool runs.
+
+**Pi / OMP:** The extension registers the equivalent refusal on Pi's event bus.
+The scenario asserts the same no-execution contract, but registration and error
+delivery are host-owned and therefore not byte-identical.
+
+**Contract:** `packages/e2e-tests/tests/dropped-input-guard.test.ts` runs one
+assertion set through the selected harness. The Pi-family registration carrier is
+an intentional divergence; accepting or executing the placeholder is not.
+
+## 34. Notice holding is OpenCode-only
+
+OpenCode's assistant-message transform can hold and release notice messages in
+its native run loop. Pi and OMP do not expose an equivalent notice-holding
+carrier: their notices are delivered through Pi UI/event surfaces instead.
+
+`packages/e2e-tests/tests/notice-loop-race.test.ts` therefore remains an
+OpenCode-only behavior scenario, and its manifest entry names the Pi/OMP
+omission explicitly rather than silently treating it as parity.
+
+## 35. OMP provider attestation prevents whole-system byte parity
+
+**HOST-IMPOSED, OMP 18.2.6:** the Anthropic adapter injects
+`x-anthropic-billing-header` into `system[0]` and replaces its `cch` value with
+an XXHash64-derived attestation of the entire outgoing body. Growing the message
+tail therefore changes the system bytes even when Magic Context's contribution
+is frozen. Source: [pi-ai anthropic.ts, createClaudeBillingHeader / patchCch / wrapFetchForCch](https://github.com/can1357/oh-my-pi/blob/v18.2.6/packages/ai/src/providers/anthropic.ts#L685-L759),
+also shipped in `@oh-my-pi/pi-ai@18.2.6/src/providers/anthropic.ts:685-759`.
+Real RPC requests reproduced changing `cch` values (`4527d`, `81d25`) with all
+other system bytes unchanged.
+
+The manifest declares OMP divergences for `cache-stability` and
+`long-running-session`, rather than stripping the header or weakening their
+whole-system identity assertions. The latter fails in phase 1; later OMP phases
+are **not claimed verified** by that scenario. The independent OMP cache-invariant,
+historian, todo, memory, and overflow scenarios remain enabled. Pi's long-session
+marker assertion reads either the pending SQL marker or the applied native JSONL
+marker for the exact published ordinal: Pi does not populate OpenCode's applied
+marker SQL column.
+
+## 36. OMP parity fixtures use native configuration and wire conventions
+
+| Scenarios | Classification and correction |
+| --- | --- |
+| Historian success, deferred marker, emergency blocking, slow historian, overflow recovery, conflict disable | HARNESS GAP: write OMP `config.yml` and Magic Context's shared `XDG_CONFIG_HOME/cortexkit/magic-context.jsonc`; the old Pi-only filenames did not configure OMP. Real OMP historian subprocesses publish without product spawn changes. |
+| Todo synthesis, memory injection | HARNESS GAP: disable OMP `tools.xdev` and `tools.intentTracing` for directly scripted tool replies, and recognize the actual `_todowrite` / `_ctx_memory` Anthropic wire names. IDs, payloads, replay bytes and memory content assertions remain intact. |
+| Cache invariants, compaction off | HARNESS GAP: non-git fixture memory identities must use OMP's exposed cwd, which removes `/private` on macOS, rather than a different realpath spelling. |
+| Short-context overflow | HARNESS GAP: replace exact 20-character repeated cycles with distinct same-sized records. OMP correctly rejected the old ballast as a thinking loop, so no reply mass accumulated. The real run now peaks at 93.6% of 128K, publishes historian work and drops 25 tags. |
+| Window overlay reload | PRODUCT BUG on both Pi hosts: `getContextUsage().contextWindow` is configured catalog metadata, not observed provider truth. Mark it catalog-sourced in pressure, scheduler, wrap-up and status consumers so the measured overlay wins. HARNESS GAP on OMP: add its mock model cell, and restart/resume for reload because OMP RPC leaves `ExtensionCommandContext.reload` unbound/no-op. |
+
+OMP source references, shipped in 18.2.6:
+`pi-coding-agent/src/config/settings.ts:181-194` (`config.yml`),
+`src/config/settings-schema.ts:4639-4646,4749-4778` (intent tracing and xd devices),
+`pi-ai/src/providers/anthropic.ts:886-900` (wire tool prefix),
+`pi-utils/src/dirs.ts:198-203` (`standardizeMacOSPath`), and
+`pi-coding-agent/src/extensibility/extensions/runner.ts:460,711,1261` (reload handler).
+The overlay test preserves exact 100K/160K denominators, the stale-before-reload
+assertion, and the same session ID through the OMP restart.
+
+## 37. Provider context-edit ownership guard and host hook ordering
 
 When Magic Context compaction is enabled, both harnesses fail closed instead of
 silently stripping Anthropic server-side context edits. OpenCode inspects the

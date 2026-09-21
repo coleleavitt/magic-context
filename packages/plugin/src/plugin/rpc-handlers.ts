@@ -7,15 +7,32 @@ import { once } from "node:events";
 import { chmodSync, createWriteStream, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
-import { isCompactionEnabled } from "../config/agent-disable";
+import { COMPACTION_ENABLED_PATH, isCompactionEnabled } from "../config/agent-disable";
 import type { MagicContextConfig } from "../config/schema/magic-context";
-import { getMostRecentTaskRunAt } from "../features/magic-context/dreamer/storage-task-schedule";
+import {
+    getAuthorityManagedMarker,
+    getMemoryMirrorStatus,
+} from "../features/magic-context/context-authority";
+import {
+    getFailingDreamTasks,
+    getMostRecentTaskRunAt,
+} from "../features/magic-context/dreamer/storage-task-schedule";
 import { getDreamTaskBacklogs } from "../features/magic-context/dreamer/task-gates";
 import {
     CANONICAL_DREAM_TASKS,
     type DreamTaskBacklogMap,
+    type DreamTaskFailureState,
+    toolLoopDreamTasks,
 } from "../features/magic-context/dreamer/task-registry";
+import {
+    type DreamerTickFailure,
+    getDreamerTickFailure,
+} from "../features/magic-context/dreamer/tick-failure";
 import { getLocalEmbeddingNativeMemoryStats } from "../features/magic-context/memory/embedding-local";
+import {
+    emptyMemoryImportanceHistogram,
+    getActiveMemoryImportanceHistogram,
+} from "../features/magic-context/memory/memory-diagnostics";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { getMessageIndexQueueHeapStats } from "../features/magic-context/message-index-async";
 import { getMural } from "../features/magic-context/mural/storage-mural";
@@ -39,18 +56,24 @@ import {
     emptyWorkMetricsCarry,
     type WorkMetricsCarry,
 } from "../features/magic-context/work-metrics";
+import type { HiddenCompletionExecutor } from "../hooks/magic-context/compartment-runner-types";
+import {
+    type EmbedHistoryDeps,
+    pauseEmbedHistoryDrain,
+    runEmbedHistoryDrain,
+} from "../hooks/magic-context/embed-history-runner";
 import { getEmbedDrainUiStatus } from "../hooks/magic-context/embed-session-state";
 import {
     resolveContextLimit,
     resolveContextWindowGeometry,
     resolveExecuteThresholdDetail,
 } from "../hooks/magic-context/event-resolvers";
+import { executeFlush } from "../hooks/magic-context/execute-flush";
 import { formatEmbedStatusText } from "../hooks/magic-context/format-embed-status";
 import { getLiveNotificationParams } from "../hooks/magic-context/hook-handlers";
 import type { LiveSessionState } from "../hooks/magic-context/live-session-state";
 import { getLkgSlotHeapStats } from "../hooks/magic-context/lkg-slot";
 import { computeM0BlockTokens } from "../hooks/magic-context/m0-token-breakdown";
-import { RUST_SESSION_UPGRADE_REFUSAL } from "../hooks/magic-context/maintenance-authority";
 import { getCompartmentMirrorHeapStats } from "../hooks/magic-context/module-state-sync";
 import {
     findLastAssistantModelFromOpenCodeDb,
@@ -74,7 +97,9 @@ import {
 import { resolveCacheTtlDisplay } from "../shared/cache-ttl-display";
 import type { ConfigParseFailure } from "../shared/config-diagnostics";
 import { getMagicContextStorageDir } from "../shared/data-path";
+import { activeHostLimitations } from "../shared/host-limitations";
 import { getLoggerDiagnostics, log } from "../shared/logger";
+import { pushNotification } from "../shared/rpc-notifications";
 import type { MagicContextRpcServer } from "../shared/rpc-server";
 import type {
     DebugHeapSnapshotResponse,
@@ -90,6 +115,7 @@ import {
     resolveTailHygieneStatus,
     type WireTailHygieneBaseline,
 } from "../shared/tail-hygiene-status";
+import { renderCapabilityRefusal } from "../shared/user-facing-codes";
 import { applyStickySnapshotCache } from "./sidebar-snapshot-cache";
 
 // Per-process incremental work-metrics state, keyed by session. The RPC server
@@ -124,6 +150,18 @@ export async function executeRustRecompRpc(
 
 export interface RustSessionStatus {
     usage?: { current_total_input_tokens?: number; context_limit_tokens?: number };
+    memory_mirror?: {
+        feed_head?: number;
+        module_live_rows?: number;
+        host_cursor?: number;
+        host_cursor_updated_at_ms?: number;
+        stalled?: boolean;
+        code?: string | null;
+    };
+    authority?: {
+        memories?: { project?: string; state?: "TS" | "PREPARING" | "MODULE" | "DRAINING" } | null;
+        notes?: { project?: string; state?: "TS" | "PREPARING" | "MODULE" | "DRAINING" } | null;
+    };
     tail_hygiene?: WireTailHygieneBaseline | null;
     boundary_present?: boolean;
     coverage_ordinal?: number | null;
@@ -410,6 +448,7 @@ export function buildSidebarSnapshot(
 
         let lastDreamerRunAt: number | null = null;
         let dreamerBacklog: DreamTaskBacklogMap | undefined;
+        let dreamerFailures: DreamTaskFailureState[] | undefined;
         const dreamerProgress = projectIdentity
             ? (liveSessionState?.dreamerProgressByProject?.get(projectIdentity) ?? null)
             : null;
@@ -426,6 +465,9 @@ export function buildSidebarSnapshot(
                 // the live "last successful run" is MAX(last_run_at) across the
                 // project's task_schedule_state rows (issue #194).
                 lastDreamerRunAt = getMostRecentTaskRunAt(db, projectIdentity);
+                // A scheduled task can fail on every slot for weeks. Without this the
+                // only in-session trace is a backlog count that never falls.
+                dreamerFailures = getFailingDreamTasks(db, projectIdentity);
             } catch {
                 // task_schedule_state may not exist on a pre-V2 DB
             }
@@ -543,6 +585,7 @@ export function buildSidebarSnapshot(
         const nativeContextUsagePercentage =
             nativeContextLimit > 0 ? (effectiveInputTokens / nativeContextLimit) * 100 : undefined;
 
+        const hostLimitations = activeHostLimitations();
         const calibration = resolveModelCalibration(activeProviderID, activeModelID);
         const tailHygiene = resolveTailHygieneStatus(
             liveSessionState?.channel1StateBySession.get(sessionId),
@@ -588,6 +631,7 @@ export function buildSidebarSnapshot(
             projectIdentity,
             dreamerBacklog,
             dreamerProgress,
+            ...(dreamerFailures === undefined ? {} : { dreamerFailures }),
             compartmentTokens: calibrated.compartmentTokens,
             factTokens: calibrated.factTokens,
             memoryTokens: calibrated.memoryTokens,
@@ -596,6 +640,7 @@ export function buildSidebarSnapshot(
             conversationTokens: calibrated.conversationTokens,
             toolCallTokens: calibrated.toolCallTokens,
             toolDefinitionTokens: calibrated.toolDefinitionTokens,
+            ...(hostLimitations.length > 0 ? { hostLimitations } : {}),
             ...(tailHygiene === undefined ? {} : { tailHygiene }),
             executeThreshold,
             executeThresholdClamped,
@@ -657,6 +702,15 @@ export function buildSidebarSnapshotRpcResponse(
     }
 }
 
+/** The recorded maintenance-tick failure; storage trouble here reports none. */
+function safeTickFailure(db: Database): DreamerTickFailure | null {
+    try {
+        return getDreamerTickFailure(db);
+    } catch {
+        return null;
+    }
+}
+
 export function buildStatusDetail(
     db: Database,
     sessionId: string,
@@ -678,9 +732,26 @@ export function buildStatusDetail(
         moduleStatus,
         compactionEnabled,
     );
+    const rustMode = config?.transform_mode === "rust";
+    const projectIdentity = rustMode ? resolveProjectIdentity(directory) : null;
+    const moduleMemoryAuthority = moduleStatus?.authority?.memories;
+    const moduleMemoryState = moduleMemoryAuthority?.state;
+    const moduleFeedHead = moduleStatus?.memory_mirror?.feed_head;
     const detail: StatusDetail = {
         ...base,
-        hostBackendsModuleSide: config?.transform_mode === "rust",
+        memoryImportanceHistogram: emptyMemoryImportanceHistogram(),
+        // Not project-scoped: the maintenance timer is one per process, and a
+        // pass that ends early costs every project its work, so this is read
+        // from the shared store rather than from a project's schedule rows.
+        dreamerTickFailure: safeTickFailure(db),
+        hostBackendsModuleSide: rustMode,
+        memoryMirror: rustMode ? getMemoryMirrorStatus(db, moduleFeedHead) : undefined,
+        memoryAuthorityMismatch:
+            rustMode &&
+            moduleStatus?.authority !== undefined &&
+            projectIdentity !== null &&
+            getAuthorityManagedMarker(db, projectIdentity) !== null &&
+            (moduleMemoryState === "TS" || moduleMemoryAuthority === null),
         activeProfile: typeof config?.profile === "string" ? config.profile : null,
         tagCounter: 0,
         activeTags: 0,
@@ -731,6 +802,12 @@ export function buildStatusDetail(
             context_db_schema_version: getPersistedSchemaVersion(db),
             plugin_supported_version: LATEST_SUPPORTED_VERSION,
         };
+        if (base.projectIdentity) {
+            detail.memoryImportanceHistogram = getActiveMemoryImportanceHistogram(
+                db,
+                base.projectIdentity,
+            );
+        }
         const muralConfig = config?.mural as { enabled?: boolean } | undefined;
         if (muralConfig?.enabled && base.projectIdentity) {
             const row = getMural(db, base.projectIdentity);
@@ -1271,6 +1348,7 @@ export function registerRpcHandlers(
         client: unknown;
         liveSessionState: LiveSessionState;
         rustModeModuleClient?: RustModeModuleClient;
+        hiddenCompletionExecutor?: HiddenCompletionExecutor;
         storageDir?: string;
         getDebugMemoryHolders?: () => RuntimeDebugMemoryHolders | undefined;
     },
@@ -1345,7 +1423,7 @@ export function registerRpcHandlers(
                 error: "Rust module status unavailable; canonical session state was not read",
             };
         }
-        return buildStatusDetail(
+        const detail = buildStatusDetail(
             db,
             sessionId,
             dir,
@@ -1355,7 +1433,15 @@ export function registerRpcHandlers(
             injectionBudgetTokens,
             moduleStatus,
             compactionEnabled,
-        ) as unknown as Record<string, unknown>;
+        );
+        // Name the tasks this host cannot run. Only the RPC boundary knows which
+        // completion transport the host supplies, and a user who never sees the
+        // list has no way to tell a task that is unavailable here from one that
+        // simply has no backlog.
+        if (args.hiddenCompletionExecutor?.capabilities.tools === false) {
+            detail.dreamerUnsupportedTasks = toolLoopDreamTasks();
+        }
+        return detail as unknown as Record<string, unknown>;
     });
 
     rpcServer.handle("embed-detail", async (params) => {
@@ -1392,9 +1478,9 @@ export function registerRpcHandlers(
         return { count: buildCompartmentCount(db, sessionId, moduleStatus) };
     });
 
-    // Under TypeScript authority, the RPC dialogs share the same recomp/upgrade
-    // orchestrators as /ctx-* commands. Rust authority branches below: recomp goes
-    // to session.recomp, while session upgrade refuses because the module owns state.
+    // Under TypeScript authority, the RPC dialogs share the same recomp
+    // orchestrator as the /ctx-* commands. Rust authority branches below: recomp
+    // goes to session.recomp because the module owns state.
     const buildManagedCtx = async (
         db: NonNullable<ReturnType<typeof getDb>>,
     ): Promise<ManagedRecompContext> => {
@@ -1409,6 +1495,7 @@ export function registerRpcHandlers(
         const historianModel = resolveHistorianModel(config, "opencode");
         return {
             client: args.client as ManagedRecompContext["client"],
+            hiddenCompletionExecutor: args.hiddenCompletionExecutor,
             db,
             liveSessionState,
             directory,
@@ -1420,7 +1507,6 @@ export function registerRpcHandlers(
             autoPromote: config.memory?.auto_promote ?? true,
             historianModel: historianModel.primary,
             fallbackModels: historianModel.fallbacks,
-            runMigration: config.memory?.enabled !== false && !!historianModel.primary?.model,
             userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
             historianTwoPass: config.historian?.two_pass === true,
             getNotificationParams,
@@ -1459,56 +1545,140 @@ export function registerRpcHandlers(
         return { ok: true };
     });
 
-    // TUI-triggered `/ctx-session-upgrade`: full recomp + once-per-project memory
-    // migration. Fired from the upgrade dialog's "Run upgrade now" action.
-    rpcServer.handle("upgrade", async (params) => {
+    // The three handlers below exist for a host whose only command seam is the
+    // TUI (OpenCode 2 registers /ctx-* through its keymap layer, and its lane
+    // never runs the OpenCode 1 `command.execute.before` hook). Each performs the
+    // same server-side work as the matching command branch and returns its text,
+    // so the caller can render it in a dialog or toast instead of a chat row.
+    const compactionOffRefusal = (command: string): string =>
+        `Magic Context compaction is disabled (${COMPACTION_ENABLED_PATH}: false) — /${command} manages compacted history and has no effect in this mode.`;
+
+    /** Show a completed background run's text on whichever TUI is listening. */
+    const pushResultDialog = (sessionId: string, title: string, message: string): void => {
+        pushNotification("action", { action: "show-result-dialog", title, message }, sessionId);
+    };
+
+    rpcServer.handle("flush", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
+        if (!compactionEnabled) return { ok: true, message: compactionOffRefusal("ctx-flush") };
+        let message: string;
+        if (config.transform_mode === "rust" && rustModeModuleClient) {
+            try {
+                const response = await rustModeModuleClient.call({
+                    sessionId,
+                    projectRoot: String(params.directory ?? directory),
+                    method: "session.flush",
+                    body: { method: "session.flush", v: 1, session_id: sessionId },
+                });
+                const value = (response ?? {}) as Record<string, unknown>;
+                message =
+                    value.armed === false
+                        ? "No pending operations to flush."
+                        : "Flushed: Changes take effect on next message.";
+            } catch (error) {
+                log("[rpc] flush failed:", error);
+                return { ok: false, error: renderCapabilityRefusal("context_cleanup") };
+            }
+        } else {
+            const db = getDb();
+            if (!db) return { ok: false, error: "db unavailable" };
+            message = executeFlush(db, sessionId);
+        }
+        // The user asked for a full refresh, so signal all three one-shot sets:
+        // rebuild <session-history>, re-read the system-prompt adjuncts, and force
+        // the queued drops to materialize. That makes the next request a priced
+        // pass instead of leaving the flush invisible until one happens anyway.
+        liveSessionState.historyRefreshSessions.add(sessionId);
+        liveSessionState.systemPromptRefreshSessions.add(sessionId);
+        liveSessionState.pendingMaterializationSessions.add(sessionId);
+        return { ok: true, message };
+    });
+
+    rpcServer.handle("wrapup", async (params) => {
+        const sessionId = String(params.sessionId ?? "");
+        if (!sessionId) return { ok: false, error: "no session" };
+        if (!compactionEnabled) return { ok: true, message: compactionOffRefusal("ctx-wrapup") };
+        const requested = Number(params.messagesToKeep ?? 20);
+        const messagesToKeep = Number.isSafeInteger(requested) && requested > 0 ? requested : 20;
         if (config.transform_mode === "rust") {
-            return { ok: false, error: RUST_SESSION_UPGRADE_REFUSAL };
+            return { ok: false, error: renderCapabilityRefusal("history_compression") };
         }
         const db = getDb();
         if (!db) return { ok: false, error: "db unavailable" };
 
-        const { runManagedUpgrade } = await import("../hooks/magic-context/recomp-orchestrator");
-        const { sendIgnoredMessage } = await import(
-            "../hooks/magic-context/send-session-notification"
-        );
-        log(`[rpc] session-upgrade requested for session ${sessionId}`);
-        const ctx = await buildManagedCtx(db);
-        void runManagedUpgrade(ctx, sessionId)
-            .then((message) => {
-                void sendIgnoredMessage(
-                    args.client,
+        const { runManagedWrapup } = await import("../hooks/magic-context/wrapup-orchestrator");
+        const model = liveSessionState.liveModelBySession.get(sessionId);
+        const contextLimit = model
+            ? resolveContextLimit(model.providerID, model.modelID, { db, sessionID: sessionId })
+            : 128_000;
+        const ctx = {
+            ...(await buildManagedCtx(db)),
+            contextLimit,
+            executeThresholdPercentage: resolveExecuteThresholdDetail(
+                config.execute_threshold_percentage ?? 65,
+                model ? `${model.providerID}/${model.modelID}` : undefined,
+                65,
+                {
+                    tokensConfig: config.execute_threshold_tokens,
+                    contextLimit,
                     sessionId,
-                    message,
-                    getNotificationParams(sessionId),
-                    true, // force-persist: a multi-minute upgrade's outcome must stay visible
-                ).catch(() => {});
-            })
-            .catch((error: unknown) => log("[rpc] session-upgrade failed:", error));
-        return { ok: true };
+                },
+            ).percentage,
+            hasPendingNaturalBust: (sid: string) =>
+                liveSessionState.historyRefreshSessions.has(sid) ||
+                liveSessionState.systemPromptRefreshSessions.has(sid) ||
+                liveSessionState.pendingMaterializationSessions.has(sid),
+        };
+        log(`[rpc] wrapup requested for session ${sessionId} (keep ${messagesToKeep})`);
+        // Fire-and-forget: a wrapup runs the historian over the live tail and can
+        // take minutes, which is far longer than an RPC caller can wait.
+        void runManagedWrapup(ctx, sessionId, { messagesToKeep })
+            .then((message) => pushResultDialog(sessionId, "Wrapup", message))
+            .catch((error: unknown) => log("[rpc] wrapup failed:", error));
+        return { ok: true, started: true };
     });
 
-    // The user made an explicit choice on the upgrade dialog (Confirm or Cancel).
-    // Set the durable stamp so the FRESH reminder won't re-show. We deliberately
-    // do NOT stamp when the dialog is merely displayed — a display that the user
-    // closed/ctrl-c'd before acting must re-show on the next process (dogfood
-    // 2026-05-30). Resume prompts are staging-driven and unaffected by this stamp.
-    rpcServer.handle("dismiss-upgrade-reminder", async (params) => {
+    rpcServer.handle("embed", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
         const db = getDb();
         if (!db) return { ok: false, error: "db unavailable" };
+        const action = String(params.action ?? "status");
+        const embedDeps: EmbedHistoryDeps = {
+            db,
+            resolveDirectory: (id) =>
+                liveSessionState.sessionDirectoryBySession.get(id) ??
+                String(params.directory ?? directory),
+            memoryEnabled: config.memory?.enabled !== false,
+            allowHomeProject: config.allow_home_project,
+            recompProgressBySession: liveSessionState.recompProgressBySession,
+        };
+        if (action === "pause") {
+            return { ok: true, message: pauseEmbedHistoryDrain(embedDeps, sessionId) };
+        }
+        if (action === "start") {
+            log(`[rpc] embed start requested for session ${sessionId}`);
+            // Same reason as wrapup: a backfill over a long session's compartments
+            // outlives the request, so the outcome arrives as a dialog.
+            void runEmbedHistoryDrain(embedDeps, sessionId)
+                .then((message) => pushResultDialog(sessionId, "Embed", message))
+                .catch((error: unknown) => log("[rpc] embed start failed:", error));
+            return { ok: true, started: true };
+        }
         try {
-            const { updateSessionMeta } = await import(
-                "../features/magic-context/storage-meta-session"
-            );
-            updateSessionMeta(db, sessionId, { upgradeRemindedAt: Date.now() });
-            return { ok: true };
+            return {
+                ok: true,
+                message: buildEmbedDetail(
+                    db,
+                    sessionId,
+                    String(params.directory ?? directory),
+                    liveSessionState,
+                ).statusText,
+            };
         } catch (error) {
-            log("[rpc] dismiss-upgrade-reminder failed:", error);
-            return { ok: false, error: String(error) };
+            log("[rpc] embed status error:", error);
+            return { ok: false, error: "unavailable" };
         }
     });
 

@@ -10,6 +10,7 @@ import {
     type SessionFact,
 } from "../../features/magic-context/compartment-storage";
 import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
+import { compareMemorySelectionPriority } from "../../features/magic-context/memory/memory-selection";
 import {
     getMaxMemoryIdForProjects,
     getMemoriesByProject,
@@ -54,6 +55,7 @@ import {
     COMPARTMENT_RENDER_EPOCH,
     decodeCachedM0UpgradeIdentity,
     encodeCachedM0UpgradeIdentity,
+    MEMORY_RENDER_FORMAT_EPOCH,
 } from "./compartment-render-epoch";
 import { extractM0Block, renderCompartmentAtTier, renderDecayedCompartments } from "./decay-render";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
@@ -390,11 +392,17 @@ export function prepareCompartmentInjection(
         }
     }
 
+    // A compartment whose endpoints could not be re-derived after the host
+    // changed store projections still renders: its summary IS the history and
+    // does not depend on the raw rows (most old compartments outlive their raw
+    // rows anyway once the host prunes them). Only its start/end coordinates
+    // are stale, and range recovery refuses those by rebase_status, so the
+    // agent gets the compartment text and a clear refusal instead of a gap.
     const compartments = getCompartments(db, sessionId);
     // v2 faithful facts: session_facts is retired as a render source. Facts are
     // promoted to project memory and render via <project-memory>. We no longer
     // read or render session_facts here (matching the runner's removed write
-    // side); legacy pre-v2 rows are left un-rendered until /ctx-session-upgrade.
+    // side); legacy pre-v2 rows are left un-rendered.
     const facts: SessionFact[] = [];
 
     let memoryBlock: string | undefined;
@@ -750,6 +758,8 @@ export interface M0SnapshotMarkers {
     sessionFactsVersion: number;
     upgradeState: string | null;
     compartmentRenderEpoch: string | null;
+    /** Records the renderer used by cached bytes; written on a natural HARD but never triggers one. */
+    memoryRenderEpoch: string | null;
     // HARD-bust markers are captured from runtime signals at the injectM0M1
     // call site (NOT a pure DB read), so readCurrentM0SnapshotMarkers takes
     // them as inputs. The tool-set hash is retained for attribution only: its
@@ -848,6 +858,8 @@ export interface M0M1RenderOptions {
     allowFreshContentionFallback?: boolean;
     /** Exact off-wire prefix chosen before reduction gates; do not decide again at delivery. */
     preparedPrefix?: InjectM0M1Result;
+    /** Preserve the original host message order so prefix trimming can still identify the boundary after replay or pruning removes rows. */
+    prefixTrimSourceOrder?: PrefixTrimSourceOrder;
     /** Persisted pair captured before a fallible preflight. Contention may recover
      * from it, but must not adopt a newer row written while the preflight ran. */
     contentionFallbackPrefix?: InjectM0M1Result;
@@ -894,6 +906,16 @@ export interface MaterializeM0Result {
     renderedMemoryIds: number[];
 }
 
+export type PrefixTrimStatus = "not-attempted" | "not-required" | "applied" | "refused";
+
+export interface PrefixTrimSourceOrder {
+    /** Stable IDs in the exact order supplied by the host before this transform mutates the array. */
+    messageIds: readonly string[];
+    /** ID-less synthetic users are valid only as one contiguous leading block. */
+    syntheticHeadCount: number;
+    invalidReason: string | null;
+}
+
 export interface InjectM0M1Result {
     injected: boolean;
     prependedMessageCount: number;
@@ -904,6 +926,7 @@ export interface InjectM0M1Result {
     m1Text: string | null;
     preparedMessages?: MessageLike[];
     preparedTrimBoundaryId?: string | null;
+    prefixTrimStatus?: PrefixTrimStatus;
 }
 
 export class MaterializeContentionError extends Error {
@@ -1048,16 +1071,6 @@ function memoryCanonicalIdentity(memory: Memory, workspace: WorkspaceRenderConte
         workspace.identities,
         workspace.canonicalIdentityByStoredPath,
     );
-}
-
-function memorySelectionOrder(left: Memory, right: Memory): number {
-    if (left.status === "permanent" && right.status !== "permanent") return -1;
-    if (right.status === "permanent" && left.status !== "permanent") return 1;
-    const leftImportance = left.importance ?? Number.NEGATIVE_INFINITY;
-    const rightImportance = right.importance ?? Number.NEGATIVE_INFINITY;
-    const importanceDiff = rightImportance - leftImportance;
-    if (importanceDiff !== 0) return importanceDiff;
-    return left.id - right.id;
 }
 
 function memoryRenderOrder(left: Memory, right: Memory): number {
@@ -1412,6 +1425,7 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
             sessionFactsVersion: getSessionFactsVersion(args.db, args.sessionId),
             upgradeState: getUpgradeState(args.db, args.sessionId),
             compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
+            memoryRenderEpoch: MEMORY_RENDER_FORMAT_EPOCH,
             systemHash: hard.systemHash,
             toolSetHash: hard.toolSetHash ?? "",
             modelKey: piModelRefToCanonical(hard.modelKey),
@@ -1518,6 +1532,7 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
         sessionFactsVersion: state.cachedM0SessionFactsVersion,
         upgradeState: cachedUpgradeIdentity.upgradeState,
         compartmentRenderEpoch: cachedUpgradeIdentity.compartmentRenderEpoch,
+        memoryRenderEpoch: cachedUpgradeIdentity.memoryRenderEpoch,
         systemHash: state.cachedM0SystemHash ?? "",
         toolSetHash: state.cachedM0ToolSetHash ?? "",
         modelKey: state.cachedM0ModelKey ?? "",
@@ -1591,6 +1606,8 @@ export function mustMaterialize(args: {
     if (cachedUpgradeIdentity.compartmentRenderEpoch !== current.compartmentRenderEpoch) {
         return { value: true, reason: "compartment_render_epoch" };
     }
+    // The memory-render epoch is intentionally NOT compared here. Selection changes
+    // affect m[0] bytes only when the next natural HARD rebuilds the frozen prefix.
     // Null components are legacy rows encoded before mural/budget joined the
     // identity: adopt silently (the values persist on the next natural HARD)
     // rather than folding the whole fleet once at upgrade. Only a real change
@@ -1730,7 +1747,7 @@ export function trimMemoriesToBudgetV2(
     budgetTokens: number,
     renderOptions: MemoryRenderOptions = {},
 ): TrimMemoriesResultV2 {
-    const selectionOrder = [...memories].sort(memorySelectionOrder);
+    const selectionOrder = [...memories].sort(compareMemorySelectionPriority);
     const selected: Memory[] = [];
     const accounting = createMemoryBlockAccounting(renderOptions);
 
@@ -1779,7 +1796,7 @@ export function trimWorkspaceMemoriesToBudgetV2(
 
     for (const memory of memories
         .filter((candidate) => candidate.status === "permanent")
-        .sort(memorySelectionOrder)) {
+        .sort(compareMemorySelectionPriority)) {
         trySelect(memory);
     }
 
@@ -1797,7 +1814,7 @@ export function trimWorkspaceMemoriesToBudgetV2(
 
     for (const identity of workspace.identities) {
         let memberTokens = 0;
-        const candidates = (byIdentity.get(identity) ?? []).sort(memorySelectionOrder);
+        const candidates = (byIdentity.get(identity) ?? []).sort(compareMemorySelectionPriority);
         for (const memory of candidates) {
             if (selectedIds.has(memory.id)) continue;
             const cost = accounting.candidateCost(memory);
@@ -1812,7 +1829,7 @@ export function trimWorkspaceMemoriesToBudgetV2(
 
     const remaining = memories
         .filter((memory) => !selectedIds.has(memory.id))
-        .sort(memorySelectionOrder);
+        .sort(compareMemorySelectionPriority);
     for (const memory of remaining) {
         trySelect(memory);
     }
@@ -1857,7 +1874,7 @@ function readM0Compartments(db: Database, sessionId: string): M0Compartment[] {
         db,
         `SELECT id, session_id, sequence, start_message, end_message, start_message_id,
                 end_message_id, title, content, p1, p2, p3, p4, episode_type,
-                created_at, importance, legacy
+                created_at, importance, legacy, rebase_status
            FROM compartments
           WHERE session_id = ?
           ORDER BY sequence ASC`,
@@ -1919,6 +1936,7 @@ function rowToM0Compartment(row: Record<string, unknown>): M0Compartment {
         episodeType: nullableString(row.episode_type),
         legacy: Number(row.legacy ?? 0),
         createdAt: Number(row.created_at ?? 0),
+        rebaseStatus: row.rebase_status === "unresolved" ? "unresolved" : "ok",
     };
 }
 
@@ -1932,7 +1950,7 @@ function readNewCompartments(
         db,
         `SELECT id, session_id, sequence, start_message, end_message, start_message_id,
                 end_message_id, title, content, p1, p2, p3, p4, episode_type,
-                created_at, importance, legacy
+                created_at, importance, legacy, rebase_status
            FROM compartments
           WHERE session_id = ? AND sequence > ?
           ORDER BY sequence ASC`,
@@ -2123,6 +2141,7 @@ function applyMarkersToState(
         markers.compartmentRenderEpoch,
         markers.muralEnabled,
         markers.renderBudgetIdentity,
+        markers.memoryRenderEpoch,
     );
     // Runtime markers must be mirrored into flat state because the next
     // mustMaterialize pass reads cachedM0SystemHash/ToolSetHash/ModelKey directly
@@ -2370,6 +2389,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             sessionFactsVersion: getSessionFactsVersion(options.db, options.sessionId),
             upgradeState: getUpgradeState(options.db, options.sessionId),
             compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
+            memoryRenderEpoch: MEMORY_RENDER_FORMAT_EPOCH,
             // HARD-bust markers are flight-constant (system/tool/model identity of
             // THIS request) — they cannot change mid-materialization-transaction,
             // so carry the captured values and exclude them from the stale check.
@@ -2440,6 +2460,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
                 snapshotMarkers.compartmentRenderEpoch,
                 snapshotMarkers.muralEnabled,
                 snapshotMarkers.renderBudgetIdentity,
+                snapshotMarkers.memoryRenderEpoch,
             ),
             systemHash: snapshotMarkers.systemHash,
             toolSetHash: snapshotMarkers.toolSetHash,
@@ -2847,6 +2868,7 @@ function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
         sessionFactsVersion: row.cached_m0_session_facts_version,
         upgradeState: cachedUpgradeIdentity.upgradeState,
         compartmentRenderEpoch: cachedUpgradeIdentity.compartmentRenderEpoch,
+        memoryRenderEpoch: cachedUpgradeIdentity.memoryRenderEpoch,
         systemHash: row.cached_m0_system_hash ?? "",
         toolSetHash: row.cached_m0_tool_set_hash ?? "",
         modelKey: row.cached_m0_model_key ?? "",
@@ -2908,6 +2930,7 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
         markers.compartmentRenderEpoch,
         markers.muralEnabled,
         markers.renderBudgetIdentity,
+        markers.memoryRenderEpoch,
     );
     state.cachedM0SystemHash = markers.systemHash;
     state.cachedM0ToolSetHash = markers.toolSetHash;
@@ -3180,6 +3203,56 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
     };
 }
 
+function isSyntheticPrefixHead(message: MessageLike): boolean {
+    if (
+        message.info.id !== undefined ||
+        message.info.role !== "user" ||
+        message.parts.length === 0
+    ) {
+        return false;
+    }
+    return message.parts.every((part) => (part as { synthetic?: boolean }).synthetic === true);
+}
+
+/**
+ * Freeze the host's source order before tag replay and tool pruning mutate the live array.
+ * The IDs are evidence only: delivery trims surviving live objects and never restores old parts.
+ */
+export function capturePrefixTrimSourceOrder(
+    messages: readonly MessageLike[],
+): PrefixTrimSourceOrder {
+    const messageIds: string[] = [];
+    const seen = new Set<string>();
+    let syntheticHeadCount = 0;
+    let sawPersistedRow = false;
+    let invalidReason: string | null = null;
+
+    for (const [index, message] of messages.entries()) {
+        const id = message.info.id;
+        if (typeof id !== "string" || id.length === 0) {
+            if (!sawPersistedRow && isSyntheticPrefixHead(message)) {
+                syntheticHeadCount += 1;
+                continue;
+            }
+            invalidReason = `source message at index ${index} has no stable id outside the synthetic head`;
+            break;
+        }
+        sawPersistedRow = true;
+        if (seen.has(id)) {
+            invalidReason = `source message id ${id} appears more than once`;
+            break;
+        }
+        seen.add(id);
+        messageIds.push(id);
+    }
+
+    return Object.freeze({
+        messageIds: Object.freeze(messageIds),
+        syntheticHeadCount,
+        invalidReason,
+    });
+}
+
 function trimToPreparedPrefix(
     options: M0M1RenderOptions,
     prepared: Pick<
@@ -3188,18 +3261,83 @@ function trimToPreparedPrefix(
         | "m0RematerializedThisPass"
         | "materializationContentionRetryExhausted"
     >,
-): void {
-    if (options.compactionOff || !options.messages) return;
+): PrefixTrimStatus {
+    if (options.compactionOff || !options.messages) return "not-attempted";
     const boundary = prepared.preparedTrimBoundaryId;
-    const index = boundary
-        ? options.messages.findIndex((message) => message.info.id === boundary)
-        : -1;
-    if (index >= 0) options.messages.splice(0, index + 1);
+    let status: PrefixTrimStatus = "not-required";
+
+    if (boundary) {
+        const sourceOrder = options.prefixTrimSourceOrder;
+        if (sourceOrder) {
+            const refuse = (reason: string): PrefixTrimStatus => {
+                sessionLog(
+                    options.sessionId,
+                    `prefix trim: boundary ${boundary}; pass=${options.isCacheBustingPass ? "priced" : "defer"}; no in-pass trim applied (${reason})`,
+                );
+                return "refused";
+            };
+            if (sourceOrder.invalidReason) {
+                status = refuse(sourceOrder.invalidReason);
+            } else {
+                const sourcePosition = new Map<string, number>();
+                sourceOrder.messageIds.forEach((id, index) => {
+                    sourcePosition.set(id, index);
+                });
+                const boundaryPosition = sourcePosition.get(boundary);
+                if (boundaryPosition === undefined) {
+                    status = refuse("boundary absent from immutable source order");
+                } else {
+                    let lastSourcePosition = -1;
+                    let sawPersistedRow = false;
+                    let liveOrderError: string | null = null;
+                    const retained: MessageLike[] = [];
+                    for (const [index, message] of options.messages.entries()) {
+                        const id = message.info.id;
+                        if (typeof id !== "string" || id.length === 0) {
+                            if (!sawPersistedRow && isSyntheticPrefixHead(message)) continue;
+                            liveOrderError = `live message at index ${index} has no stable id outside the synthetic head`;
+                            break;
+                        }
+                        sawPersistedRow = true;
+                        const position = sourcePosition.get(id);
+                        if (position === undefined) {
+                            liveOrderError = `live message ${id} is absent from immutable source order`;
+                            break;
+                        }
+                        if (position <= lastSourcePosition) {
+                            liveOrderError = `live message ${id} violates immutable source order`;
+                            break;
+                        }
+                        lastSourcePosition = position;
+                        if (position > boundaryPosition) retained.push(message);
+                    }
+                    if (liveOrderError) status = refuse(liveOrderError);
+                    else {
+                        options.messages.splice(0, options.messages.length, ...retained);
+                        status = "applied";
+                    }
+                }
+            }
+        } else {
+            const index = options.messages.findIndex((message) => message.info.id === boundary);
+            if (index >= 0) {
+                options.messages.splice(0, index + 1);
+                status = "applied";
+            } else {
+                sessionLog(
+                    options.sessionId,
+                    `prefix trim: boundary ${boundary} absent from current messages; pass=${options.isCacheBustingPass ? "priced" : "defer"}; no in-pass trim applied`,
+                );
+                status = "refused";
+            }
+        }
+    }
     if (
         prepared.m0RematerializedThisPass ||
         (options.isCacheBustingPass && !prepared.materializationContentionRetryExhausted)
     )
         clearInjectionCache(options.sessionId);
+    return status;
 }
 
 /** Capture a complete persisted pair and its boundary before a fallible preflight. */
@@ -3245,11 +3383,16 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
     const prepared = options.preparedPrefix;
     if (prepared?.preparedMessages) {
         const head = prepared.preparedMessages;
+        let prefixTrimStatus: PrefixTrimStatus = "not-attempted";
         if (options.messages) {
-            trimToPreparedPrefix(options, prepared);
+            prefixTrimStatus = trimToPreparedPrefix(options, prepared);
             options.messages.unshift(...structuredClone(head));
         }
-        return { ...prepared, prependedMessageCount: options.messages ? head.length : 0 };
+        return {
+            ...prepared,
+            prependedMessageCount: options.messages ? head.length : 0,
+            prefixTrimStatus,
+        };
     }
     // Callers normally pass getOrCreateSessionMeta(), which already contains the
     // persisted mural payload. Keep compatibility with lean process-local states
@@ -3513,32 +3656,30 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
             ? contentionReplayBoundary
             : readCachedBaselineState(options.db, options.sessionId).boundary;
     const preparedMessages: MessageLike[] = [];
-    let prependedMessageCount = 0;
-    {
-        const muralForWire = options.state.cachedM0MuralDataUrl
-            ? {
-                  enabled: true,
-                  supportsVision: true,
-                  dataUrl: options.state.cachedM0MuralDataUrl,
-                  contentHash: options.state.cachedM0MuralHash ?? undefined,
-              }
-            : undefined;
-        prependedMessageCount = prependM0M1Messages(
-            options.sessionId,
-            preparedMessages,
-            m0Text,
-            m1Text,
-            muralForWire,
-        );
-        if (options.messages) {
-            trimToPreparedPrefix(options, {
-                m0RematerializedThisPass: rematerialized,
-                materializationContentionRetryExhausted: contentionExhausted,
-                preparedTrimBoundaryId,
-            });
-            options.messages.unshift(...structuredClone(preparedMessages));
-        } else prependedMessageCount = 0;
-    }
+    const muralForWire = options.state.cachedM0MuralDataUrl
+        ? {
+              enabled: true,
+              supportsVision: true,
+              dataUrl: options.state.cachedM0MuralDataUrl,
+              contentHash: options.state.cachedM0MuralHash ?? undefined,
+          }
+        : undefined;
+    let prependedMessageCount = prependM0M1Messages(
+        options.sessionId,
+        preparedMessages,
+        m0Text,
+        m1Text,
+        muralForWire,
+    );
+    let prefixTrimStatus: PrefixTrimStatus = "not-attempted";
+    if (options.messages) {
+        prefixTrimStatus = trimToPreparedPrefix(options, {
+            m0RematerializedThisPass: rematerialized,
+            materializationContentionRetryExhausted: contentionExhausted,
+            preparedTrimBoundaryId,
+        });
+        options.messages.unshift(...structuredClone(preparedMessages));
+    } else prependedMessageCount = 0;
 
     return {
         injected: true,
@@ -3550,5 +3691,6 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
         m1Text,
         preparedMessages,
         preparedTrimBoundaryId,
+        prefixTrimStatus,
     };
 }
