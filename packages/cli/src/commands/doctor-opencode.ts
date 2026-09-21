@@ -54,6 +54,7 @@ import { Database } from "@magic-context/core/shared/sqlite";
 import { ensureTuiPluginEntry } from "@magic-context/core/shared/tui-config";
 import { parse, stringify } from "comment-json";
 import {
+    devPathPluginPackageDir,
     isDevPathPluginEntry,
     isLocalPathPluginEntry,
     matchesPluginEntry,
@@ -69,6 +70,7 @@ import { formatDatabaseRepairGuidance } from "../lib/database-repair-guidance";
 import { collectDiagnostics } from "../lib/diagnostics-opencode";
 import {
     checkLocalEmbeddingRuntime,
+    checkLocalEmbeddingRuntimeByResolution,
     formatLocalEmbeddingRuntimeDoctorWarning,
     formatLocalEmbeddingRuntimeWasmFallback,
     formatLocalEmbeddingRuntimeWasmSelected,
@@ -465,17 +467,74 @@ async function runIssueFlow(): Promise<number> {
 // bundle when the native addon is absent. Verify both lanes so a loadable
 // onnxruntime-web package cannot hide a missing persistence-capable bundle.
 // Shared by the explicit-`local` branch and the no-config/default-provider path.
+/**
+ * Install trees to probe for the local embedding runtime, newest-intent first.
+ *
+ * A `file://` registration in opencode.json / tui.json is a real install whose
+ * only tree is the checkout itself, and OpenCode fetches nothing from npm for
+ * it — so `getOpenCodePluginCacheRoots()` is empty and the cache-root probe
+ * reports "no installed plugin tree found to inspect" on a fully working dev
+ * setup. Collect the dev dirs the same way the Pi doctor does
+ * (`piPluginDirCandidates`), and keep the cache roots for managed installs.
+ */
+function openCodeDevPluginDirs(): string[] {
+    const paths = detectConfigPaths();
+    const dirs: string[] = [];
+    const collect = (
+        file: string,
+        format: "json" | "jsonc" | "none",
+        read: (config: Record<string, unknown>) => unknown[],
+    ): void => {
+        if (format === "none" || !existsSync(file)) return;
+        try {
+            const config = parse(readFileSync(file, "utf-8")) as Record<string, unknown>;
+            for (const entry of read(config)) {
+                const dir = devPathPluginPackageDir(entry);
+                if (dir && !dirs.includes(dir)) dirs.push(dir);
+            }
+        } catch {
+            // An unparseable host config is reported by its own check; the
+            // embedding probe must not fail because of it.
+        }
+    };
+    collect(paths.opencodeConfig, paths.opencodeConfigFormat, (config) =>
+        readPluginEntries(config).map(({ entry }) => entry),
+    );
+    collect(paths.tuiConfig, paths.tuiConfigFormat, (config) =>
+        Array.isArray(config.plugin) ? config.plugin : [],
+    );
+    return dirs;
+}
+
 function checkLocalEmbeddingRuntimeForDoctor(runtimePreference: LocalEmbeddingRuntime = "auto"): {
     issues: number;
     localRuntimeBroken?: boolean;
     unverified?: boolean;
 } {
-    const runtime = checkLocalEmbeddingRuntime(
+    let runtime = checkLocalEmbeddingRuntime(
         getOpenCodePluginCacheRoots(),
         process.platform,
         process.arch,
         runtimePreference,
     );
+    // Dev checkouts hoist differently than the npm cache (bun workspace vs
+    // `<root>/node_modules/onnxruntime-node`), so ask Node's resolver from the
+    // plugin dir exactly as the plugin would at runtime. Only consulted when the
+    // cache roots produced no verdict, so a managed install keeps reporting for
+    // itself.
+    if (runtime.state === "unknown") {
+        for (const pluginDir of openCodeDevPluginDirs()) {
+            const devRuntime = checkLocalEmbeddingRuntimeByResolution(
+                pluginDir,
+                process.platform,
+                process.arch,
+                runtimePreference,
+            );
+            if (devRuntime.state === "unknown") continue;
+            runtime = devRuntime;
+            if (devRuntime.state === "ok" || devRuntime.state === "wasm-selected") break;
+        }
+    }
     if (runtime.state === "wasm-selected") {
         log.info(formatLocalEmbeddingRuntimeWasmSelected(runtime));
         return { issues: 0 };

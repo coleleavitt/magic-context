@@ -326,8 +326,22 @@ export function isLocalPathPluginEntry(entry: unknown): boolean {
  * such as `magic-context-theme` must not suppress the real plugin registration.
  */
 export function isDevPathPluginEntry(entry: unknown): boolean {
+    return devPathPluginPackageDir(entry) !== null;
+}
+
+/**
+ * The package directory a dev-path entry resolves to, but only when the nearest
+ * package.json above it names the OpenCode Magic Context package. Returns null
+ * for managed specifiers, foreign local packages, and unreadable paths.
+ *
+ * A dev checkout is the only install tree a `file://` registration has, so the
+ * doctor's local-embedding probe needs the directory itself, not just the
+ * boolean — `getOpenCodePluginCacheRoots()` is empty when nothing was ever
+ * fetched from npm.
+ */
+export function devPathPluginPackageDir(entry: unknown): string | null {
     const candidate = pluginEntryPackage(entry);
-    if (!candidate || !isLocalPathPluginEntry(entry)) return false;
+    if (!candidate || !isLocalPathPluginEntry(entry)) return null;
 
     let localPath: string;
     try {
@@ -343,14 +357,14 @@ export function isDevPathPluginEntry(entry: unknown): boolean {
             const packagePath = resolve(localPath, "package.json");
             if (existsSync(packagePath)) {
                 const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as { name?: unknown };
-                return pkg.name === PLUGIN_NAME;
+                return pkg.name === PLUGIN_NAME ? localPath : null;
             }
             localPath = dirname(localPath);
         }
     } catch {
         // An unreadable or unresolved path cannot prove that our plugin is installed.
     }
-    return false;
+    return null;
 }
 
 /**

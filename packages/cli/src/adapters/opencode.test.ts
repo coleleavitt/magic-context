@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { OpenCodeAdapter } from "./opencode";
+import { pathToFileURL } from "node:url";
+import { devPathPluginPackageDir, OpenCodeAdapter } from "./opencode";
 
 // An OpenCode 2 host reads its native `plugins` array and still decodes the legacy
 // `plugin` array, loading BOTH. A user who registered a checkout under `plugins`
@@ -102,5 +103,49 @@ describe("OpenCodeAdapter registration keys across host generations", () => {
         const result = await adapter.removePluginEntry();
         expect(result.ok).toBe(true);
         expect(read()).toEqual({ plugins: ["other"] });
+    });
+});
+
+// A `file://` registration is a real install whose only tree is the checkout.
+// The doctor's local-embedding probe needs the directory, not just a boolean,
+// because OpenCode fetches nothing from npm for a dev path and the plugin cache
+// roots are therefore empty.
+describe("devPathPluginPackageDir", () => {
+    const checkout = resolve(import.meta.dir, "../../../plugin");
+
+    test("returns the package dir for a file:// entry pointing at the plugin", () => {
+        expect(devPathPluginPackageDir(pathToFileURL(checkout).href)).toBe(checkout);
+    });
+
+    test("returns the package dir for an entry pointing INSIDE the package", () => {
+        // tui.json registers the TUI entrypoint file, not the package root.
+        const entry = pathToFileURL(join(checkout, "src", "tui", "entry.mjs")).href;
+        expect(devPathPluginPackageDir(entry)).toBe(checkout);
+    });
+
+    test("returns the package dir for an absolute path and an object-form entry", () => {
+        expect(devPathPluginPackageDir(checkout)).toBe(checkout);
+        expect(devPathPluginPackageDir({ package: checkout })).toBe(checkout);
+    });
+
+    test("returns null for a managed npm specifier", () => {
+        expect(devPathPluginPackageDir("@cortexkit/opencode-magic-context@latest")).toBeNull();
+    });
+
+    test("returns null for a local package that is not Magic Context", () => {
+        const foreign = mkdtempSync(join(tmpdir(), "mc-oc-foreign-"));
+        try {
+            writeFileSync(
+                join(foreign, "package.json"),
+                JSON.stringify({ name: "magic-context-theme" }),
+            );
+            expect(devPathPluginPackageDir(foreign)).toBeNull();
+        } finally {
+            rmSync(foreign, { recursive: true, force: true });
+        }
+    });
+
+    test("returns null for a path that does not exist", () => {
+        expect(devPathPluginPackageDir(join(tmpdir(), "mc-oc-absent-dir"))).toBeNull();
     });
 });
