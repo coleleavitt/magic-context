@@ -22,8 +22,8 @@ import {
  * the flush are the control — they must carry some other reason — and the turn
  * after it must carry the explicit-flush one.
  */
-const HEURISTICS_DECISION = "heuristics WILL RUN — reason=";
-const EXPLICIT_FLUSH = `${HEURISTICS_DECISION}explicit_flush`;
+const HEURISTICS_DECISION = "heuristics WILL";
+const EXPLICIT_FLUSH = "heuristics WILL RUN — reason=explicit_flush";
 
 async function eventually<T>(
 	read: () => T | undefined,
@@ -142,6 +142,7 @@ test("/ctx-flush makes the next OpenCode 2 request a priced pass", async () => {
 			"the post-flush turn to run as an explicit-flush pass",
 		);
 		expect(afterFlush.length).toBeGreaterThan(0);
+		expect(readFileSync(join(fixture.root, "llm-schema-guard.jsonl"), "utf8")).toContain(`PASS ${session.id} `);
 	} catch (error) {
 		console.error(host.stdout(), host.stderr());
 		throw error;

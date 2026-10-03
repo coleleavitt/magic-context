@@ -410,12 +410,13 @@ forEachHost(import.meta.url, "long-running OpenCode Magic Context session", (hos
             modelContextLimit: 100_000,
             magicContextConfig: {
                 execute_threshold_percentage: 20,
+                embedding: { provider: "off" },
                 protected_tags: 1,
                 memory: {
                     enabled: true,
                     auto_promote: false,
                     injection_budget_tokens: 500,
-                    auto_search: { enabled: true, score_threshold: 0.1, min_prompt_chars: 12 },
+                    auto_search: { enabled: true, score_threshold: 0.3, min_prompt_chars: 12 },
                     git_commit_indexing: { enabled: false },
                 },
                 dreamer: { disable: true },
@@ -549,15 +550,15 @@ forEachHost(import.meta.url, "long-running OpenCode Magic Context session", (hos
         await send(sessionId, "turn 9: first post-trigger turn records the nudge anchor", "phase 3 nudge anchor");
         let nudgeMarker = await send(sessionId, "turn 10: second post-trigger turn should receive the note nudge", "phase 3 nudge delivery");
         let nudgeBody = (await mainRequestForMarker(nudgeMarker)).body;
-        for (let retry = 0; retry < 4 && !JSON.stringify(nudgeBody).includes("deferred note"); retry += 1) {
+        for (let retry = 0; retry < 4 && !JSON.stringify(nudgeBody).includes("notes ready"); retry += 1) {
             nudgeMarker = await send(sessionId, `turn ${11 + retry}: extra post-trigger turn for persisted nudge delivery`, "phase 3 nudge delivery retry");
             nudgeBody = (await mainRequestForMarker(nudgeMarker)).body;
         }
-        expect(JSON.stringify(nudgeBody)).toContain("deferred note");
+        expect(JSON.stringify(nudgeBody)).toContain("notes ready");
         replayNudgeMarker = await send(sessionId, "turn 15: note nudge sticky replay should be byte-identical", "phase 3 nudge replay");
         const replayNudgeBody = (await mainRequestForMarker(replayNudgeMarker)).body;
-        expect(JSON.stringify(replayNudgeBody)).toContain("deferred note");
-        expect(readMeta<{ note_nudge_anchors: string }>(sessionId, "note_nudge_anchors")?.note_nudge_anchors ?? "").toContain("deferred note");
+        expect(JSON.stringify(replayNudgeBody)).toContain("notes ready");
+        expect(readMeta<{ note_nudge_anchors: string }>(sessionId, "note_nudge_anchors")?.note_nudge_anchors ?? "").toContain("notes ready");
         }
         // The 15-minute cooldown uses process-local wall-clock time; this long test cannot advance it without sleeping.
 
@@ -715,6 +716,12 @@ forEachHost(import.meta.url, "long-running OpenCode Magic Context session", (hos
                 .contextDb()
                 .prepare("SELECT COUNT(*) AS n FROM memories WHERE content = ?")
                 .get(autoSearchMemory) as { n: number } | null;
+            if ((mirroredMemory?.n ?? 0) !== 1) {
+                const body = h.mock.requests().at(-1)?.body;
+                console.error("memory write tool result", JSON.stringify(Array.isArray(body?.messages) ? body.messages.slice(-2) : body).slice(-3000));
+                const diagnostic = await Bun.file(join(h.dataDir, "cortexkit", "magic-context-e2e.log")).text();
+                console.error(diagnostic.split("\n").filter(line => /config|embedding|observation|disabled|registered project/.test(line)).join("\n"));
+            }
             expect(mirroredMemory?.n ?? 0).toBe(1);
         } else {
             seedMemory(autoSearchMemory);

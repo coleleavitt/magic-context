@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import {
     __resetToolDefinitionMeasurements,
+    getLargestMeasuredToolDefinitionTokens,
     recordToolDefinition,
 } from "../../features/magic-context/tool-definition-tokens";
 import {
@@ -39,6 +40,17 @@ function toolMessage(output: string): MessageLike {
 }
 
 describe("final outgoing-wire token estimate", () => {
+    it("counts attachments still sent with a legacy dropped skeleton", () => {
+        const row = toolMessage("[dropped §7§]");
+        const state = (row.parts[0] as { state: { attachments?: unknown[] } }).state;
+        const without = estimate([row]).messageTokens.toolCall;
+        state.attachments = [
+            { type: "file", mime: "image/png", url: "https://example.com/image.png" },
+        ];
+        expect(estimate([row]).messageTokens.toolCall - without).toBe(1200);
+        state.attachments = [];
+        expect(estimate([row]).messageTokens.toolCall).toBe(without);
+    });
     it("describes the final three post-transform message tails compactly", () => {
         const messages = [
             { info: { role: "assistant" }, parts: [{ type: "text" }] },
@@ -76,6 +88,40 @@ describe("final outgoing-wire token estimate", () => {
         expect(unchanged.tokens).toBeGreaterThan(inputLimit);
     });
 
+    it("counts every OpenCode 2 tool-part representation", () => {
+        const convertedOutput = "converted-tool-output ".repeat(20_000);
+        const result = estimate([
+            {
+                info: { id: "v2-parts", role: "assistant" },
+                parts: [
+                    { type: "tool-call", input: { path: "converted.log" } },
+                    { type: "tool-result", result: { type: "text", value: convertedOutput } },
+                    {
+                        type: "tool-invocation",
+                        args: { path: "legacy.log" },
+                        result: convertedOutput,
+                    },
+                    { type: "tool_use", input: { path: "anthropic.log" } },
+                    { type: "tool_result", content: convertedOutput },
+                    {
+                        type: "tool",
+                        state: { input: { path: "native.log" }, output: convertedOutput },
+                    },
+                    {
+                        type: "tool",
+                        state: {
+                            input: { path: "converted.log" },
+                            content: [{ type: "text", text: convertedOutput }],
+                        },
+                    },
+                ],
+            } as unknown as MessageLike,
+        ]);
+
+        expect(result.trusted).toBe(true);
+        expect(result.messageTokens.toolCall).toBeGreaterThan(100_000);
+    });
+
     it("reports a compact completed recomp refresh", () => {
         const trimmed = estimate([
             {
@@ -89,4 +135,78 @@ describe("final outgoing-wire token estimate", () => {
         expect(trimmed.trusted).toBe(true);
         expect(trimmed.messageTokens.conversation).toBeGreaterThan(0);
     });
+});
+
+it("unknown-model fit inflates raw mass instead of admitting a locally-fitting request", () => {
+    const result = estimate([
+        {
+            info: { id: "m", role: "user" },
+            parts: [{ type: "text", text: "hello" }],
+        } as MessageLike,
+    ]);
+    expect(result.tokens).toBeGreaterThanOrEqual(20000);
+    expect(result.rawTokens).toBeLessThan(11000);
+    expect(result.trusted).toBe(true);
+});
+it("uses a conservative measured tool-definition envelope when the current model is unmeasured", () => {
+    recordToolDefinition("test-provider", "measured-model", "build", "read", "A".repeat(4000), {});
+    const result = estimateFinalWireInputTokens({
+        messages: [
+            {
+                info: { id: "m", role: "user" },
+                parts: [{ type: "text", text: "hello" }],
+            } as MessageLike,
+        ],
+        systemPromptTokens: 10_000,
+        providerID: "test-provider",
+        modelID: "unmeasured-model",
+        agentName: "build",
+    });
+    expect(result.trusted).toBe(true);
+    expect(result.toolDefinitionTokens).toBeGreaterThanOrEqual(
+        2 * (getLargestMeasuredToolDefinitionTokens() ?? 0),
+    );
+});
+
+it("unsupported nontext parts never produce a trusted fit estimate", () => {
+    const result = estimate([
+        {
+            info: { id: "m", role: "user" },
+            parts: [{ type: "audio", data: "unknown" }],
+        } as unknown as MessageLike,
+    ]);
+    expect(result.trusted).toBe(false);
+    expect(result.completeness).toBe("partial");
+});
+it("an inline image (like the memory mural in m[0]) keeps the estimate trusted", () => {
+    const result = estimate([
+        {
+            info: { id: "m0", role: "user" },
+            parts: [
+                { type: "text", text: "<memory-mural>" },
+                { type: "file", mime: "image/png", url: "data:image/png;base64,iVBORw0KGgo=" },
+            ],
+        } as unknown as MessageLike,
+    ]);
+    expect(result.trusted).toBe(true);
+});
+
+it("a non-image attachment still leaves the estimate untrusted", () => {
+    const result = estimate([
+        {
+            info: { id: "m", role: "user" },
+            parts: [{ type: "file", mime: "application/pdf", url: "file:///tmp/spec.pdf" }],
+        } as unknown as MessageLike,
+    ]);
+    expect(result.trusted).toBe(false);
+});
+
+it("nonfinite system mass cannot be trusted even with known tool definitions", () => {
+    estimate([]);
+    const result = estimateFinalWireInputTokens({
+        messages: [],
+        ...MODEL,
+        systemPromptTokens: Number.POSITIVE_INFINITY,
+    });
+    expect(result.trusted).toBe(false);
 });

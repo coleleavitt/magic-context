@@ -1,8 +1,15 @@
-import { getMeasuredToolDefinitionTokens } from "../../features/magic-context/tool-definition-tokens";
-import { estimateImageTokensFromDataUrl } from "./image-token-estimate";
+import {
+    getLargestMeasuredToolDefinitionTokens,
+    getMeasuredToolDefinitionTokens,
+} from "../../features/magic-context/tool-definition-tokens";
+import { providerMass, resolveDecisionCalibration } from "./decision-calibration";
+import {
+    estimateImageTokensFromDataUrl,
+    estimateToolAttachmentImageTokens,
+} from "./image-token-estimate";
 import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
-import { resolveModelCalibration } from "./tokenizer-calibration";
+import { UNKNOWN_FIT_RATIO } from "./tokenizer-calibration";
 
 export interface MessageTokenEstimate {
     conversation: number;
@@ -62,10 +69,12 @@ export function estimateMessageTokens(message: MessageLike): MessageTokenEstimat
             signature?: string;
             data?: string;
             ignored?: boolean;
-            state?: { input?: unknown; output?: unknown };
+            state?: { input?: unknown; output?: unknown; content?: unknown; error?: unknown };
             args?: unknown;
             input?: unknown;
             content?: unknown;
+            output?: unknown;
+            result?: unknown;
             mime?: string;
             url?: unknown;
             metadata?: { anthropic?: { signature?: string } };
@@ -97,17 +106,31 @@ export function estimateMessageTokens(message: MessageLike): MessageTokenEstimat
                 }
                 break;
             case "tool":
-                toolCall += serializedTokens(p.state?.input);
-                toolCall += serializedTokens(p.state?.output);
+                toolCall += serializedTokens(p.state?.input ?? p.input ?? p.args);
+                toolCall += serializedTokens(
+                    p.state?.output ?? p.state?.content ?? p.output ?? p.result ?? p.content,
+                );
+                toolCall += serializedTokens(p.state?.error);
+                // Legacy skeletons may still carry media. Count what the wire
+                // actually contains, not what its output marker implies.
+                toolCall += estimateToolAttachmentImageTokens(p.state);
+                break;
+            case "tool-call":
+                toolCall += serializedTokens(p.input ?? p.args);
                 break;
             case "tool-invocation":
-                toolCall += serializedTokens(p.args);
+                toolCall += serializedTokens(p.args ?? p.input);
+                toolCall += serializedTokens(p.result ?? p.output ?? p.state?.output);
+                toolCall += serializedTokens(p.state?.error);
+                break;
+            case "tool-result":
+                toolCall += serializedTokens(p.result ?? p.content ?? p.output);
                 break;
             case "tool_use":
-                toolCall += serializedTokens(p.input);
+                toolCall += serializedTokens(p.input ?? p.args);
                 break;
             case "tool_result":
-                toolCall += serializedTokens(p.content);
+                toolCall += serializedTokens(p.content ?? p.result ?? p.output);
                 break;
         }
     }
@@ -128,13 +151,17 @@ export interface FinalWireTokenEstimate {
     messageTokens: MessageTokenEstimate;
     systemTokens: number;
     toolDefinitionTokens: number | undefined;
+    /** Unscaled transform-array/system/tool measurement; provider framing is unmeasured. */
+    rawTokens?: number;
+    rawComponents?: { system: number; tools: number; prose: number };
+    completeness?: "complete" | "partial";
+    componentsComplete?: boolean;
 }
 
 /**
- * Telemetry-only estimate of the outgoing prompt after transform mutations.
- * System and tool definitions use the sidebar's calibrated measurements, while
- * messages are re-read from the final array. This is diagnostic data, not an
- * abort gate; provider-accurate gating is deferred to module-side Rust accounting.
+ * Estimate the returned transform array plus observed system and tool definitions.
+ * This is not exact provider tokenization: provider framing remains unmeasured.
+ * Fit callers must require trusted, not merely compare a numeric partial estimate.
  */
 export function estimateFinalWireInputTokens(
     input: FinalWireTokenEstimateInput,
@@ -152,23 +179,115 @@ export function estimateFinalWireInputTokens(
         input.providerID && input.modelID
             ? getMeasuredToolDefinitionTokens(input.providerID, input.modelID, input.agentName)
             : undefined;
-    const calibration = resolveModelCalibration(input.providerID, input.modelID);
+    const calibration = resolveDecisionCalibration(input.providerID, input.modelID);
+    const largestToolDefinitions =
+        measuredToolDefinitions === undefined
+            ? getLargestMeasuredToolDefinitionTokens()
+            : undefined;
+    // An unknown route inherits an upper envelope from observed tool sets, not zero.
+    // Account for calibration below one on known models; unknown models already apply
+    // UNKNOWN_FIT_RATIO to the whole request in providerMass.
+    const toolDefinitions =
+        measuredToolDefinitions ??
+        (largestToolDefinitions === undefined
+            ? undefined
+            : Math.ceil(
+                  (largestToolDefinitions * UNKNOWN_FIT_RATIO) /
+                      (calibration.seeded ? calibration.toolsRatio : UNKNOWN_FIT_RATIO),
+              ));
+    const rawComponents = {
+        system: input.systemPromptTokens,
+        tools: (toolDefinitions ?? 0) + messageTokens.toolCall,
+        prose: messageTokens.conversation,
+    };
+    const tokens = providerMass(rawComponents, calibration, true);
+    const complete =
+        Number.isFinite(tokens) &&
+        tokens > 0 &&
+        Number.isFinite(input.systemPromptTokens) &&
+        input.systemPromptTokens > 0 &&
+        toolDefinitions !== undefined &&
+        input.messages.every(hasCountableParts);
     const systemTokens = Math.round(
         Math.max(0, input.systemPromptTokens) * calibration.systemRatio,
     );
     const toolDefinitionTokens =
-        measuredToolDefinitions === undefined
+        toolDefinitions === undefined
             ? undefined
-            : Math.round(measuredToolDefinitions * calibration.toolsRatio);
+            : Math.round(
+                  toolDefinitions *
+                      (calibration.seeded ? calibration.toolsRatio : UNKNOWN_FIT_RATIO),
+              );
     return {
-        tokens:
-            systemTokens +
-            (toolDefinitionTokens ?? 0) +
-            messageTokens.conversation +
-            messageTokens.toolCall,
-        trusted: systemTokens > 0 && toolDefinitionTokens !== undefined,
+        tokens,
+        trusted: complete,
+        rawTokens: rawComponents.system + rawComponents.tools + rawComponents.prose,
+        rawComponents,
+        completeness: complete ? "complete" : "partial",
+        componentsComplete:
+            toolDefinitions !== undefined && input.messages.every(hasCountableParts),
         messageTokens,
         systemTokens,
         toolDefinitionTokens,
     };
+}
+
+function hasCountableParts(message: MessageLike): boolean {
+    return message.parts.every((part) => {
+        if (!part || typeof part !== "object") return false;
+        const p = part as unknown as Record<string, unknown>;
+        if (p.ignored === true) return true;
+        switch (p.type) {
+            case "text":
+            case "reasoning":
+                return typeof p.text === "string";
+            case "thinking":
+                return typeof p.thinking === "string";
+            case "redacted_thinking":
+                return typeof p.data === "string";
+            case "tool": {
+                const state =
+                    p.state !== null && typeof p.state === "object"
+                        ? (p.state as Record<string, unknown>)
+                        : undefined;
+                const hasInput =
+                    state?.input !== undefined || p.input !== undefined || p.args !== undefined;
+                const hasResult =
+                    state?.output !== undefined ||
+                    state?.content !== undefined ||
+                    state?.error !== undefined ||
+                    p.output !== undefined ||
+                    p.result !== undefined ||
+                    p.content !== undefined;
+                return hasInput && hasResult;
+            }
+            case "tool-call":
+                return p.input !== undefined || p.args !== undefined;
+            case "tool-invocation":
+                return (
+                    (p.args !== undefined || p.input !== undefined) &&
+                    (p.result !== undefined ||
+                        p.output !== undefined ||
+                        (p.state !== null && typeof p.state === "object"))
+                );
+            case "tool-result":
+                return p.result !== undefined || p.content !== undefined || p.output !== undefined;
+            case "tool_use":
+                return p.input !== undefined || p.args !== undefined;
+            case "tool_result":
+                return p.content !== undefined || p.result !== undefined || p.output !== undefined;
+            case "step-start":
+            case "step-finish":
+                return true;
+            case "file":
+                // An inline image is counted from its pixel dimensions, and that count
+                // is capped per image, so it is a bounded estimate. Every session with a
+                // memory mural carries one in m[0]; leaving it uncountable made every
+                // fit check on those sessions untrusted, so last-known-good replay was
+                // refused on every engine blip. Other attachments stay uncountable.
+                return typeof p.url === "string" && p.url.startsWith("data:image/");
+            default:
+                return false;
+        }
+    });
 }

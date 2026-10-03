@@ -3,21 +3,16 @@ import {
     HiddenCompletionRefusal,
     type HiddenRunIdentity,
 } from "../hooks/magic-context/compartment-runner-types";
-import { __resetHostLimitations, activeHostLimitations } from "../shared/host-limitations";
 import { Database } from "../shared/sqlite";
+import { createV2HiddenCompletionExecutor, type HiddenChildHost } from "./hidden-completion";
 import {
-    createV2HiddenCompletionExecutor,
-    type HiddenChildHost,
-    hiddenChildrenMetaKey,
-} from "./hidden-completion";
-import {
+    HIDDEN_CURATE_AGENT,
     HIDDEN_DREAMER_AGENT,
     HIDDEN_HISTORIAN_AGENT,
     HiddenChildHook,
     registerHiddenChildAgents,
 } from "./hooks/hidden-child";
 import type { SessionContext } from "./hooks/types";
-import { type HostServiceOwner, HostServiceUnavailable } from "./host-service";
 import type { StoreRow } from "./store-reader";
 
 const run: HiddenRunIdentity = {
@@ -30,6 +25,12 @@ const run: HiddenRunIdentity = {
     timeoutMs: 1200,
     title: "shared title is replaced by the carrier",
     directory: "/project",
+};
+
+const dreamerRun: HiddenRunIdentity = {
+    ...run,
+    agent: HIDDEN_DREAMER_AGENT,
+    kind: "dreamer-task",
 };
 
 const request = (
@@ -52,14 +53,44 @@ const request = (
 
 class Rows {
     private readonly rows = new Map<string, StoreRow<"assistant">[]>();
+    private readonly idle = new Map<string, StoreRow<"idle">[]>();
     private seq = 0;
+    latestAssistantCalls = 0;
+    latestIdleCalls = 0;
 
     latestSequence(sessionID: string): number {
-        return this.rows.get(sessionID)?.at(-1)?.seq ?? -1;
+        return Math.max(
+            this.rows.get(sessionID)?.at(-1)?.seq ?? -1,
+            this.idle.get(sessionID)?.at(-1)?.seq ?? -1,
+        );
+    }
+
+    assistantSince(sessionID: string, afterSeq: number): StoreRow<"assistant">[] {
+        return (this.rows.get(sessionID) ?? []).filter((row) => row.seq > afterSeq);
     }
 
     latestAssistant(sessionID: string): StoreRow<"assistant"> | undefined {
+        this.latestAssistantCalls += 1;
         return this.rows.get(sessionID)?.at(-1);
+    }
+
+    latestIdle(sessionID: string): StoreRow<"idle"> | undefined {
+        this.latestIdleCalls += 1;
+        return this.idle.get(sessionID)?.at(-1);
+    }
+
+    appendIdle(sessionID: string, outcome: "succeeded" | "failed" | "interrupted") {
+        const row: StoreRow<"idle"> = {
+            id: `message-${++this.seq}`,
+            session_id: sessionID,
+            type: "idle",
+            seq: this.seq,
+            data: { outcome, time: { created: Date.now() } },
+        };
+        const current = this.idle.get(sessionID) ?? [];
+        current.push(row);
+        this.idle.set(sessionID, current);
+        return row;
     }
 
     append(
@@ -72,6 +103,7 @@ class Rows {
             rawTokens?: boolean;
             error?: unknown;
             finish?: string;
+            outcome?: "succeeded" | "failed" | "interrupted";
             omitFinish?: boolean;
         } = {},
     ): StoreRow<"assistant"> {
@@ -83,13 +115,15 @@ class Rows {
             data: {
                 content: [{ type: "text", text }],
                 ...(options.omitFinish ? {} : { finish: options.finish ?? "stop" }),
+                ...(options.outcome === undefined ? {} : { outcome: options.outcome }),
                 ...(options.error === undefined ? {} : { error: options.error }),
                 model: { providerID: "mock", id: options.modelID ?? "cheap" },
                 ...(options.usage === false
                     ? {}
                     : {
-                          tokens: options.rawTokens
-                              ? ({ input: null, output: "not-a-number", reasoning: 3 } as never)
+                          // Deliberately exercise corrupt and older rows with incomplete token data.
+                          tokens: (options.rawTokens
+                              ? { input: null, output: "not-a-number", reasoning: 3 }
                               : {
                                     input: 101,
                                     output: 11,
@@ -97,7 +131,7 @@ class Rows {
                                     ...(options.cache === false
                                         ? {}
                                         : { cache: { read: 7, write: 5 } }),
-                                },
+                                }) as StoreRow<"assistant">["data"]["tokens"],
                       }),
                 time: { created: Date.now(), completed: Date.now() },
             },
@@ -121,29 +155,18 @@ async function eventually(check: () => boolean, timeoutMs = 2000): Promise<void>
     }
 }
 
-function retiredChild(id: string, retiredAt: number) {
-    return {
-        id,
-        role: "historian" as const,
-        generation: "host-generation-1",
-        title: "Magic Context historian",
-        model: { providerID: "mock", modelID: "cheap" },
-        created_at: retiredAt - 1,
-        title_reasserted: true,
-        retired_at: retiredAt,
-        reason: "seeded",
-    };
-}
-
 async function setup(
     generation = "host-generation-1",
     capabilities: {
         remove?: boolean;
+        modelCatalog?: () => Promise<unknown>;
+        logs?: string[];
         /**
          * Which registration, if any, the fake host would report as its own. Undefined stands for
          * a host that registered no service at all (`--standalone`, or a plain `serve`).
          */
-        owner?: HostServiceOwner;
+        owner?: unknown;
+        keepSubagents?: boolean;
     } = {},
 ) {
     const db = new Database(":memory:");
@@ -160,18 +183,23 @@ async function setup(
     const interrupts: string[] = [];
     const requests: SessionContext[] = [];
     const removed: string[] = [];
-    const removals: Array<{ sessionID: string; owner?: HostServiceOwner }> = [];
+    const removals: Array<{ sessionID: string; owner?: unknown; directory?: string }> = [];
     let nextID = 0;
     let failPrompt = false;
     let promptError: Error | undefined;
     let providerError: unknown;
     let providerErrorUnsettled = false;
+    let terminalOutcome: "succeeded" | "failed" | "interrupted" | undefined;
+    let terminalRowType: "assistant" | "idle" = "assistant";
+    let readableSessionError: unknown;
+    let eventSessionError: unknown;
     let removeError: Error | undefined;
     let delayRowMs = 0;
     let omitUsage = false;
     let omitCache = false;
     let rawTokens = false;
     let completion = "editor completion";
+    let reasoningOnly = false;
 
     const host: HiddenChildHost = {
         async create(input) {
@@ -181,7 +209,13 @@ async function setup(
             return { id };
         },
         async get() {
-            return { model: { providerID: "mock", id: "user" } };
+            return {
+                model: { providerID: "mock", id: "user" },
+                ...(readableSessionError === undefined ? {} : { error: readableSessionError }),
+            };
+        },
+        async terminalError() {
+            return eventSessionError;
         },
         async switchModel(input) {
             switches.push(structuredClone(input));
@@ -218,13 +252,27 @@ async function setup(
                 });
                 return;
             }
-            const write = () =>
-                rows.append(input.sessionID, completion, {
+            if (terminalOutcome !== undefined) {
+                if (terminalRowType === "idle") rows.appendIdle(input.sessionID, terminalOutcome);
+                else
+                    rows.append(input.sessionID, "", {
+                        outcome: terminalOutcome,
+                        usage: false,
+                        omitFinish: true,
+                    });
+                return;
+            }
+            const write = () => {
+                const row = rows.append(input.sessionID, completion, {
                     usage: !omitUsage,
                     cache: !omitCache,
                     rawTokens,
                     modelID: child.model.id,
+                    ...(reasoningOnly ? { finish: "length" } : {}),
                 });
+                if (reasoningOnly)
+                    row.data.content = [{ type: "reasoning", text: "private reasoning" }];
+            };
             if (delayRowMs > 0) setTimeout(write, delayRowMs);
             else write();
         },
@@ -236,28 +284,22 @@ async function setup(
         async update(input) {
             updates.push(structuredClone(input));
         },
-        // The session interface an OpenCode 2 host injects has no remove, so the default fake has
-        // none either; the tests that cover cleanup opt the capability in.
-        ...(capabilities.remove
-            ? {
-                  async remove(input: { sessionID: string; owner?: HostServiceOwner }) {
-                      removals.push(structuredClone(input));
-                      if (removeError) throw removeError;
-                      removed.push(input.sessionID);
-                  },
-              }
-            : {}),
+        async removeSession(input) {
+            if (removeError) throw removeError;
+            removed.push(input.sessionID);
+        },
     };
     const create = (hostGeneration = generation) =>
         createV2HiddenCompletionExecutor(host, {
             db,
             projectIdentity: "/project",
+            directory: "/project",
             hook,
             openReader: () => rows,
             generation: hostGeneration,
-            removalSpacingMs: 0,
-            resolveOwner: () => capabilities.owner,
-            log: () => {},
+            ...(capabilities.keepSubagents ? { keepSubagents: true } : {}),
+            log: (message) => capabilities.logs?.push(message),
+            ...(capabilities.modelCatalog ? { modelCatalog: capabilities.modelCatalog } : {}),
         });
     const executor = await create();
     return {
@@ -274,23 +316,6 @@ async function setup(
         requests,
         removed,
         removals,
-        meta: () =>
-            JSON.parse(
-                (
-                    db
-                        .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
-                        .get(hiddenChildrenMetaKey("/project")) as { value: string }
-                ).value,
-            ) as { retired_children: Array<{ id: string; reason: string }> },
-        seedRetired(children: ReturnType<typeof retiredChild>[]) {
-            db.prepare(
-                `INSERT INTO schema_migrations_meta (key, value) VALUES (?, ?)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-            ).run(
-                hiddenChildrenMetaKey("/project"),
-                JSON.stringify({ version: 1, active: {}, retired_children: children }),
-            );
-        },
         setFailPrompt(value: boolean) {
             failPrompt = value;
         },
@@ -302,6 +327,18 @@ async function setup(
         },
         setProviderErrorUnsettled(value: boolean) {
             providerErrorUnsettled = value;
+        },
+        setTerminalOutcome(value: "succeeded" | "failed" | "interrupted" | undefined) {
+            terminalOutcome = value;
+        },
+        setTerminalRowType(value: "assistant" | "idle") {
+            terminalRowType = value;
+        },
+        setReadableSessionError(value: unknown) {
+            readableSessionError = value;
+        },
+        setEventSessionError(value: unknown) {
+            eventSessionError = value;
         },
         setRemoveError(value: Error | undefined) {
             removeError = value;
@@ -321,6 +358,9 @@ async function setup(
         setCompletion(value: string) {
             completion = value;
         },
+        setReasoningOnly(value: boolean) {
+            reasoningOnly = value;
+        },
     };
 }
 
@@ -338,6 +378,31 @@ async function close(
 }
 
 describe("OpenCode 2 hidden child completion", () => {
+    test.each([
+        "historian",
+        "dreamer-task",
+    ] as const)("retains length-capped reasoning for %s", async (kind) => {
+        const state = await setup();
+        try {
+            state.setReasoningOnly(true);
+            const handle = await state.executor.open({
+                ...run,
+                kind,
+                agent: kind === "historian" ? "historian" : "dreamer-classifier",
+            });
+            await state.executor.attempt(handle, request("cheap"));
+            const completion = await state.executor.collect(handle, 50);
+            expect(completion).toMatchObject({
+                text: null,
+                reasoning: "private reasoning",
+                lengthCapped: true,
+                tokenLog: { max_tokens: null, finish_reason: "length", reasoning: 3 },
+            });
+            await close(state.executor, handle, true);
+        } finally {
+            state.db.close();
+        }
+    });
     test("sends the exact calibrated pair with options and provider usage", async () => {
         const state = await setup();
         try {
@@ -349,7 +414,7 @@ describe("OpenCode 2 hidden child completion", () => {
                     title: "Magic Context historian",
                     agent: "historian",
                     model: { providerID: "mock", id: "cheap" },
-                    location: { directory: "/project" },
+                    parentID: "user-session",
                     metadata: { magic_context: "hidden-run", role: "historian" },
                 },
             ]);
@@ -367,12 +432,18 @@ describe("OpenCode 2 hidden child completion", () => {
             expect(completion).toMatchObject({
                 text: "editor completion",
                 usage: { input: 101, output: 11, cacheRead: 7, cacheWrite: 5 },
+                tokenLog: {
+                    input: 101,
+                    output: 11,
+                    reasoning: 3,
+                    cache_read: 7,
+                    cache_write: 5,
+                    max_tokens: null,
+                },
                 providerId: "mock",
                 modelId: "cheap",
             });
-            expect(state.updates).toEqual([
-                { sessionID: "child-1", title: "Magic Context historian" },
-            ]);
+            expect(state.updates).toEqual([]);
             await close(state.executor, handle, true);
         } finally {
             state.db.close();
@@ -399,7 +470,7 @@ describe("OpenCode 2 hidden child completion", () => {
         }
     });
 
-    test("reuses one successful child for a second run and reasserts its title once", async () => {
+    test("creates a fresh successful child for each run without rewriting its title", async () => {
         const state = await setup();
         try {
             for (const text of ["first", "second"]) {
@@ -409,100 +480,172 @@ describe("OpenCode 2 hidden child completion", () => {
                 expect((await state.executor.collect(handle, 50)).text).toBe(text);
                 await close(state.executor, handle, true);
             }
-            expect(state.creates).toHaveLength(1);
-            expect(state.requests).toHaveLength(2);
-            expect(state.updates).toHaveLength(1);
-        } finally {
-            state.db.close();
-        }
-    });
-
-    test("retires an overall failed run and creates a fresh child next time", async () => {
-        const state = await setup();
-        try {
-            const first = await state.executor.open(run);
-            await state.executor.attempt(first, request());
-            await close(state.executor, first, true);
-
-            state.setFailPrompt(true);
-            const second = await state.executor.open(run);
-            await expect(state.executor.attempt(second, request())).rejects.toThrow(
-                "provider unavailable",
-            );
-            await close(state.executor, second, false);
-
-            state.setFailPrompt(false);
-            const third = await state.executor.open(run);
-            expect(third.id).toBe("child-2");
-            await state.executor.attempt(third, request());
-            await close(state.executor, third, true);
             expect(state.creates).toHaveLength(2);
-            const meta = JSON.parse(
-                (
-                    state.db
-                        .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
-                        .get(hiddenChildrenMetaKey("/project")) as { value: string }
-                ).value,
-            );
-            expect(meta.retired_children).toHaveLength(1);
-            expect(meta.retired_children[0]).toMatchObject({
-                id: "child-1",
-                reason: "hidden-run-failed",
-            });
+            expect(state.requests).toHaveLength(2);
+            expect(state.updates).toHaveLength(0);
         } finally {
             state.db.close();
         }
     });
 
-    test("keeps the child when a run fails only on settled provider errors", async () => {
+    test("does not reuse a child after a settled provider error", async () => {
         const state = await setup();
         try {
             state.setProviderError({ message: "Go usage limit exceeded" });
             for (let i = 0; i < 5; i++) {
                 const handle = await state.executor.open(run);
-                expect(handle.id).toBe("child-1");
+                expect(handle.id).toBe(`child-${i + 1}`);
                 await expect(state.executor.attempt(handle, request("cheap"))).rejects.toThrow(
                     "Hidden completion provider error: ",
                 );
-                await expect(state.executor.attempt(handle, request("fallback"))).rejects.toThrow(
-                    "Go usage limit exceeded",
-                );
-                // The historian caller reports promptSettled=false after any failed attempt.
                 await close(state.executor, handle, false);
             }
             state.setProviderError(undefined);
             const recovered = await state.executor.open(run);
-            expect(recovered.id).toBe("child-1");
+            expect(recovered.id).toBe("child-6");
             await state.executor.attempt(recovered, request());
             await close(state.executor, recovered, true);
-            expect(state.creates).toHaveLength(1);
-            const meta = JSON.parse(
-                (
-                    state.db
-                        .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
-                        .get(hiddenChildrenMetaKey("/project")) as { value: string }
-                ).value,
-            );
-            expect(meta.retired_children).toHaveLength(0);
+            expect(state.creates).toHaveLength(6);
+            expect(state.removed).toHaveLength(6);
         } finally {
             state.db.close();
         }
     });
 
-    test("a restarted executor reuses a child whose newest assistant is a settled provider error", async () => {
+    test("retires a child immediately after a settled provider failure", async () => {
         const state = await setup();
         try {
-            state.setProviderError({ message: "The usage limit has been reached" });
+            state.setProviderError({ message: "Go usage limit exceeded" });
             const handle = await state.executor.open(run);
-            await expect(state.executor.attempt(handle, request())).rejects.toThrow();
+            await expect(state.executor.attempt(handle, request())).rejects.toThrow(
+                "Hidden completion provider error: ",
+            );
             await close(state.executor, handle, false);
+
+            // After a provider failure the child is stopped and retired, so a pending host step
+            // (such as a scheduled retry) cannot run on it after the run's marker is released.
+            expect(state.interrupts).toEqual(["child-1"]);
+            expect(state.removed).toEqual(["child-1"]);
+
             state.setProviderError(undefined);
-            const restarted = await state.create();
-            const next = await restarted.open(run);
-            expect(next.id).toBe("child-1");
-            await restarted.attempt(next, request());
-            await close(restarted, next, true);
-            expect(state.creates).toHaveLength(1);
+            const recovered = await state.executor.open(run);
+            expect(recovered.id).toBe("child-2");
+            await state.executor.attempt(recovered, request());
+            await close(state.executor, recovered, true);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("reopens a fresh child when a fallback retries a retired run", async () => {
+        const state = await setup();
+        try {
+            state.setProviderError({ message: "Go usage limit exceeded" });
+            const handle = await state.executor.open(run);
+            await expect(state.executor.attempt(handle, request("cheap"))).rejects.toThrow(
+                "Hidden completion provider error: ",
+            );
+
+            state.setProviderError(undefined);
+            await state.executor.attempt(handle, request("fallback"));
+            expect(handle.id).toBe("child-2");
+            expect(state.creates[1]?.model).toEqual({ providerID: "mock", id: "fallback" });
+            await close(state.executor, handle, true);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("interrupts and retires a failed child while its attempt marker is still registered", async () => {
+        const state = await setup();
+        try {
+            const events: string[] = [];
+            const release = state.hook.releaseAttempt.bind(state.hook);
+            state.hook.releaseAttempt = (marker: string) => {
+                events.push("release");
+                release(marker);
+            };
+            const interrupt = state.host.interrupt.bind(state.host);
+            state.host.interrupt = async (input) => {
+                events.push(`interrupt ${input.sessionID}`);
+                return interrupt(input);
+            };
+            state.setProviderError({ message: "Go usage limit exceeded" });
+            const handle = await state.executor.open(run);
+            await expect(state.executor.attempt(handle, request())).rejects.toThrow(
+                "Hidden completion provider error: ",
+            );
+            // Until the marker is released the hook still recognises this run's prompt, so
+            // stopping the child first leaves no window in which a host step on it is refused.
+            expect(events).toEqual(["interrupt child-1", "release"]);
+            await close(state.executor, handle, false);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("fails an outcome-only failed assistant in one poll with persisted host detail", async () => {
+        const state = await setup();
+        try {
+            state.setTerminalOutcome("failed");
+            state.setEventSessionError({
+                type: "ProviderModelNotFoundError",
+                message: "ollama-cloud/deepseek-v4.1-flash is unavailable",
+            });
+            const handle = await state.executor.open({ ...run, timeoutMs: 40 });
+            const pollsBefore = state.rows.latestAssistantCalls;
+            const failure = state.executor.attempt(handle, request());
+            await expect(failure).rejects.toThrow("outcome=failed");
+            await expect(failure).rejects.toThrow("ProviderModelNotFoundError");
+            await expect(failure).rejects.toThrow(
+                "ollama-cloud/deepseek-v4.1-flash is unavailable",
+            );
+            expect(state.rows.latestAssistantCalls - pollsBefore).toBe(1);
+            await close(state.executor, handle, false);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("fails an outcome-only idle row in one poll", async () => {
+        const state = await setup();
+        try {
+            state.setTerminalRowType("idle");
+            state.setTerminalOutcome("failed");
+            const handle = await state.executor.open({ ...run, timeoutMs: 40 });
+            const pollsBefore = state.rows.latestIdleCalls;
+            const failure = state.executor.attempt(handle, request());
+            await expect(failure).rejects.toThrow("outcome=failed");
+            await expect(failure).rejects.toThrow('"type":"idle"');
+            expect(state.rows.latestIdleCalls - pollsBefore).toBe(1);
+            await close(state.executor, handle, false);
+
+            state.setTerminalOutcome(undefined);
+            state.setTerminalRowType("assistant");
+            const recovered = await state.executor.open(run);
+            expect(recovered.id).toBe("child-2");
+            await state.executor.attempt(recovered, request());
+            await close(state.executor, recovered, true);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("treats every OpenCode 2.0.12 assistant outcome as terminal", async () => {
+        const state = await setup();
+        try {
+            state.setTerminalOutcome("interrupted");
+            const interrupted = await state.executor.open({ ...run, timeoutMs: 40 });
+            await expect(state.executor.attempt(interrupted, request())).rejects.toThrow(
+                "outcome=interrupted",
+            );
+            await close(state.executor, interrupted, false);
+
+            state.setTerminalOutcome("succeeded");
+            const succeeded = await state.executor.open({ ...run, timeoutMs: 40 });
+            await state.executor.attempt(succeeded, request());
+            expect((await state.executor.collect(succeeded, 50)).text).toBeNull();
+            await close(state.executor, succeeded, true);
         } finally {
             state.db.close();
         }
@@ -526,9 +669,7 @@ describe("OpenCode 2 hidden child completion", () => {
             expect(next.id).toBe("child-2");
             await state.executor.attempt(next, request());
             await close(state.executor, next, true);
-            expect(state.meta().retired_children).toMatchObject([
-                { id: "child-1", reason: "newest-assistant-not-reusable" },
-            ]);
+            expect(state.removed).toEqual(["child-1", "child-2"]);
         } finally {
             state.db.close();
         }
@@ -550,181 +691,7 @@ describe("OpenCode 2 hidden child completion", () => {
             expect(next.id).toBe("child-2");
             await state.executor.attempt(next, request());
             await close(state.executor, next, true);
-            expect(state.meta().retired_children).toMatchObject([
-                { id: "child-1", reason: "hidden-run-failed" },
-            ]);
-        } finally {
-            state.db.close();
-        }
-    });
-
-    test("deletes a retired child's session and forgets the entry", async () => {
-        const state = await setup("host-generation-1", { remove: true });
-        try {
-            const first = await state.executor.open(run);
-            await state.executor.attempt(first, request());
-            await close(state.executor, first, true);
-
-            state.setFailPrompt(true);
-            const second = await state.executor.open(run);
-            await expect(state.executor.attempt(second, request())).rejects.toThrow(
-                "provider unavailable",
-            );
-            await close(state.executor, second, false);
-
-            await eventually(() => state.removed.includes("child-1"));
-            await eventually(() => state.meta().retired_children.length === 0);
-        } finally {
-            state.db.close();
-        }
-    });
-
-    test("deletes only through the registration that created the child", async () => {
-        const owner: HostServiceOwner = {
-            registration: "/state/opencode/service-local.json",
-            serviceID: "owning-service",
-            pid: 4242,
-        };
-        const state = await setup("host-generation-1", { remove: true, owner });
-        try {
-            const first = await state.executor.open(run);
-            await state.executor.attempt(first, request());
-            await close(state.executor, first, true);
-
-            state.setFailPrompt(true);
-            const second = await state.executor.open(run);
-            await expect(state.executor.attempt(second, request())).rejects.toThrow(
-                "provider unavailable",
-            );
-            await close(state.executor, second, false);
-
-            await eventually(() => state.removed.includes("child-1"));
-            expect(state.removals).toEqual([{ sessionID: "child-1", owner }]);
-        } finally {
-            state.db.close();
-        }
-    });
-
-    test("carries the creating host's binding across a restart of the executor", async () => {
-        const owner: HostServiceOwner = {
-            registration: "/state/opencode/service-local.json",
-            serviceID: "owning-service",
-            pid: 4242,
-        };
-        const state = await setup("host-generation-1", { remove: true, owner });
-        try {
-            const handle = await state.executor.open(run);
-            await state.executor.attempt(handle, request());
-            await close(state.executor, handle, true);
-
-            // A newer host build retires the previous generation's child. The binding it deletes
-            // through has to be the one the CREATING process recorded, which this restarted
-            // executor only knows from the persisted row.
-            const restarted = await state.create("host-generation-2");
-            const next = await restarted.open(run);
-            await restarted.attempt(next, request());
-            await close(restarted, next, true);
-
-            await eventually(() => state.removed.includes("child-1"));
-            expect(state.removals[0]).toEqual({ sessionID: "child-1", owner });
-        } finally {
-            state.db.close();
-        }
-    });
-
-    test("keeps an unbound child recorded and names the limitation instead of guessing a host", async () => {
-        __resetHostLimitations();
-        // A host that registered no service: nothing this process can reach owns the child.
-        const state = await setup("host-generation-1", { remove: true, owner: undefined });
-        try {
-            state.setRemoveError(
-                new HostServiceUnavailable(
-                    "This session was created by an OpenCode host that registered no service",
-                ),
-            );
-            state.setFailPrompt(true);
-            const handle = await state.executor.open(run);
-            await expect(state.executor.attempt(handle, request())).rejects.toThrow(
-                "provider unavailable",
-            );
-            await close(state.executor, handle, false);
-
-            await eventually(() => state.removals.length === 1);
-            expect(state.removals).toEqual([{ sessionID: "child-1" }]);
-            expect(state.removed).toEqual([]);
-            // Still recorded, so a later process inside a registered service retries it.
-            expect(state.meta().retired_children.map((child) => child.id)).toEqual(["child-1"]);
-            expect(activeHostLimitations()).toContain("hidden_cleanup_unbound");
-        } finally {
-            __resetHostLimitations();
-            state.db.close();
-        }
-    });
-
-    test("keeps a retired entry when deletion cannot reach the host", async () => {
-        const state = await setup("host-generation-1", { remove: true });
-        try {
-            state.setRemoveError(new Error("connection refused"));
-            state.setFailPrompt(true);
-            const handle = await state.executor.open(run);
-            await expect(state.executor.attempt(handle, request())).rejects.toThrow(
-                "provider unavailable",
-            );
-            await close(state.executor, handle, false);
-            expect(state.meta().retired_children).toMatchObject([{ id: "child-1" }]);
-
-            // A failed cleanup must not stop the next run from working.
-            state.setFailPrompt(false);
-            const next = await state.executor.open(run);
-            expect(next.id).toBe("child-2");
-            await state.executor.attempt(next, request());
-            await close(state.executor, next, true);
-            expect(state.removed).toEqual([]);
-            expect(state.meta().retired_children).toMatchObject([{ id: "child-1" }]);
-        } finally {
-            state.db.close();
-        }
-    });
-
-    test("sweeps a retired backlog left behind by an earlier process", async () => {
-        const state = await setup("host-generation-1", { remove: true });
-        try {
-            state.seedRetired([
-                retiredChild("stale-1", 1),
-                retiredChild("stale-2", 2),
-                retiredChild("stale-3", 3),
-            ]);
-            const swept = await state.create();
-            await eventually(() => state.meta().retired_children.length === 0);
-            expect(state.removed).toEqual(["stale-1", "stale-2", "stale-3"]);
-            // The sweep leaves the executor usable; it never blocks boot on cleanup.
-            const handle = await swept.open(run);
-            await swept.attempt(handle, request());
-            await close(swept, handle, true);
-        } finally {
-            state.db.close();
-        }
-    });
-
-    test("bounds the retired list when deletion is unavailable", async () => {
-        const state = await setup();
-        try {
-            state.seedRetired(
-                Array.from({ length: 200 }, (_value, index) =>
-                    retiredChild(`stale-${index}`, index + 1),
-                ),
-            );
-            const bounded = await state.create();
-            state.setFailPrompt(true);
-            const handle = await bounded.open(run);
-            await expect(bounded.attempt(handle, request())).rejects.toThrow(
-                "provider unavailable",
-            );
-            await close(bounded, handle, false);
-            const retained = state.meta().retired_children;
-            expect(retained).toHaveLength(200);
-            expect(retained.at(0)?.id).toBe("stale-1");
-            expect(retained.at(-1)?.id).toBe("child-1");
+            expect(state.removed).toEqual(["child-1", "child-2"]);
         } finally {
             state.db.close();
         }
@@ -847,48 +814,6 @@ describe("OpenCode 2 hidden child completion", () => {
         }
     });
 
-    test("a restarted executor reuses the successful v2 child from persisted project meta", async () => {
-        const state = await setup();
-        try {
-            const first = await state.executor.open(run);
-            await state.executor.attempt(first, request());
-            await close(state.executor, first);
-
-            const restarted = await createV2HiddenCompletionExecutor(state.host, {
-                db: state.db,
-                projectIdentity: "/project",
-                hook: state.hook,
-                openReader: () => state.rows,
-                generation: "host-generation-1",
-            });
-            const reused = await restarted.open(run);
-            expect(reused.id).toBe("child-1");
-            await restarted.attempt(reused, request("after restart"));
-            await close(restarted, reused);
-            expect(state.creates).toHaveLength(1);
-        } finally {
-            state.db.close();
-        }
-    });
-
-    test("a new host generation retires the previous generation's child", async () => {
-        const state = await setup();
-        try {
-            const first = await state.executor.open(run);
-            await state.executor.attempt(first, request());
-            await close(state.executor, first, true);
-
-            const restarted = await state.create("host-generation-2");
-            const second = await restarted.open(run);
-            expect(second.id).toBe("child-2");
-            await restarted.attempt(second, request());
-            await close(restarted, second, true);
-            expect(state.creates).toHaveLength(2);
-        } finally {
-            state.db.close();
-        }
-    });
-
     test("registers fail-closed hidden carrier agents", async () => {
         const agents = new Map<
             string,
@@ -925,10 +850,30 @@ describe("OpenCode 2 hidden child completion", () => {
                 });
             },
         });
-        expect([...agents.keys()]).toEqual([HIDDEN_HISTORIAN_AGENT, HIDDEN_DREAMER_AGENT]);
-        for (const agent of agents.values()) {
+        expect([...agents.keys()]).toEqual([
+            HIDDEN_HISTORIAN_AGENT,
+            HIDDEN_DREAMER_AGENT,
+            HIDDEN_CURATE_AGENT,
+            "dreamer-memory-mapper",
+            "dreamer-primer-investigator",
+            "dreamer-retrospective",
+        ]);
+        for (const [id, agent] of agents) {
             expect(agent.hidden).toBe(true);
-            expect(agent.permissions).toEqual([{ action: "*", resource: "*", effect: "deny" }]);
+            const tools: Record<string, string[]> = {
+                [HIDDEN_CURATE_AGENT]: ["ctx_memory"],
+                "dreamer-memory-mapper": ["read", "grep", "glob"],
+                "dreamer-primer-investigator": ["read", "grep", "glob", "ctx_search"],
+                "dreamer-retrospective": ["ctx_search"],
+            };
+            expect(agent.permissions).toEqual([
+                { action: "*", resource: "*", effect: "deny" },
+                ...(tools[id] ?? []).map((tool) => ({
+                    action: tool,
+                    resource: "*",
+                    effect: "allow" as const,
+                })),
+            ]);
         }
     });
 
@@ -955,5 +900,77 @@ describe("OpenCode 2 hidden child completion", () => {
         } finally {
             state.db.close();
         }
+    });
+
+    test("drops and warns once for an undeclared hidden-run variant", async () => {
+        const logs: string[] = [];
+        const state = await setup("host-generation-1", {
+            logs,
+            modelCatalog: async () => [{ id: "cheap", providerID: "mock", variants: { high: {} } }],
+        });
+        const identity = { ...run, model: { model: "mock/cheap", qualifier: "medium" } };
+        try {
+            const handle = await state.executor.open(identity);
+            expect(state.creates[0]?.model).toEqual({ providerID: "mock", id: "cheap" });
+            await state.executor.attempt(handle, request("cheap"));
+            await state.executor.attempt(handle, request("cheap"));
+            expect(state.creates[0]?.model).toEqual({ providerID: "mock", id: "cheap" });
+            expect(logs.filter((line) => line.includes("variant 'medium'")).length).toBe(1);
+            await close(state.executor, handle, true);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("passes a declared hidden-run variant through unchanged", async () => {
+        const state = await setup("host-generation-1", {
+            modelCatalog: async () => [
+                { id: "cheap", providerID: "mock", variants: { medium: {} } },
+            ],
+        });
+        const identity = { ...run, model: { model: "mock/cheap", qualifier: "medium" } };
+        try {
+            const handle = await state.executor.open(identity);
+            expect(state.creates[0]?.model).toEqual({
+                providerID: "mock",
+                id: "cheap",
+                variant: "medium",
+            });
+            await close(state.executor, handle, true);
+        } finally {
+            state.db.close();
+        }
+    });
+});
+
+test("hidden tool-loop hard-stops at soft prompt budget when the host has no pre-tool hook", async () => {
+    const fixture = await setup();
+    fixture.setDelayRow(1200);
+    const executor = fixture.executor;
+    let finalized: boolean | undefined;
+    const handle = await executor.open({
+        ...dreamerRun,
+        agent: HIDDEN_CURATE_AGENT,
+        timeoutMs: 3000,
+        metadata: {
+            tokenBudget: 130,
+            onBudgetUpdate: (state: { finalizeFired: boolean }) => {
+                finalized = state.finalizeFired;
+            },
+        },
+    });
+    const attempt = executor.attempt(handle, request());
+    await eventually(() => fixture.requests.length > 0);
+    // The fixture's assistant reports 101 input, 7 cache read and 5 cache write tokens.
+    fixture.rows.append(handle.id, "", { finish: "tool-calls" });
+    await expect(attempt).rejects.toMatchObject({ name: "DreamTokenBudgetExceeded" });
+    expect(fixture.interrupts).toContain(handle.id);
+    expect(fixture.requests).toHaveLength(1);
+    expect(finalized).toBe(false);
+    await executor.close(handle, {
+        promptSettled: false,
+        privacySensitive: true,
+        context: "test",
+        log: () => {},
     });
 });

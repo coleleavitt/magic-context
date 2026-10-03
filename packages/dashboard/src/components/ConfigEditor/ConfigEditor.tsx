@@ -15,7 +15,9 @@ import { configSaveBlocker } from "./config-save-guard";
 import type { DreamTaskConfig, DreamTaskModelConfig } from "./DreamerTasksField";
 import DreamerTasksField from "./DreamerTasksField";
 import HarnessModelFields, { type Harness, modelCatalogForHarness } from "./HarnessModelFields";
+import LiveBadge from "./LiveBadge";
 import PerModelField from "./PerModelField";
+import { structuredConfigSaveContent } from "./structured-save";
 
 // ── JSONC helpers ───────────────────────────────────────────
 
@@ -48,11 +50,6 @@ function parseConfigContent(text: string): ParsedConfigContent {
   } catch (error) {
     return { value: {}, error: jsoncErrorMessage(error) };
   }
-}
-
-/** Pretty-print config as JSONC (plain JSON with 2-space indent). */
-function toJsonc(obj: Record<string, unknown>): string {
-  return JSON.stringify(obj, null, 2);
 }
 
 // ── Config field definitions ────────────────────────────────
@@ -437,34 +434,10 @@ function ConfigForm(props: {
       return;
     }
 
-    // Merge form data with original to preserve unknown keys
-    const original = parsed();
-    const merged = { ...original, ...formData() };
-    // Deep merge for nested objects so we don't blow away sub-keys the form
-    // doesn't currently expose. The shallow `...formData()` above would
-    // otherwise replace the whole sub-tree. A legacy top-level `experimental`
-    // block (if any) is preserved by the shallow spread and relocated by the
-    // plugin's config migration on next load.
-    for (const key of [
-      "embedding",
-      "memory",
-      "sqlite",
-      "system_prompt_injection",
-      "caveman_text_compression",
-      "mural",
-      "prompt_surface",
-      "storage",
-      "compaction",
-      "pi",
-    ]) {
-      if (typeof formData()[key] === "object" && formData()[key] != null) {
-        merged[key] = {
-          ...((original[key] as Record<string, unknown>) ?? {}),
-          ...(formData()[key] as Record<string, unknown>),
-        };
-      }
-    }
-    props.onSave(toJsonc(merged));
+    // Patch the values into the file text rather than re-serializing the
+    // object, so the user's comments survive. The guard above has already
+    // checked that `props.content` parses.
+    props.onSave(structuredConfigSaveContent(props.content, formData()));
   };
 
   const handleRawSave = () => {
@@ -528,6 +501,7 @@ function ConfigForm(props: {
       <div class="config-field">
         <div class="config-field-header">
           <span class="config-field-label">{field.label}</span>
+          <LiveBadge path={field.key} />
           <span class="config-field-key">{field.key}</span>
         </div>
         <span class="config-field-desc">{field.description}</span>
@@ -1437,6 +1411,7 @@ function ConfigForm(props: {
             <div class="config-field">
               <div class="config-field-header">
                 <span class="config-field-label">Task schedules and model overrides</span>
+                <LiveBadge path={`dreamer.${dreamerHarness()}.tasks`} />
                 <span class="config-field-key">dreamer.tasks / dreamer.{"<harness>"}.tasks</span>
               </div>
               <span class="config-field-desc">
@@ -1794,7 +1769,7 @@ function ConfigForm(props: {
               (getNestedValue(formData(), "todowrite") as
                 | { enabled?: boolean; overlay?: boolean }
                 | undefined) ?? {};
-            const todowriteEnabled = () => todowrite().enabled ?? true;
+            const todowriteEnabled = () => todowrite().enabled ?? false;
             const todowriteOverlay = () => todowrite().overlay ?? true;
             const setTodowrite = (patch: Record<string, unknown>) =>
               handleFieldChange("todowrite", { ...todowrite(), ...patch });
@@ -2218,6 +2193,9 @@ function ProjectConfigDetail(props: {
 export default function ConfigEditor(props: {
   modelCatalogs: ModelCatalogs;
   opencodeInstallState: OpencodeInstallState;
+  catalogLoading: boolean;
+  catalogError: string | null;
+  onRetryCatalogs: () => void;
 }) {
   const [configTarget, setConfigTarget] = createSignal<ConfigTarget>(loadConfigTarget());
   const [userConfig, { refetch: refetchUser }] = createResource(() => getConfig("user"));
@@ -2279,6 +2257,17 @@ export default function ConfigEditor(props: {
           </button>
         </div>
       </div>
+
+      <Show when={props.catalogLoading || props.catalogError}>
+        <div class="empty-state" role="status">
+          <span>{props.catalogLoading ? "Loading OpenCode models..." : props.catalogError}</span>
+          <Show when={!props.catalogLoading && props.catalogError}>
+            <button type="button" class="btn sm" onClick={props.onRetryCatalogs}>
+              Retry model discovery
+            </button>
+          </Show>
+        </div>
+      </Show>
 
       <div class="tab-pills">
         <button

@@ -490,14 +490,27 @@ const CronScheduleSchema = z
 const DreamTaskBaseConfigSchema = z
     .object({
         schedule: CronScheduleSchema.default(""),
+        token_budget: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe(
+                "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+            ),
     })
     .strict();
+
+export const DREAM_TASK_PROMOTION_DEFAULTS = {
+    "review-user-memories": 3,
+    "promote-primers": 2,
+} as const;
 
 const PromotionThresholdSchema = z
     .number()
     .min(2)
     .max(20)
-    .optional()
+    .default(DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"])
     .describe(
         "review-user-memories: min candidate observations before promotion is considered (default: 3)",
     );
@@ -505,7 +518,7 @@ const PrimerPromotionThresholdSchema = z
     .number()
     .min(2)
     .max(20)
-    .optional()
+    .default(DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"])
     .describe(
         "promote-primers: min recurring source days before promotion is considered (default: 2)",
     );
@@ -554,8 +567,10 @@ const DEFAULT_TASK_SCHEDULES: Record<DreamTaskName, string> = {
 
 function defaultTaskConfig(task: DreamTaskName): z.input<typeof DreamTaskConfigSchema> {
     const base: z.input<typeof DreamTaskConfigSchema> = { schedule: DEFAULT_TASK_SCHEDULES[task] };
-    if (task === "review-user-memories") base.promotion_threshold = 3;
-    if (task === "promote-primers") base.promotion_threshold = 2;
+    if (task === "review-user-memories")
+        base.promotion_threshold = DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"];
+    if (task === "promote-primers")
+        base.promotion_threshold = DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"];
     return base;
 }
 
@@ -584,9 +599,19 @@ export const DreamTasksSchema = z
         retrospective: RetrospectiveTaskConfigSchema.default(() =>
             RetrospectiveTaskConfigSchema.parse(defaultTaskConfig("retrospective")),
         ),
-        "maintain-docs": DreamTaskBaseConfigSchema.default(() =>
-            DreamTaskBaseConfigSchema.parse(defaultTaskConfig("maintain-docs")),
-        ),
+        "maintain-docs": DreamTaskBaseConfigSchema.extend({
+            max_tokens: z
+                .number()
+                .int()
+                .positive()
+                .default(12000)
+                .describe(
+                    "Maximum combined token count of proposed ARCHITECTURE.md and STRUCTURE.md",
+                ),
+        }).default(() => ({
+            ...DreamTaskBaseConfigSchema.parse(defaultTaskConfig("maintain-docs")),
+            max_tokens: 12000,
+        })),
         "evaluate-smart-notes": DreamTaskBaseConfigSchema.default(() =>
             DreamTaskBaseConfigSchema.parse(defaultTaskConfig("evaluate-smart-notes")),
         ),
@@ -620,6 +645,12 @@ const AgentMetadataSchema = AgentOverrideConfigSchema.pick({
 
 /** Combined dreamer metadata plus independent strict execution blocks. */
 export const DreamerConfigSchema = AgentMetadataSchema.extend({
+    runner: z
+        .enum(["broca", "host"])
+        .optional()
+        .describe(
+            'Which side runs the dreamer completions the Rust module routes (classify-memories) in Rust transform mode: "host" runs them on this process\'s carrier, "broca" routes them to the Broca module. When unset, historian.runner applies, and when that is unset too the harness decides the same way it does for the historian. User-level config only.',
+        ),
     opencode: DreamerOpenCodeHarnessBlockSchema.optional(),
     pi: DreamerPiHarnessBlockSchema.optional(),
     omp: DreamerOmpHarnessBlockSchema.optional(),
@@ -641,6 +672,25 @@ export const HistorianConfigSchema = AgentMetadataSchema.extend({
     opencode: OpenCodeHarnessBlockSchema.optional(),
     pi: PiHarnessBlockSchema.optional(),
     omp: OmpHarnessBlockSchema.optional(),
+    runner: z
+        .enum(["broca", "host"])
+        .optional()
+        .describe(
+            'Which side runs the historian completion in Rust transform mode: "host" queues it for this process to run on the configured historian model, "broca" routes it to the Broca module. When unset the harness decides: OpenCode 1 and OpenCode 2 use "host", Claude Code (through the Thalamus gateway, which has no host to run a completion) uses "broca". User-level config only — it decides whose provider account pays for the call.',
+        ),
+    host_runner: z
+        .object({
+            enabled: z
+                .boolean()
+                .optional()
+                .describe(
+                    "Whether this process answers historian runs queued for a claimant (default true). Setting it to false stops the pull loop without changing historian.runner, so an operator can take one machine out of the lane and leave the queued runs for another claimant or for the runner setting to be changed deliberately.",
+                ),
+        })
+        .optional()
+        .describe(
+            "Controls for this process's historian pull loop, which answers runs the Rust module queues for the host runner (`historian.runner: \"host\"`, or unset on OpenCode 1 and OpenCode 2). User-level config only — it decides whether this machine's provider account is spent on folds.",
+        ),
     two_pass: z
         .boolean()
         .default(false)
@@ -651,7 +701,7 @@ export const HistorianConfigSchema = AgentMetadataSchema.extend({
         .array(z.enum(["*", "read", "aft_outline", "aft_zoom", "aft_search"]))
         .default([])
         .describe(
-            'OpenCode only. Tools to REMOVE from the historian\'s default allow-list [read, aft_outline, aft_zoom, aft_search]. Applies to both historian and historian-editor agents. Use ["*"] to strip all tool definitions from the model request — this prevents weak instruction-following models (e.g. mistral-small-latest) from entering tool-calling loops. Individual tool names remove just that tool. Note: a user-supplied historian.permission override can re-allow a tool that disallowed_tools removed — disallowed_tools sets the baseline, permission overrides take precedence. (default: [])',
+            "Legacy compatibility setting. Historians, recomp and editor passes always run with zero tools and locked permissions; this list no longer changes their tool surface. (default: [])",
         ),
 }).optional();
 export type HistorianConfig = NonNullable<z.infer<typeof HistorianConfigSchema>>;
@@ -671,7 +721,7 @@ const BaseEmbeddingConfigSchema = z
             .enum(["local", "openai-compatible", "off", "synapse"])
             .default("local")
             .describe(
-                "Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings.",
+                "Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings. Session history is embedded for semantic ctx_search whenever the provider is not 'off', regardless of memory.enabled; memories are embedded only while memory.enabled is true.",
             ),
         fallback_provider: EmbeddingFallbackProviderSchema.optional().describe(
             "Fallback provider for the Synapse lane. Required when provider is 'synapse'; local, openai-compatible, and off are valid.",
@@ -727,7 +777,7 @@ const BaseEmbeddingConfigSchema = z
             .enum(["auto", "native", "wasm"])
             .default("auto")
             .describe(
-                "Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Set 'native' only to prefer speed while accepting that pre-1.4.0 Bun crash risk, or 'wasm' to avoid loading the native addon.",
+                "Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Inference runs in a dedicated worker. On Bun before 1.4.0, even explicit 'native' uses WASM because native worker teardown can crash the process. Set 'wasm' to avoid loading the native addon on newer hosts too.",
             ),
         local_dtype: z
             .enum([
@@ -859,7 +909,7 @@ export interface MuralConfig {
 
 export interface MagicContextConfig {
     enabled: boolean;
-    /** User-level setting that lets a session started exactly in the canonical home directory use a deterministic directory identity. */
+    /** User-level setting that lets a session in the canonical home directory use project memory. */
     allow_home_project: boolean;
     mural: MuralConfig;
     /** Selects the runtime implementation for this project. Rust mode is experimental and requires user-level subc configuration. */
@@ -1045,7 +1095,7 @@ export const MagicContextConfigSchema = z
             .boolean()
             .default(false)
             .describe(
-                "Allow Magic Context sessions launched from the exact canonical home directory. The home session uses its deterministic dir: identity so pre-gate memories reconnect. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace.",
+                "Allow Magic Context sessions launched from the exact canonical home directory. A non-git home uses its deterministic dir: identity; a home repository uses its git: identity. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace.",
             ),
         mural: z
             .object({
@@ -1127,7 +1177,7 @@ export const MagicContextConfigSchema = z
             .union([z.string(), z.object({ default: z.string() }).catchall(z.string())])
             .default("5m")
             .describe(
-                'How long Magic Context assumes the provider\'s cached prefix stays valid. This is MC\'s own deferral gate — it does not change the provider\'s actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard, then default). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
+                'How long Magic Context assumes the provider\'s cached prefix stays valid. This is MC\'s own deferral gate — it does not change the provider\'s actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard). Explicit per-model entries win; otherwise GPT-5.6 and later (including gpt-6*, through any provider prefix) use a built-in 30m lifetime before the object default or 5m fallback. An unset or global "5m" opts into built-in defaults; any other global string is an explicit policy and wins. Policy is frozen per session, including across restarts; a model switch resolves against that frozen policy. /ctx-status shows the effective value and source. OpenAI documents at least 30 minutes since the latest write or reuse: https://developers.openai.com/api/docs/guides/prompt-caching (Cache lifetime and Summary of model differences). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
             ),
         prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe(
             "Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. OpenCode 1.x, Pi, and OMP register tool descriptions once per process (they follow the default preset). OpenCode 2 rewrites the five ctx_* descriptions per request from the draft model.",
@@ -1210,7 +1260,9 @@ export const MagicContextConfigSchema = z
             .number()
             .min(60_000)
             .default(DEFAULT_HISTORIAN_TIMEOUT_MS)
-            .describe("Timeout for each historian prompt call in milliseconds (default: 600000)"),
+            .describe(
+                "Timeout for each historian prompt call in both TypeScript and Rust transform modes, in milliseconds (default: 600000)",
+            ),
         commit_cluster_trigger: z
             .object({
                 enabled: z
@@ -1326,7 +1378,7 @@ export const MagicContextConfigSchema = z
             .boolean()
             .default(false)
             .describe(
-                "Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect.",
+                "Debug: keep every settled Magic Context child session instead of deleting it after success: historian, all Dreamer tasks, smart-note evaluation and compilation, user-memory review, and memory migration. Kept Dreamer children can contain memory-pool text and user messages from other sessions of the same operator; their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect. On OpenCode 2, one hidden session holds many runs; it is kept once any of its runs settled, and only a Dreamer session none of whose runs settled is still deleted.",
             ),
         debug_rpc: z
             .boolean()
@@ -1357,9 +1409,9 @@ export const MagicContextConfigSchema = z
             .object({
                 enabled: z
                     .boolean()
-                    .default(true)
+                    .default(false)
                     .describe(
-                        "Pi only: register Magic Context's todowrite task-list tool. Disable if you use your own todo extension. OpenCode ships its own built-in todowrite; this setting has no effect there.",
+                        "Pi only: off by default. Set todowrite.enabled=true to register Magic Context's todowrite task-list tool and /todos command. OpenCode ships its own built-in todowrite; this setting has no effect there.",
                     ),
                 overlay: z
                     .boolean()
@@ -1368,7 +1420,7 @@ export const MagicContextConfigSchema = z
                         "Pi only: show the persistent todo overlay above the editor while tasks are active.",
                     ),
             })
-            .default({ enabled: true, overlay: true })
+            .default({ enabled: false, overlay: true })
             .describe(
                 "Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart.",
             ),
@@ -1407,7 +1459,9 @@ export const MagicContextConfigSchema = z
                 enabled: z
                     .boolean()
                     .default(true)
-                    .describe("Enable cross-session memory (default: true)"),
+                    .describe(
+                        "Enable cross-session memory (default: true). Does not affect history embedding or semantic ctx_search over session history; set embedding.provider to 'off' to stop all embedding.",
+                    ),
                 injection_budget_tokens: z
                     .number()
                     .min(500)
@@ -1504,6 +1558,78 @@ export const MagicContextConfigSchema = z
             protected_tags: data.protected_tags as number | undefined,
         };
     });
+
+/** Settings whose fresh values can be used by later agent runs without changing rendered prompt bytes. */
+export const LIVE_RELOAD_CONFIG_PATHS = [
+    "mural.model",
+    "toast_duration_ms",
+    "historian.opencode.model",
+    "historian.opencode.fallback_models",
+    "historian.opencode.variant",
+    "historian.pi.model",
+    "historian.pi.fallback_models",
+    "historian.pi.thinking_level",
+    "historian.omp.model",
+    "historian.omp.fallback_models",
+    "historian.omp.thinking_level",
+    "historian.two_pass",
+    "historian.maxTokens",
+    "historian_timeout_ms",
+    "commit_cluster_trigger.enabled",
+    "commit_cluster_trigger.min_clusters",
+    "memory.auto_promote",
+    "dreamer.maxTokens",
+    "dreamer.opencode.model",
+    "dreamer.opencode.fallback_models",
+    "dreamer.opencode.variant",
+    "dreamer.opencode.tasks",
+    "dreamer.pi.model",
+    "dreamer.pi.fallback_models",
+    "dreamer.pi.thinking_level",
+    "dreamer.pi.tasks",
+    "dreamer.omp.model",
+    "dreamer.omp.fallback_models",
+    "dreamer.omp.thinking_level",
+    "dreamer.omp.tasks",
+    "dreamer.tasks.map-memories.schedule",
+    "dreamer.tasks.verify.schedule",
+    "dreamer.tasks.verify-broad.schedule",
+    "dreamer.tasks.curate.schedule",
+    "dreamer.tasks.compress-cues.schedule",
+    "dreamer.tasks.classify-memories.schedule",
+    "dreamer.tasks.retrospective.schedule",
+    "dreamer.tasks.retrospective.recency_days",
+    "dreamer.tasks.maintain-docs.schedule",
+    "dreamer.tasks.evaluate-smart-notes.schedule",
+    "dreamer.tasks.review-user-memories.schedule",
+    "dreamer.tasks.review-user-memories.promotion_threshold",
+    "dreamer.tasks.promote-primers.schedule",
+    "dreamer.tasks.promote-primers.promotion_threshold",
+    "dreamer.tasks.refresh-primers.schedule",
+    "memory.git_commit_indexing.enabled",
+    "memory.git_commit_indexing.since_days",
+    "memory.git_commit_indexing.max_commits",
+] as const;
+
+// Mark the input schema nodes, not their parsed defaults, so the JSON schema,
+// runtime projection, docs and dashboard all share one policy source.
+for (const path of LIVE_RELOAD_CONFIG_PATHS) {
+    let node: z.ZodType = MagicContextConfigSchema._def.in as z.ZodType;
+    for (const part of path.split(".")) {
+        while (
+            node instanceof z.ZodOptional ||
+            node instanceof z.ZodDefault ||
+            node instanceof z.ZodNullable
+        ) {
+            node = node.unwrap() as z.ZodType;
+        }
+        if (!(node instanceof z.ZodObject) || !(part in node.shape)) {
+            throw new Error(`Unknown live config path: ${path}`);
+        }
+        node = node.shape[part] as z.ZodType;
+    }
+    z.globalRegistry.add(node, { ...node.meta(), "x-mc-live-reload": true });
+}
 
 /**
  * Derived default protected_tokens formula:

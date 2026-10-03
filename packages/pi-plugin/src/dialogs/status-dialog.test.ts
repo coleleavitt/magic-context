@@ -1,14 +1,22 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { recordDreamerTickFailure } from "@magic-context/core/features/magic-context/dreamer/tick-failure";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { insertMemory } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
 import { setSessionWorkMetrics } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import {
 	insertTag,
 	updateTagTokenCount,
 } from "@magic-context/core/features/magic-context/storage-tags";
+import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
-import { buildStatusView } from "@magic-context/core/shared/status-view";
+import {
+	buildStatusViewFor,
+	STATUS_COLUMN_GAP,
+	statusColumnsFor,
+} from "@magic-context/core/shared/status-view";
+import { checkLocalStatusSource } from "@magic-context/core/shared/status-view-check";
 import {
 	clearPiChannel1State,
 	setPiChannel1Baseline,
@@ -25,6 +33,7 @@ import {
 	type StatusDialogDetail,
 	showStatusDialog,
 	statusViewSourceFromPiDetail,
+	stopStatusDialogRefresh,
 } from "./status-dialog";
 
 /**
@@ -38,7 +47,72 @@ function plainTheme() {
 	} as never;
 }
 
+/**
+ * A detail whose shared model carries every section, so a layout test can assert
+ * on the whole grid instead of on whichever sections a sparse fixture happens to
+ * produce. The cache TTL is pinned to a session value so the Configured row is
+ * short: the default spelling carries the model key and is long enough that the
+ * shared column rule would keep the sections in one column at any width. The
+ * caller owns the returned database and must close it.
+ */
+function fullStatusDetail(sessionId: string) {
+	const db = createTestDb();
+	insertTag(db, sessionId, "m1", "tool", 4_000, 1);
+	const detail = buildPiStatusDetail(
+		{ getAllTools: () => [] } as never,
+		{
+			...fakeContext(sessionId),
+			getContextUsage: () => ({
+				tokens: 40_000,
+				percent: 20,
+				contextWindow: 200_000,
+			}),
+			getSystemPrompt: () => "system prompt",
+		} as never,
+		{ db, projectIdentity: resolveProjectIdentity(process.cwd()) },
+		sessionId,
+	);
+	return {
+		db,
+		detail: { ...detail, cacheTtl: "5m", cacheTtlSource: "session" as const },
+	};
+}
+
 describe("Pi status dialog", () => {
+	it("shutdown closes the dialog and clears its refresh interval", async () => {
+		const db = createTestDb();
+		try {
+			let finished = false;
+			let component: { dispose(): void } | undefined;
+			const ctx = {
+				...fakeContext("ses-status-shutdown"),
+				ui: {
+					custom: async (
+						factory: (...args: never[]) => { dispose(): void },
+					) => {
+						component = factory({ requestRender() {} }, {}, {}, () => {
+							finished = true;
+						});
+					},
+				},
+			};
+			await showStatusDialog({ getAllTools: () => [] } as never, ctx as never, {
+				db,
+				projectIdentity: resolveProjectIdentity(process.cwd()),
+			});
+			const cleared = spyOn(globalThis, "clearInterval");
+			try {
+				stopStatusDialogRefresh();
+				expect(finished).toBe(true);
+				expect(cleared).toHaveBeenCalledTimes(1);
+			} finally {
+				cleared.mockRestore();
+				component?.dispose();
+			}
+		} finally {
+			closeQuietly(db);
+		}
+	});
 	it("displays usage against the output-reserved safe window", () => {
 		const db = createTestDb();
 		try {
@@ -105,6 +179,40 @@ describe("Pi status dialog", () => {
 
 			expect(detail.cacheTtl).toBe("1h");
 			expect(detail.cacheTtlSource).toBe("config");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("counts compartments served in m[1] in the Compartments bucket", () => {
+		// Compartments published after the last m[0] fold ride in m[1]'s
+		// <new-compartments> block; m[0]'s <session-history> may still be empty.
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-status-m1-compartments";
+			const m0History = "<session-history>\n</session-history>";
+			const newCompartments =
+				"<new-compartments>\n## 11-14 · Continued runtime inspection\nRead production, gear and ABI record code before implementing the plan.\n</new-compartments>";
+			getOrCreateSessionMeta(db, sessionId);
+			db.prepare(
+				"UPDATE session_meta SET cached_m0_bytes = ?, cached_m1_bytes = ? WHERE session_id = ?",
+			).run(
+				Buffer.from(m0History, "utf8"),
+				Buffer.from(
+					`<session-history-since>\n${newCompartments}\n</session-history-since>`,
+					"utf8",
+				),
+				sessionId,
+			);
+			const detail = buildPiStatusDetail(
+				{ getAllTools: () => [] } as never,
+				fakeContext(sessionId) as never,
+				{ db, projectIdentity: resolveProjectIdentity(process.cwd()) },
+				sessionId,
+			);
+			expect(detail.compartmentTokens).toBe(
+				estimateTokens(m0History) + estimateTokens(newCompartments),
+			);
 		} finally {
 			closeQuietly(db);
 		}
@@ -508,9 +616,11 @@ Warning: History compression could not finish this turn. It will retry automatic
 			const text = rendered.flat().join("\n");
 			expect(text).not.toContain("Work tokens");
 			// The window derivation is now drawn as the shared line every host
-			// prints verbatim, instead of Pi's own "Window …" rewrite of it.
-			expect(text).toContain("Context:");
-			expect(text).toContain("usable");
+			// prints verbatim, instead of Pi's own "Window …" rewrite of it. The
+			// line no longer carries a `Context:` prefix: it pushed the line past
+			// the narrowest dialog's content width, where it wrapped.
+			expect(text).toContain("usable · window");
+			expect(text).not.toContain("Context:");
 		} finally {
 			closeQuietly(db);
 		}
@@ -736,6 +846,90 @@ Warning: History compression could not finish this turn. It will retry automatic
 		}
 	});
 
+	/**
+	 * The tokenizer calibration leaves the hygiene masses fractional; Pi prints
+	 * the same whole token counts as the OpenCode dialog and the sidebar.
+	 */
+	it("prints the hygiene masses as whole token counts", () => {
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-status-hygiene-rounding";
+			insertTag(db, sessionId, "m1", "tool", 4_000, 1);
+			const detail = buildPiStatusDetail(
+				{ getAllTools: () => [] } as never,
+				{
+					...fakeContext(sessionId),
+					getContextUsage: () => ({
+						tokens: 40_000,
+						percent: 20,
+						contextWindow: 200_000,
+					}),
+					getSystemPrompt: () => "system prompt",
+				} as never,
+				{ db, projectIdentity: resolveProjectIdentity(process.cwd()) },
+				sessionId,
+			);
+			const text = renderPiStatusOverlay(
+				{
+					...detail,
+					tailHygiene: {
+						u: 63_063.522,
+						t: 288_527.546,
+						severity: 0.2186,
+						evaluable: true,
+						reclaimableToolOutputCount: 3,
+					},
+				},
+				plainTheme(),
+				74,
+			).join("\n");
+			expect(text).toContain("21.9% · 63,064 / 288,528 tok");
+			expect(text).not.toContain("63,063.522");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	/**
+	 * The bar is drawn from the shared width distribution, so its runs add up to
+	 * the row width. Rounding each segment's share on its own left blank cells
+	 * between the coloured runs.
+	 */
+	it("fills the bar row exactly, with no blank cell between the runs", () => {
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-status-bar-width";
+			insertTag(db, sessionId, "m1", "tool", 4_000, 1);
+			const detail = buildPiStatusDetail(
+				{ getAllTools: () => [] } as never,
+				{
+					...fakeContext(sessionId),
+					getContextUsage: () => ({
+						tokens: 40_000,
+						percent: 20,
+						contextWindow: 200_000,
+					}),
+					getSystemPrompt: () => "system prompt",
+				} as never,
+				{ db, projectIdentity: resolveProjectIdentity(process.cwd()) },
+				sessionId,
+			);
+			const innerWidth = 74;
+			const lines = renderPiStatusOverlay(detail, plainTheme(), innerWidth);
+			const barLine = lines.find((line) => line.includes("\u2588"));
+			expect(barLine).toBeDefined();
+			// Every cell of the bar row is a block: a blank cell between two runs
+			// would show up as a shorter visible width than the row it fills.
+			expect(visibleWidth(barLine ?? "")).toBe(innerWidth);
+			expect(
+				(barLine ?? "").includes(" \u2588") ||
+					(barLine ?? "").includes("\u2588 "),
+			).toBe(false);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("draws the shared sections, in order, with the shared labels", () => {
 		const db = createTestDb();
 		try {
@@ -755,9 +949,12 @@ Warning: History compression could not finish this turn. It will retry automatic
 				{ db, projectIdentity: resolveProjectIdentity(process.cwd()) },
 				sessionId,
 			);
-			const view = buildStatusView(statusViewSourceFromPiDetail(detail), {
-				version: "0.0.0",
-			});
+			const view = buildStatusViewFor(
+				checkLocalStatusSource(statusViewSourceFromPiDetail(detail)),
+				{
+					version: "0.0.0",
+				},
+			);
 			const lines = renderPiStatusOverlay(detail, plainTheme(), 74);
 
 			// Section titles appear in the model's order, and every row label the
@@ -798,6 +995,103 @@ Warning: History compression could not finish this turn. It will retry automatic
 				"Press D",
 			]) {
 				expect(text).not.toContain(gone);
+			}
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("pairs sections into two columns when the overlay is wide enough", () => {
+		const { db, detail } = fullStatusDetail("ses-status-two-column");
+		try {
+			const innerWidth = 96;
+			const lines = renderPiStatusOverlay(detail, plainTheme(), innerWidth);
+			const view = buildStatusViewFor(
+				checkLocalStatusSource(statusViewSourceFromPiDetail(detail)),
+				{
+					version: "0.0.0",
+				},
+			);
+			// The shared model decides the layout and sizes each column from its own
+			// widest section, so a value never wraps inside its column.
+			const layout = statusColumnsFor(view.sections, innerWidth);
+			expect(layout.twoColumn).toBe(true);
+			const gap = STATUS_COLUMN_GAP;
+
+			expect(view.sections.length).toBe(7);
+			for (let i = 0; i < view.sections.length; i += 2) {
+				const left = view.sections[i];
+				if (!left) throw new Error("left section missing");
+				const right = view.sections[i + 1];
+				// The pair shares one title line: the left title at the start, the
+				// right title exactly after the left column and the gap.
+				const titleIndex = lines.findIndex((line) =>
+					right
+						? line.startsWith(left.title) && line.includes(right.title)
+						: line.trimEnd() === left.title,
+				);
+				expect(titleIndex).toBeGreaterThanOrEqual(0);
+				const titleLine = lines[titleIndex] ?? "";
+				expect(titleLine.startsWith(left.title)).toBe(true);
+				if (right) {
+					expect(titleLine.slice(layout.leftWidth + gap)).toBe(right.title);
+				}
+
+				const rowCount = Math.max(left.rows.length, right?.rows.length ?? 0);
+				for (let r = 0; r < rowCount; r++) {
+					const line = lines[titleIndex + 1 + r] ?? "";
+					const leftRow = left.rows[r];
+					if (leftRow) {
+						expect(line.startsWith(leftRow.label)).toBe(true);
+						// The value is right-aligned within the left column: it ends at
+						// the column's right edge.
+						expect(
+							line.slice(
+								layout.leftWidth - leftRow.value.length,
+								layout.leftWidth,
+							),
+						).toBe(leftRow.value);
+					}
+					const rightRow = right?.rows[r];
+					if (rightRow && right) {
+						const rightStart = layout.leftWidth + gap;
+						const rightEnd = rightStart + layout.rightWidth;
+						expect(line.slice(rightEnd - rightRow.value.length, rightEnd)).toBe(
+							rightRow.value,
+						);
+					}
+				}
+			}
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("keeps the one-column shape below the two-column minimum", () => {
+		const { db, detail } = fullStatusDetail("ses-status-one-column");
+		try {
+			const innerWidth = 60;
+			const lines = renderPiStatusOverlay(detail, plainTheme(), innerWidth);
+			const view = buildStatusViewFor(
+				checkLocalStatusSource(statusViewSourceFromPiDetail(detail)),
+				{
+					version: "0.0.0",
+				},
+			);
+
+			// Walk the sections in model order: each title is alone on its own
+			// line, followed by its rows, each padded to the full inner width.
+			let cursor = 0;
+			for (const section of view.sections) {
+				const titleIndex = lines.indexOf(section.title, cursor);
+				expect(titleIndex).toBeGreaterThanOrEqual(cursor);
+				cursor = titleIndex + 1;
+				for (const row of section.rows) {
+					const line = lines[cursor] ?? "";
+					expect(line.startsWith(row.label)).toBe(true);
+					expect(visibleWidth(line)).toBe(innerWidth);
+					cursor += 1;
+				}
 			}
 		} finally {
 			closeQuietly(db);
@@ -867,4 +1161,62 @@ describe("Pi status overlay: blocked background maintenance", () => {
 			closeQuietly(db);
 		}
 	});
+});
+
+it("Pi status includes config generation and last reload warning", () => {
+	const db = createTestDb();
+	try {
+		const detail = buildPiStatusDetail(
+			{ getAllTools: () => [] } as never,
+			fakeContext("ses-status-live-config") as never,
+			{
+				db,
+				projectIdentity: resolveProjectIdentity(process.cwd()),
+				configGeneration: 6,
+				configAdoptedAt: 1730000000000,
+				configReloadFailure: {
+					path: "/tmp/magic-context.jsonc",
+					message: "malformed",
+				},
+			},
+			"ses-status-live-config",
+		);
+		expect(formatPiStatusSummary(detail)).toContain(
+			"Config generation: 6 (adopted ",
+		);
+		expect(formatPiStatusSummary(detail)).toContain(
+			"Config reload failed /tmp/magic-context.jsonc: malformed",
+		);
+		expect(
+			buildStatusViewFor(
+				checkLocalStatusSource(statusViewSourceFromPiDetail(detail)),
+				{
+					version: "test",
+				},
+			).sections.some((section) => section.title === "Config"),
+		).toBe(true);
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("a Pi snapshot the status model cannot draw renders the unavailable view instead of throwing", () => {
+	const db = createTestDb();
+	try {
+		const detail = buildPiStatusDetail(
+			{ getAllTools: () => [] } as never,
+			fakeContext("ses-status-malformed") as never,
+			{ db, projectIdentity: resolveProjectIdentity(process.cwd()) },
+			"ses-status-malformed",
+		);
+		// The shared model formats usagePercentage with toFixed; a snapshot
+		// without it used to throw out of the overlay's render.
+		const broken = { ...detail, usagePercentage: undefined } as never;
+		const text = renderPiStatusOverlay(broken, plainTheme(), 74).join("\n");
+		expect(text).toContain("Status unavailable");
+		expect(text).toContain("incomplete status data");
+		expect(text).toContain("usagePercentage");
+	} finally {
+		closeQuietly(db);
+	}
 });

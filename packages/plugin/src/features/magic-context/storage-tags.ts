@@ -1,6 +1,7 @@
 import { resolveToolTier } from "../../hooks/magic-context/emergency-drop";
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
 import { newestCtxReduceTagNumbers } from "./reclaim-protection";
 import type { TagEntry } from "./types";
 
@@ -130,7 +131,6 @@ export interface MessageTokenTotal {
     hasNull: boolean;
 }
 
-const CONTENT_ID_SUFFIX = /:(?:p|file)\d+$/;
 const RECENT_OWNER_SCAN_PAGE_SIZE = 128;
 const recentTagOwnerStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -142,7 +142,7 @@ function ownerMessageIdForTagRow(row: {
     if (row.type === "tool") {
         return row.tool_owner_message_id ?? row.message_id;
     }
-    return row.message_id.replace(CONTENT_ID_SUFFIX, "");
+    return contentTagOwnerMessageId(row.message_id);
 }
 
 function getRecentTagOwnerStatement(db: Database): PreparedStatement {
@@ -189,7 +189,7 @@ export function getRecentTagOwnerMessageIds(
                     ? typeof row.tool_owner_message_id === "string"
                         ? row.tool_owner_message_id
                         : null
-                    : row.message_id.replace(CONTENT_ID_SUFFIX, "");
+                    : contentTagOwnerMessageId(row.message_id);
             // Reclaim selectors withhold legacy tool rows whose owner is unknown.
             // Skip them here too so they do not consume a known-owner slot.
             if (!ownerId || recent.has(ownerId)) continue;
@@ -590,6 +590,7 @@ export function getAllStatusTagTokenTotalsFlat(
     db: Database,
     sessionId: string,
     floor = 0,
+    calibration: { proseRatio: number; toolsRatio: number } = { proseRatio: 1, toolsRatio: 1 },
 ): { totals: Map<string, number>; nullMessageIds: Set<string> } {
     // floor > 0 (OpenCode) loads only the live-wire range (tag_number >= floor):
     // tag_number is monotonic with message order, so every tag below the first
@@ -642,10 +643,10 @@ export function getAllStatusTagTokenTotalsFlat(
             continue;
         }
         if (nullMessageIds.has(owner)) continue;
+        const ratio = row.type === "tool" ? calibration.toolsRatio : calibration.proseRatio;
         const weight =
-            (row.token_count ?? 0) +
-            (row.input_token_count ?? 0) +
-            (row.reasoning_token_count ?? 0);
+            ((row.token_count ?? 0) + (row.input_token_count ?? 0)) * ratio +
+            (row.reasoning_token_count ?? 0) * calibration.proseRatio;
         totals.set(owner, (totals.get(owner) ?? 0) + weight);
     }
     return { totals, nullMessageIds };
@@ -723,7 +724,7 @@ function getTagNumbersByMessageIdStatement(db: Database): PreparedStatement {
     let stmt = getTagNumbersByMessageIdStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT tag_number FROM tags WHERE session_id = ? AND (message_id = ? OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\') ORDER BY tag_number ASC",
+            "SELECT tag_number FROM tags WHERE session_id = ? AND (message_id = ? OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\') ORDER BY tag_number ASC",
         );
         getTagNumbersByMessageIdStatements.set(db, stmt);
     }
@@ -734,7 +735,7 @@ function getDeleteTagsByMessageIdStatement(db: Database): PreparedStatement {
     let stmt = deleteTagsByMessageIdStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "DELETE FROM tags WHERE session_id = ? AND (message_id = ? OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\')",
+            "DELETE FROM tags WHERE session_id = ? AND (message_id = ? OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\')",
         );
         deleteTagsByMessageIdStatements.set(db, stmt);
     }
@@ -838,9 +839,15 @@ function toTagEntry(row: TagRow): TagEntry {
         dropMode:
             row.drop_mode === "truncated"
                 ? "truncated"
-                : row.drop_mode === "edit_marker"
-                  ? "edit_marker"
-                  : "full",
+                : row.drop_mode === "skeleton_real"
+                  ? "skeleton_real"
+                  : row.drop_mode === "skeleton_stripped"
+                    ? "skeleton_stripped"
+                    : row.drop_mode === "edit_marker"
+                      ? "edit_marker"
+                      : row.drop_mode === "edit_marker_stripped"
+                        ? "edit_marker_stripped"
+                        : "full",
         toolName: row.tool_name ?? null,
         inputByteSize: row.input_byte_size ?? 0,
         byteSize: row.byte_size,
@@ -965,7 +972,31 @@ export function markWhitespaceAssistantTagInert(
 export function getInertWhitespaceAssistantTags(
     db: Database,
     sessionId: string,
+    messageIds?: readonly string[],
 ): InertWhitespaceAssistantTag[] {
+    if (messageIds) {
+        // The fingerprint index lets the wire reader seek each visible owner instead
+        // of scanning every compacted tag. Keep the unscoped API for reduction tools.
+        const statement = db.prepare(
+            `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
+             FROM tags
+             WHERE session_id = ? AND type = 'message' AND status = 'compacted'
+               AND entry_fingerprint >= ? AND entry_fingerprint < ?`,
+        );
+        return [...new Set(messageIds)].flatMap((messageId) => {
+            const prefix = `${WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX}${messageId}:p`;
+            const rows = statement.all(sessionId, prefix, `${prefix.slice(0, -1)}q`) as Array<{
+                tagNumber: number;
+                entryFingerprint: string;
+            }>;
+            return rows.map((row) => ({
+                tagNumber: row.tagNumber,
+                contentId: row.entryFingerprint.slice(
+                    WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX.length,
+                ),
+            }));
+        });
+    }
     const rows = db
         .prepare(
             `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
@@ -1249,13 +1280,36 @@ function getPiFallbackMessageFoldTagRowsByMessageId(
         .filter(isPiFallbackFoldTagRow);
 }
 
+const foldStatements = new WeakMap<Database, Map<string, PreparedStatement>>();
+
+/**
+ * One compiled statement per connection and SQL text. Folding runs once per
+ * duplicate tag, and a store conversion can fold thousands of them in one
+ * transaction, so compiling the same few statements again for every tag was a
+ * measurable share of the work.
+ */
+function foldStatement(db: Database, sql: string): PreparedStatement {
+    let statements = foldStatements.get(db);
+    if (!statements) {
+        statements = new Map();
+        foldStatements.set(db, statements);
+    }
+    let statement = statements.get(sql);
+    if (!statement) {
+        statement = db.prepare(sql);
+        statements.set(sql, statement);
+    }
+    return statement;
+}
+
 function mergeSizeAndTokenColumnsIntoSurvivor(
     db: Database,
     sessionId: string,
     survivor: PiFallbackFoldTagRow,
     duplicate: PiFallbackFoldTagRow,
 ): void {
-    db.prepare(
+    foldStatement(
+        db,
         `UPDATE tags
          SET byte_size = ?,
              reasoning_byte_size = ?,
@@ -1299,10 +1353,10 @@ function applyDroppedStatusIfNeeded(
 ): void {
     if (survivor.status === "dropped") return;
     if (duplicate.status !== "dropped") return;
-    db.prepare("UPDATE tags SET status = 'dropped' WHERE session_id = ? AND tag_number = ?").run(
-        sessionId,
-        survivor.tagNumber,
-    );
+    foldStatement(
+        db,
+        "UPDATE tags SET status = 'dropped' WHERE session_id = ? AND tag_number = ?",
+    ).run(sessionId, survivor.tagNumber);
     survivor.status = "dropped";
 }
 
@@ -1312,53 +1366,51 @@ function retargetPendingOps(
     fromTagNumber: number,
     toTagNumber: number,
 ): void {
-    const rows = db
-        .prepare(
-            `SELECT id, operation
-             FROM pending_ops
-             WHERE session_id = ? AND tag_id = ?
-             ORDER BY id ASC`,
-        )
+    const rows = foldStatement(
+        db,
+        `SELECT id, operation
+         FROM pending_ops
+         WHERE session_id = ? AND tag_id = ?
+         ORDER BY id ASC`,
+    )
         .all(sessionId, fromTagNumber)
         .filter(isPendingOpIdentityRow);
     for (const row of rows) {
-        const existing = db
-            .prepare(
-                `SELECT 1
-                 FROM pending_ops
-                 WHERE session_id = ? AND tag_id = ? AND operation = ?
-                 LIMIT 1`,
-            )
-            .get(sessionId, toTagNumber, row.operation);
+        const existing = foldStatement(
+            db,
+            `SELECT 1
+             FROM pending_ops
+             WHERE session_id = ? AND tag_id = ? AND operation = ?
+             LIMIT 1`,
+        ).get(sessionId, toTagNumber, row.operation);
         if (existing) {
-            db.prepare("DELETE FROM pending_ops WHERE session_id = ? AND id = ?").run(
+            foldStatement(db, "DELETE FROM pending_ops WHERE session_id = ? AND id = ?").run(
                 sessionId,
                 row.id,
             );
         } else {
-            db.prepare("UPDATE pending_ops SET tag_id = ? WHERE session_id = ? AND id = ?").run(
-                toTagNumber,
-                sessionId,
-                row.id,
-            );
+            foldStatement(
+                db,
+                "UPDATE pending_ops SET tag_id = ? WHERE session_id = ? AND id = ?",
+            ).run(toTagNumber, sessionId, row.id);
         }
     }
-    db.prepare("DELETE FROM pending_ops WHERE session_id = ? AND tag_id = ?").run(
+    foldStatement(db, "DELETE FROM pending_ops WHERE session_id = ? AND tag_id = ?").run(
         sessionId,
         fromTagNumber,
     );
 }
 
 function deleteFoldedDuplicateTag(db: Database, sessionId: string, tagNumber: number): void {
-    db.prepare("DELETE FROM source_contents WHERE session_id = ? AND tag_id = ?").run(
+    foldStatement(db, "DELETE FROM source_contents WHERE session_id = ? AND tag_id = ?").run(
         sessionId,
         tagNumber,
     );
-    db.prepare("DELETE FROM tags WHERE session_id = ? AND tag_number = ?").run(
+    foldStatement(db, "DELETE FROM tags WHERE session_id = ? AND tag_number = ?").run(
         sessionId,
         tagNumber,
     );
-    db.prepare("DELETE FROM pending_ops WHERE session_id = ? AND tag_id = ?").run(
+    foldStatement(db, "DELETE FROM pending_ops WHERE session_id = ? AND tag_id = ?").run(
         sessionId,
         tagNumber,
     );
@@ -1369,10 +1421,22 @@ function foldDuplicateIntoSurvivor(
     sessionId: string,
     survivor: PiFallbackFoldTagRow,
     duplicate: PiFallbackFoldTagRow,
+    /**
+     * False when the caller already knows no queued operation targets the
+     * duplicate, which lets a bulk fold skip the per-tag queue lookup.
+     */
+    duplicateMayHaveQueuedOps = true,
+    /**
+     * False when the duplicate's content is now only a fragment of the
+     * survivor's, so its executed drop must not hide the survivor.
+     */
+    propagateDroppedStatus = true,
 ): void {
     mergeSizeAndTokenColumnsIntoSurvivor(db, sessionId, survivor, duplicate);
-    applyDroppedStatusIfNeeded(db, sessionId, survivor, duplicate);
-    retargetPendingOps(db, sessionId, duplicate.tagNumber, survivor.tagNumber);
+    if (propagateDroppedStatus) applyDroppedStatusIfNeeded(db, sessionId, survivor, duplicate);
+    if (duplicateMayHaveQueuedOps) {
+        retargetPendingOps(db, sessionId, duplicate.tagNumber, survivor.tagNumber);
+    }
     deleteFoldedDuplicateTag(db, sessionId, duplicate.tagNumber);
 }
 
@@ -1396,9 +1460,23 @@ interface PartTagRow extends PiFallbackFoldTagRow {
     partIndex: number;
 }
 
-function readPartTagRows(db: Database, sessionId: string, messageId: string): PartTagRow[] {
-    const prefix = `${messageId}:p`;
-    return db
+/**
+ * Every message tag of the session keyed `<messageId>:p<digits>`, grouped by
+ * the message id and ordered by part index (tag number within one index).
+ *
+ * One read for the whole session, instead of one LIKE scan per message: a LIKE
+ * with an ESCAPE clause cannot use the (session_id, message_id) index, so the
+ * per-message form scanned every tag of the session once per joined message and
+ * made a store conversion quadratic in the session size.
+ *
+ * The split is unambiguous: the digits after the LAST `:p` are the part index
+ * and everything before it is the message id, which is exactly the set of rows
+ * the per-message `<messageId>:p%` pattern plus the digits-only check selected.
+ * Anything that is not a plain part index (`:pfile`) is left alone rather than
+ * guessed at.
+ */
+function readPartTagRowsByMessage(db: Database, sessionId: string): Map<string, PartTagRow[]> {
+    const rows = db
         .prepare(
             `SELECT tag_number AS tagNumber,
                     message_id AS messageId,
@@ -1414,40 +1492,45 @@ function readPartTagRows(db: Database, sessionId: string, messageId: string): Pa
              FROM tags
              WHERE session_id = ?
                AND type = 'message'
-               AND message_id LIKE ? ESCAPE '\\'
              ORDER BY tag_number ASC`,
         )
-        .all(sessionId, `${escapeLikePattern(messageId)}:p%`)
-        .filter(isPiFallbackFoldTagRow)
-        .flatMap((row) => {
-            // `<id>:p3` — anything that is not a plain part index (`:pfile`, a
-            // colon inside the id) is left alone rather than guessed at.
-            const suffix = row.messageId.startsWith(prefix)
-                ? row.messageId.slice(prefix.length)
-                : "";
-            if (!/^\d+$/.test(suffix)) return [];
-            return [{ ...row, partIndex: Number.parseInt(suffix, 10) }];
-        })
-        .sort((a, b) => a.partIndex - b.partIndex);
+        .all(sessionId)
+        .filter(isPiFallbackFoldTagRow);
+    const byMessage = new Map<string, PartTagRow[]>();
+    for (const row of rows) {
+        const marker = row.messageId.lastIndexOf(":p");
+        if (marker < 0) continue;
+        const suffix = row.messageId.slice(marker + 2);
+        if (!/^\d+$/.test(suffix)) continue;
+        const messageId = row.messageId.slice(0, marker);
+        const group = byMessage.get(messageId);
+        const entry = { ...row, partIndex: Number.parseInt(suffix, 10) };
+        if (group) group.push(entry);
+        else byMessage.set(messageId, [entry]);
+    }
+    // Stable sort: rows sharing a part index stay in tag-number order.
+    for (const group of byMessage.values()) group.sort((a, b) => a.partIndex - b.partIndex);
+    return byMessage;
 }
 
-function tagNumbersWithQueuedDrop(
+/** Tag numbers of the session with a queued operation, all of them and drops alone. */
+function readQueuedTagNumbers(
     db: Database,
     sessionId: string,
-    tagNumbers: readonly number[],
-): Set<number> {
-    if (tagNumbers.length === 0) return new Set();
-    const placeholders = tagNumbers.map(() => "?").join(", ");
+): { any: Set<number>; drop: Set<number> } {
     const rows = db
         .prepare(
-            `SELECT DISTINCT tag_id AS tagNumber
-             FROM pending_ops
-             WHERE session_id = ? AND operation = 'drop' AND tag_id IN (${placeholders})`,
+            "SELECT tag_id AS tagNumber, operation FROM pending_ops WHERE session_id = ? AND tag_id IS NOT NULL",
         )
-        .all(sessionId, ...tagNumbers) as Array<{ tagNumber?: unknown }>;
-    return new Set(
-        rows.flatMap((row) => (typeof row.tagNumber === "number" ? [row.tagNumber] : [])),
-    );
+        .all(sessionId) as Array<{ tagNumber?: unknown; operation?: unknown }>;
+    const any = new Set<number>();
+    const drop = new Set<number>();
+    for (const row of rows) {
+        if (typeof row.tagNumber !== "number") continue;
+        any.add(row.tagNumber);
+        if (row.operation === "drop") drop.add(row.tagNumber);
+    }
+    return { any, drop };
 }
 
 /**
@@ -1466,6 +1549,11 @@ function tagNumbersWithQueuedDrop(
  * after the merge that same operation would remove the whole joined text, which
  * is a larger deletion than the one they asked for. Those queue entries are
  * removed and reported to the caller instead.
+ *
+ * An executed drop follows the same rule: a folded tag's `dropped` status is
+ * not copied onto the surviving tag, because the survivor now stands for the
+ * whole joined text. When every fragment was dropped the survivor is one of
+ * them and is already `dropped`, so the joined text stays hidden.
  */
 export function foldShrunkPartTags(
     db: Database,
@@ -1477,24 +1565,36 @@ export function foldShrunkPartTags(
         rekeyedTagNumbers: [],
         discardedDropTagNumbers: [],
     };
+    if (messages.length === 0) return result;
+    // Read once for the whole session. Folding one message only rewrites that
+    // message's own tags and the queue entries that target them, so the rows
+    // read up front are exactly what a per-message read would have returned
+    // at that message's turn.
+    const rowsByMessage = readPartTagRowsByMessage(db, sessionId);
+    const queuedTags = readQueuedTagNumbers(db, sessionId);
+    const discardDrop = foldStatement(
+        db,
+        "DELETE FROM pending_ops WHERE session_id = ? AND tag_id = ? AND operation = 'drop'",
+    );
+    const rekey = foldStatement(
+        db,
+        "UPDATE tags SET message_id = ? WHERE session_id = ? AND tag_number = ? AND type = 'message'",
+    );
     for (const { messageId, partCount } of messages) {
-        const rows = readPartTagRows(db, sessionId, messageId);
+        const rows = rowsByMessage.get(messageId) ?? [];
         if (rows.length === 0) continue;
         const orphans = rows.filter((row) => row.partIndex >= partCount);
         if (orphans.length === 0) continue;
 
-        const queued = tagNumbersWithQueuedDrop(
-            db,
-            sessionId,
-            rows.map((row) => row.tagNumber),
-        );
+        // Ascending, as the earlier per-message `SELECT DISTINCT tag_id` returned them.
+        const queued = [
+            ...new Set(rows.map((row) => row.tagNumber).filter((tag) => queuedTags.drop.has(tag))),
+        ].sort((a, b) => a - b);
         // Every fragment already queued for removal means the merged text is
         // exactly what the user asked to drop; anything less would widen it.
-        if (queued.size > 0 && queued.size < rows.length) {
+        if (queued.length > 0 && queued.length < rows.length) {
             for (const tagNumber of queued) {
-                db.prepare(
-                    "DELETE FROM pending_ops WHERE session_id = ? AND tag_id = ? AND operation = 'drop'",
-                ).run(sessionId, tagNumber);
+                discardDrop.run(sessionId, tagNumber);
                 result.discardedDropTagNumbers.push(tagNumber);
             }
         }
@@ -1505,15 +1605,20 @@ export function foldShrunkPartTags(
             // its tag number and moves down onto the part that remains.
             const lowest = orphans[0];
             if (!lowest) continue;
-            db.prepare(
-                "UPDATE tags SET message_id = ? WHERE session_id = ? AND tag_number = ? AND type = 'message'",
-            ).run(`${messageId}:p0`, sessionId, lowest.tagNumber);
+            rekey.run(`${messageId}:p0`, sessionId, lowest.tagNumber);
             result.rekeyedTagNumbers.push(lowest.tagNumber);
             survivor = { ...lowest, messageId: `${messageId}:p0`, partIndex: 0 };
         }
         for (const orphan of orphans) {
             if (orphan.tagNumber === survivor.tagNumber) continue;
-            foldDuplicateIntoSurvivor(db, sessionId, survivor, orphan);
+            foldDuplicateIntoSurvivor(
+                db,
+                sessionId,
+                survivor,
+                orphan,
+                queuedTags.any.has(orphan.tagNumber),
+                false,
+            );
             result.foldedTagNumbers.push(orphan.tagNumber);
         }
     }
@@ -1692,20 +1797,22 @@ export function markTagsCompactedByMessageIds(
            )
          RETURNING id`,
     );
-    return db.transaction(() => {
-        let changed = 0;
-        for (const messageId of new Set(messageIds)) {
-            const escaped = escapeLikePattern(messageId);
-            changed += update.all(
-                sessionId,
-                messageId,
-                `${escaped}:p%`,
-                `${escaped}:file%`,
-                messageId,
-            ).length;
-        }
-        return changed;
-    })();
+    return db
+        .transaction(() => {
+            let changed = 0;
+            for (const messageId of new Set(messageIds)) {
+                const escaped = escapeLikePattern(messageId);
+                changed += update.all(
+                    sessionId,
+                    messageId,
+                    `${escaped}:p%`,
+                    `${escaped}:file%`,
+                    messageId,
+                ).length;
+            }
+            return changed;
+        })
+        .immediate();
 }
 
 /**
@@ -1716,6 +1823,7 @@ export function markTagsCompactedByMessageIds(
  *   - Message tags: `messageId == <removed-msg-id>` (text parts).
  *   - File tags: `messageId LIKE <removed-msg-id>:p%` /
  *     `<removed-msg-id>:file%`.
+ *   - Content-derived text tags (Pi): `<removed-msg-id>:mc-text-v1:%`.
  *   - Tool tags owned by the removed message:
  *     `tool_owner_message_id == <removed-msg-id>` (v3.3.1 Layer C).
  *
@@ -1737,8 +1845,9 @@ export function deleteTagsByMessageId(
         const escapedMessageId = escapeLikePattern(messageId);
         const textPartPattern = `${escapedMessageId}:p%`;
         const filePartPattern = `${escapedMessageId}:file%`;
+        const contentDerivedTextPattern = `${escapedMessageId}${escapeLikePattern(TEXT_TAG_IDENTITY_MARKER)}%`;
         const messageScopedTags = getTagNumbersByMessageIdStatement(db)
-            .all(sessionId, messageId, textPartPattern, filePartPattern)
+            .all(sessionId, messageId, textPartPattern, filePartPattern, contentDerivedTextPattern)
             .filter(isTagNumberRow)
             .map((row) => row.tag_number);
 
@@ -1758,6 +1867,7 @@ export function deleteTagsByMessageId(
                 messageId,
                 textPartPattern,
                 filePartPattern,
+                contentDerivedTextPattern,
             );
         }
         if (ownerScopedTagNumbers.length > 0) {
@@ -2056,18 +2166,24 @@ export function getDroppedTagsBySession(
     sessionId: string,
     scope?: { ownerIds: readonly string[]; messageAddresses: readonly string[] },
 ): TagEntry[] {
-    // Filter before hydrating tag rows: a long folded history can dwarf the servable tail.
+    // Query owner and message addresses separately so their indexes bound both
+    // scans to the visible tail. Unary + keeps the status filter but prevents
+    // choosing the session-wide dropped-tag index for these scoped lookups.
     const rows = (
         scope
             ? db
-                  .prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags
-        WHERE session_id = ? AND status = 'dropped'
-          AND ((type = 'tool' AND tool_owner_message_id IN (SELECT value FROM json_each(?)))
-            OR (type != 'tool' AND message_id IN (SELECT value FROM json_each(?))))
+                  .prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags INDEXED BY idx_tags_pi_fallback_tool_owner
+        WHERE session_id = ? AND type = 'tool' AND +status = 'dropped'
+          AND tool_owner_message_id IN (SELECT value FROM json_each(?))
+        UNION ALL
+        SELECT ${TAG_SELECT_COLUMNS} FROM tags INDEXED BY idx_tags_session_message_id
+        WHERE session_id = ? AND type != 'tool' AND +status = 'dropped'
+          AND message_id IN (SELECT value FROM json_each(?))
         ORDER BY tag_number ASC, id ASC`)
                   .all(
                       sessionId,
                       JSON.stringify(scope.ownerIds),
+                      sessionId,
                       JSON.stringify(scope.messageAddresses),
                   )
             : getDroppedTagsBySessionStatement(db).all(sessionId)

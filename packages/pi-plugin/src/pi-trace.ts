@@ -44,15 +44,26 @@ async function resolve(): Promise<TraceApi | null> {
 	return api;
 }
 
-/** Run `fn` inside a host span when tracing is available, else directly. */
+/**
+ * Run `fn` inside a host span when tracing is available, else directly.
+ *
+ * Never waits for the trace api: the first resolution imports pi-ai, and a
+ * context pass delayed by that import can outlive the host's bounded wait and
+ * still hold its SQLite write when the next turn starts. Until the api has
+ * resolved, passes run untraced while the resolution finishes in the
+ * background.
+ */
 export async function tracedContextPass<T>(
 	name: string,
 	attrs: Attrs,
 	fn: () => Promise<T>,
 ): Promise<T> {
-	const trace = await resolve();
-	if (!trace) return fn();
-	return trace.withSpan(name, attrs, () => fn());
+	if (api === undefined) {
+		void resolve();
+		return fn();
+	}
+	if (!api) return fn();
+	return api.withSpan(name, attrs, () => fn());
 }
 
 /** Merge attributes onto the active host span (no-op without tracing). */

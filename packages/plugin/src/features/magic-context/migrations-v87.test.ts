@@ -2,13 +2,13 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     LATEST_MIGRATION_VERSION,
     runMigrations,
@@ -58,7 +58,7 @@ afterEach(() => {
 });
 
 function tempDir(): string {
-    const dir = mkdtempSync(join(tmpdir(), "mc-v87-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "mc-v87-"));
     tempDirs.push(dir);
     return dir;
 }
@@ -166,7 +166,6 @@ describe("migration v87: harness labels follow host-store evidence", () => {
             initializeDatabase(db);
             runMigrations(db);
 
-            expect(LATEST_SUPPORTED_VERSION).toBe(88);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
             expect(
                 db

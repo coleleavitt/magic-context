@@ -11,6 +11,7 @@ interface VerificationPathsExecOptions {
     timeout: number;
     maxBuffer: number;
     encoding: BufferEncoding;
+    windowsHide: true;
 }
 
 type VerificationPathsExecResult = {
@@ -28,7 +29,11 @@ const defaultExecFileForVerificationPaths: VerificationPathsExecFile = async (
     file,
     args,
     options,
-) => (await execFileAsync(file, [...args], options)) as VerificationPathsExecResult;
+) =>
+    (await execFileAsync(file, [...args], {
+        ...options,
+        windowsHide: true,
+    })) as VerificationPathsExecResult;
 
 let execFileForVerificationPaths = defaultExecFileForVerificationPaths;
 
@@ -45,9 +50,21 @@ async function runGit(cwd: string, args: readonly string[]): Promise<string | nu
             timeout: GIT_TIMEOUT_MS,
             maxBuffer: 16 * 1024 * 1024,
             encoding: "utf8",
+            windowsHide: true,
         });
         return String(result.stdout);
-    } catch {
+    } catch (error) {
+        if (
+            (error as { killed?: boolean }).killed ||
+            (error as NodeJS.ErrnoException).code === "ETIMEDOUT"
+        ) {
+            throw new Error(
+                `Git verification command git ${args.join(" ")} timed out after ${GIT_TIMEOUT_MS}ms`,
+                {
+                    cause: error,
+                },
+            );
+        }
         return null;
     }
 }

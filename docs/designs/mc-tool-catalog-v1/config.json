@@ -1,0 +1,20 @@
+{
+  "config": {
+    "compaction_enabled": true,
+    "memory_enabled": true,
+    "dreamer_runnable": true,
+    "temporal_awareness": true,
+    "caveman_text_compression": false,
+    "language": null,
+    "prompt_surface": {
+      "default": "full",
+      "models": {
+        "anthropic/claude-haiku-4-5": "light"
+      }
+    },
+    "guidance_override_sha256": null,
+    "tool_descriptions": {},
+    "disabled_tools": []
+  },
+  "text_revision": "688e3ccf33d746625eb3c7002027f74ab0eb5c78e658bfa1175594421a9a8602"
+}

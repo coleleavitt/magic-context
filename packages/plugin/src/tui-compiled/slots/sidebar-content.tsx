@@ -11,6 +11,7 @@ import { For, Show, createEffect, createMemo, createSignal, on, onCleanup } from
 import packageJson from "../../../package.json";
 import { badgeTextColor } from "../badge-contrast";
 import { loadSidebarSnapshot } from "../data/context-db";
+import { directoryForSession } from "../data/session-directory";
 import { formatThresholdPercent } from "../../shared/format-threshold";
 import { renderUserFacingFailure } from "../../shared/user-facing-codes";
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "../compaction-off";
@@ -83,7 +84,10 @@ function createSidebarController(initialPrefs) {
 function compactTokens(value) {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(0)}K`;
-  return String(value);
+  // Token counts are whole numbers to the reader even when the tokenizer
+  // calibration leaves them fractional; a raw `522.4` beside a `63K` reads as
+  // a measurement error rather than as precision.
+  return String(Math.round(value));
 }
 
 /**
@@ -560,7 +564,7 @@ const SidebarContent = props => {
     const sid = props.sessionID();
     if (!sid) return;
     const sequence = ++snapshotRequestSequence;
-    const directory = props.api.state.path.directory ?? "";
+    const directory = directoryForSession(props.api.state.session?.get?.(sid)?.directory, props.api.state.path.directory ?? "");
     void loadSidebarSnapshot(sid, directory).then(data => {
       // Guard against a session switch while this load was in flight:
       // painting session A's snapshot into the now-active session B shows
@@ -620,7 +624,7 @@ const SidebarContent = props => {
       return;
     }
     const sequence = ++snapshotRequestSequence;
-    const directory = props.api.state.path.directory ?? "";
+    const directory = directoryForSession(props.api.state.session?.get?.(sid)?.directory, props.api.state.path.directory ?? "");
     void loadSidebarSnapshot(sid, directory).then(data => {
       if (!recompActive || recompSessionId !== sid || props.sessionID() !== sid || sequence !== snapshotRequestSequence) return;
       const phase = data?.recompProgress?.phase;

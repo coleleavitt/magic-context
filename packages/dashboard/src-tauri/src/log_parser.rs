@@ -10,6 +10,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy)]
 pub enum Harness {
     Opencode,
+    /// The OpenCode 2 plugin logs under its own `opencode2` temp subtree.
+    Opencode2,
     Pi,
     Omp,
 }
@@ -18,6 +20,7 @@ impl Harness {
     fn as_str(self) -> &'static str {
         match self {
             Harness::Opencode => "opencode",
+            Harness::Opencode2 => "opencode2",
             Harness::Pi => "pi",
             Harness::Omp => "omp",
         }
@@ -29,6 +32,7 @@ impl Harness {
 /// The plugin writes separate logs per harness so a single machine running
 /// each can produce an independent issue report:
 ///   - OpenCode → `${tmpdir}/opencode/magic-context/magic-context.log`
+///   - OpenCode 2 → `${tmpdir}/opencode2/magic-context/magic-context.log`
 ///   - Pi       → `${tmpdir}/pi/magic-context/magic-context.log`
 ///   - OMP      → `${tmpdir}/omp/magic-context/magic-context.log`
 ///
@@ -78,7 +82,7 @@ fn resolve_storage_dir() -> Option<PathBuf> {
 
 /// Return every distinct legacy and fleet log the dashboard can read.
 pub fn resolve_log_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::with_capacity(8);
+    let mut paths = Vec::with_capacity(10);
     if let Some(override_path) = std::env::var("MAGIC_CONTEXT_LOG_PATH")
         .ok()
         .map(|value| PathBuf::from(value.trim()))
@@ -86,7 +90,12 @@ pub fn resolve_log_paths() -> Vec<PathBuf> {
     {
         paths.push(override_path);
     }
-    for harness in [Harness::Opencode, Harness::Pi, Harness::Omp] {
+    for harness in [
+        Harness::Opencode,
+        Harness::Opencode2,
+        Harness::Pi,
+        Harness::Omp,
+    ] {
         let path = resolve_log_path_from_temp_dir(&std::env::temp_dir(), harness);
         if !paths.contains(&path) {
             paths.push(path);
@@ -96,6 +105,7 @@ pub fn resolve_log_paths() -> Vec<PathBuf> {
         let logs = storage_dir.join("logs");
         for name in [
             "magic-context.opencode.log",
+            "magic-context.opencode2.log",
             "magic-context.pi.log",
             "magic-context.omp.log",
             "magic-context.log",
@@ -250,6 +260,13 @@ fn decode_escapes(value: &str) -> Option<String> {
             'n' => decoded.push('\n'),
             '"' => decoded.push('"'),
             '\\' => decoded.push('\\'),
+            'u' => {
+                let mut codepoint = 0u32;
+                for _ in 0..4 {
+                    codepoint = codepoint * 16 + chars.next()?.to_digit(16)?;
+                }
+                decoded.push(char::from_u32(codepoint)?);
+            }
             _ => return None,
         }
     }
@@ -647,10 +664,12 @@ pub fn parse_log_line(line: &str) -> Option<LogEntry> {
         "dreamer"
     } else if record.message.contains("historian") || record.message.contains("compartment") {
         "historian"
+    } else if record.message.contains("note-nudge") || record.message.contains("note nudge") {
+        // Checked before the generic "nudge" match, which would otherwise
+        // claim every note-nudge line too.
+        "note-nudge"
     } else if record.message.contains("nudge") {
         "nudge"
-    } else if record.message.contains("note-nudge") || record.message.contains("note nudge") {
-        "note-nudge"
     } else {
         "general"
     }
@@ -899,7 +918,10 @@ fn detect_bust_cause(entries: &[LogEntry], event_idx: usize) -> String {
     if causes.is_empty() {
         "Unknown cause".to_string()
     } else {
-        causes.dedup();
+        // Several lines in the window can name the same cause, not always next
+        // to each other; keep the first mention of each.
+        let mut seen = std::collections::HashSet::new();
+        causes.retain(|cause| seen.insert(cause.clone()));
         causes.join(", ")
     }
 }
@@ -980,9 +1002,9 @@ pub fn read_log_tails(paths: &[PathBuf], max_lines: usize) -> Vec<LogEntry> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_cache_events, log_spec_admits, parse_log_line, parse_log_record, read_log_tail,
+        detect_bust_cause, extract_cache_events, log_spec_admits, parse_log_line, parse_log_record, read_log_tail,
         read_log_tails, resolve_log_path_for, resolve_log_path_from_temp_dir, resolve_log_paths,
-        Harness, LogGrammar, Regex,
+        Harness, LogEntry, LogGrammar, Regex,
     };
     use std::collections::HashMap;
     // `Path` is only used by the macOS/Windows temp-dir cases below; importing it
@@ -990,16 +1012,6 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     use std::path::Path;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
-
-    // The env var is process-global; serialize the tests that mutate it.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
 
     fn golden_fixture() -> serde_json::Value {
         serde_json::from_str(include_str!(
@@ -1028,6 +1040,42 @@ mod tests {
     const R2_LINE: &str = "2026-09-05T10:41:03.130Z WARN  magic-context.perf: [harness=opencode session=opencode:ses_00fc88222ffe] transform stage folded ms=412 retry=2";
     const R1_LINE: &str = "2026-09-05T10:41:03.130Z WARN  magic-context session=opencode:ses_00fc88222ffe tag=perf transform stage folded ms=412 retry=2";
     const LEGACY_LINE: &str = "[2026-09-05T10:41:03.130Z] [magic-context][ses_00fc88222ffe] transform stage folded ms=412 retry=2";
+
+    /// The writer removes complete CSI escape sequences (7-bit `ESC [` or the C1
+    /// byte U+009B, then parameter bytes 0x30-0x3F, intermediate bytes 0x20-0x2F
+    /// and one final byte 0x40-0x7E) before rendering, so a reader can never
+    /// recover them. The fixture's `event` still holds the colored input; the
+    /// expected record is the event with those sequences removed. A lone ESC and
+    /// other control characters are escaped, not removed, and round-trip.
+    fn strip_complete_csi(value: &str) -> String {
+        let chars: Vec<char> = value.chars().collect();
+        let mut out = String::with_capacity(value.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let start = if chars[i] == '\u{1b}' && chars.get(i + 1) == Some(&'[') {
+                Some(i + 2)
+            } else if chars[i] == '\u{9b}' {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(mut j) = start {
+                while j < chars.len() && ('\u{30}'..='\u{3f}').contains(&chars[j]) {
+                    j += 1;
+                }
+                while j < chars.len() && ('\u{20}'..='\u{2f}').contains(&chars[j]) {
+                    j += 1;
+                }
+                if j < chars.len() && ('\u{40}'..='\u{7e}').contains(&chars[j]) {
+                    i = j + 1;
+                    continue;
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
+    }
 
     #[test]
     fn reads_every_render_case_of_the_authority_fleet_r2_fixture() {
@@ -1060,8 +1108,16 @@ mod tests {
                 "{name}"
             );
             assert_eq!(record.bound, bound, "{name}");
-            assert_eq!(record.message, event["message"].as_str().unwrap(), "{name}");
-            assert_eq!(record.kv, pairs(&event["fields"]), "{name}");
+            assert_eq!(
+                record.message,
+                strip_complete_csi(event["message"].as_str().unwrap()),
+                "{name}"
+            );
+            let mut expected_kv = pairs(&event["fields"]);
+            for value in expected_kv.values_mut() {
+                *value = strip_complete_csi(value);
+            }
+            assert_eq!(record.kv, expected_kv, "{name}");
             assert_eq!(record.grammar, LogGrammar::FleetR2, "{name}");
         }
     }
@@ -1119,6 +1175,21 @@ mod tests {
             )])
         );
         assert_eq!(record.message, "transform stage folded");
+    }
+
+    #[test]
+    fn reads_message_updated_identifiers_as_fields() {
+        let record = parse_log_record("[2026-09-05T10:41:03.130Z] [magic-context][ses_538] event message.updated: provider=mock model=test hasUsageTokens=true tokens.input=10 cache.read=2 cache.write=0 message.id=msg_538 session.id=ses_538").unwrap();
+        assert_eq!(record.session.as_deref(), Some("ses_538"));
+        assert_eq!(record.message, "event message.updated:");
+        assert_eq!(
+            record.kv.get("message.id").map(String::as_str),
+            Some("msg_538")
+        );
+        assert_eq!(
+            record.kv.get("session.id").map(String::as_str),
+            Some("ses_538")
+        );
     }
 
     #[test]
@@ -1195,8 +1266,8 @@ mod tests {
             .is_empty());
 
         let dated = Regex::new(r"\.\d{4}-\d{2}-\d{2}\.log$").unwrap();
-        let _guard = env_lock();
-        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.remove("MAGIC_CONTEXT_LOG_PATH");
         for path in resolve_log_paths() {
             assert!(!dated.is_match(&path.to_string_lossy()), "{path:?}");
         }
@@ -1271,6 +1342,32 @@ mod tests {
     }
 
     #[test]
+    fn note_nudge_lines_get_their_own_component() {
+        let line = "2026-09-05T10:41:03.130Z INFO  magic-context session=opencode:ses_n note nudge delivered";
+        assert_eq!(parse_log_line(line).unwrap().component, "note-nudge");
+        let line = "2026-09-05T10:41:03.130Z INFO  magic-context session=opencode:ses_n nudge sent";
+        assert_eq!(parse_log_line(line).unwrap().component, "nudge");
+    }
+
+    #[test]
+    fn bust_causes_name_each_cause_once_even_when_not_adjacent() {
+        let entries: Vec<LogEntry> = [
+            "2026-09-05T10:41:01.000Z INFO  magic-context session=opencode:ses_b cache event cache.read=70 cache.write=20 tokens.input=10",
+            "2026-09-05T10:41:02.000Z INFO  magic-context session=opencode:ses_b Execute pass started",
+            "2026-09-05T10:41:02.100Z INFO  magic-context session=opencode:ses_b heuristic cleanup ran",
+            "2026-09-05T10:41:02.200Z INFO  magic-context session=opencode:ses_b Execute pass finished",
+            "2026-09-05T10:41:03.000Z INFO  magic-context session=opencode:ses_b cache event cache.read=0 cache.write=90 tokens.input=10",
+        ]
+        .iter()
+        .map(|line| parse_log_line(line).unwrap())
+        .collect();
+        assert_eq!(
+            detect_bust_cause(&entries, 4),
+            "Execute pass, Heuristic cleanup"
+        );
+    }
+
+    #[test]
     fn rejects_wrong_grammar_without_silently_splitting() {
         assert!(parse_log_record(
             "2026-09-05T10:41:03.130Z WARN magic-context session=opencode:ses_bad transform failed: boom"
@@ -1288,8 +1385,8 @@ mod tests {
 
     #[test]
     fn resolve_log_path_for_uses_harness_fallback_when_env_unset() {
-        let _guard = env_lock();
-        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.remove("MAGIC_CONTEXT_LOG_PATH");
 
         assert_eq!(
             resolve_log_path_for(Harness::Opencode),
@@ -1347,13 +1444,24 @@ mod tests {
 
     #[test]
     fn resolve_log_paths_reads_all_harnesses_when_no_override_is_set() {
-        let _guard = env_lock();
-        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.remove("MAGIC_CONTEXT_LOG_PATH");
 
         let paths = resolve_log_paths();
-        for harness in [Harness::Opencode, Harness::Pi, Harness::Omp] {
+        for harness in [
+            Harness::Opencode,
+            Harness::Opencode2,
+            Harness::Pi,
+            Harness::Omp,
+        ] {
             assert!(paths.contains(&resolve_log_path_for(harness)));
         }
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with("opencode2/magic-context/magic-context.log")));
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with("logs/magic-context.opencode2.log")));
         assert!(paths
             .iter()
             .any(|path| path.ends_with("logs/magic-context.opencode.log")));
@@ -1370,11 +1478,11 @@ mod tests {
 
     #[test]
     fn resolve_log_paths_keeps_standard_families_with_a_shared_override() {
-        let _guard = env_lock();
+        let mut env = crate::test_env::EnvGuard::new();
         let custom = std::env::temp_dir()
             .join("custom")
             .join("magic-context.log");
-        std::env::set_var(
+        env.set(
             "MAGIC_CONTEXT_LOG_PATH",
             custom.to_string_lossy().to_string(),
         );
@@ -1387,7 +1495,7 @@ mod tests {
             Harness::Omp
         )));
 
-        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+        env.remove("MAGIC_CONTEXT_LOG_PATH");
     }
 
     #[test]
@@ -1415,11 +1523,11 @@ mod tests {
 
     #[test]
     fn resolve_log_path_for_honors_magic_context_log_path_override() {
-        let _guard = env_lock();
+        let mut env = crate::test_env::EnvGuard::new();
         let custom = std::env::temp_dir()
             .join("custom")
             .join("magic-context.log");
-        std::env::set_var(
+        env.set(
             "MAGIC_CONTEXT_LOG_PATH",
             custom.to_string_lossy().to_string(),
         );
@@ -1430,13 +1538,13 @@ mod tests {
         );
         assert_eq!(resolve_log_path_for(Harness::Pi), PathBuf::from(&custom));
 
-        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+        env.remove("MAGIC_CONTEXT_LOG_PATH");
     }
 
     #[test]
     fn resolve_log_path_for_ignores_blank_magic_context_log_path() {
-        let _guard = env_lock();
-        std::env::set_var("MAGIC_CONTEXT_LOG_PATH", "   ");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.set("MAGIC_CONTEXT_LOG_PATH", "   ");
 
         assert_eq!(
             resolve_log_path_for(Harness::Pi),
@@ -1446,6 +1554,6 @@ mod tests {
                 .join("magic-context.log")
         );
 
-        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+        env.remove("MAGIC_CONTEXT_LOG_PATH");
     }
 }

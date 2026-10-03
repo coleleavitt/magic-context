@@ -68,6 +68,7 @@ export interface CacheBustSentinelOptions {
     send: boolean;
     intervalMs: number;
     lookbackMs: number;
+    maxRunMs?: number;
     stateFile: string;
     databasePath: string;
     rustStorePath: string;
@@ -107,6 +108,8 @@ export interface CacheBustEvent {
         divergence_class: string;
         first_divergence: string;
         analyzer_cmd: string;
+        /** Render-identity components the matched pass changed, when it logged them. */
+        identity_delta?: string[];
     };
 }
 
@@ -119,6 +122,8 @@ export interface AgentDeliverRequest {
         from_session_id: "health-sentinel-mc";
         from_harness: "magic-context";
         content: string;
+        /** The sender is a script with no session, so replies cannot reach it. */
+        one_way: true;
     };
     urgency: "high";
     expected_residence_epoch?: number;
@@ -146,6 +151,7 @@ interface OpenBustWindowState {
 interface SessionWatermarkState {
     lastAnalyzedRequestTimestampMs: number;
     openWindow?: OpenBustWindowState;
+    scanCursor?: string;
 }
 
 interface SentWindowState {
@@ -184,6 +190,8 @@ export interface SentinelCounters {
     accepted: number;
     dedup: number;
     sendRefused: number;
+    filesExamined: number;
+    bounded: boolean;
 }
 
 interface SentinelRunDeps {
@@ -198,7 +206,7 @@ interface SentinelRunDeps {
         sinceExclusiveMs: number,
         decisions: readonly CacheBustDecisionAttribution[],
         options: CacheBustSentinelOptions,
-    ) => Promise<CacheBustSessionAnalysis>;
+    ) => Promise<CacheBustSessionAnalysis & { filesExamined?: number; scanBounded?: boolean; scanCursor?: string }>;
     loadDecisions?: (
         session: ActiveCacheBustSession,
         options: CacheBustSentinelOptions,
@@ -262,6 +270,7 @@ export function loadSentinelState(path: string): CacheBustSentinelState {
             ...(open && startMs !== undefined && lastBustMs !== undefined
                 ? { openWindow: { startMs, lastBustMs } }
                 : {}),
+            ...(typeof row?.scanCursor === "string" ? { scanCursor: row.scanCursor } : {}),
         };
     }
     for (const [key, raw] of Object.entries(windows)) {
@@ -320,6 +329,7 @@ export function parseSentinelArgs(argv: string[]): CacheBustSentinelOptions {
     const valueFlags = new Set([
         "--interval-ms",
         "--lookback-ms",
+        "--max-run-ms",
         "--state-file",
         "--db",
         "--rust-store",
@@ -366,6 +376,9 @@ export function parseSentinelArgs(argv: string[]): CacheBustSentinelOptions {
         send: args.includes("--send"),
         intervalMs,
         lookbackMs,
+        maxRunMs: values.has("--max-run-ms")
+            ? parsePositiveInteger(values.get("--max-run-ms"), "--max-run-ms")
+            : 30_000,
         stateFile: values.get("--state-file") ?? join(storageDir, "cache-bust-sentinel-state.json"),
         databasePath: values.get("--db") ?? join(storageDir, "context.db"),
         rustStorePath: values.get("--rust-store") ?? join(storageDir, "store.db"),
@@ -422,7 +435,8 @@ export function enumerateActiveSessions(
             const since =
                 state.sessions[sessionId]?.lastAnalyzedRequestTimestampMs ??
                 nowMs - options.lookbackMs;
-            return activityMs > since ? [{ sessionId, harness, projectPath, activityMs }] : [];
+            return activityMs > since || state.sessions[sessionId]?.scanCursor
+                ? [{ sessionId, harness, projectPath, activityMs }] : [];
         });
     } finally {
         db.close(false);
@@ -449,6 +463,35 @@ export function loadSessionDecisions(
     };
     const booleanField = (row: Record<string, unknown>, ...keys: string[]): boolean =>
         keys.some((key) => row[key] === true || row[key] === 1 || row[key] === "true");
+    const stringListField = (
+        row: Record<string, unknown>,
+        ...keys: string[]
+    ): string[] | undefined => {
+        for (const key of keys) {
+            const value = row[key];
+            if (Array.isArray(value)) {
+                const strings = value.filter(
+                    (entry): entry is string => typeof entry === "string" && entry.length > 0,
+                );
+                if (strings.length > 0) return strings;
+            }
+            if (typeof value !== "string" || value.length === 0) continue;
+            try {
+                const parsed = JSON.parse(value);
+                if (Array.isArray(parsed)) {
+                    const strings = parsed.filter(
+                        (entry): entry is string =>
+                            typeof entry === "string" && entry.length > 0,
+                    );
+                    if (strings.length > 0) return strings;
+                }
+            } catch {
+                const strings = value.split(",").filter(Boolean);
+                if (strings.length > 0) return strings;
+            }
+        }
+        return undefined;
+    };
     const normalize = (
         row: Record<string, unknown>,
         source: string,
@@ -504,6 +547,15 @@ export function loadSessionDecisions(
             droppedTokens: numberField(row, "dropped_tokens", "applied_drop_tokens") ?? 0,
             droppedCount: appliedDrops ?? 0,
             inputTokens: numberField(row, "input_tokens", "prompt_tokens") ?? 0,
+            inputCount: numberField(row, "oc_input", "input_count"),
+            externalEpoch: booleanField(
+                row,
+                "restart_epoch",
+                "deploy_epoch",
+                "config_epoch",
+                "external_epoch",
+            ),
+            identityDelta: stringListField(row, "identity_delta", "render_identity_delta"),
             flush:
                 booleanField(row, "flush", "flush_applied", "explicit_flush") ||
                 materializeReason === "explicit_flush",
@@ -537,7 +589,36 @@ export function loadSessionDecisions(
             .query("SELECT * FROM mc_pass_trace WHERE session_id = ?")
             .all(session.sessionId) as Array<Record<string, unknown>>;
         addRows(rows, source);
-        for (const row of rows) {
+        if (rows.length === 0) return;
+        // Store migration 63 moved the histories into ring rows and dropped the array columns;
+        // its read-only view rebuilds each session's arrays in sequence order. Older stores
+        // still carry the columns on the trace row itself.
+        const ringView = Boolean(
+            db
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = 'mc_pass_trace_history_arrays'",
+                )
+                .get(),
+        );
+        const histories = ringView
+            ? (db
+                  .query(
+                      "SELECT scheduler_history, scheduler_interesting_history FROM mc_pass_trace_history_arrays WHERE session_id = ?",
+                  )
+                  .all(session.sessionId) as Array<Record<string, unknown>>)
+            : rows.filter(
+                  (row) =>
+                      typeof row.scheduler_history === "string" ||
+                      typeof row.scheduler_interesting_history === "string",
+              );
+        if (histories.length === 0) {
+            // Reading zero decisions here would look like a quiet session, not a schema the
+            // sentinel no longer understands.
+            throw new CacheBustSentinelInputError(
+                `${source} has a trace row for ${session.sessionId} but neither ring-row histories nor history columns`,
+            );
+        }
+        for (const row of histories) {
             for (const column of ["scheduler_history", "scheduler_interesting_history"] as const) {
                 if (typeof row[column] !== "string") continue;
                 try {
@@ -589,6 +670,9 @@ export function loadSessionDecisions(
             prior.droppedTokens = Math.max(prior.droppedTokens, record.droppedTokens);
             prior.droppedCount = Math.max(prior.droppedCount, record.droppedCount);
             prior.inputTokens = Math.max(prior.inputTokens, record.inputTokens);
+            prior.inputCount ??= record.inputCount;
+            prior.externalEpoch ||= record.externalEpoch;
+            prior.identityDelta ??= record.identityDelta;
             prior.flush ||= record.flush;
             prior.source = `${prior.source}+${record.source}`;
             continue;
@@ -653,13 +737,16 @@ async function analyzeActiveSession(
     session: ActiveCacheBustSession,
     sinceExclusiveMs: number,
     decisions: readonly CacheBustDecisionAttribution[],
-    options: CacheBustSentinelOptions,
-): Promise<CacheBustSessionAnalysis> {
+    options: CacheBustSentinelOptions & { scanCursor?: string; scanDeadlineMs?: number; scanNow?: () => number },
+): Promise<CacheBustSessionAnalysis & { filesExamined?: number; scanBounded?: boolean; scanCursor?: string }> {
     if (session.harness === "opencode") {
         const analysis = analyzeOpenCodeCacheBustSession({
             sessionId: session.sessionId,
             sinceExclusiveMs,
             untilInclusiveMs: Date.now(),
+            scanCursor: options.scanCursor,
+            scanDeadlineMs: options.scanDeadlineMs,
+            scanNow: options.scanNow,
             anthropicDir: options.anthropicDir,
             mcLogPath: options.mcLogPath,
             openaiDir: options.openaiDir,
@@ -793,6 +880,9 @@ export function eventForWindow(
             divergence_class: divergenceClass,
             first_divergence: representative.firstDivergence,
             analyzer_cmd: representative.analyzerCmd,
+            ...(representative.identityDelta?.length
+                ? { identity_delta: representative.identityDelta }
+                : {}),
         },
     };
     state.windows[key] = {
@@ -816,7 +906,8 @@ export function agentDeliverRequest(
             from_agent: fromAgent,
             from_session_id: SENTINEL_FROM_SESSION_ID,
             from_harness: SENTINEL_FROM_HARNESS,
-            content: `${event.session_id}: cache bust detected in directory ${event.directory} at ${event.payload.at}; rewritten_tokens=${event.payload.rewritten_tokens}; divergence_class=${event.payload.divergence_class}; first_divergence=${event.payload.first_divergence}; analyzer_cmd=${event.payload.analyzer_cmd}`,
+            content: `${event.session_id}: cache bust detected in directory ${event.directory} at ${event.payload.at}; rewritten_tokens=${event.payload.rewritten_tokens}; divergence_class=${event.payload.divergence_class}; first_divergence=${event.payload.first_divergence}${event.payload.identity_delta ? `; identity_delta=${event.payload.identity_delta.join(",")}` : ""}; analyzer_cmd=${event.payload.analyzer_cmd}`,
+            one_way: true,
         },
         urgency: "high",
     };
@@ -969,6 +1060,8 @@ function emptyCounters(): SentinelCounters {
         accepted: 0,
         dedup: 0,
         sendRefused: 0,
+        filesExamined: 0,
+        bounded: false,
     };
 }
 
@@ -1003,7 +1096,9 @@ export async function runSentinelOnce(
     options: CacheBustSentinelOptions,
     deps: SentinelRunDeps = {},
 ): Promise<SentinelCounters> {
-    const nowMs = (deps.now ?? Date.now)();
+    const clock = deps.now ?? Date.now;
+    const nowMs = clock();
+    const deadlineMs = nowMs + (options.maxRunMs ?? 30_000);
     const stdout = deps.stdout ?? console.log;
     const stderr = deps.stderr ?? console.error;
     const state = loadSentinelState(options.stateFile);
@@ -1011,6 +1106,7 @@ export async function runSentinelOnce(
     const sessions = listSessions(state, nowMs, options);
     const counters = emptyCounters();
     counters.sessions = sessions.length;
+    stderr(JSON.stringify({ kind: "cache_bust_sentinel_start", at: new Date(nowMs).toISOString() }));
     const transport = options.send
         ? (deps.transport ??
           new SubcWakeEventTransport(
@@ -1023,6 +1119,10 @@ export async function runSentinelOnce(
 
     try {
         for (const session of sessions) {
+            if (clock() >= deadlineMs) {
+                counters.bounded = true;
+                break;
+            }
             const priorSession = state.sessions[session.sessionId];
             const sinceExclusiveMs =
                 priorSession?.lastAnalyzedRequestTimestampMs ?? nowMs - options.lookbackMs;
@@ -1031,8 +1131,10 @@ export async function runSentinelOnce(
                 session,
                 sinceExclusiveMs,
                 decisions,
-                options,
+                { ...options, scanCursor: priorSession?.scanCursor, scanDeadlineMs: deadlineMs, scanNow: clock },
             );
+            counters.filesExamined += analysis.filesExamined ?? 0;
+            counters.bounded ||= analysis.scanBounded ?? false;
             const requests = analysis.requests.filter(
                 (request) =>
                     request.session === session.sessionId &&
@@ -1131,18 +1233,24 @@ export async function runSentinelOnce(
                     : requests.length > 0
                       ? Math.max(...requests.map((request) => request.timestampMs))
                       : null;
-            if (highWater !== null && highWater > sessionState.lastAnalyzedRequestTimestampMs) {
+            if (analysis.scanCursor) sessionState.scanCursor = analysis.scanCursor;
+            else delete sessionState.scanCursor;
+            if (!analysis.scanBounded && highWater !== null && highWater > sessionState.lastAnalyzedRequestTimestampMs) {
                 sessionState.lastAnalyzedRequestTimestampMs = highWater;
             }
             updateOpenWindowState(sessionState, requests, windows);
             state.sessions[session.sessionId] = sessionState;
             saveSentinelState(options.stateFile, state);
+            if (analysis.scanBounded || clock() >= deadlineMs) {
+                counters.bounded = true;
+                break;
+            }
         }
     } finally {
         await transport?.close?.();
     }
     saveSentinelState(options.stateFile, state);
-    stderr(JSON.stringify({ kind: "cache_bust_sentinel_summary", counters }));
+    stderr(JSON.stringify({ kind: "cache_bust_sentinel_summary", at: new Date(clock()).toISOString(), elapsedMs: clock() - nowMs, counters }));
     return counters;
 }
 

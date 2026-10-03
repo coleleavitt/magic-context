@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripSystemInjection } from "../src/hooks/magic-context/system-injection-stripper";
 import { __test, analyzeOpenCodeCacheBustSession } from "./analyze-cache-busts";
+import { type CacheBustDecisionAttribution } from './cache-bust-attribution';
 import { describeBodyPair, normalizeRequestBody } from "./cache-bust-body-sources";
 
 type UsageFixture = {
@@ -182,6 +183,90 @@ describe("analyze-cache-bust dump discovery", () => {
         expect(run.stdout.toString()).toContain(
             "wireModel=claude-opus-5 → claude-opus-4-8",
         );
+    });
+
+    test("repeated epoch HARD decisions on one session are attributed to self-inflicted epochs", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-double-epoch-"));
+        tempDirs.push(dir);
+        const session = "ses_doubleEpoch";
+        const start = Date.parse("2026-09-20T16:00:00.000Z");
+        for (const [index, text] of ["initial", "first epoch", "second epoch"].entries()) {
+            const at = new Date(start + index * 6_000).toISOString();
+            writeDump(
+                dir,
+                `2026-09-20T16-00-${String(index * 6).padStart(2, "0")}-000Z-00000${index + 1}-${session}`,
+                at,
+                session,
+                bodyWithBreakpointMessage(text),
+                responseUsage({ input_tokens: 100, cache_read_input_tokens: index === 0 ? 20_000 : 100, cache_creation_input_tokens: index === 0 ? 0 : 19_900 }),
+            );
+        }
+        const decisions = [6_000, 12_000].map((offset) => ({
+            timestampMs: start + offset,
+            decision: "defer",
+            materialized: true,
+            materializeReason: "epoch_change",
+            identityDelta: ["other"],
+            emergency: false,
+            droppedTokens: 0,
+            droppedCount: 0,
+            inputTokens: 100,
+            flush: false,
+            source: "fixture",
+        }));
+        const rows = __test.analyzeSnapshots(snapshotsFor(dir, session), decisions);
+        expect(rows[1]?.divergenceClass).toBe("accounted_hard_epoch");
+        expect(rows[2]?.divergenceClass).toBe("self_inflicted_epoch");
+    });
+
+    test("an epoch HARD explained by a preceding full retry stays accounted; one with nothing before it is unfaulted", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-unfaulted-epoch-"));
+        tempDirs.push(dir);
+        const session = "ses_unfaultedEpoch";
+        const start = Date.parse("2026-09-20T16:00:00.000Z");
+        // Two epoch HARDs five minutes apart, so neither counts as a repeat of the other.
+        const offsets = [0, 60_000, 360_000];
+        for (const [index, text] of ["initial", "after retry", "spontaneous"].entries()) {
+            const at = new Date(start + offsets[index]!).toISOString();
+            writeDump(
+                dir,
+                `${at.replaceAll(":", "-").replace(".", "-")}-00000${index + 1}-${session}`,
+                at,
+                session,
+                bodyWithBreakpointMessage(text),
+                responseUsage({ input_tokens: 100, cache_read_input_tokens: index === 0 ? 20_000 : 100, cache_creation_input_tokens: index === 0 ? 0 : 19_900 }),
+            );
+        }
+        const pass = (offset: number, source: string) => ({
+            timestampMs: start + offset,
+            decision: "HARD",
+            materialized: true,
+            materializeReason: "epoch_change",
+            identityDelta: ["other"],
+            emergency: false,
+            droppedTokens: 0,
+            droppedCount: 0,
+            inputTokens: 100,
+            flush: false,
+            source,
+        });
+        const decisions = [
+            pass(60_000, "rust pass log"),
+            pass(360_000, "rust pass log"),
+            {
+                ...pass(55_000, "rust adapter log"),
+                decision: "disruption",
+                materialized: false,
+                materializeReason: null,
+                disruption: "full_retry",
+            },
+        ];
+        const rows = __test.analyzeSnapshots(snapshotsFor(dir, session), decisions);
+        expect(rows[1]?.divergenceClass).toBe("accounted_hard_epoch");
+        expect(rows[2]?.divergenceClass).toBe("unfaulted_epoch");
+        expect(rows[2]?.decision?.identityDelta).toEqual(["other"]);
+        // The disruption marker is never joined to a request as its pass.
+        expect(rows.every((row) => row.decision?.disruption === undefined)).toBe(true);
     });
 
     test("skips an unmetered pass as a baseline for the next real short-read bust", () => {
@@ -411,6 +496,72 @@ describe("analyze-cache-bust dump discovery", () => {
         });
 
         expect(analysis.requests.at(-1)?.divergenceClass).toBe("accounted_hard_system_hash");
+    });
+
+    test("joins slow AFT passes and wakes for an input-step epoch", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-aft-slow-pass-"));
+        tempDirs.push(dir);
+        const session = "ses_313660571ffeZTsf4koSJwk50Q";
+        const requests = [
+            ["2026-09-22T11:54:34.997Z", "baseline", 300_000],
+            ["2026-09-22T11:54:40.313Z", "coverage fold", 10_000],
+            ["2026-09-22T11:55:29.581Z", "epoch rewrite", 10_000],
+        ] as const;
+        for (const [at, text, cacheRead] of requests) {
+            const stem = `${at.replaceAll(":", "-").replace(".", "-")}-${session}`;
+            writeDump(
+                dir,
+                stem,
+                at,
+                session,
+                bodyWithBreakpointMessage(text),
+                responseUsage({
+                    input_tokens: 2,
+                    cache_read_input_tokens: cacheRead,
+                    cache_creation_input_tokens: 200_000,
+                }),
+            );
+        }
+        const decisions: CacheBustDecisionAttribution[] = [
+            {
+                timestampMs: Date.parse("2026-09-22T11:54:36.709Z"),
+                decision: "SOFT",
+                canonicalDecision: "execute",
+                materialized: true,
+                materializeReason: "coverage_fold",
+                emergency: false,
+                droppedTokens: 0,
+                droppedCount: 0,
+                inputTokens: 373_959,
+                inputCount: 513,
+                flush: false,
+                source: "fixture",
+            },
+            {
+                timestampMs: Date.parse("2026-09-22T11:55:13.792Z"),
+                decision: "HARD",
+                canonicalDecision: "HARD",
+                materialized: true,
+                materializeReason: "epoch_change",
+                emergency: false,
+                droppedTokens: 0,
+                droppedCount: 0,
+                inputTokens: 343_741,
+                inputCount: 12_747,
+                flush: false,
+                source: "fixture",
+            },
+        ];
+
+        const analysis = analyzeOpenCodeCacheBustSession({
+            sessionId: session,
+            anthropicDir: dir,
+            openaiDir: join(dir, "missing-openai"),
+            decisions,
+            mcLogPath: null,
+        });
+        expect(analysis.requests[1]?.divergenceClass).not.toBe("no_mc_pass_row");
+        expect(analysis.requests[2]?.divergenceClass).toBe("self_inflicted_epoch");
     });
 
     test("prints complete UTF-8 body bytes separately from reusable normalized prefix bytes", () => {
@@ -923,4 +1074,40 @@ describe("analyze-cache-bust rotating billing header", () => {
         expect(current.hash).toBe(previous.hash);
         expect(describeBodyPair([previous], [current])).toBeUndefined();
     });
+});
+
+
+describe("bounded sentinel dump scans", () => {
+    test("skips 20,000 old files and resumes a bounded scan without losing requests", () => {
+        const dir = mkdtempSync(join(tmpdir(), "mc-sentinel-scan-"));
+        tempDirs.push(dir);
+        for (let i = 0; i < 20_000; i++) {
+            writeFileSync(join(dir, `dump-2026-09-23T00-00-00-000Z-${String(i).padStart(5, "0")}-ses_scanfixture.meta.json`), "{}");
+        }
+        const sessionId = "ses_scanfixture";
+        const base = Date.parse("2026-09-24T12:00:00.000Z");
+        for (let i = 0; i < 40; i++) {
+            const createdAt = new Date(base + i * 1_000).toISOString();
+            const stem = `dump-${createdAt.replace(/:(\d\d):(\d\d)\.(\d\d\d)Z$/, "-$1-$2-$3Z")}-${i}-ses_scanfixture`;
+            writeDump(dir, stem, createdAt, sessionId, bodyWithBreakpointMessage(`request ${i}`));
+        }
+        const scan = (sinceExclusiveMs: number, scanCursor?: string) => analyzeOpenCodeCacheBustSession({
+            sessionId,
+            anthropicDir: dir,
+            openaiDir: join(dir, "missing"),
+            sinceExclusiveMs,
+            scanCursor,
+            scanDeadlineMs: Date.now() + 60_000,
+        });
+        const first = scan(base - 1);
+        expect(first.filesExamined).toBe(32);
+        expect(first.scanBounded).toBe(true);
+        const second = scan(base - 1, first.scanCursor);
+        expect(second.filesExamined).toBe(8);
+        expect(second.scanBounded).toBe(false);
+        expect([...first.requests, ...second.requests].map((row) => row.timestampMs)).toEqual(
+            Array.from({ length: 40 }, (_, i) => base + i * 1_000),
+        );
+        expect(scan(base + 39_000).filesExamined).toBe(0);
+    }, 30_000);
 });

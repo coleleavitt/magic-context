@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
@@ -28,6 +28,7 @@ import {
 import { renderMemoryBlockV2 } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import {
 	__test,
 	createPiM0M1PassSnapshot,
@@ -74,7 +75,7 @@ function result(toolCallId: string) {
 describe("workspace memory sharing", () => {
 	it("filters foreign categories consistently in Pi m[0] and status counts", () => {
 		const db = createTestDb();
-		const dir = mkdtempSync(join(tmpdir(), "mc-pi-share-"));
+		const dir = createTestTempDirFromPath(join(tmpdir(), "mc-pi-share-"));
 		try {
 			db.exec(`
 				INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
@@ -124,7 +125,9 @@ describe("workspace memory sharing", () => {
 
 	it("does not render foreign memories when share_categories is malformed", () => {
 		const db = createTestDb();
-		const dir = mkdtempSync(join(tmpdir(), "mc-pi-share-malformed-"));
+		const dir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-share-malformed-"),
+		);
 		try {
 			db.exec(`
 				INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
@@ -161,7 +164,9 @@ describe("workspace memory sharing", () => {
 describe("Pi memory budget selection", () => {
 	it("selects the verified memory when an importance-50 budget admits one", () => {
 		const db = createTestDb();
-		const dir = mkdtempSync(join(tmpdir(), "mc-pi-memory-recency-"));
+		const dir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-memory-recency-"),
+		);
 		try {
 			const projectIdentity = resolveProjectIdentity(dir);
 			const neverVerified = insertMemory(db, {
@@ -209,6 +214,55 @@ describe("Pi memory budget selection", () => {
 });
 
 describe("trimPiMessagesToBoundary", () => {
+	it("context_edit of a partially covered entry retains the edited suffix and does not trim across it", () => {
+		const edited = [
+			user("old"),
+			user("edited UNCOVERED_SUFFIX"),
+			user("append"),
+		];
+		const ids = ["old", "partial", "append"];
+		expect(
+			__test.trimPiMessagesToBoundary(
+				edited,
+				ids,
+				"partial",
+				true,
+				"ses-edit",
+				true,
+			),
+		).toBe(0);
+		expect(JSON.stringify(edited)).toContain("UNCOVERED_SUFFIX");
+		const prefix = JSON.stringify(edited);
+		const defer = [
+			user("old"),
+			user("edited UNCOVERED_SUFFIX"),
+			user("append"),
+			user("later"),
+		];
+		expect(
+			__test.trimPiMessagesToBoundary(
+				defer,
+				[...ids, "later"],
+				"partial",
+				true,
+				"ses-edit",
+				true,
+			),
+		).toBe(0);
+		expect(JSON.stringify(defer.slice(0, edited.length))).toBe(prefix);
+		const removedByHost = [user("old"), user("append")];
+		expect(
+			__test.trimPiMessagesToBoundary(
+				removedByHost,
+				["old", "append"],
+				"partial",
+				true,
+				"ses-edit",
+				true,
+			),
+		).toBe(0);
+		expect(removedByHost).toHaveLength(2);
+	});
 	it("sweeps non-contiguous toolResults whose assistant toolCall was trimmed", () => {
 		const messages = [
 			assistant(["call-a"]),
@@ -331,7 +385,9 @@ describe("trimPiMessagesToBoundary", () => {
 
 	it("renders frozen compartment and user-profile snapshots without m[0]/m[1] duplication", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0-frozen-cp-profile-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0-frozen-cp-profile-"),
+		);
 		try {
 			const state = piState("ses-pi-frozen-cp-profile", cwd);
 			appendCompartments(db, state.sessionId, [
@@ -410,7 +466,7 @@ function piState(sessionId: string, cwd: string) {
 describe("injectM0M1Pi memory feature gate", () => {
 	it("does NOT render project memories into m[0]/m[1] when memoryEnabled=false", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-memgate-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-m0m1-memgate-"));
 		try {
 			const base = piState("ses-pi-memgate", cwd);
 			// A compartment (history) MUST still render — only memory is gated.
@@ -492,7 +548,9 @@ describe("injectM0M1Pi memory feature gate", () => {
 
 	it("uses the system-hash HARD path for a memory-on to memory-off transition", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-memory-off-transition-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-memory-off-transition-"),
+		);
 		try {
 			const state = piState("ses-pi-memgate-transition", cwd);
 			insertMemory(db, {
@@ -553,7 +611,9 @@ describe("injectM0M1Pi memory feature gate", () => {
 
 	it("keeps the memory-on m[0]/m[1] shape byte-identical", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-memory-on-shape-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-memory-on-shape-"),
+		);
 		try {
 			const state = piState("ses-pi-memgate-shape", cwd);
 			insertMemory(db, {
@@ -583,7 +643,9 @@ describe("injectM0M1Pi memory feature gate", () => {
 describe("injectM0M1Pi", () => {
 	it("keeps project memory but removes compartment rendering and trim in compaction-off mode", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-compaction-off-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-compaction-off-"),
+		);
 		try {
 			const offState = {
 				...piState("ses-pi-compaction-off", cwd),
@@ -632,7 +694,7 @@ describe("injectM0M1Pi", () => {
 
 	it("renders first-pass m[0] with no inner content and m[1] placeholder", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-empty-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-m0m1-empty-"));
 		try {
 			const messages = [userMessage("hello", 10)];
 			injectM0M1Pi(piState("ses-pi-empty", cwd), db, messages as never);
@@ -650,7 +712,9 @@ describe("injectM0M1Pi", () => {
 
 	it("reads project docs once on a HARD fold and replays byte-identical output", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-docs-snapshot-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-docs-snapshot-"),
+		);
 		let reads = 0;
 		const restoreObserver = __test.setProjectDocsReadObserverForTests(() => {
 			reads += 1;
@@ -679,7 +743,7 @@ describe("injectM0M1Pi", () => {
 
 	it("gates project docs block and hash with injectDocs=false", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-docs-gate-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-m0m1-docs-gate-"));
 		try {
 			writeFileSync(
 				join(cwd, "ARCHITECTURE.md"),
@@ -743,7 +807,7 @@ describe("injectM0M1Pi", () => {
 
 	it("replays byte-stable cached m[0]/m[1] for identical state", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-stable-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-m0m1-stable-"));
 		try {
 			const state = piState("ses-pi-stable", cwd);
 			const first = [userMessage("hello", 10)];
@@ -763,7 +827,9 @@ describe("injectM0M1Pi", () => {
 
 	it("folds a legacy render epoch once, then replays m[0]/m[1] byte-identically", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-render-epoch-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-render-epoch-"),
+		);
 		try {
 			const state = piState("ses-pi-render-epoch", cwd);
 			injectM0M1Pi(state, db, [userMessage("first", 10)] as never);
@@ -810,7 +876,9 @@ describe("injectM0M1Pi", () => {
 
 	it("replays the pre-epoch memory order on defer and applies recency on one natural HARD", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-memory-epoch-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-memory-epoch-"),
+		);
 		try {
 			const projectIdentity = resolveProjectIdentity(cwd);
 			const neverVerified = insertMemory(db, {
@@ -899,7 +967,9 @@ describe("injectM0M1Pi", () => {
 
 	it("rematerializes m[0] when a LEGACY compartment appears (upgrade_state HARD flip)", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-compartment-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-compartment-"),
+		);
 		try {
 			const state = piState("ses-pi-compartment", cwd);
 			const first = [userMessage("hello", 10)];
@@ -940,7 +1010,9 @@ describe("injectM0M1Pi", () => {
 
 	it("SOFT m[1] refresh keeps the cached m[0] sha256 unchanged while publishing a new compartment", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-soft-delta-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-soft-delta-"),
+		);
 		try {
 			const state = piState("ses-pi-soft-delta", cwd);
 			// First v2 compartment (p1 present → legacy=0, upgrade_state stays
@@ -1020,7 +1092,9 @@ describe("injectM0M1Pi", () => {
 
 	it("routes cached m[0] with NULL required marker through guarded rematerialize", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-null-marker-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-null-marker-"),
+		);
 		try {
 			const state = piState("ses-pi-null-marker", cwd);
 			const first = [userMessage("hello", 10)];
@@ -1047,7 +1121,9 @@ describe("injectM0M1Pi", () => {
 
 	it("keeps legacy cached max seq 0 when a real seq-0 compartment exists", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-legacy-zero-real-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-legacy-zero-real-"),
+		);
 		try {
 			const state = piState("ses-pi-legacy-zero-real", cwd);
 			appendCompartments(db, state.sessionId, [
@@ -1085,7 +1161,9 @@ describe("injectM0M1Pi", () => {
 
 	it("normalizes legacy cached max seq 0 to empty only with zero compartments", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-legacy-zero-empty-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-legacy-zero-empty-"),
+		);
 		try {
 			const state = piState("ses-pi-legacy-zero-empty", cwd);
 			injectM0M1Pi(state, db, [userMessage("hello", 10)] as never);
@@ -1115,7 +1193,9 @@ describe("injectM0M1Pi", () => {
 
 	it("routes cached m[0] with any partial required marker through guarded rematerialize", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-partial-marker-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-partial-marker-"),
+		);
 		try {
 			const state = piState("ses-pi-partial-marker", cwd);
 			injectM0M1Pi(state, db, [userMessage("hello", 10)] as never);
@@ -1135,7 +1215,9 @@ describe("injectM0M1Pi", () => {
 
 	it("rematerializes instead of reusing cached m[0] when compartment boundary is NULL", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-null-boundary-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-null-boundary-"),
+		);
 		try {
 			const state = piState("ses-pi-null-boundary", cwd);
 			appendCompartments(db, state.sessionId, [
@@ -1175,7 +1257,9 @@ describe("injectM0M1Pi", () => {
 
 	it("reuses cached m[0] (no rematerialize loop) when the compartment is legitimately boundaryless", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-empty-boundary-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-empty-boundary-"),
+		);
 		try {
 			const state = piState("ses-pi-empty-boundary", cwd);
 			// A compartment with EMPTY end_message_id is a legitimate state (schema
@@ -1225,7 +1309,7 @@ describe("injectM0M1Pi", () => {
 
 	it("retries instead of losing seq-0 compartment published during materialization", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-seq0-race-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-m0m1-seq0-race-"));
 		try {
 			const state = piState("ses-pi-seq0-race", cwd);
 			const originalExec = db.exec.bind(db);
@@ -1270,7 +1354,9 @@ describe("injectM0M1Pi", () => {
 
 	it("trims against the frozen cached boundary instead of live rewritten compartments", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-frozen-boundary-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-frozen-boundary-"),
+		);
 		try {
 			const state = piState("ses-pi-frozen-boundary", cwd);
 			appendCompartments(db, state.sessionId, [
@@ -1309,7 +1395,9 @@ describe("injectM0M1Pi", () => {
 
 	it("falls back to cached m[0] when BEGIN IMMEDIATE error exposes only SQLITE_BUSY code", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-begin-busy-code-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-begin-busy-code-"),
+		);
 		try {
 			const state = piState("ses-pi-begin-busy-code", cwd);
 			injectM0M1Pi(state, db, [userMessage("hello", 10)] as never);
@@ -1356,7 +1444,9 @@ describe("injectM0M1Pi", () => {
 
 	it("falls back to cached m[0] when BEGIN IMMEDIATE is busy", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0m1-begin-busy-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m0m1-begin-busy-"),
+		);
 		try {
 			const state = piState("ses-pi-begin-busy", cwd);
 			injectM0M1Pi(state, db, [userMessage("hello", 10)] as never);
@@ -1397,7 +1487,9 @@ describe("injectM0M1Pi", () => {
 
 	it("replays byte-identical m[1] on defer and surfaces additive memory on next cache-busting pass", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-additive-stable-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m1-additive-stable-"),
+		);
 		try {
 			const state = piState("ses-pi-m1-additive-stable", cwd);
 			appendCompartments(db, state.sessionId, [
@@ -1450,7 +1542,9 @@ describe("injectM0M1Pi", () => {
 
 	it("renders archive removals for m0-resident memory only on cache-busting pass and replays them on defer", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-archive-delta-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m1-archive-delta-"),
+		);
 		try {
 			const state = piState("ses-pi-m1-archive-delta", cwd);
 			appendCompartments(db, state.sessionId, [
@@ -1511,7 +1605,9 @@ describe("injectM0M1Pi", () => {
 
 	it("force-renders an eligible supersede replacement that predates the m0 marker", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-forced-supersede-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m1-forced-supersede-"),
+		);
 		try {
 			const state = piState("ses-pi-m1-forced-supersede", cwd);
 			const replacement = insertMemory(db, {
@@ -1570,7 +1666,9 @@ describe("injectM0M1Pi", () => {
 
 	it("skips memory mutation deltas for memories trimmed out of m0", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-trimmed-delta-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m1-trimmed-delta-"),
+		);
 		try {
 			const state = {
 				...piState("ses-pi-m1-trimmed-delta", cwd),
@@ -1611,7 +1709,9 @@ describe("injectM0M1Pi", () => {
 
 	it("reconcile rematerialization advances the memory mutation cursor and omits memory-updates", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-reconcile-delta-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m1-reconcile-delta-"),
+		);
 		try {
 			const state = piState("ses-pi-m1-reconcile-delta", cwd);
 			const memory = insertMemory(db, {
@@ -1652,7 +1752,7 @@ describe("injectM0M1Pi", () => {
 
 	it("soft m1 refresh CAS rolls back and replays a sibling cached m1 on marker mismatch", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-soft-cas-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-m1-soft-cas-"));
 		const originalExec = db.exec.bind(db);
 		try {
 			const state = piState("ses-pi-m1-soft-cas", cwd);
@@ -1696,7 +1796,9 @@ describe("injectM0M1Pi", () => {
 
 	it("soft m1 refresh CAS rejects byte-different m[0] even when non-doc markers match", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-soft-cas-bytes-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m1-soft-cas-bytes-"),
+		);
 		const originalExec = db.exec.bind(db);
 		try {
 			const state = piState("ses-pi-m1-soft-cas-bytes", cwd);
@@ -1743,7 +1845,9 @@ describe("injectM0M1Pi", () => {
 
 	it("soft m1 refresh CAS treats docs-hash-only marker drift as a match", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-soft-cas-docs-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m1-soft-cas-docs-"),
+		);
 		const originalExec = db.exec.bind(db);
 		try {
 			const state = piState("ses-pi-m1-soft-cas-docs", cwd);
@@ -1786,7 +1890,7 @@ describe("injectM0M1Pi", () => {
 describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 	it("renders <project-memory> as a SIBLING after </session-history>, not nested inside it", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0-siblings-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-m0-siblings-"));
 		try {
 			const state = piState("ses-pi-siblings", cwd);
 			appendCompartments(db, state.sessionId, [
@@ -1839,7 +1943,7 @@ describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 		// read separately (lower), a memory present in m[0] could also satisfy
 		// "id > watermark" and render again in m[1] — duplicated across the split.
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m0-watermark-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-m0-watermark-"));
 		try {
 			const state = piState("ses-pi-watermark", cwd);
 			for (const content of [
@@ -1870,7 +1974,7 @@ describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 
 	it("HARD fold binds memory expiry cutoff and materializedAt to one timestamp", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-d16c-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-d16c-"));
 		try {
 			const state = piState("ses-pi-d16c", cwd);
 			insertMemory(db, {
@@ -1951,7 +2055,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("does NOT materialize m[0] on a new compartment (it rides m[1])", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-newcomp-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-tax-newcomp-"));
 		try {
 			const state = {
 				...piState("ses-pi-tax-newcomp", cwd),
@@ -1973,7 +2077,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("HARD: a model change folds m[0]", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-tax-model-"));
 		try {
 			const state = {
 				...piState("ses-pi-tax-model", cwd),
@@ -2002,7 +2106,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("HARD: a system-hash change folds m[0]", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-sys-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-tax-sys-"));
 		try {
 			const state = {
 				...piState("ses-pi-tax-sys", cwd),
@@ -2031,8 +2135,12 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("lazy-adopts a NULL cached project marker without a no-switch HARD fold", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-project-null-a-"));
-		const cwdB = mkdtempSync(join(tmpdir(), "pi-tax-project-null-b-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-tax-project-null-a-"),
+		);
+		const cwdB = createTestTempDirFromPath(
+			join(tmpdir(), "pi-tax-project-null-b-"),
+		);
 		try {
 			const state = {
 				...piState("ses-pi-tax-project-null", cwd),
@@ -2085,8 +2193,8 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("HARD: a genuine same-session project switch folds exactly once, then stabilizes", () => {
 		const db = createTestDb();
-		const cwdA = mkdtempSync(join(tmpdir(), "pi-tax-project-a-"));
-		const cwdB = mkdtempSync(join(tmpdir(), "pi-tax-project-b-"));
+		const cwdA = createTestTempDirFromPath(join(tmpdir(), "pi-tax-project-a-"));
+		const cwdB = createTestTempDirFromPath(join(tmpdir(), "pi-tax-project-b-"));
 		try {
 			const stateA = {
 				...piState("ses-pi-tax-project-switch", cwdA),
@@ -2144,8 +2252,12 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("model and system changes materialize with classified reasons, not first_render", () => {
 		const db = createTestDb();
-		const cwdModel = mkdtempSync(join(tmpdir(), "pi-tax-model-reason-"));
-		const cwdSystem = mkdtempSync(join(tmpdir(), "pi-tax-system-reason-"));
+		const cwdModel = createTestTempDirFromPath(
+			join(tmpdir(), "pi-tax-model-reason-"),
+		);
+		const cwdSystem = createTestTempDirFromPath(
+			join(tmpdir(), "pi-tax-system-reason-"),
+		);
 		try {
 			const modelState = {
 				...piState("ses-pi-tax-model-reason", cwdModel),
@@ -2185,7 +2297,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("an empty current HARD signal is never treated as a change", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-empty-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-tax-empty-"));
 		try {
 			const state = {
 				...piState("ses-pi-tax-empty", cwd),
@@ -2214,7 +2326,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("does NOT materialize m[0] on a project docs hash change", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-docs-soft-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-tax-docs-soft-"));
 		try {
 			const state = {
 				...piState("ses-pi-tax-docs-soft", cwd),
@@ -2242,7 +2354,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("folds current project docs on the next natural HARD materialization", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-docs-hard-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-tax-docs-hard-"));
 		try {
 			const state = {
 				...piState("ses-pi-tax-docs-hard", cwd),
@@ -2283,7 +2395,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 	});
 	it("reproduces the copied live marker tuple and keeps three canonical-alias replays byte-identical", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-live-marker-repro-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-live-marker-repro-"),
+		);
 		try {
 			const state = {
 				...piState("019de471-4fdc-762d-9286-624dfad0b5fe", cwd),
@@ -2360,7 +2474,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 				mustMaterializePi({ ...state, muralEnabled: undefined }, db),
 			).toEqual({
 				value: true,
-				reason: "render_config",
+				reason: "render_config:mural(true→false)",
 				mismatch: { signal: "muralEnabled", cached: true, current: false },
 			});
 		} finally {
@@ -2371,7 +2485,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("does not hard-fold when the current model switches from canonical to Pi alias spelling", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-forward-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-tax-model-alias-forward-"),
+		);
 		try {
 			const state = {
 				...piState("ses-pi-tax-model-alias-forward", cwd),
@@ -2395,7 +2511,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("persists a Pi-native baseline canonically, then accepts the reverse spelling flip", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-reverse-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-tax-model-alias-reverse-"),
+		);
 		try {
 			const state = {
 				...piState("ses-pi-tax-model-alias-reverse", cwd),
@@ -2422,7 +2540,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("does not hard-fold when an existing cached baseline stores a native alias", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-upgrade-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-tax-model-alias-upgrade-"),
+		);
 		try {
 			const state = {
 				...piState("ses-pi-tax-model-alias-upgrade", cwd),
@@ -2445,7 +2565,9 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 
 	it("folds exactly once for a genuinely different model in the same alias family", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-tax-model-alias-real-switch-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-tax-model-alias-real-switch-"),
+		);
 		try {
 			const state = {
 				...piState("ses-pi-tax-model-alias-real-switch", cwd),
@@ -2492,7 +2614,7 @@ describe("mustMaterializePi — SOFT/HARD taxonomy (parity with OpenCode)", () =
 describe("injectM0M1Pi m[1]-rendered coverage watermark (marker-drain liveness)", () => {
 	it("reports the m[1] delta watermark on a fresh recompute and null on pure replay", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-coverage-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-m1-coverage-"));
 		try {
 			const state = piState("ses-pi-m1-coverage", cwd);
 			appendCompartments(db, state.sessionId, [
@@ -2580,7 +2702,9 @@ describe("injectM0M1Pi m[1]-rendered coverage watermark (marker-drain liveness)"
 
 	it("certifies coverage from the m[1] delta when the m[0] baseline is empty (the liveness-gap shape)", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-coverage-empty-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m1-coverage-empty-"),
+		);
 		try {
 			const state = piState("ses-pi-m1-coverage-empty", cwd);
 			// Materialize with NO compartments: the empty m[0] baseline whose
@@ -2657,7 +2781,9 @@ describe("injectM0M1Pi m[1]-rendered coverage watermark (marker-drain liveness)"
 
 	it("soft m[1] refresh sibling-fallback reports null coverage even with a newer live compartment", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-coverage-sibling-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m1-coverage-sibling-"),
+		);
 		const originalExec = db.exec.bind(db);
 		try {
 			const state = piState("ses-pi-m1-coverage-sibling", cwd);
@@ -2721,4 +2847,339 @@ describe("injectM0M1Pi m[1]-rendered coverage watermark (marker-drain liveness)"
 			closeQuietly(db);
 		}
 	});
+});
+
+it("Fable HARD history uses the real-token budget in Pi", () => {
+	const db = createTestDb();
+	try {
+		const compartments = Array.from({ length: 52 }, (_, i) => ({
+			startMessage: i + 1,
+			endMessage: i + 1,
+			title: `Arc ${i}`,
+			content: "",
+			p1: "P1 summary code decision result ".repeat(640),
+			p2: "P2 summary code decision result ".repeat(320),
+			p3: "P3 summary code decision result ".repeat(160),
+			p4: "P4 summary code decision result ".repeat(48),
+			importance: 50,
+			legacy: 0,
+		}));
+		const state = {
+			sessionId: "calibration-history",
+			projectIdentity: "",
+			projectDirectory: "",
+			memoryEnabled: false,
+			injectDocs: false,
+			historyBudgetTokens: 60000,
+			hardSignals: {
+				modelKey: "anthropic/claude-fable-5-1",
+				systemHash: "",
+				cacheExpired: false,
+				lastResponseTime: 0,
+			},
+		};
+		const actual = renderM0Pi(state, db, "", 1, [], compartments, []);
+		const expected = renderM0Pi(
+			{
+				...state,
+				historyBudgetTokens: 38173,
+				hardSignals: { ...state.hardSignals, modelKey: "unknown/neutral" },
+			},
+			db,
+			"",
+			1,
+			[],
+			compartments,
+			[],
+		);
+		expect(actual).toBe(expected);
+		expect(actual).not.toBe(
+			renderM0Pi(
+				{
+					...state,
+					hardSignals: { ...state.hardSignals, modelKey: "unknown/neutral" },
+				},
+				db,
+				"",
+				1,
+				[],
+				compartments,
+				[],
+			),
+		);
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("Pi keeps policy-identified m0 frozen as live budgets rise and folds a policy edit once", () => {
+	const db = createTestDb();
+	try {
+		const state = {
+			...piState("ses-pi-policy", ""),
+			historyBudgetTokens: 13762,
+			historyBudgetPolicyIdentity: "p0.15:percentage:40",
+		};
+		const first = injectM0M1Pi(
+			state,
+			db,
+			[userMessage("seed", 1)] as never,
+			undefined,
+			false,
+		);
+		expect(first.m0Materialized).toBe(true);
+		const baseline = getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes;
+		for (const historyBudgetTokens of [15670, 16200, 16800]) {
+			const replay = injectM0M1Pi(
+				{ ...state, historyBudgetTokens },
+				db,
+				[userMessage("grow", 2)] as never,
+				undefined,
+				false,
+			);
+			expect(replay.m0Materialized).toBe(false);
+			expect(getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes).toEqual(
+				baseline,
+			);
+		}
+		const edited = {
+			...state,
+			historyBudgetTokens: 22400,
+			historyBudgetPolicyIdentity: "p0.2:percentage:40",
+		};
+		expect(mustMaterializePi(edited, db).reason).toContain(
+			"render_config:budget(",
+		);
+		expect(
+			injectM0M1Pi(
+				edited,
+				db,
+				[userMessage("edit", 3)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(true);
+		expect(
+			injectM0M1Pi(
+				edited,
+				db,
+				[userMessage("replay", 4)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(false);
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("Pi adopts legacy numeric history silently and retains absolute memory-budget edits", () => {
+	const db = createTestDb();
+	try {
+		const state = {
+			...piState("ses-pi-legacy-policy", ""),
+			historyBudgetTokens: 12000,
+			injectionBudgetTokens: 4000,
+		};
+		injectM0M1Pi(
+			state,
+			db,
+			[userMessage("legacy", 1)] as never,
+			undefined,
+			false,
+		);
+		const current = {
+			...state,
+			historyBudgetTokens: 16000,
+			historyBudgetPolicyIdentity: "p0.15:percentage:40",
+		};
+		expect(mustMaterializePi(current, db).value).toBe(false);
+		expect(
+			mustMaterializePi({ ...current, injectionBudgetTokens: 5000 }, db).reason,
+		).toBe("render_config:budget(m4000-h12000→m5000-hp0.15:percentage:40)");
+		const hard = {
+			...current,
+			hardSignals: {
+				systemHash: "new-system",
+				modelKey: "",
+				cacheExpired: false,
+				lastResponseTime: 0,
+			},
+		};
+		expect(
+			injectM0M1Pi(
+				hard,
+				db,
+				[userMessage("hard", 2)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(true);
+		expect(
+			getOrCreateSessionMeta(db, state.sessionId).cachedM0UpgradeState,
+		).toContain("hp0.15:percentage:40");
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("Pi review: legacy replay survives restart and only a natural HARD records policy", () => {
+	const db = createTestDb();
+	try {
+		const hardSignals = {
+			modelKey: "review/larger-model",
+			systemHash: "",
+			cacheExpired: false,
+			lastResponseTime: 0,
+		};
+		const legacy = {
+			...piState("ses-pi-review-restart", ""),
+			historyBudgetTokens: 12000,
+			hardSignals,
+		};
+		injectM0M1Pi(
+			legacy,
+			db,
+			[userMessage("seed", 1)] as never,
+			undefined,
+			false,
+		);
+		const legacyIdentity = getOrCreateSessionMeta(
+			db,
+			legacy.sessionId,
+		).cachedM0UpgradeState?.split("|rendered-budgets:")[0];
+		db.prepare(
+			"UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ?",
+		).run(legacyIdentity, legacy.sessionId);
+		const before = getOrCreateSessionMeta(db, legacy.sessionId);
+		expect(before.cachedM0UpgradeState).toContain("-h12000");
+		for (let restart = 0; restart < 2; restart++) {
+			const state = {
+				...piState(legacy.sessionId, ""),
+				historyBudgetTokens: restart === 0 ? 16000 : 1,
+				hardSignals,
+				historyBudgetPolicyIdentity: "p0.15:percentage:40",
+			};
+			expect(
+				injectM0M1Pi(
+					state,
+					db,
+					[userMessage("replay", 2)] as never,
+					undefined,
+					false,
+				).m0Materialized,
+			).toBe(false);
+			const after = getOrCreateSessionMeta(db, legacy.sessionId);
+			expect(after.cachedM0Bytes).toEqual(before.cachedM0Bytes);
+			expect(after.cachedM0UpgradeState).toBe(before.cachedM0UpgradeState);
+		}
+		const hard = {
+			...piState(legacy.sessionId, ""),
+			historyBudgetTokens: 100,
+			historyBudgetPolicyIdentity: "p0.15:percentage:40",
+			hardSignals: {
+				modelKey: "review/smaller-model",
+				systemHash: "",
+				cacheExpired: false,
+				lastResponseTime: 0,
+			},
+		};
+		expect(mustMaterializePi(hard, db).reason).toBe("model_change");
+		expect(
+			injectM0M1Pi(
+				hard,
+				db,
+				[userMessage("hard", 3)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(true);
+		expect(
+			getOrCreateSessionMeta(db, legacy.sessionId).cachedM0UpgradeState,
+		).toContain("-hp0.15:percentage:40");
+		expect(
+			injectM0M1Pi(
+				hard,
+				db,
+				[userMessage("replay", 4)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(false);
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("Pi shrinking budget refolds an oversized baseline once with empty m1", () => {
+	const db = createTestDb();
+	try {
+		const state = {
+			...piState("ses-pi-review-shrink", ""),
+			historyBudgetTokens: 12000,
+			historyBudgetPolicyIdentity: "p0.15:percentage:40",
+		};
+		appendCompartments(db, state.sessionId, [
+			{
+				sequence: 1,
+				startMessage: 1,
+				endMessage: 1,
+				startMessageId: "seed",
+				endMessageId: "seed",
+				title: "large baseline",
+				content: "",
+				p1: "history bytes ".repeat(500),
+				p2: "dense",
+				p3: "brief",
+				p4: "anchor",
+				importance: 100,
+			},
+		]);
+		injectM0M1Pi(state, db, [userMessage("seed", 1)] as never, undefined, true);
+		const before = getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes;
+		expect(before?.toString()).toContain("large baseline");
+		const shrink = { ...state, historyBudgetTokens: 1 };
+		const resized = injectM0M1Pi(
+			shrink,
+			db,
+			[userMessage("resize", 2)] as never,
+			undefined,
+			false,
+		);
+		expect(resized.m0Materialized).toBe(true);
+		expect(resized.m0Reason).toContain("render_config:budget_shrink(");
+		const after = getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes;
+		expect(after?.length).toBeLessThan(before?.length ?? 0);
+		expect(
+			getOrCreateSessionMeta(db, state.sessionId).cachedM0UpgradeState,
+		).toContain("|rendered-budgets:");
+		for (const recompute of [false, true, true]) {
+			expect(
+				injectM0M1Pi(
+					shrink,
+					db,
+					[userMessage("replay", 3)] as never,
+					undefined,
+					recompute,
+				).m0Materialized,
+			).toBe(false);
+			expect(getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes).toEqual(
+				after,
+			);
+		}
+		expect(
+			injectM0M1Pi(
+				state,
+				db,
+				[userMessage("growth", 4)] as never,
+				undefined,
+				false,
+			).m0Materialized,
+		).toBe(false);
+		expect(getOrCreateSessionMeta(db, state.sessionId).cachedM0Bytes).toEqual(
+			after,
+		);
+	} finally {
+		closeQuietly(db);
+	}
 });

@@ -17,6 +17,8 @@ export type CacheBustDivergenceClass =
     | "usage_missing"
     | "provider_full_miss"
     | "provider_short_read_identical_bytes"
+    | "self_inflicted_epoch"
+    | "unfaulted_epoch"
     | "unaccounted_defer_pass"
     | "unaccounted_double_bust"
     | "unaccounted_tail_rewrite"
@@ -31,6 +33,8 @@ export interface AnalyzedCacheRequest {
     divergenceClass?: CacheBustDivergenceClass;
     firstDivergence: string;
     analyzerCmd: string;
+    /** Render-identity components the matched pass reported as changed, when it logged them. */
+    identityDelta?: string[];
 }
 
 export interface CacheBustSessionAnalysis {
@@ -58,8 +62,21 @@ export interface CacheBustDecisionAttribution {
     droppedTokens: number;
     droppedCount: number;
     inputTokens: number;
+    /** Raw OpenCode message count observed by the Rust pass, when logged. */
+    inputCount?: number;
+    /** A restart, deploy, or explicit configuration epoch independently explains epoch_change. */
+    externalEpoch?: boolean;
+    /** Names the render-identity components changed during transformation. The `mur` entry
+     * represents mural content; other entries show that an independent identity also changed. */
+    identityDelta?: string[];
     flush: boolean;
     source: string;
+    /**
+     * Set on log markers that are not passes: a module fault, a full-array retry, a
+     * fallback serve, or an adapter restart. Names the kind. Such records never
+     * join a request; they only explain an epoch HARD that follows them.
+     */
+    disruption?: string;
 }
 
 export interface CacheBustAttributionInput {
@@ -86,7 +103,17 @@ export interface CacheBustAttributionInput {
     currentModel?: string;
     /** The meter read short while the reusable byte prefix was unchanged. */
     providerShortReadWithIdenticalPrefix?: boolean;
+    /** Current raw OpenCode message count divided by the preceding pass count. */
+    ocInputStepRatio?: number;
     decision?: CacheBustDecisionAttribution;
+    /** The last session pass that rebuilt the cached prefix after its rendering identity changed. */
+    previousEpochHard?: CacheBustDecisionAttribution;
+    /**
+     * The newest disruption in the 60 s before the matched pass. `undefined` means the
+     * disruption markers were not available (no adapter log for the session); `null`
+     * means the log was read and nothing disrupted the session in that window.
+     */
+    precedingDisruption?: string | null;
 }
 
 export interface CacheBustRule {
@@ -180,6 +207,16 @@ export const CACHE_BUST_RULE_TABLE: readonly CacheBustRule[] = [
         divergenceClass: "provider_short_read_identical_bytes",
         accounted: true,
         rule: "provider read fell short while the reusable byte prefix was unchanged; provider-side latency or eviction, not a prompt rewrite",
+    },
+    {
+        divergenceClass: "self_inflicted_epoch",
+        accounted: false,
+        rule: "epoch_change has no restart/deploy/config epoch and either only mur: changed or raw OpenCode input stepped by at least 4×",
+    },
+    {
+        divergenceClass: "unfaulted_epoch",
+        accounted: false,
+        rule: "epoch_change has no restart/deploy/config epoch and the adapter log shows no module fault, full-array retry, fallback serve, or adapter restart in the preceding 60 s; the wake names identity_delta",
     },
     {
         divergenceClass: "unaccounted_defer_pass",
@@ -335,6 +372,31 @@ export function classifyCacheBust(input: CacheBustAttributionInput): CacheBustDi
     if (decision.materialized) {
         if (materializeReason === "model_change") return "accounted_hard_model_change";
         if (materializeReason === "system_hash") return "accounted_hard_system_hash";
+        const muralOnlyIdentityDelta =
+            decision.identityDelta?.length === 1 && decision.identityDelta[0] === "mur";
+        const repeatedEpochHard = input.previousEpochHard !== undefined &&
+            input.previousEpochHard.materialized &&
+            input.previousEpochHard.materializeReason?.toLowerCase() === "epoch_change" &&
+            !input.previousEpochHard.externalEpoch &&
+            decision.timestampMs > input.previousEpochHard.timestampMs &&
+            decision.timestampMs - input.previousEpochHard.timestampMs <= 60_000;
+        if (
+            materializeReason === "epoch_change" &&
+            !decision.externalEpoch &&
+            (repeatedEpochHard || muralOnlyIdentityDelta || (input.ocInputStepRatio ?? 0) >= 4)
+        ) {
+            return "self_inflicted_epoch";
+        }
+        // A render identity that changes with nothing around it to explain the change
+        // (no fault, retry, fallback, or restart) is the spontaneous case; the wake
+        // carries identity_delta so it names the component that moved.
+        if (
+            materializeReason === "epoch_change" &&
+            !decision.externalEpoch &&
+            input.precedingDisruption === null
+        ) {
+            return "unfaulted_epoch";
+        }
         if (materializeReason && EPOCH_REASONS.has(materializeReason)) {
             return "accounted_hard_epoch";
         }

@@ -24,21 +24,21 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, statSync, writeFileSy
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { pinMockAgents } from "../mock-routing";
-import type { MockProvider } from "../mock-provider/server";
+import type { MockProvider, MockResponse } from "../mock-provider/server";
 import { waitForReady } from "../opencode-runner/spawn";
 import { prepareContextDatabase } from "../prepare-context-db";
+import { isolateStoreDirectories } from "./store-directories";
+import { assertWriteFenceUnchanged, snapshotWriteFence } from "./write-fence";
 import {
 	assertIsolation,
-	assertLiveUnchanged,
 	assertOpenPaths,
 	type OpenCode2Isolation,
 	PLUGIN,
 	ROOT_KEYS,
-	snapshotLive,
 } from "./spawn";
 
-/** Directories the 1.x child gets on top of the five the v2 runner already isolates. */
-const EXTRA_ROOT_KEYS = ["XDG_RUNTIME_DIR", "OPENCODE1_CONFIG_HOME"] as const;
+/** The 1.x host needs a separate config home because the host generations use different config shapes. */
+const EXTRA_ROOT_KEYS = ["OPENCODE1_CONFIG_HOME"] as const;
 
 /**
  * Both generations must name the SAME provider and model.
@@ -132,19 +132,6 @@ export function resolveOpenCode1CLI(): string {
 	return path;
 }
 
-/** Whether some other OpenCode host is already serving, which would make a live-store snapshot ambiguous. */
-function foreignServeRunning(ownPid?: number): boolean {
-	const result = spawnSync("pgrep", ["-alf", "opencode"], { encoding: "utf8" });
-	if (result.error || (result.status !== 0 && result.status !== 1)) {
-		throw new Error("Cannot determine whether a live OpenCode host owns the store");
-	}
-	if (result.status !== 0) return false;
-	return result.stdout
-		.split("\n")
-		.filter((line) => /\bserve\b/.test(line))
-		.some((line) => Number(line.trim().split(/\s+/)[0]) !== ownPid);
-}
-
 /** Every strict ancestor directory of `path`, from its parent up to the filesystem root. */
 function ancestorDirectories(path: string): Set<string> {
 	const ancestors = new Set<string>();
@@ -159,23 +146,11 @@ function ancestorDirectories(path: string): Set<string> {
 }
 
 /**
- * Sample the 1.x child's whole process group and refuse any descriptor outside
- * the throwaway root, then require that the store it opened is the throwaway one
- * by inode rather than by name.
- *
- * Mirrors the v2 runner's guard. It is written out again here instead of reused
- * because the allowed set differs in two ways.
- *
- * First, this child is the operator's own `opencode` binary and loads the plugin
- * bundle from the checkout, so both of those paths are expected.
- *
- * Second, OpenCode 1.18.x holds a read-only directory handle on every ancestor of
- * its working directory — observed here as descriptors walking from the
- * throwaway root up to `/`. Those exact directory paths are dropped before the
- * check, and only those: a handle on any FILE, or on any directory that is not
- * an ancestor of the throwaway root, is still refused, so a descriptor on the
- * operator's store or home still fails. The 2.x host does not do this, which is
- * why the shared v2 guard has no such allowance.
+ * Sample the 1.x child's whole process group. Refuse writable paths and
+ * database/config descriptors outside the throwaway root, then require that
+ * the opened database matches the private store by inode. OpenCode 1 also
+ * holds read-only handles on every ancestor of its working directory up to
+ * `/`; those exact directory handles are not writes and are omitted.
  */
 export function inspectOpenCode1Files(
 	pid: number,
@@ -193,19 +168,22 @@ export function inspectOpenCode1Files(
 	if (!pids.length) throw new Error("v1 process group disappeared before fd inspection");
 	const result = spawnSync("lsof", ["-p", pids.join(","), "-Fin"], { encoding: "utf8" });
 	if (result.status !== 0) throw new Error(`Cannot inspect v1 open files: ${result.stderr}`);
-	const paths = result.stdout
-		.split("\n")
-		.filter((line) => line.startsWith("n"))
-		.map((line) => line.slice(1));
+	const paths: string[] = [];
+	const writable: string[] = [];
+	let fd = "";
+	for (const line of result.stdout.split("\n")) {
+		if (line.startsWith("f")) fd = line.slice(1);
+		if (!line.startsWith("n")) continue;
+		const path = line.slice(1);
+		paths.push(path);
+		if (/[0-9]+[wu]$/.test(fd)) writable.push(path);
+	}
 	const ancestors = ancestorDirectories(fixture.root);
 	assertOpenPaths(
 		paths.filter((path) => !ancestors.has(path)),
 		fixture.root,
-		[
-			realpathSync(resolve(PLUGIN, "../../node_modules")),
-			realpathSync(PLUGIN),
-			realpathSync(cliPath),
-		],
+		[],
+		writable.filter((path) => !ancestors.has(path)),
 	);
 	const expected = statSync(fixture.openCodeDbPath);
 	let inode: number | undefined;
@@ -284,6 +262,8 @@ export async function spawnOpencode1(
 		XDG_STATE_HOME: fixture.env.XDG_STATE_HOME,
 		XDG_CACHE_HOME: fixture.env.XDG_CACHE_HOME,
 		XDG_RUNTIME_DIR: fixture.env.XDG_RUNTIME_DIR,
+		CARGO_HOME: fixture.env.CARGO_HOME,
+		RUSTUP_HOME: fixture.env.RUSTUP_HOME,
 		OPENCODE_DB: "opencode2.db",
 		OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
 		OPENCODE_DISABLE_PROJECT_CONFIG: "true",
@@ -294,6 +274,8 @@ export async function spawnOpencode1(
 	};
 	// Same environment guard the v2 runner applies, against the same root.
 	assertIsolation(fixture.root, env);
+	const references = isolateStoreDirectories(fixture.root, fixture.openCodeDbPath, fixture.contextDbPath);
+	fixture.referencedDirectories = [...new Set([...(fixture.referencedDirectories ?? []), ...references])];
 
 	const pluginEntry = join(PLUGIN, "dist/index.js");
 	if (!existsSync(pluginEntry)) {
@@ -357,7 +339,7 @@ export async function spawnOpencode1(
 	);
 	prepareContextDatabase(fixture.env.XDG_DATA_HOME!);
 
-	const before = foreignServeRunning() ? undefined : snapshotLive();
+	const fence = snapshotWriteFence(fixture.referencedDirectories ?? []);
 	const child: ChildProcess = spawn(
 		cli,
 		["serve", "--port", "0", "--hostname", "127.0.0.1"],
@@ -385,7 +367,7 @@ export async function spawnOpencode1(
 		if (child.pid) killGroup(child.pid);
 		await exited;
 		if (child.pid) liveGroups.delete(child.pid);
-		if (before) assertLiveUnchanged(before);
+		assertWriteFenceUnchanged(fence);
 		if (safetyError) throw safetyError;
 	};
 
@@ -424,6 +406,70 @@ export async function spawnOpencode1(
 		await stop().catch(() => undefined);
 		throw error;
 	}
+}
+
+/** One ordinary prompt on whichever host generation the caller holds. */
+export interface PromptDriver {
+	(text: string, extraParts?: Array<Record<string, unknown>>): Promise<void>;
+}
+
+export interface DriveHistorianOptions {
+	/** Sends one prompt and does not resolve until that turn is finished. */
+	prompt: PromptDriver;
+	/** The shared mock provider, so the pressure answer can be armed and disarmed. */
+	mock: MockProvider;
+	/** The answer that carries enough reported usage to reach the force band. */
+	pressure: MockResponse;
+	/** The answer restored afterwards, so later phases are not still under pressure. */
+	quiet: MockResponse;
+	/** Named in the failure message when the rounds run out. */
+	label: string;
+	/** Read after every round; true ends the loop. */
+	satisfied: () => boolean;
+	rounds?: number;
+	/** How long each round waits for the background publication to land. */
+	settleMs?: number;
+	/** Text of round `round` (zero-based), for a fixture that needs real prose mass. */
+	text?: (round: number) => string;
+}
+
+/**
+ * Drive pressure turns until the historian has published what the caller needs.
+ *
+ * Pressure is what makes the historian run at all, and it is also what lets it
+ * run more than once inside its ten-minute drain window: at the force band the
+ * drain budget is deliberately bypassed. Each round is one ordinary turn, so
+ * nothing is reached into — the loop just keeps asking until the durable state
+ * the caller depends on exists.
+ *
+ * The settle wait after each prompt is the part that matters on OpenCode 2: the
+ * publication lands in the background after the turn's response, so a loop that
+ * fires prompts back to back finishes its rounds before the first one has
+ * produced anything.
+ *
+ * Returns the number of rounds driven.
+ */
+export async function driveHistorian(options: DriveHistorianOptions): Promise<number> {
+	const rounds = options.rounds ?? 12;
+	const settleMs = options.settleMs ?? 4_000;
+	const text = options.text ?? ((round: number) => `pressure round ${round}: keep the historian draining.`);
+	options.mock.setDefault(options.pressure);
+	let driven = 0;
+	try {
+		for (let round = 0; round < rounds; round += 1) {
+			await options.prompt(text(round));
+			driven += 1;
+			const deadline = Date.now() + settleMs;
+			while (Date.now() < deadline) {
+				if (options.satisfied()) return driven;
+				await Bun.sleep(200);
+			}
+		}
+	} finally {
+		options.mock.setDefault(options.quiet);
+	}
+	if (!options.satisfied()) throw new Error(`the historian never produced ${options.label}`);
+	return driven;
 }
 
 /** Fail a fixture build loudly rather than silently proving nothing about an unconverted store. */

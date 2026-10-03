@@ -1,18 +1,30 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, parse as parsePath, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { removeJsoncArrayEntries } from "@magic-context/core/shared/jsonc-edit";
 import {
     type OpenCodeHostGeneration,
     openCodeHostGenerationFromVersion,
+    resolveOpenCodeDbPath,
 } from "@magic-context/core/shared/opencode-db-path";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import {
+    type HostUseProbe,
+    type HostUseProbeTargets,
+    openCodeHostDatabaseFiles,
+    removeOpenCodeV2PluginCacheSlot,
+} from "../commands/doctor-opencode2-cache";
 import { writeFileAtomic } from "../lib/atomic-write";
+import { readJsoncTextForEdit } from "../lib/jsonc-config";
 import { detectOpenCode } from "../lib/opencode-detect";
 import { getOpenCodeVersion } from "../lib/opencode-helpers";
 import {
     getOpenCodePluginPackageJsonPaths,
+    getOpenCodeV2PluginCacheSlot,
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION as PLUGIN_ENTRY,
     OPENCODE_PLUGIN_NAME as PLUGIN_NAME,
+    readConfiguredOpenCodePluginSpec,
+    readOpenCodeV2CachedPluginVersion,
 } from "../lib/opencode-plugin-cache";
 import {
     type OpenCodePluginConfigKey,
@@ -28,6 +40,7 @@ import {
 import type {
     HarnessAdapter,
     HarnessConfigPaths,
+    PluginCacheClearResult,
     PluginCacheInfo,
     PluginEntryResult,
 } from "./types";
@@ -39,36 +52,43 @@ export interface OpenCodeAdapterOptions {
      * must target the running host's own key or the plugin loads twice.
      */
     hostGeneration?: OpenCodeHostGeneration;
+    /**
+     * Asks which processes hold the host database or a cache slot open before
+     * `doctor --clear` removes an OpenCode 2 slot. Defaults to `lsof`.
+     */
+    probeHostUse?: (targets: HostUseProbeTargets) => HostUseProbe;
 }
 
 export class OpenCodeAdapter implements HarnessAdapter {
     readonly kind = "opencode" as const;
     readonly displayName = "OpenCode";
     readonly pluginPackageName = PLUGIN_NAME;
-    private readonly hostGeneration: OpenCodeHostGeneration | undefined;
-    private resolvedWriteKey: OpenCodePluginConfigKey | undefined;
+    private hostGeneration: OpenCodeHostGeneration | undefined;
+    private readonly probeHostUse: ((targets: HostUseProbeTargets) => HostUseProbe) | undefined;
 
     constructor(options: OpenCodeAdapterOptions = {}) {
         this.hostGeneration = options.hostGeneration;
+        this.probeHostUse = options.probeHostUse;
     }
 
     /**
-     * Resolved on first write, not at construction: the registry instantiates
+     * Resolved on first use, not at construction: the registry instantiates
      * adapters at import time and running `opencode --version` there would cost
      * every command a process spawn. A Desktop-only install has no runnable
-     * binary to version; it keeps the 1.x key until Desktop ships a 2.x line.
+     * binary to version; it counts as 1.x until Desktop ships a 2.x line.
      */
+    private get resolvedHostGeneration(): OpenCodeHostGeneration {
+        if (this.hostGeneration) return this.hostGeneration;
+        const detection = detectOpenCode();
+        this.hostGeneration =
+            detection.kind === "cli"
+                ? openCodeHostGenerationFromVersion(getOpenCodeVersion(detection.binary))
+                : "v1";
+        return this.hostGeneration;
+    }
+
     private get writeKey(): OpenCodePluginConfigKey {
-        if (this.resolvedWriteKey) return this.resolvedWriteKey;
-        const generation =
-            this.hostGeneration ??
-            (() => {
-                const detection = detectOpenCode();
-                if (detection.kind !== "cli") return "v1" as const;
-                return openCodeHostGenerationFromVersion(getOpenCodeVersion(detection.binary));
-            })();
-        this.resolvedWriteKey = pluginConfigKeyFor(generation);
-        return this.resolvedWriteKey;
+        return pluginConfigKeyFor(this.resolvedHostGeneration);
     }
 
     isInstalled(): boolean {
@@ -138,7 +158,9 @@ export class OpenCodeAdapter implements HarnessAdapter {
             // so an entry under either is a live registration.
             const entries = readPluginEntries(cfg);
             const existing = entries.find(({ entry }) => matchesPluginEntry(entry, PLUGIN_NAME));
-            const existingDev = entries.find(({ entry }) => isDevPathPluginEntry(entry));
+            const existingDev = entries.find(({ entry }) =>
+                isDevPathPluginEntry(entry, dirname(target)),
+            );
 
             // Local dev-path entries are recognized so we don't double-add
             // an @latest entry on top, but they are NEVER replaced by setup.
@@ -223,13 +245,18 @@ export class OpenCodeAdapter implements HarnessAdapter {
                     configPath: target,
                 };
             }
+            // Edit the text rather than re-serializing the parsed config, so
+            // comments inside the plugin arrays survive the removal.
+            const document = readJsoncTextForEdit(target);
+            let text = document.text;
             let removed = false;
             for (const key of ["plugin", "plugins"] as const) {
-                const list = cfg[key];
-                if (!Array.isArray(list)) continue;
-                const kept = list.filter((e) => !matchesPluginEntry(e, PLUGIN_NAME));
-                if (kept.length !== list.length) {
-                    cfg[key] = kept;
+                if (!Array.isArray(cfg[key])) continue;
+                const result = removeJsoncArrayEntries(text, [key], (entry) =>
+                    matchesPluginEntry(entry, PLUGIN_NAME),
+                );
+                if (result.removed) {
+                    text = result.text;
                     removed = true;
                 }
             }
@@ -241,7 +268,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
                     configPath: target,
                 };
             }
-            writeFileAtomic(target, `${stringifyJsonc(cfg, null, 4)}\n`);
+            writeFileAtomic(target, document.bom + text);
             return {
                 ok: true,
                 action: "updated",
@@ -262,21 +289,107 @@ export class OpenCodeAdapter implements HarnessAdapter {
         return "Install OpenCode: curl -fsSL https://opencode.ai/install | bash";
     }
 
-    getPluginCacheInfo(): PluginCacheInfo {
-        const path = getOpenCodePluginCacheDir();
-        return {
-            path,
-            exists: existsSync(path),
-            sizeBytes: dirSizeBytes(path),
-        };
+    /**
+     * OpenCode 1 keeps plugins under `<cache>/opencode/packages/`; OpenCode 2
+     * under `<cache>/opencode/npm/<name>@<spec>/`. Both can exist on one
+     * machine, so each one present is reported. From the OpenCode 2 tree only
+     * Magic Context's own `@latest` slot is offered: other packages' slots are
+     * not ours to remove, and a dist-tag or pinned slot is what the user chose.
+     */
+    getPluginCacheInfo(): PluginCacheInfo[] {
+        const legacyPath = getOpenCodePluginCacheDir();
+        const legacyExists = existsSync(legacyPath);
+        const slot = getOpenCodeV2PluginCacheSlot();
+        const slotExists = existsSync(slot);
+        const caches: PluginCacheInfo[] = [];
+        // With neither present, the 1.x path is still reported (as missing) so
+        // callers keep seeing where OpenCode's cache would be.
+        if (legacyExists || !slotExists) {
+            caches.push({
+                path: legacyPath,
+                exists: legacyExists,
+                sizeBytes: dirSizeBytes(legacyPath),
+                label: "OpenCode 1 plugin packages",
+            });
+        }
+        if (slotExists) {
+            caches.push({
+                path: slot,
+                exists: true,
+                sizeBytes: dirSizeBytes(slot),
+                label: "OpenCode 2 Magic Context @latest install",
+                clear: () => this.clearOpenCodeV2Slot(slot),
+            });
+        }
+        return caches;
+    }
+
+    /**
+     * Same guard as `doctor --fix`: the slot stays while any process holds an
+     * OpenCode session database (either host generation's) or a file in the
+     * slot, or when that cannot be checked.
+     */
+    private clearOpenCodeV2Slot(slot: string): PluginCacheClearResult {
+        let databases: string[];
+        try {
+            databases = [
+                ...new Set([resolveOpenCodeDbPath("v1").path, resolveOpenCodeDbPath("v2").path]),
+            ];
+        } catch (err) {
+            return {
+                cleared: false,
+                reason: `could not locate the OpenCode database to check whether OpenCode is running (${err instanceof Error ? err.message : String(err)})`,
+            };
+        }
+        const removal = removeOpenCodeV2PluginCacheSlot(
+            slot,
+            openCodeHostDatabaseFiles(databases),
+            {
+                probe: this.probeHostUse,
+            },
+        );
+        switch (removal.action) {
+            case "cleared":
+                return { cleared: true };
+            case "in_use":
+                return {
+                    cleared: false,
+                    reason: `OpenCode is running (pid ${removal.pids.join(", ")}); quit it (and \`opencode service stop\`) first`,
+                };
+            case "in_use_unknown":
+                return { cleared: false, reason: removal.reason };
+            case "error":
+                return { cleared: false, reason: removal.error };
+        }
     }
 
     getLogPath(): string {
         return getMagicContextLogPath("opencode");
     }
 
+    /** The spec the config registers Magic Context under; `latest` when unreadable. */
+    private configuredPluginSpec(): string {
+        const paths = detectConfigPaths();
+        if (paths.opencodeConfigFormat === "none") return "latest";
+        try {
+            const cfg = parseJsonc(readFileSync(paths.opencodeConfig, "utf-8")) as Record<
+                string,
+                unknown
+            > | null;
+            return readConfiguredOpenCodePluginSpec(cfg);
+        } catch {
+            return "latest";
+        }
+    }
+
     getInstalledPluginVersion(): string | null {
-        // Look in OpenCode's plugin cache for the installed package version.
+        if (this.resolvedHostGeneration === "v2") {
+            // OpenCode 2 loads the slot keyed by the configured spec (`@latest`,
+            // a dist-tag, or a pinned version); the 1.x tree is not read by it.
+            const slot = getOpenCodeV2PluginCacheSlot(undefined, this.configuredPluginSpec());
+            return readOpenCodeV2CachedPluginVersion(slot) ?? null;
+        }
+        // Look in OpenCode 1's plugin cache for the installed package version.
         for (const candidate of getOpenCodePluginPackageJsonPaths()) {
             if (!existsSync(candidate)) continue;
             try {
@@ -322,24 +435,26 @@ export function isLocalPathPluginEntry(entry: unknown): boolean {
 
 /**
  * Match a local plugin entry only when its nearest package.json identifies the
- * OpenCode Magic Context package. A basename substring is not sufficient: paths
+ * OpenCode Magic Context package. `configDir` is the directory of the config
+ * file the entry came from. A basename substring is not sufficient: paths
  * such as `magic-context-theme` must not suppress the real plugin registration.
  */
-export function isDevPathPluginEntry(entry: unknown): boolean {
-    return devPathPluginPackageDir(entry) !== null;
+export function isDevPathPluginEntry(entry: unknown, configDir: string): boolean {
+    return devPathPluginPackageDir(entry, configDir) !== null;
 }
 
 /**
  * The package directory a dev-path entry resolves to, but only when the nearest
  * package.json above it names the OpenCode Magic Context package. Returns null
  * for managed specifiers, foreign local packages, and unreadable paths.
+ * `configDir` is the directory of the config file the entry came from.
  *
  * A dev checkout is the only install tree a `file://` registration has, so the
  * doctor's local-embedding probe needs the directory itself, not just the
  * boolean — `getOpenCodePluginCacheRoots()` is empty when nothing was ever
  * fetched from npm.
  */
-export function devPathPluginPackageDir(entry: unknown): string | null {
+export function devPathPluginPackageDir(entry: unknown, configDir: string): string | null {
     const candidate = pluginEntryPackage(entry);
     if (!candidate || !isLocalPathPluginEntry(entry)) return null;
 
@@ -348,7 +463,10 @@ export function devPathPluginPackageDir(entry: unknown): string | null {
         if (candidate.startsWith("file://")) {
             localPath = fileURLToPath(candidate);
         } else {
-            localPath = resolve(candidate);
+            // OpenCode resolves a relative entry against the directory of the
+            // config file that declares it, so the CLI's working directory
+            // must play no part (otherwise setup adds a second registration).
+            localPath = resolve(configDir, candidate);
         }
 
         if (statSync(localPath).isFile()) localPath = dirname(localPath);

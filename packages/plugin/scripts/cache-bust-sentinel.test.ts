@@ -33,6 +33,7 @@ import {
     saveSentinelState,
     SubcWakeEventTransport,
 } from "./cache-bust-sentinel";
+import { disruptionLogMarkers } from "./cache-bust-scheduler-log";
 
 const temporaryDirectories: string[] = [];
 
@@ -149,6 +150,108 @@ describe("cache-bust attribution contract", () => {
                     ?.accounted,
             );
         }
+    });
+
+    test("a mural-only epoch is self-inflicted unless an external epoch independently explains it", () => {
+        const classify = (externalEpoch: boolean): CacheBustDivergenceClass =>
+            classifyCacheBust({
+                divergenceIndex: 2,
+                previousMessageCount: 10,
+                decision: decision({
+                    materialized: true,
+                    materializeReason: "epoch_change",
+                    identityDelta: ["mur"],
+                    externalEpoch,
+                }),
+            });
+
+        expect(classify(false)).toBe("self_inflicted_epoch");
+        expect(classify(true)).toBe("accounted_hard_epoch");
+    });
+
+    test("two epoch HARDs within a minute without an external epoch wake the sentinel", () => {
+        const first = decision({ timestampMs: 10_000, materialized: true, materializeReason: "epoch_change", identityDelta: ["other"] });
+        const second = decision({ timestampMs: 16_000, materialized: true, materializeReason: "epoch_change", identityDelta: ["other"] });
+        const classify = (prior: CacheBustDecisionAttribution, current: CacheBustDecisionAttribution) => classifyCacheBust({
+            divergenceIndex: 2,
+            previousMessageCount: 10,
+            decision: current,
+            previousEpochHard: prior,
+        });
+        expect(classify(first, second)).toBe("self_inflicted_epoch");
+        expect(classify(first, { ...second, externalEpoch: true })).toBe("accounted_hard_epoch");
+        expect(classify({ ...first, timestampMs: -50_000 }, second)).toBe("accounted_hard_epoch");
+        expect(classify(first, { ...second, materializeReason: "model_change" })).toBe("accounted_hard_model_change");
+    });
+
+    test("an epoch HARD with no disruption in the preceding minute wakes as unfaulted", () => {
+        const hard = decision({
+            timestampMs: 100_000,
+            materialized: true,
+            materializeReason: "epoch_change",
+            identityDelta: ["other"],
+        });
+        const classify = (
+            precedingDisruption: string | null | undefined,
+            current: CacheBustDecisionAttribution = hard,
+        ) =>
+            classifyCacheBust({
+                divergenceIndex: 2,
+                previousMessageCount: 10,
+                decision: current,
+                precedingDisruption,
+            });
+        expect(classify(null)).toBe("unfaulted_epoch");
+        expect(isUnaccountedCacheBustClass("unfaulted_epoch")).toBe(true);
+        expect(classify("full_retry")).toBe("accounted_hard_epoch");
+        expect(classify("module_fault")).toBe("accounted_hard_epoch");
+        // No adapter log: the disruption question is unanswered, so it stays accounted.
+        expect(classify(undefined)).toBe("accounted_hard_epoch");
+        expect(classify(null, { ...hard, externalEpoch: true })).toBe("accounted_hard_epoch");
+    });
+
+    test("reads fault, retry, fallback, and restart markers from the adapter log", () => {
+        const session = "ses_313660571ffeZTsf4koSJwk50Q";
+        const line = (at: string, body: string, id = session) =>
+            `[${at}] [magic-context][${id}] ${body}`;
+        const text = [
+            line("2026-09-22T23:36:30.883Z", "transform stage: stage=rust.state_sync elapsed=5390.5ms retry=full reason=need_full_sync"),
+            line("2026-09-22T23:36:31.000Z", "need_full_sync retry=full ordinal_memo=kept"),
+            line("2026-09-23T00:11:14.902Z", "rust pass: decision=error reason=none served_from=raw in=929 out=929 applied=false"),
+            line("2026-09-23T00:12:00.000Z", "rust pass: decision=SOFT+ reason=none served_from=lkg in=929 out=900 applied=false"),
+            line("2026-09-23T00:13:00.000Z", "transform stage: stage=rust.ordinal_rebuild elapsed=900.0ms mode=prime rows=124219 pages=249 rewinds=0 cause=cold"),
+            line("2026-09-23T00:14:00.000Z", "rust pass: decision=SOFT+ reason=none served_from=transform in=929 out=900 applied=true"),
+            line("2026-09-23T00:15:00.000Z", "transform stage: stage=rust.ordinal_rebuild elapsed=90.0ms mode=rewind rows=499 pages=1 rewinds=1 cause=store_drift"),
+            line("2026-09-23T00:16:00.000Z", "rust pass: decision=error reason=none served_from=raw", "ses_other"),
+        ].join("\n");
+        expect(
+            disruptionLogMarkers(text, session).map((marker) => ({
+                at: new Date(marker.timestampMs).toISOString(),
+                kind: marker.disruption,
+            })),
+        ).toEqual([
+            { at: "2026-09-22T23:36:30.883Z", kind: "full_retry" },
+            { at: "2026-09-22T23:36:31.000Z", kind: "full_retry" },
+            { at: "2026-09-23T00:11:14.902Z", kind: "module_fault" },
+            { at: "2026-09-23T00:12:00.000Z", kind: "fallback_serve" },
+            { at: "2026-09-23T00:13:00.000Z", kind: "adapter_restart" },
+        ]);
+    });
+
+    test("the wake for an unfaulted epoch names the identity_delta components", () => {
+        const row = {
+            ...request(1_000, "BUST", "unfaulted_epoch"),
+            identityDelta: ["other", "tfe"],
+        };
+        const [window] = groupBustWindows([row]);
+        const event = eventForWindow(window!, "/tmp/sentinel-project", __test.defaultState());
+        expect(event?.payload).toMatchObject({
+            divergence_class: "unfaulted_epoch",
+            identity_delta: ["other", "tfe"],
+        });
+        const wake = agentDeliverRequest(event!, "agent", "from");
+        expect(wake.body.content).toContain("divergence_class=unfaulted_epoch");
+        expect(wake.body.content).toContain("identity_delta=other,tfe");
     });
 
     test("a zero provider read with no MC pass row is still a provider full miss, not no_mc_pass_row", () => {
@@ -528,6 +631,77 @@ describe("MC decision store joins", () => {
             droppedCount: 2,
         });
     });
+
+    // The pass-trace half of store migration 63, exactly as ck-mc runs it.
+    const migration63PassTrace = readFileSync(
+        join(
+            import.meta.dir,
+            "../../../crates/mc-store/src/migrations/store_063_pass_trace_ring.sql",
+        ),
+        "utf8",
+    );
+
+    test("reads rust scheduler history from migration 63 ring rows", () => {
+        const directory = temporaryDirectory("cache-bust-sentinel-ring-");
+        const storePath = join(directory, "store.db");
+        const store = new Database(storePath);
+        store.exec(`
+            CREATE TABLE mc_pass_trace (
+                session_id TEXT PRIMARY KEY,
+                scheduler_history TEXT NOT NULL DEFAULT '[]',
+                scheduler_interesting_history TEXT NOT NULL DEFAULT '[]'
+            );
+        `);
+        store.query("INSERT INTO mc_pass_trace VALUES (?, ?, ?)").run(
+            "ses_sentinel",
+            JSON.stringify([
+                {
+                    timestamp_ms: 20_200,
+                    request_observed_at_ms: 20_100,
+                    scheduler_decision: "Execute",
+                    canonical_decision: "execute",
+                    applied_drop_count: 2,
+                },
+            ]),
+            "[]",
+        );
+        store.exec(migration63PassTrace);
+        const columns = (
+            store.query("PRAGMA table_info(mc_pass_trace)").all() as Array<{ name: string }>
+        ).map((row) => row.name);
+        expect(columns).not.toContain("scheduler_history");
+        store.close(false);
+
+        const loaded = loadSessionDecisions(activeSession, {
+            ...options(join(directory, "state.json")),
+            databasePath: join(directory, "context.db"),
+            rustStorePath: storePath,
+        });
+
+        expect(nearestCacheBustDecision(loaded, 20_100)).toMatchObject({
+            canonicalDecision: "execute",
+            droppedCount: 2,
+        });
+    });
+
+    test("reports an error, not zero rows, for a trace row with no readable history", () => {
+        const directory = temporaryDirectory("cache-bust-sentinel-no-history-");
+        const storePath = join(directory, "store.db");
+        const store = new Database(storePath);
+        store.exec(`
+            CREATE TABLE mc_pass_trace (session_id TEXT PRIMARY KEY, receive_count INTEGER);
+            INSERT INTO mc_pass_trace VALUES ('ses_sentinel', 3);
+        `);
+        store.close(false);
+
+        expect(() =>
+            loadSessionDecisions(activeSession, {
+                ...options(join(directory, "state.json")),
+                databasePath: join(directory, "context.db"),
+                rustStorePath: storePath,
+            }),
+        ).toThrow(CacheBustSentinelInputError);
+    });
 });
 
 describe("agent.deliver contract", () => {
@@ -591,6 +765,7 @@ describe("agent.deliver contract", () => {
                 from_session_id: "health-sentinel-mc" as const,
                 from_harness: "magic-context" as const,
                 content,
+                one_way: true as const,
             },
             urgency: "high" as const,
         };
@@ -627,6 +802,7 @@ describe("agent.deliver contract", () => {
             "from_session_id",
             "from_harness",
             "content",
+            "one_way",
         ]);
         expect(await transport.record(event)).toEqual({
             result: { disposition: "delivered", committed_order: 41 },
@@ -703,6 +879,30 @@ describe("agent.deliver contract", () => {
 });
 
 describe("cache-bust sentinel runs", () => {
+    test("resumes a timed-out pass and emits every window", async () => {
+        const directory = temporaryDirectory("cache-bust-sentinel-resume-");
+        const stateFile = join(directory, "state.json");
+        const sent: string[] = [];
+        let time = 1_000;
+        const sessions = ["ses_one", "ses_two"].map((sessionId) => ({ ...activeSession, sessionId }));
+        const deps = {
+            now: () => time,
+            listActiveSessions: (state: { sessions: Record<string, { lastAnalyzedRequestTimestampMs: number }> }) =>
+                sessions.filter((session) => (state.sessions[session.sessionId]?.lastAnalyzedRequestTimestampMs ?? 0) < 900),
+            loadDecisions: () => [],
+            analyzeSession: async (session: ActiveCacheBustSession) => {
+                time += 20;
+                return { requests: [{ ...request(900), session: session.sessionId }], highWaterMarkMs: 900 };
+            },
+            stdout: (line: string) => { sent.push(JSON.parse(line).session_id); },
+            stderr: () => {},
+        };
+        const runOptions = { ...options(stateFile), maxRunMs: 10 };
+        expect((await runSentinelOnce(runOptions, deps)).bounded).toBe(true);
+        expect(sent).toEqual(["ses_one"]);
+        expect((await runSentinelOnce(runOptions, deps)).bounded).toBe(true);
+        expect(sent).toEqual(["ses_one", "ses_two"]);
+    });
     test("persists and reuses the per-session request high-water mark", async () => {
         const directory = temporaryDirectory("cache-bust-sentinel-watermark-");
         const stateFile = join(directory, "state.json");

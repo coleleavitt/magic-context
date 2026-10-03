@@ -18,6 +18,12 @@ import { formatCacheTtlDisplay } from "./cache-ttl-display";
 import { type ConfigParseFailure, formatConfigParseStatusLine } from "./config-diagnostics";
 import { formatThresholdPercent } from "./format-threshold";
 import type { TailHygieneStatus } from "./rpc-types";
+import {
+    type StatusCheck,
+    type StatusUnavailableReason,
+    type StatusVersions,
+    statusVersionNotice,
+} from "./status-view-check";
 import { formatTailHygiene } from "./tail-hygiene-status";
 import {
     renderUserFacingFailure,
@@ -115,10 +121,16 @@ export interface StatusViewSource {
     readonly tagCountsAuthoritative?: boolean;
     readonly lastNudgeTokens: number;
     readonly pendingOpsCount: number;
+    readonly compactionMarker?: {
+        readonly code: "MC-C11" | null;
+        readonly attempts: number;
+        readonly lastError: string | null;
+        readonly pendingSinceMs: number | null;
+    };
     readonly protectedTagCount: number;
     readonly isSubagent: boolean;
     readonly cacheTtl: string;
-    readonly cacheTtlSource?: "config" | "session" | "default";
+    readonly cacheTtlSource?: import("./cache-ttl-display").CacheTtlDisplaySource;
     readonly cacheTtlModelKey?: string;
     readonly lastResponseTime: number;
     readonly cacheRemainingMs: number;
@@ -145,12 +157,38 @@ export interface StatusViewSource {
     readonly readySmartNoteCount?: number;
     readonly archivedCompartmentCount?: number;
     readonly configParseFailures?: readonly ConfigParseFailure[];
+    readonly configGeneration?: number;
+    readonly configAdoptedAt?: number;
+    readonly configReloadFailure?: { readonly path: string; readonly message: string };
     /** OpenCode spells this `compaction_enabled`; both spellings are accepted. */
     readonly compaction_enabled?: boolean;
     readonly compactionEnabled?: boolean;
     /** Failure codes to print under the sections, already selected by the host. */
     readonly warnings?: readonly UserFacingFailureKey[];
+    /**
+     * Set when this server migrated the shared store at startup while other
+     * OpenCode servers (these PIDs, from their RPC discovery records) could not
+     * be checked; if one was an older build still running, it now reads a
+     * store newer than it supports.
+     */
+    readonly unconfirmedMigrationHolders?: {
+        readonly pids: readonly number[];
+        readonly fromVersion: number;
+        readonly toVersion: number;
+    };
+    readonly hiddenVariantWarnings?: readonly string[];
 }
+
+declare const checkedStatusViewSource: unique symbol;
+
+/**
+ * A `StatusViewSource` that has passed `checkStatusViewSource`. The brand exists
+ * only in the type system: `buildStatusView` accepts nothing else, so a payload
+ * cannot reach the view model without going through the check.
+ */
+export type CheckedStatusViewSource = StatusViewSource & {
+    readonly [checkedStatusViewSource]: true;
+};
 
 export interface StatusViewOptions {
     /** Plugin version shown next to the title. */
@@ -177,14 +215,121 @@ export const STATUS_CATEGORY_COLORS = {
 } as const;
 
 /**
- * Terminal columns below which the two-column section grid is not drawn.
- *
- * Two columns need, per column, the widest label column (19) plus a space plus
- * room for a value (about 14), and the dialog adds four columns of padding and
- * four of gap between the columns: 2 × 34 + 8 = 76. Narrower than that, the
- * sections are drawn in one column instead of squeezing labels into wraps.
+ * Columns reserved between the two section columns when the grid is drawn.
+ * The dialog draws its two columns at equal width with this gap between them.
  */
-export const STATUS_TWO_COLUMN_MIN_COLUMNS = 76;
+export const STATUS_COLUMN_GAP = 4;
+
+/**
+ * Columns one section needs so that neither its labels nor its values wrap:
+ * the label column, one separating space, and the longest value in the section.
+ */
+export function statusSectionWidth(section: StatusSection): number {
+    const longestValue = section.rows.reduce(
+        (longest, row) => Math.max(longest, row.value.length),
+        0,
+    );
+    return section.labelWidth + 1 + longestValue;
+}
+
+/** How the sections are laid out at one content width. */
+export interface StatusColumnLayout {
+    /** True when both columns fit; false means the caller draws one column. */
+    readonly twoColumn: boolean;
+    /** Columns the widest section in the left column needs. */
+    readonly leftWidth: number;
+    /** Columns the widest section in the right column needs. */
+    readonly rightWidth: number;
+}
+
+function widestSectionWidth(sections: readonly StatusSection[]): number {
+    return sections.reduce((widest, section) => Math.max(widest, statusSectionWidth(section)), 0);
+}
+
+/**
+ * Whether the sections fit in two columns at this content width, and how wide
+ * each column has to be.
+ *
+ * A value never wraps, so a section needs `labelWidth + 1 + longest value`
+ * columns and the grid is drawn only when both columns' requirements plus the
+ * gap fit the content width. When they do not, the caller draws the same
+ * sections in one column instead of squeezing values into mid-word wraps.
+ *
+ * The returned widths are the columns' own requirements, so a caller that sizes
+ * its columns from them cannot wrap a value even when the two requirements are
+ * very different. Both renderers call this so neither decides the layout on its
+ * own.
+ */
+export function statusColumnsFor(
+    sections: readonly StatusSection[],
+    contentWidth: number,
+): StatusColumnLayout {
+    const left = sections.filter((_section, index) => index % 2 === 0);
+    const right = sections.filter((_section, index) => index % 2 === 1);
+    const leftWidth = widestSectionWidth(left);
+    const rightWidth = widestSectionWidth(right);
+    const twoColumn =
+        left.length > 0 &&
+        right.length > 0 &&
+        leftWidth + rightWidth + STATUS_COLUMN_GAP <= contentWidth;
+    return { twoColumn, leftWidth, rightWidth };
+}
+
+/**
+ * Integer column widths for the breakdown bar, summing exactly to `totalWidth`.
+ *
+ * Each segment's proportional share is rounded down and the leftover columns go
+ * to the largest fractional remainders, so the widths always add up to the bar
+ * width. Rounding every segment independently instead leaves the bar short of
+ * its container by up to one column per segment, which paints as blank cells
+ * between the coloured runs.
+ *
+ * Every segment that carries tokens keeps at least one column, so a category
+ * whose share rounds below a column stays visible in the bar.
+ */
+export function distributeBarWidths(tokens: readonly number[], totalWidth: number): number[] {
+    const width = Math.max(0, Math.floor(totalWidth));
+    if (tokens.length === 0) return [];
+    if (width === 0) return tokens.map(() => 0);
+    const weights = tokens.map((value) =>
+        typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0,
+    );
+    const total = weights.reduce((sum, value) => sum + value, 0);
+    if (total <= 0) {
+        // No token counts to weigh by: split the bar as evenly as possible.
+        const base = Math.floor(width / tokens.length);
+        const remainder = width - base * tokens.length;
+        return tokens.map((_value, index) => base + (index < remainder ? 1 : 0));
+    }
+    const floors: number[] = weights.map((weight) => (weight > 0 ? 1 : 0));
+    const assigned = floors.reduce((sum, value) => sum + value, 0);
+    if (assigned > width) {
+        // Narrower than the number of categories: keep the leftmost ones.
+        let remaining = width;
+        return floors.map((value) => {
+            if (value === 0 || remaining === 0) return 0;
+            remaining -= 1;
+            return 1;
+        });
+    }
+    const remaining = width - assigned;
+    const exact = weights.map((weight) => (weight / total) * remaining);
+    const shares = exact.map((value) => Math.floor(value));
+    let leftover = remaining - shares.reduce((sum, value) => sum + value, 0);
+    const byRemainder = exact
+        .map((value, index) => ({
+            index,
+            fraction: value - Math.floor(value),
+            weight: weights[index] ?? 0,
+        }))
+        .sort((a, b) => b.fraction - a.fraction || b.weight - a.weight || a.index - b.index);
+    for (const entry of byRemainder) {
+        if (leftover <= 0) break;
+        shares[entry.index] = (shares[entry.index] ?? 0) + 1;
+        leftover -= 1;
+    }
+    return floors.map((value, index) => value + (shares[index] ?? 0));
+}
 
 /** Compact token count, e.g. 623K. Shared so every host prints one spelling. */
 export function formatStatusTokens(value: number): string {
@@ -305,7 +450,7 @@ function cacheRows(source: StatusViewSource, now: number): StatusRow[] {
             label: "Last response",
             value:
                 source.lastResponseTime > 0
-                    ? `${Math.round((now - source.lastResponseTime) / 1000)}s ago`
+                    ? formatRelativeTime(source.lastResponseTime, now)
                     : "never",
             tone: "text",
         },
@@ -428,7 +573,23 @@ function knowledgeSections(source: StatusViewSource, now: number): StatusSection
  * been arranged), and a narrow host draws the same list in one column.
  */
 function statusSections(source: StatusViewSource, now: number): StatusSection[] {
-    if (!compactionEnabled(source)) return knowledgeSections(source, now);
+    const configSection: StatusSection[] =
+        source.configGeneration === undefined
+            ? []
+            : [
+                  {
+                      title: "Config",
+                      labelWidth: 12,
+                      rows: [
+                          {
+                              label: "Generation",
+                              value: `${source.configGeneration} · adopted ${source.configAdoptedAt ? new Date(source.configAdoptedAt).toLocaleString() : "unknown"}`,
+                              tone: "muted",
+                          },
+                      ],
+                  },
+              ];
+    if (!compactionEnabled(source)) return [...knowledgeSections(source, now), ...configSection];
     return [
         { title: "Tags", labelWidth: 8, rows: tagRows(source) },
         {
@@ -458,6 +619,13 @@ function statusSections(source: StatusViewSource, now: number): StatusSection[] 
                     value: String(source.pendingOpsCount),
                     tone: source.pendingOpsCount > 0 ? "warning" : "muted",
                 },
+                {
+                    label: "Marker",
+                    value: source.compactionMarker?.code
+                        ? `${source.compactionMarker.code} · ${source.compactionMarker.attempts} attempts · ${source.compactionMarker.lastError ?? "unknown error"}`
+                        : "healthy",
+                    tone: source.compactionMarker?.code ? "warning" : "muted",
+                },
             ],
         },
         {
@@ -474,6 +642,7 @@ function statusSections(source: StatusViewSource, now: number): StatusSection[] 
         },
         { title: "Cache TTL", labelWidth: 14, rows: cacheRows(source, now) },
         { title: "History Compression", labelWidth: 14, rows: historyRows(source, now) },
+        ...configSection,
         {
             title: "Memory",
             labelWidth: 9,
@@ -486,20 +655,44 @@ function statusSections(source: StatusViewSource, now: number): StatusSection[] 
 }
 
 function warningBlock(source: StatusViewSource): StatusWarning[] {
+    const holders = source.unconfirmedMigrationHolders;
     return [
+        ...(holders && holders.pids.length > 0
+            ? [
+                  {
+                      text: `Magic Context upgraded its database from v${holders.fromVersion} to v${holders.toVersion} while OpenCode PID ${holders.pids.join(", ")} could not be checked. If an older OpenCode is still open, quit all OpenCode processes and start again.`,
+                      tone: "error" as const,
+                  },
+              ]
+            : []),
+        ...(source.hiddenVariantWarnings ?? []).map((text) => ({ text, tone: "warning" as const })),
+        ...(source.configReloadFailure
+            ? [
+                  {
+                      text: `Config reload failed ${source.configReloadFailure.path}: ${source.configReloadFailure.message}`,
+                      tone: "error" as const,
+                  },
+              ]
+            : []),
         ...(source.configParseFailures ?? []).map((failure) => ({
             text: formatConfigParseStatusLine(failure),
             tone: "error" as const,
         })),
         ...(source.warnings ?? []).map((code) => ({
-            text: renderUserFacingFailure(code),
+            text:
+                code === "compaction_marker_missing" && source.compactionMarker?.code
+                    ? `${renderUserFacingFailure(code)} ${source.compactionMarker.attempts} attempts; last error: ${source.compactionMarker.lastError ?? "unknown"}.`
+                    : renderUserFacingFailure(code),
             tone: "warning" as const,
         })),
     ];
 }
 
-/** Builds the full status view from one snapshot. */
-export function buildStatusView(source: StatusViewSource, options: StatusViewOptions): StatusView {
+/** Builds the full status view from one checked snapshot. */
+export function buildStatusView(
+    source: CheckedStatusViewSource,
+    options: StatusViewOptions,
+): StatusView {
     const now = options.now ?? Date.now();
     const off = !compactionEnabled(source);
     const tone = off ? "accent" : pressureTone(source.usagePercentage);
@@ -544,6 +737,131 @@ export function buildStatusView(source: StatusViewSource, options: StatusViewOpt
         warnings: warningBlock(source),
         footer: "Esc to close",
     };
+}
+
+/** Short name for the reason, shown on the headline and in the reason row. */
+function unavailableLabel(reason: StatusUnavailableReason): string {
+    if (reason.kind === "rpc_error") return "server did not answer";
+    if (reason.kind === "not_tracked") {
+        return reason.cause === "home_directory" ? "home directory" : "memory paused";
+    }
+    if (reason.kind === "malformed") return "incomplete status data";
+    return "view error";
+}
+
+/** Full-width sentences explaining the reason and what to do about it. */
+function unavailableExplanation(
+    reason: StatusUnavailableReason,
+    versionNotice: string | null,
+): string[] {
+    const persists = "If this persists after a restart, report it with magic-context.log attached.";
+    if (reason.kind === "rpc_error") {
+        return [
+            `The Magic Context server did not return status: ${reason.message}`,
+            renderUserFacingFailure("status_unavailable", "plain"),
+        ];
+    }
+    if (reason.kind === "not_tracked" && reason.cause === "home_directory") {
+        return [
+            "This is your home directory, so Magic Context keeps no project history or memory here.",
+            "Set allow_home_project in magic-context.jsonc to opt in.",
+        ];
+    }
+    if (reason.kind === "not_tracked") {
+        return [
+            "Magic Context could not work out a project identity for this directory, so its memory features are paused.",
+            'magic-context.log names the cause (search for "memory features paused"), for example a git command that failed.',
+        ];
+    }
+    if (reason.kind === "malformed") {
+        return [
+            `The status reply is missing, or has unexpected values for: ${reason.fields.join(", ")}.`,
+            versionNotice ? "The version difference above is the likely cause." : persists,
+        ];
+    }
+    return [`The status view could not be drawn: ${reason.message}`, persists];
+}
+
+/**
+ * The view drawn instead of the status when there is no usable snapshot. It has
+ * the same shape as a full view (headline, sections, warnings, footer), so a
+ * host draws it with the same code and cannot crash on a missing part.
+ */
+export function buildUnavailableStatusView(
+    reason: StatusUnavailableReason,
+    versions: StatusVersions | null,
+    options: StatusViewOptions,
+): StatusView {
+    const label = unavailableLabel(reason);
+    const versionNotice = statusVersionNotice(versions);
+    const rows: StatusRow[] = [{ label: "Reason", value: label, tone: "warning" }];
+    if (versions) {
+        rows.push(
+            { label: "Server", value: versions.server ?? "not reported", tone: "muted" },
+            { label: "UI", value: versions.ui, tone: "muted" },
+        );
+    }
+    return {
+        title: "⚡ Magic Context Status",
+        version: `v${options.version}`,
+        headline: {
+            left: { text: "Status unavailable", tone: "error" },
+            right: { text: label, tone: "muted" },
+        },
+        windowLine: null,
+        bar: [],
+        breakdown: [],
+        hygiene: null,
+        sections: [{ title: "Status unavailable", labelWidth: 8, rows }],
+        warnings: [
+            ...(versionNotice ? [{ text: versionNotice, tone: "error" as const }] : []),
+            ...unavailableExplanation(reason, versionNotice).map((text) => ({
+                text,
+                tone: "warning" as const,
+            })),
+        ],
+        footer: "Esc to close",
+    };
+}
+
+/**
+ * The view for one checked status result: the full status, or the
+ * "status unavailable" view naming why there is none. A version difference
+ * between the server and this UI is named in both. This never throws, so a
+ * host can call it inside a render without guarding it.
+ */
+export function buildStatusViewFor(
+    check: StatusCheck<unknown>,
+    options: StatusViewOptions,
+): StatusView {
+    if (check.state === "unavailable") {
+        return buildUnavailableStatusView(check.reason, check.versions, options);
+    }
+    try {
+        const view = buildStatusView(check.source, options);
+        const versionNotice = statusVersionNotice(check.versions);
+        const notices: StatusWarning[] = [
+            ...(versionNotice ? [{ text: versionNotice, tone: "warning" as const }] : []),
+            ...(check.ignoredFields.length > 0
+                ? [
+                      {
+                          text: `Ignored status fields with an unexpected shape: ${check.ignoredFields.join(", ")}`,
+                          tone: "warning" as const,
+                      },
+                  ]
+                : []),
+        ];
+        return notices.length > 0 ? { ...view, warnings: [...notices, ...view.warnings] } : view;
+    } catch (error) {
+        return buildUnavailableStatusView(
+            {
+                kind: "view_error",
+                message: error instanceof Error ? error.message : String(error),
+            },
+            check.versions,
+            options,
+        );
+    }
 }
 
 /** Pads one row to its section's label column; values print flush right. */

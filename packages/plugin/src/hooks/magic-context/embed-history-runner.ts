@@ -24,7 +24,6 @@ export interface EmbedHistoryDeps {
     db: Database;
     /** Resolve the session's own directory (falls back to the plugin directory). */
     resolveDirectory: (sessionId: string) => string;
-    memoryEnabled: boolean;
     allowHomeProject?: boolean;
     /** Progress entries the sidebar and /ctx-status read. */
     recompProgressBySession: Map<string, RecompProgress>;
@@ -38,9 +37,8 @@ export async function runEmbedHistoryDrain(
     sessionId: string,
     options?: { signal?: AbortSignal; silent?: boolean },
 ): Promise<string> {
-    if (!deps.memoryEnabled) {
-        return "Memory is disabled for this project, so there is no semantic embedding to backfill.";
-    }
+    // History embedding does not depend on `memory.enabled`; with no provider
+    // the drain itself reports that there is nothing to embed.
     const directory = deps.resolveDirectory(sessionId);
     // Idempotent start: if a drain is already running for this session, don't
     // abort it and re-acquire — that races the just-released lease and returns
@@ -49,41 +47,57 @@ export async function runEmbedHistoryDrain(
     if (active && !active.signal.aborted && !options?.signal) {
         return "Embedding is already running for this session.";
     }
-    await ensureProjectRegisteredFromOpenCodeDirectory(directory, deps.db);
-    const sessionProjectIdentity = resolveProjectIdentityForSession(
-        directory,
-        deps.allowHomeProject,
-    );
-    if (!sessionProjectIdentity) return "No project identity is bound for the home directory.";
-    deps.onDirectoryResolved?.(sessionId, directory);
-    embedPauseBySession.delete(sessionId);
-    const prior = embedRunStateBySession.get(sessionId);
-    if (prior) prior.abort();
+    // Claim the session before the first await. A second start that arrives while
+    // this one is still registering the project must see it as running; claimed any
+    // later, both starts pass the check above and the second aborts the first,
+    // which then reports a pause nobody asked for.
+    if (active) active.abort();
     const controller = new AbortController();
     embedRunStateBySession.set(sessionId, controller);
     const signal = options?.signal ?? controller.signal;
     const progressState = {
         recompProgressBySession: deps.recompProgressBySession,
     } as LiveSessionState;
-    if (!options?.silent) {
-        setRecompStarting(progressState, sessionId, "Embedding history…", "embed");
-    }
     let runFailed = 0;
+    let sessionProjectIdentity: string;
     let outcome: Awaited<ReturnType<typeof embedSessionCompartmentChunks>>;
     try {
-        outcome = await embedSessionCompartmentChunks(deps.db, sessionProjectIdentity, sessionId, {
-            signal,
-            onProgress: ({ embedded, total }) => {
-                const cur = deps.recompProgressBySession.get(sessionId);
-                if (cur?.phase !== "recomp") return;
-                deps.recompProgressBySession.set(sessionId, {
-                    ...cur,
-                    processedMessages: embedded,
-                    totalMessages: total,
-                    updatedAt: Date.now(),
-                });
-            },
-        });
+        await ensureProjectRegisteredFromOpenCodeDirectory(directory, deps.db);
+        const identity = resolveProjectIdentityForSession(directory, deps.allowHomeProject);
+        if (!identity) return "No project identity is bound for the home directory.";
+        sessionProjectIdentity = identity;
+        deps.onDirectoryResolved?.(sessionId, directory);
+        embedPauseBySession.delete(sessionId);
+        if (!options?.silent) {
+            setRecompStarting(progressState, sessionId, "Embedding history…", "embed");
+        }
+        try {
+            outcome = await embedSessionCompartmentChunks(deps.db, identity, sessionId, {
+                signal,
+                onProgress: ({ embedded, total }) => {
+                    const cur = deps.recompProgressBySession.get(sessionId);
+                    if (cur?.phase !== "recomp") return;
+                    deps.recompProgressBySession.set(sessionId, {
+                        ...cur,
+                        processedMessages: embedded,
+                        totalMessages: total,
+                        updatedAt: Date.now(),
+                    });
+                },
+            });
+        } catch (error) {
+            // The progress entry was set to running above. Without a terminal state the
+            // sidebar and /ctx-status would show this drain running forever.
+            if (!options?.silent) {
+                setRecompTerminal(
+                    progressState,
+                    sessionId,
+                    "failed",
+                    `Embedding stopped: ${error instanceof Error ? error.message : String(error)}`,
+                );
+            }
+            throw error;
+        }
     } finally {
         // Always release the per-session controller, even if the drain threw
         // (a release-time SQLite error, etc.) — otherwise a stale controller

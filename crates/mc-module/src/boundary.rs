@@ -137,6 +137,8 @@ pub struct BoundaryMsg {
 /// Inputs for resolving the protected-tail boundary.
 #[derive(Debug, Clone)]
 pub struct BoundaryContext {
+    /// Static class ratios for this decision; original block/cache counts stay raw.
+    pub calibration: Option<crate::decision_calibration::DecisionCalibration>,
     /// Main model context limit in tokens.
     pub context_limit: f64,
     /// Execute threshold percentage used to derive usable context.
@@ -163,6 +165,7 @@ pub struct BoundaryContext {
 impl Default for BoundaryContext {
     fn default() -> Self {
         Self {
+            calibration: None,
             context_limit: 128_000.0,
             execute_threshold_percentage: 65.0,
             usage_percentage: 0.0,
@@ -260,6 +263,9 @@ pub struct TriggerContext {
     pub compartment_in_progress: bool,
     /// Projected post-drop usage percentage supplied by the caller, if available.
     pub projected_post_drop_percentage: Option<f64>,
+    /// True if this pass already has a cache-busting event that can apply pending drops;
+    /// a history publication that has not yet occurred does not qualify.
+    pub reclaim_ride_available: bool,
     /// Whether commit clusters may trigger a run.
     pub commit_cluster_trigger_enabled: bool,
     /// Minimum assistant commit clusters required for the commit trigger.
@@ -272,6 +278,7 @@ impl Default for TriggerContext {
             boundary: BoundaryContext::default(),
             compartment_in_progress: false,
             projected_post_drop_percentage: None,
+            reclaim_ride_available: false,
             commit_cluster_trigger_enabled: true,
             min_commit_clusters: DEFAULT_MIN_COMMIT_CLUSTERS_FOR_TRIGGER,
         }
@@ -416,7 +423,7 @@ pub fn resolve_protected_tail_boundary(
     messages: &[BoundaryMsg],
     ctx: &BoundaryContext,
 ) -> BoundaryResolution {
-    let index = TokenIndex::new(messages);
+    let index = TokenIndex::calibrated(messages, ctx.calibration);
     resolve_protected_tail_boundary_with_index(messages, ctx, &index)
 }
 
@@ -738,7 +745,7 @@ pub fn check_compartment_trigger(
     if ctx.compartment_in_progress {
         return no_fire(HistorianNoFireCause::HistorianAlreadyInProgress);
     }
-    let index = TokenIndex::new(messages);
+    let index = TokenIndex::calibrated(messages, ctx.boundary.calibration);
     let mut token_estimator = estimate_tokens;
     check_compartment_trigger_with_index(messages, ctx, &index, &mut token_estimator)
 }
@@ -751,7 +758,7 @@ pub(crate) fn check_compartment_trigger_with_token_estimator(
     if ctx.compartment_in_progress {
         return no_fire(HistorianNoFireCause::HistorianAlreadyInProgress);
     }
-    let index = TokenIndex::new(messages);
+    let index = TokenIndex::calibrated(messages, ctx.boundary.calibration);
     check_compartment_trigger_with_index(messages, ctx, &index, token_estimator)
 }
 
@@ -798,9 +805,15 @@ fn check_compartment_trigger_with_index(
     let has_protected_eligible_head =
         boundary.eligible_head.start < boundary.protected_start_ordinal;
 
-    let scan_budget =
-        MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE.max(trigger_budget * TAIL_SIZE_TRIGGER_MULTIPLIER);
-    let chunk = if has_protected_eligible_head {
+    let source_ratio = ctx
+        .boundary
+        .calibration
+        .map_or(1.0, |s| s.prose_ratio.max(s.tools_ratio));
+    let scan_budget = (MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE
+        .max(trigger_budget * TAIL_SIZE_TRIGGER_MULTIPLIER)
+        / source_ratio)
+        .floor();
+    let mut chunk = if has_protected_eligible_head {
         chunked_message_estimate_with_estimator(
             messages,
             boundary.eligible_head.start,
@@ -818,6 +831,7 @@ fn check_compartment_trigger_with_index(
             commit_cluster_count: 0,
         }
     };
+    chunk.tokens = (chunk.tokens * source_ratio).ceil();
     let progress = TriggerProgress {
         eligible_start_ordinal: boundary.eligible_head.start,
         eligible_chunk_tokens: chunk.tokens,
@@ -835,9 +849,10 @@ fn check_compartment_trigger_with_index(
     let force_materialization_percentage =
         escalation_bands(ctx.boundary.execute_threshold_percentage).force_materialize_percentage;
     if ctx.boundary.usage_percentage >= force_materialization_percentage {
-        if ctx
-            .projected_post_drop_percentage
-            .is_some_and(|pct| pct <= relative_post_drop_target)
+        if ctx.reclaim_ride_available
+            && ctx
+                .projected_post_drop_percentage
+                .is_some_and(|pct| pct <= relative_post_drop_target)
         {
             return no_fire_with_progress(
                 HistorianNoFireCause::ProjectedPostDropSatisfied,
@@ -891,9 +906,10 @@ fn check_compartment_trigger_with_index(
         return no_fire_with_progress(HistorianNoFireCause::BelowProactiveFloor, progress);
     }
 
-    if ctx
-        .projected_post_drop_percentage
-        .is_some_and(|pct| pct <= relative_post_drop_target)
+    if ctx.reclaim_ride_available
+        && ctx
+            .projected_post_drop_percentage
+            .is_some_and(|pct| pct <= relative_post_drop_target)
     {
         return no_fire_with_progress(HistorianNoFireCause::ProjectedPostDropSatisfied, progress);
     }
@@ -1036,26 +1052,38 @@ struct TokenIndex {
 
 impl TokenIndex {
     fn new(messages: &[BoundaryMsg]) -> Self {
-        Self::from_block_tokens(messages, |block| block.original_token_count)
+        Self::from_block_tokens(messages, |block| block.original_token_count as f64)
+    }
+
+    fn calibrated(
+        messages: &[BoundaryMsg],
+        seed: Option<crate::decision_calibration::DecisionCalibration>,
+    ) -> Self {
+        let Some(seed) = seed else {
+            return Self::new(messages);
+        };
+        Self::from_block_tokens(messages, |block| {
+            let ratio = match block.kind {
+                SelKind::ToolCall { .. } | SelKind::ToolResult { .. } => seed.tools_ratio,
+                SelKind::Media => 1.0,
+                _ => seed.prose_ratio,
+            };
+            block.original_token_count as f64 * ratio
+        })
     }
 
     #[cfg(test)]
     fn new_retokenized(messages: &[BoundaryMsg]) -> Self {
-        Self::from_block_tokens(messages, |block| estimate_tokens(&block.original))
+        Self::from_block_tokens(messages, |block| estimate_tokens(&block.original) as f64)
     }
 
     fn from_block_tokens(
         messages: &[BoundaryMsg],
-        mut block_tokens: impl FnMut(&BoundaryBlock) -> usize,
+        mut block_tokens: impl FnMut(&BoundaryBlock) -> f64,
     ) -> Self {
         let mut totals_by_ordinal = BTreeMap::new();
         for message in messages {
-            let total = message
-                .blocks
-                .iter()
-                .map(&mut block_tokens)
-                .map(|tokens| tokens as f64)
-                .sum::<f64>();
+            let total = message.blocks.iter().map(&mut block_tokens).sum::<f64>();
             *totals_by_ordinal
                 .entry(message.message_ordinal)
                 .or_insert(0.0) += total;
@@ -2252,6 +2280,7 @@ mod tests {
 
     fn boundary_ctx(json: &BoundaryCtxJson) -> BoundaryContext {
         BoundaryContext {
+            calibration: None,
             context_limit: json.context_limit,
             execute_threshold_percentage: json.execute_threshold_percentage,
             usage_percentage: json.usage_percentage,
@@ -2628,6 +2657,7 @@ mod tests {
                 boundary: boundary_ctx(&case.ctx.boundary),
                 compartment_in_progress: case.ctx.compartment_in_progress,
                 projected_post_drop_percentage: case.ctx.projected_post_drop_percentage,
+                reclaim_ride_available: true,
                 commit_cluster_trigger_enabled: case.ctx.commit_cluster_trigger_enabled,
                 min_commit_clusters: case.ctx.min_commit_clusters,
             };
@@ -2763,6 +2793,7 @@ mod tests {
                 let mut messages = Vec::new();
                 let mut ctx = TriggerContext {
                     boundary: BoundaryContext {
+                        calibration: None,
                         context_limit: limit,
                         execute_threshold_percentage: threshold,
                         usage_percentage: 75.0,
@@ -2948,6 +2979,7 @@ mod tests {
                 for threshold in [65.0, 75.0] {
                     let ctx = TriggerContext {
                         boundary: BoundaryContext {
+                            calibration: None,
                             context_limit: limit,
                             execute_threshold_percentage: threshold,
                             usage_percentage: percentage,
@@ -2985,6 +3017,59 @@ mod tests {
             prior_coverage = Some(coverage);
         }
         assert_eq!(count, 6);
+    }
+
+    #[test]
+    fn queued_drops_without_a_ride_do_not_suppress_a_runnable_historian() {
+        let messages = (1..=11)
+            .map(|ordinal| text_msg(ordinal, Role::User, &"eligible narrative ".repeat(500)))
+            .collect::<Vec<_>>();
+        let ctx = TriggerContext {
+            boundary: BoundaryContext {
+                context_limit: 20_000.0,
+                execute_threshold_percentage: 63.0,
+                usage_percentage: 61.0,
+                usage_input_tokens: 12_200.0,
+                ..ctx_for_tests()
+            },
+            projected_post_drop_percentage: Some(30.0),
+            commit_cluster_trigger_enabled: false,
+            ..TriggerContext::default()
+        };
+        let first = check_compartment_trigger(&messages, &ctx);
+        assert_eq!(first.reason, Some(TriggerReason::ProjectedHeadroom));
+        let with_ride = TriggerContext {
+            reclaim_ride_available: true,
+            ..ctx.clone()
+        };
+        assert_eq!(
+            check_compartment_trigger(&messages, &with_ride).no_fire_cause,
+            Some(HistorianNoFireCause::ProjectedPostDropSatisfied)
+        );
+        let force = TriggerContext {
+            boundary: BoundaryContext {
+                usage_percentage: 85.0,
+                usage_input_tokens: 17_000.0,
+                ..ctx.boundary
+            },
+            reclaim_ride_available: false,
+            ..ctx
+        };
+        assert_eq!(
+            check_compartment_trigger(&messages, &force).reason,
+            Some(TriggerReason::ForceBand)
+        );
+        assert_eq!(
+            check_compartment_trigger(
+                &messages,
+                &TriggerContext {
+                    reclaim_ride_available: true,
+                    ..force
+                }
+            )
+            .no_fire_cause,
+            Some(HistorianNoFireCause::ProjectedPostDropSatisfied)
+        );
     }
 
     #[test]
@@ -3030,6 +3115,7 @@ mod tests {
         for fold_only in [false, true] {
             let mut ctx = TriggerContext {
                 boundary: BoundaryContext {
+                    calibration: None,
                     context_limit: 167_000.0,
                     execute_threshold_percentage: 65.0,
                     usage_percentage: 75.0,
@@ -3070,6 +3156,7 @@ mod tests {
 
     fn ctx_for_tests() -> BoundaryContext {
         BoundaryContext {
+            calibration: None,
             context_limit: 20_000.0,
             execute_threshold_percentage: 50.0,
             usage_percentage: 81.0,
@@ -3121,6 +3208,7 @@ mod tests {
         let redundancy = TriggerContext {
             boundary: ctx_for_tests(),
             projected_post_drop_percentage: Some(20.0),
+            reclaim_ride_available: true,
             ..TriggerContext::default()
         };
         let redundancy_decision = check_compartment_trigger(

@@ -106,6 +106,7 @@ export interface HiddenCompletion {
     reasoning?: string | null;
     usage: TokenTotals;
     lengthCapped: boolean;
+    tokenLog?: import("../../shared/run-token-log").RunTokenLog;
     /** Original host messages are retained only by transports that expose them. */
     messages?: unknown[];
     providerId?: string;
@@ -242,6 +243,8 @@ export interface CandidateCompartment {
     endMessage: number;
     startMessageId: string;
     endMessageId: string;
+    startBlockIndex?: number | null;
+    endBlockIndex?: number | null;
     title: string;
     /** v2: P1 tier text (mirror). v1/compressor: flat content. */
     content: string;
@@ -272,6 +275,8 @@ export type ValidatedHistorianPassResult =
           ok: true;
           compartments: CandidateCompartment[];
           facts: Array<{ category: string; content: string }>;
+          droppedFactBlocks?: number;
+          droppedFacts?: number;
           userObservations?: string[];
           /** Durable standing-question candidates for Primers v1 (stored side-table only).
            *  `originCompartmentIndex` is the 1-based index into THIS publish's

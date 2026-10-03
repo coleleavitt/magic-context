@@ -1,4 +1,5 @@
 /// <reference types="bun-types" />
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 /**
  * Regression suite for `createSystemPromptHashHandler`'s drain semantics.
@@ -17,7 +18,7 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAnthropic } from "@ai-sdk/anthropic";
@@ -58,7 +59,7 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
@@ -313,7 +314,7 @@ describe("system-prompt-hash fail-open (per-turn handler must never throw)", () 
 describe("system-prompt-hash v2 system prompt contents", () => {
     it("keeps project docs, user profile, and key files out of the system prompt", async () => {
         useTempDataHome("sph-v2-adjuncts-out-");
-        const directory = mkdtempSync(join(tmpdir(), "sph-docs-project-"));
+        const directory = createTestTempDirFromPath(join(tmpdir(), "sph-docs-project-"));
         tempDirs.push(directory);
         writeFileSync(join(directory, "ARCHITECTURE.md"), "Alpha <closing-tag> & beta", "utf-8");
         const sessionId = "ses-v2-adjuncts-out";
@@ -556,6 +557,30 @@ describe("system-prompt-hash skips OpenCode internal hidden agents (issue #52)",
         expect(system[0]).toBe(COMPACTION_PROMPT_HEAD);
     });
 
+    it("skips injection and keeps the stored hash for OpenCode 1.18's compaction prompt", async () => {
+        // OpenCode 1.18 rewrote compaction.txt. Without this signature the
+        // compaction request's prompt became the session's stored hash, and the
+        // next real turn folded again when its own prompt flipped the hash back.
+        useTempDataHome("sph-skip-compaction-118-");
+        const sessionId = "ses-compaction-118";
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, sessionId);
+        updateSessionMeta(db, sessionId, { systemPromptHash: "main-agent-hash-abc123" });
+        const historyRefreshSessions = new Set<string>();
+        const { handler } = buildHandler({ historyRefreshSessions });
+
+        const prompt =
+            "You are a context summarization agent. You are given a conversation between a user and an agent. Your goal is to produce a structured summary.";
+        const system = [prompt];
+        await handler({ sessionID: sessionId }, { system });
+
+        expect(system).toEqual([prompt]);
+        expect(getOrCreateSessionMeta(db, sessionId).systemPromptHash).toBe(
+            "main-agent-hash-abc123",
+        );
+        expect(historyRefreshSessions.has(sessionId)).toBe(false);
+    });
+
     it("does NOT update systemPromptHash for internal-agent calls", async () => {
         // Title-gen runs once on the first user turn with a totally
         // different system prompt than the main agent. If we updated the
@@ -716,7 +741,7 @@ describe("system-prompt-hash subagent self-management (Unit B)", () => {
         const joined = system.join("\n");
         // Minimal block: marker + §N§ + ctx_reduce mechanics …
         expect(joined).toContain("## Magic Context");
-        expect(joined).toContain("§N§ identifiers");
+        expect(joined).toContain("§N§ tag");
         expect(joined).toContain("ctx_reduce");
         // … but NONE of the primary's role/guidance.
         expect(joined).not.toContain("long-term partner");
@@ -932,7 +957,7 @@ describe("provisional ctx_reduce availability (pre-first-user race)", () => {
         // provisional fail-open true; persisting a hash computed from the
         // reduce-enabled guidance variant would flip (hash change → flush →
         // HARD fold) as soon as the real first user message denies the tool.
-        const dir = mkdtempSync(join(tmpdir(), "sph-provisional-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "sph-provisional-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
         const { mkdirSync } = require("node:fs");
@@ -962,7 +987,7 @@ describe("provisional ctx_reduce availability (pre-first-user race)", () => {
     });
 
     it("persists the hash from the frozen deny-verdict variant once the first user row exists", async () => {
-        const dir = mkdtempSync(join(tmpdir(), "sph-frozen-deny-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "sph-frozen-deny-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
 

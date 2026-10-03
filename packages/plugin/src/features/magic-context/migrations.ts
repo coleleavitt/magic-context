@@ -1,8 +1,11 @@
+import { isMainThread } from "node:worker_threads";
 import { extractTiersFromInner } from "../../hooks/magic-context/compartment-parser";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import { splitLkgSlotPrefixes, splitReplayDecisions } from "./migration-v94-write-split";
 import { repairOpenCode2HarnessLabels } from "./opencode2-relabel";
+import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
@@ -186,7 +189,13 @@ function authorityPrivilegeCheck(): string {
     return "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
 }
 
-function managedAuthorityNoteRow(row: "OLD" | "NEW"): string {
+/**
+ * SQL predicate that is true when a `notes` row belongs to a project whose notes the
+ * Rust module owns. `row` names the row being tested: `OLD`/`NEW` inside the
+ * authority triggers, or the table name when an ordinary statement must skip the
+ * rows those triggers would refuse.
+ */
+export function managedAuthorityNoteRow(row: "OLD" | "NEW" | "notes"): string {
     return `(
         EXISTS (SELECT 1 FROM authority_managed WHERE project_path = ${row}.project_path)
         OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = ${row}.project_path)
@@ -3094,6 +3103,105 @@ export const MIGRATIONS: Migration[] = [
             }
         },
     },
+    {
+        version: 89,
+        description: "persist indexed message creation times for date-bounded search",
+        up(db: Database): void {
+            if (!tableExists(db, "message_fts_rowid_map")) return;
+            ensureColumn(db, "message_fts_rowid_map", "message_time_ms", "INTEGER");
+            db.exec(`
+                CREATE INDEX IF NOT EXISTS idx_message_fts_rowid_map_session_time
+                    ON message_fts_rowid_map(session_id, message_time_ms);
+                CREATE TABLE IF NOT EXISTS message_time_backfill_state (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    cursor_session_id TEXT NOT NULL DEFAULT '',
+                    cursor_ordinal INTEGER NOT NULL DEFAULT 0,
+                    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO message_time_backfill_state
+                    (id, cursor_session_id, cursor_ordinal, completed, updated_at)
+                VALUES (1, '', 0, 0, 0);
+            `);
+        },
+    },
+    {
+        version: 90,
+        description: "record compartment lease owner pids",
+        up(db: Database): void {
+            if (!tableExists(db, "compartment_state_lease")) return;
+            ensureColumn(db, "compartment_state_lease", "owner_pid", "INTEGER");
+        },
+    },
+    {
+        version: 91,
+        description: "per-project embedding high-water mark for memories written outside this host",
+        up(db: Database): void {
+            // Vectors are computed by host code, not by a database trigger: a memory
+            // row inserted by another writer arrives with no embedding and nothing
+            // asks for one. The Rust module writes project memories directly in
+            // single-store mode, so it records the highest memory id it wrote here
+            // and the host's ordinary backfill loop drains everything above the
+            // embedded mark. A high-water mark rather than a per-row column keeps
+            // the memories table untouched, so a row written by either writer is
+            // byte-identical.
+            //
+            // embedded_memory_id is what the host has already handed to the embedder;
+            // written_memory_id is what the other writer has produced. Equal values
+            // mean there is nothing to drain.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS memory_embedding_watermarks (
+                    project_path TEXT PRIMARY KEY,
+                    written_memory_id INTEGER NOT NULL DEFAULT 0,
+                    embedded_memory_id INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+            `);
+        },
+    },
+    {
+        version: 92,
+        description: "store-level offline single-store state and canonical compartment boundaries",
+        up(db: Database): void {
+            // A summary rebuild stages retained compartments before replacing them;
+            // its staging rows must preserve the block indices as well.
+            for (const table of ["compartments", "recomp_compartments"]) {
+                if (!tableExists(db, table)) continue;
+                ensureColumn(db, table, "start_block_index", "INTEGER");
+                ensureColumn(db, table, "end_block_index", "INTEGER");
+            }
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS single_store_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    state TEXT NOT NULL CHECK (state IN ('required', 'migrated')),
+                    migrated_at INTEGER,
+                    migrated_by TEXT,
+                    backup_dir TEXT,
+                    report_json TEXT
+                );
+                INSERT OR IGNORE INTO single_store_state(id, state) VALUES (1, 'required');
+            `);
+        },
+    },
+    {
+        version: 93,
+        description: "per-session compartment history revision for shared readers",
+        up(db: Database): void {
+            installCompartmentHistoryVersions(db);
+        },
+    },
+    {
+        version: 94,
+        description:
+            "store LKG prefixes as slices and replay decisions as rows instead of growing records",
+        up(db: Database): void {
+            // The LKG slot's prefix and the replay document in session_meta grew
+            // on every pass, and SQLite rewrote each whole record every time; see
+            // migration-v94-write-split.ts.
+            splitLkgSlotPrefixes(db);
+            splitReplayDecisions(db);
+        },
+    },
 ];
 
 /**
@@ -3128,6 +3236,32 @@ function getCurrentVersion(db: Database): number {
 
 function isMigrationApplied(db: Database, version: number): boolean {
     return db.prepare("SELECT 1 FROM schema_migrations WHERE version = ?").get(version) != null;
+}
+
+/**
+ * Whether `runMigrations` would apply anything to this database. Read-only: it
+ * creates no bookkeeping table and takes no write lock, so a startup that has
+ * nothing to migrate can skip the migration worker entirely.
+ */
+export function hasPendingMigrations(db: Database): boolean {
+    const bookkeeping = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+        .get();
+    if (bookkeeping == null) return true;
+    const currentVersion = getCurrentVersion(db);
+    return MIGRATIONS.some(
+        (candidate) =>
+            candidate.version > currentVersion && !isMigrationApplied(db, candidate.version),
+    );
+}
+
+// Counts migration bodies applied on the process's main thread. Startup applies
+// them on a worker thread so the host keeps answering requests; a test reads this
+// to prove a startup open never fell back to running them here.
+let mainThreadMigrationBodies = 0;
+
+export function __getMainThreadMigrationBodyCountForTests(): number {
+    return mainThreadMigrationBodies;
 }
 
 /**
@@ -3210,9 +3344,10 @@ export function runMigrations(db: Database): void {
             // retryable MigrationLockBusyError classification below.
             migration = undefined;
 
-            const transactionStartedAt = performance.now();
+            let transactionStartedAt = 0;
             const applied = db
                 .transaction(() => {
+                    transactionStartedAt = performance.now();
                     currentVersion = getCurrentVersion(db);
                     // Keep the append-only version boundary for legacy databases whose
                     // bookkeeping contains only a current-version row. Within the pending
@@ -3239,6 +3374,7 @@ export function runMigrations(db: Database): void {
                         loggedPlan = true;
                     }
 
+                    if (isMainThread) mainThreadMigrationBodies += 1;
                     migration.up(db);
                     db.prepare(
                         "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
@@ -3284,8 +3420,11 @@ export function runMigrations(db: Database): void {
 
     if (touchedLegacyAuthorityBatch) {
         try {
-            const transactionStartedAt = performance.now();
-            db.transaction(() => installLatestAuthorityTriggers(db)).immediate();
+            let transactionStartedAt = 0;
+            db.transaction(() => {
+                transactionStartedAt = performance.now();
+                installLatestAuthorityTriggers(db);
+            }).immediate();
             logSlowWriteTransaction("migration-runner", transactionStartedAt);
         } catch (error) {
             throw new Error(

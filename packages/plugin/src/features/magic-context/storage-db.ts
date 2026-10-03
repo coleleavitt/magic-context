@@ -7,6 +7,7 @@ import {
     mkdirSync,
     readdirSync,
     readFileSync,
+    rmdirSync,
     statSync,
     unlinkSync,
 } from "node:fs";
@@ -17,28 +18,54 @@ import {
     getMagicContextStorageDir,
 } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
+import { harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
+    type AsyncProcessInspection,
     classifyProcessKind,
     inspectLivePiProcesses,
+    inspectProcessesAsync,
+    inspectWindowsProcessesSync,
+    isOwnRpcServerRecord,
     isPidAlive,
     isPidIdentityPlausible,
+    type PidLiveness,
     parseRpcPortFile,
     readProcessProbeEvidence,
 } from "../../shared/rpc-utils";
-import { Database, detectSqliteRuntime, registerSlowWriteReporter } from "../../shared/sqlite";
+import {
+    Database,
+    detectSqliteRuntime,
+    isTransientSqliteError,
+    registerSlowWriteReporter,
+    registerSqliteDiagnosticSink,
+    withoutSqliteTransformPass,
+    withSqliteBackgroundWriter,
+} from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 
-import { ensureContextStoreUuid } from "./context-authority";
+import { ensureContextStoreUuid } from "./context-store-uuid";
 import {
     attachFailClosedBlockingProcessEvidence,
     type FailClosedBlockingProcess,
     type FailClosedProcessKind,
 } from "./fail-closed-block";
 import { startMessageFtsRowidMapBackfill } from "./message-fts-rowid-map";
-import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
+import {
+    LKG_SLOT_CHUNKS_DDL,
+    LKG_SLOTS_DDL,
+    SESSION_REPLAY_DECISIONS_DDL,
+} from "./migration-v94-write-split";
+import { runMigrationsOffThread } from "./migration-worker-client";
+import {
+    FORK_MIGRATION_VERSION_FLOOR,
+    hasPendingMigrations,
+    runMigrations,
+    runMigrationsWithRetry,
+} from "./migrations";
+import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
     loadToolDefinitionMeasurements,
@@ -48,8 +75,10 @@ import { runToolOwnerBackfill } from "./tool-owner-backfill";
 
 // The SQLite chokepoint cannot import the logging chain itself (it is executed
 // directly by Node in the backend smoke); every storage open path runs through
-// this module, so registering here covers privileged writes on both runtimes.
+// this module, so registering here covers privileged writes and writer
+// acquisition/hold diagnostics on both runtimes.
 registerSlowWriteReporter(logSlowWriteTransaction);
+registerSqliteDiagnosticSink((message) => log(message));
 
 // Re-exported so existing `from "./storage-db"` importers (and tests) keep
 // resolving these; the definitions live in the leaf module to break the
@@ -87,6 +116,27 @@ export interface MigrationOnOpenRefusal {
 
 let lastMigrationOnOpenRefusal: MigrationOnOpenRefusal | null = null;
 
+/**
+ * A schema migration this process ran at startup even though an RPC discovery
+ * record from another OpenCode server named a PID that could not be checked
+ * (no process list, or no way to tell a live server from a reused PID).
+ * `enforceMigrationOnOpenGuard` lets the migration proceed in that case, so
+ * the status dialog reports it: if the PID was a live server on an older
+ * build, that server is now reading a store with a schema version higher than
+ * the newest one it supports.
+ */
+export interface UnconfirmedMigrationHolders {
+    pids: number[];
+    fromVersion: number;
+    toVersion: number;
+}
+
+let lastUnconfirmedMigrationHolders: UnconfirmedMigrationHolders | null = null;
+
+export function getUnconfirmedMigrationHolders(): UnconfirmedMigrationHolders | null {
+    return lastUnconfirmedMigrationHolders;
+}
+
 export function getSchemaFenceRejection(): {
     persistedVersion: number;
     supportedVersion: number;
@@ -102,9 +152,10 @@ export function getMigrationOnOpenRefusal(): MigrationOnOpenRefusal | null {
 export function __resetSchemaFenceStateForTests(): void {
     lastSchemaFenceRejection = null;
     lastMigrationOnOpenRefusal = null;
+    lastUnconfirmedMigrationHolders = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 88;
+export const LATEST_SUPPORTED_VERSION = 94;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema
@@ -220,6 +271,17 @@ export function resolveDatabasePath(dbPathOverride?: string): { dbDir: string; d
     // implementation. See its doc comment for the incident history.
     const dbDir = getMagicContextStorageDir();
     return { dbDir, dbPath: join(dbDir, "context.db") };
+}
+
+/**
+ * Whether a second connection opened with this path reaches the same database.
+ * In-memory databases are private to their connection, and URI filenames may
+ * carry connection-specific options, so both keep migrating on their own
+ * connection instead of on a worker.
+ */
+function isFileBackedPath(dbPath: string): boolean {
+    const trimmed = dbPath.trim();
+    return trimmed !== "" && trimmed !== ":memory:" && !trimmed.startsWith("file:");
 }
 
 export function getDatabasePath(db: Database): string | null {
@@ -377,8 +439,27 @@ export interface RpcServerDiscovery {
      * run. That failure does not prove that the process is actively using RPC.
      */
     inconclusivePids?: number[];
+    /** The records behind `inconclusivePids`, with the process evidence that was read. */
+    inconclusiveRecords?: RpcDiscoveryRecordEvidence[];
     unreadableFile?: string;
     unreadableArm?: RpcDiscoveryUnreadableArm;
+}
+
+/**
+ * A discovery record that was kept because nothing proved it stale, with what
+ * was read about the process now using its PID. Doctor shows this so a user
+ * can decide whether to remove the record.
+ */
+export interface RpcDiscoveryRecordEvidence {
+    file: string;
+    pid: number;
+    /** The record's `started_at` (epoch ms), or null when the record has none. */
+    recordedStartedAt: number | null;
+    /** When the process now using the PID started (epoch ms), or null when unreadable. */
+    processStartTime: number | null;
+    imageName: string | null;
+    commandLine: string | null;
+    liveness: PidLiveness;
 }
 
 function unreadableDiscovery(path: string, arm: RpcDiscoveryUnreadableArm): RpcServerDiscovery {
@@ -398,6 +479,8 @@ export interface RpcDiscoveryFs {
     readFileSync(path: string, encoding: "utf8"): string;
     statSync(path: string): { mtimeMs: number };
     unlinkSync(path: string): void;
+    /** Removes an empty directory; fails when the directory is not empty. */
+    rmdirSync(path: string): void;
 }
 
 const defaultRpcDiscoveryFs: RpcDiscoveryFs = {
@@ -408,6 +491,7 @@ const defaultRpcDiscoveryFs: RpcDiscoveryFs = {
     readFileSync: (path, encoding) => String(readFileSync(path, encoding)),
     statSync: (path) => ({ mtimeMs: statSync(path).mtimeMs }),
     unlinkSync: (path) => unlinkSync(path),
+    rmdirSync: (path) => rmdirSync(path),
 };
 let rpcDiscoveryFs = defaultRpcDiscoveryFs;
 
@@ -522,7 +606,21 @@ function classifyJunkDiscovery(
  * evidence is fail-closed because it could be a concurrent write or an I/O
  * permission problem.
  */
-export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscovery {
+export function inspectRpcServerDiscovery(
+    storageDir: string,
+    processes?: AsyncProcessInspection,
+    options?: {
+        /** Give up after this many milliseconds. Only interactive CLI callers set it. */
+        deadlineMs?: number;
+        /** Report progress on long scans. Plugin hosts pass nothing, so nothing reaches their stderr. */
+        onProgress?: (checked: number, total: number) => void;
+    },
+): RpcServerDiscovery {
+    const deadline =
+        options?.deadlineMs === undefined
+            ? Number.POSITIVE_INFINITY
+            : Date.now() + options.deadlineMs;
+    let progressAt = Date.now() + 3_000;
     const rpcRoot = join(storageDir, "rpc");
     let projectEntries: Dirent[];
     try {
@@ -555,11 +653,21 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
         return { state: "absent", serverPids: [], staleFiles: [] };
     }
 
+    if (!processes && process.platform === "win32") processes = inspectWindowsProcessesSync();
     const pids = new Set<number>();
     const processByPid = new Map<number, FailClosedBlockingProcess>();
     const staleFiles: string[] = [];
     const inconclusivePids = new Set<number>();
-    for (const portFile of portFiles) {
+    const inconclusiveRecords: RpcDiscoveryRecordEvidence[] = [];
+    for (const [index, portFile] of portFiles.entries()) {
+        if (Date.now() >= deadline)
+            throw new Error(
+                `RPC holder inspection timed out after ${Math.round((options?.deadlineMs ?? 0) / 1000)} seconds (${index}/${portFiles.length} records checked). Close OpenCode and Pi, then retry.`,
+            );
+        if (options?.onProgress && Date.now() >= progressAt) {
+            options.onProgress(index, portFiles.length);
+            progressAt = Date.now() + 3_000;
+        }
         let raw: string;
         try {
             raw = rpcDiscoveryFs.readFileSync(portFile, "utf8");
@@ -576,12 +684,18 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
             if (junk) return junk;
             continue;
         }
-        const liveness = isPidAlive(record.pid);
+        // This process's own RPC server runs this build, so it can never be a host
+        // still holding an older one. Skipped before the liveness check so the file
+        // is neither reported as a blocker nor deleted as stale.
+        if (isOwnRpcServerRecord(record)) continue;
+        const liveness = processes ? processes.liveness(record.pid) : isPidAlive(record.pid);
         if (liveness === "dead") {
             staleFiles.push(portFile);
             continue;
         }
-        const evidence = readProcessProbeEvidence(record.pid);
+        const evidence = processes
+            ? processes.evidence(record.pid)
+            : readProcessProbeEvidence(record.pid);
         const identity = isPidIdentityPlausible(record, evidence);
         if (identity === "plausible") {
             pids.add(record.pid);
@@ -597,9 +711,20 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
                 processByPid.set(record.pid, detected);
             }
         } else if (identity === "implausible") {
+            // "implausible" is proof on every platform: the live process started
+            // after the record was written, or its image cannot be a host.
             staleFiles.push(portFile);
         } else {
             inconclusivePids.add(record.pid);
+            inconclusiveRecords.push({
+                file: portFile,
+                pid: record.pid,
+                recordedStartedAt: record.started_at > 0 ? record.started_at : null,
+                processStartTime: evidence.startTime,
+                imageName: evidence.imageName ?? null,
+                commandLine: evidence.commandLine,
+                liveness,
+            });
         }
     }
 
@@ -623,6 +748,9 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
                 (pid) => processByPid.get(pid) ?? { kind: "process" as const, pid },
             ),
             staleFiles,
+            // A confirmed live server decides the state, but doctor still lists
+            // the unresolved records beside it.
+            ...(inconclusiveRecords.length > 0 ? { inconclusiveRecords } : {}),
         };
     }
     const uncertainPids = [...inconclusivePids].sort((a, b) => a - b);
@@ -632,9 +760,78 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
             serverPids: [],
             staleFiles,
             inconclusivePids: uncertainPids,
+            inconclusiveRecords,
         };
     }
     return { state: "stale", serverPids: [], staleFiles };
+}
+
+/** An empty project directory younger than this may belong to a host that is about to write its record. */
+export const RPC_DISCOVERY_DIR_PRUNE_MIN_AGE_MS = 60_000;
+
+/**
+ * Remove per-project discovery directories under `<storageDir>/rpc` that hold
+ * no files. Hosts that exit remove only their own record, so these accumulate.
+ *
+ * Doctor-only (`--prune-discovery`, `--fix`); never called from storage opens.
+ * A starting host runs `mkdir -p` and then writes its port file. Removing the
+ * directory between those two steps makes the write fail, and the host becomes
+ * invisible to the storage guard. A directory modified within the last minute
+ * is therefore skipped, and one that gains a file fails to remove and stays.
+ */
+export function pruneEmptyRpcDiscoveryDirs(storageDir: string): string[] {
+    const rpcRoot = join(storageDir, "rpc");
+    let entries: Dirent[];
+    try {
+        entries = rpcDiscoveryFs.readdirSync(rpcRoot, { withFileTypes: true }) as Dirent[];
+    } catch {
+        return [];
+    }
+    const removed: string[] = [];
+    const now = Date.now();
+    for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const projectDir = join(rpcRoot, entry.name);
+        try {
+            if ((rpcDiscoveryFs.readdirSync(projectDir) as string[]).length > 0) continue;
+            const ageMs = now - rpcDiscoveryFs.statSync(projectDir).mtimeMs;
+            if (!(ageMs >= RPC_DISCOVERY_DIR_PRUNE_MIN_AGE_MS)) continue;
+            rpcDiscoveryFs.rmdirSync(projectDir);
+            removed.push(projectDir);
+        } catch {
+            // Missing, unreadable or newly non-empty: leave it for a later pass.
+        }
+    }
+    return removed;
+}
+
+/**
+ * Delete discovery records the user chose to remove (`doctor --prune-discovery`).
+ * Only files directly inside a project directory under `<storageDir>/rpc` are
+ * touched; the directories themselves are left to pruneEmptyRpcDiscoveryDirs.
+ */
+export function removeRpcDiscoveryRecords(
+    storageDir: string,
+    files: readonly string[],
+): { removed: string[]; failed: Array<{ file: string; error: string }> } {
+    const rpcRoot = resolve(join(storageDir, "rpc"));
+    const removed: string[] = [];
+    const failed: Array<{ file: string; error: string }> = [];
+    for (const file of files) {
+        const projectDir = dirname(resolve(file));
+        if (dirname(projectDir) !== rpcRoot || !basename(file).startsWith("port")) {
+            failed.push({ file, error: "not an RPC discovery record" });
+            continue;
+        }
+        try {
+            rpcDiscoveryFs.unlinkSync(file);
+            removed.push(file);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") removed.push(file);
+            else failed.push({ file, error: getErrorMessage(error) });
+        }
+    }
+    return { removed, failed };
 }
 
 function createPiBlockingProcess(pid: number): FailClosedBlockingProcess {
@@ -738,21 +935,32 @@ function enforceMigrationOnOpenGuard(
     dbPath: string,
     dbDir: string,
     latestSupportedVersion: number,
+    processes?: AsyncProcessInspection,
 ): boolean {
     const persistedVersion = getPersistedSchemaVersion(db);
     if (persistedVersion >= latestSupportedVersion) {
         lastMigrationOnOpenRefusal = null;
         return true;
     }
-    const discovery = inspectRpcServerDiscovery(dbDir);
-    const piDiscovery = inspectLivePiProcesses();
+    const discovery = inspectRpcServerDiscovery(dbDir, processes);
+    const piDiscovery = processes?.pi ?? inspectLivePiProcesses();
     const piPids = migrationBlockingPiPids(dbPath, discovery, piDiscovery.processIds);
     const serverProcesses =
         discovery.serverProcesses ??
         (discovery.state === "live"
             ? discovery.serverPids.map((pid) => ({ kind: "process" as const, pid }))
             : []);
-    const blockingProcesses = [...serverProcesses, ...piPids.map(createPiBlockingProcess)];
+    const blockingProcesses = [
+        ...serverProcesses,
+        ...piPids.map((pid) =>
+            processes
+                ? attachFailClosedBlockingProcessEvidence(
+                      { kind: "Pi", pid },
+                      processes.evidence(pid),
+                  )
+                : createPiBlockingProcess(pid),
+        ),
+    ];
     if (
         (discovery.state === "absent" ||
             discovery.state === "stale" ||
@@ -761,6 +969,14 @@ function enforceMigrationOnOpenGuard(
     ) {
         lastMigrationOnOpenRefusal = null;
         logInconclusiveMigrationProbes(dbPath, discovery, piDiscovery);
+        const uncertainPids = discovery.inconclusivePids ?? [];
+        if (uncertainPids.length > 0) {
+            lastUnconfirmedMigrationHolders = {
+                pids: [...uncertainPids],
+                fromVersion: persistedVersion,
+                toVersion: latestSupportedVersion,
+            };
+        }
         return true;
     }
     const blockingPids = [...new Set([...discovery.serverPids, ...piPids])].sort(
@@ -864,21 +1080,60 @@ function finishDatabaseOpen(
     // SQLite errors, and per-session failures are logged but
     // never fail-close the plugin. Lazy adoption covers rows the backfill could
     // not reach.
+    //
+    // The tool-owner and message-time backfills fill context.db rows from
+    // OpenCode's session store, which only an OpenCode process may read. In a Pi
+    // process they would walk every OpenCode session of every project, and the
+    // message-time pass would also advance its shared durable cursor past rows
+    // that the OpenCode process still has to fill. The rowid-map backfill reads
+    // only context.db and runs in every harness.
     if (!explicitDbPath) {
-        const runBackfills = () => {
-            try {
-                runToolOwnerBackfill(db);
-            } catch (error) {
-                log(
-                    `[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`,
-                );
-            }
-            void startMessageFtsRowidMapBackfill(db).catch((error) => {
-                log(
-                    `[magic-context] message FTS rowid-map backfill failed (will resume next startup): ${getErrorMessage(error)}`,
-                );
-            });
-        };
+        const readsOpenCodeStore = harnessOwnsOpenCodeStore();
+        let busyRetryMs = 100;
+        const runBackfills = () =>
+            withoutSqliteTransformPass(() =>
+                withSqliteBackgroundWriter(() => {
+                    if (readsOpenCodeStore) {
+                        try {
+                            runToolOwnerBackfill(db);
+                        } catch (error) {
+                            log(
+                                `[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`,
+                            );
+                        }
+                    }
+                    void startMessageFtsRowidMapBackfill(db)
+                        .then(async () => {
+                            if (!readsOpenCodeStore) return;
+                            const { readRawSessionMessagePage, readRawSessionMessages } =
+                                await import("../../hooks/magic-context/read-session-chunk");
+                            const { startMessageTimeBackfill } = await import(
+                                "./message-time-backfill"
+                            );
+                            await startMessageTimeBackfill(
+                                db,
+                                Object.assign(readRawSessionMessages, {
+                                    readPage: readRawSessionMessagePage,
+                                }),
+                            );
+                        })
+                        .catch((error) => {
+                            if (isTransientSqliteError(error)) {
+                                // Durable cursors advance only with their data. Retry the complete
+                                // chain after yielding, without sharing an interactive turn's lock-wait limit.
+                                withoutSqliteTransformPass(() => {
+                                    const timer = setTimeout(runBackfills, busyRetryMs);
+                                    timer.unref();
+                                });
+                                busyRetryMs = Math.min(30000, busyRetryMs * 2);
+                                return;
+                            }
+                            log(
+                                `[magic-context] message-index backfill failed (will resume next startup): ${getErrorMessage(error)}`,
+                            );
+                        });
+                }),
+            );
         if (bootQuietRemainingMs() > 0) scheduleAfterBootQuiet(runBackfills);
         else runBackfills();
     }
@@ -959,6 +1214,8 @@ export function initializeDatabase(
       end_message INTEGER NOT NULL,
       start_message_id TEXT DEFAULT '',
       end_message_id TEXT DEFAULT '',
+      start_block_index INTEGER,
+      end_block_index INTEGER,
       title TEXT NOT NULL,
       content TEXT NOT NULL,
       p1 TEXT,
@@ -1021,6 +1278,7 @@ export function initializeDatabase(
     CREATE TABLE IF NOT EXISTS compartment_state_lease (
       session_id TEXT PRIMARY KEY NOT NULL,
       holder_id TEXT NOT NULL,
+      owner_pid INTEGER,
       acquired_at INTEGER NOT NULL,
       expires_at INTEGER NOT NULL
     );
@@ -1441,6 +1699,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       session_id TEXT NOT NULL,
       message_ordinal INTEGER NOT NULL,
       fts_rowid INTEGER NOT NULL,
+      message_time_ms INTEGER,
       PRIMARY KEY(session_id, message_ordinal)
     );
 
@@ -1453,6 +1712,42 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     INSERT OR IGNORE INTO message_fts_rowid_map_backfill_state
       (id, watermark_rowid, completed, updated_at)
     VALUES (1, 0, 0, 0);
+
+    CREATE TABLE IF NOT EXISTS message_time_backfill_state (
+      id INTEGER PRIMARY KEY CHECK(id = 1),
+      cursor_session_id TEXT NOT NULL DEFAULT '',
+      cursor_ordinal INTEGER NOT NULL DEFAULT 0,
+      completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT OR IGNORE INTO message_time_backfill_state
+      (id, cursor_session_id, cursor_ordinal, completed, updated_at)
+    VALUES (1, '', 0, 0, 0);
+
+    CREATE TABLE IF NOT EXISTS single_store_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      state TEXT NOT NULL CHECK (state IN ('required', 'migrated')),
+      migrated_at INTEGER,
+      migrated_by TEXT,
+      backup_dir TEXT,
+      report_json TEXT
+    );
+    INSERT OR IGNORE INTO single_store_state(id, state) VALUES (1, 'required');
+
+    -- Highest memory id another writer (the Rust module in single-store mode) put
+    -- into memories for a project, and how far this host has embedded. Migration v91.
+    CREATE TABLE IF NOT EXISTS memory_embedding_watermarks (
+      project_path TEXT PRIMARY KEY,
+      written_memory_id INTEGER NOT NULL DEFAULT 0,
+      embedded_memory_id INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- Last-known-good replay slots, their prefix slices, and trailing-blank replay
+    -- decisions, in the layout of migration v94.
+    ${LKG_SLOTS_DDL}
+    ${LKG_SLOT_CHUNKS_DDL}
+    ${SESSION_REPLAY_DECISIONS_DDL}
 
     CREATE TABLE IF NOT EXISTS message_history_index (
       session_id TEXT PRIMARY KEY,
@@ -1749,6 +2044,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       end_message INTEGER NOT NULL,
       start_message_id TEXT DEFAULT '',
       end_message_id TEXT DEFAULT '',
+      start_block_index INTEGER,
+      end_block_index INTEGER,
       title TEXT NOT NULL,
       content TEXT NOT NULL,
       p1 TEXT,
@@ -1781,6 +2078,17 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     CREATE INDEX IF NOT EXISTS idx_memories_project_category_hash ON memories(project_path, category, normalized_hash);
     CREATE INDEX IF NOT EXISTS idx_message_history_index_updated_at ON message_history_index(updated_at);
   `);
+
+    // Upgrades, CLI store initialization and Pi use this same counter installer.
+    // Recreating a cleaned session assigns a new token so its reset counter cannot
+    // match cached coordinate validation from the previous session incarnation.
+    installCompartmentHistoryVersions(db);
+
+    ensureColumn(db, "message_fts_rowid_map", "message_time_ms", "INTEGER");
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_message_fts_rowid_map_session_time
+        ON message_fts_rowid_map(session_id, message_time_ms);
+    `);
 
     ensureColumn(db, "primer_candidates", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
     ensureColumn(db, "primer_candidates", "source_start_message_id", "TEXT NOT NULL DEFAULT ''");
@@ -1890,6 +2198,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "merged_reasoning_stripped_ids", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "thinking_binding_recovery_target", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "trailing_blank_decisions", "TEXT DEFAULT ''");
+    ensureColumn(db, "compartment_state_lease", "owner_pid", "INTEGER");
     ensureColumn(db, "compartments", "start_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "compartments", "end_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "memory_embeddings", "model_id", "TEXT");
@@ -2340,6 +2649,17 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
     lastSchemaFenceRejection = null;
     lastMigrationOnOpenRefusal = null;
     const existing = databases.get(dbPath);
+    if (!existing && pendingAsyncOpens.has(dbPath)) {
+        // A startup open of this database is still in flight, possibly with a
+        // worker thread migrating it. A second connection opened here would run
+        // the migrations on the main thread, contend with the worker for the write
+        // lock, or read a partly migrated schema. Report storage as unavailable;
+        // the caller retries or degrades as it does for any failed open.
+        log(
+            `[magic-context] storage not ready: ${dbPath} is still being opened or migrated; refusing a second synchronous open`,
+        );
+        return null;
+    }
     if (existing) {
         if (!enforceSchemaFence(existing, dbPath, latestSupportedVersion)) {
             return null;
@@ -2355,13 +2675,14 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         return existing;
     }
 
+    let db: Database | undefined;
     try {
         if (!explicitDbPath) {
             migrateLegacyStorageIfNeeded(dbPath, dbDir);
         }
         ensureSecureStorageDir(dbDir);
 
-        const db = new Database(dbPath);
+        db = new Database(dbPath);
         installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
         if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
             closeQuietly(db);
@@ -2376,6 +2697,9 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         ensureContextStoreUuid(db);
         return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
     } catch (error) {
+        // The connection is not cached until the open succeeds, so nothing else
+        // would ever close it.
+        if (db) closeQuietly(db);
         const detail = getErrorMessage(error);
         log(`[magic-context] storage fatal: failed to open ${dbPath}: ${detail}`);
         // No silent in-memory fallback — see comment above. Caller must
@@ -2442,13 +2766,34 @@ export async function openDatabaseAsync(
                 closeQuietly(db);
                 return null;
             }
-            if (!enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion)) {
+            const processes =
+                getPersistedSchemaVersion(db) < latestSupportedVersion
+                    ? await inspectProcessesAsync()
+                    : undefined;
+            if (
+                !enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion, processes)
+            ) {
                 guardMs = performance.now() - guardStartedAt;
                 closeQuietly(db);
                 return null;
             }
             guardMs = performance.now() - guardStartedAt;
             migrateStartedAt = performance.now();
+            // Apply pending migrations on a worker thread with its own connection
+            // so the host keeps serving requests; see migration-worker.ts. This
+            // connection stays idle meanwhile and is handed out only after the
+            // worker has committed, so no caller can read a half-migrated schema.
+            // With nothing pending, nothing is started and the open costs what it
+            // did before.
+            if (isFileBackedPath(dbPath) && hasPendingMigrations(db)) {
+                await runMigrationsOffThread({
+                    dbPath,
+                    busyTimeoutMs,
+                    sqlitePragmaConfig: { ...sqlitePragmaConfig },
+                });
+            }
+            // Already-current after the worker, so this reaches runMigrations' read-only
+            // fast path. If no worker could start, this applies the migrations here.
             initializeDatabase(db, busyTimeoutMs);
             await runMigrationsWithRetry(db);
             ensureContextStoreUuid(db);

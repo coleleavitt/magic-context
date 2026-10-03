@@ -2,10 +2,14 @@ import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import {
     captureSlot,
     dropSlot,
+    exactReusablePrefix,
     getSlot,
     type LkgEntryNote,
+    type LkgInputSnapshot,
     type LkgSlot,
     lkgContentDigest,
+    lkgContentDigestFromFields,
+    lkgContentFields,
     noteEntry,
 } from "./lkg-slot";
 import { assertOpenAiCompatAdjacency } from "./openai-compat-adjacency";
@@ -39,11 +43,7 @@ export function resolveLkgModelKeys(messages: MessageLike[]): LkgModelKeys {
         }
         const provider = info?.providerID;
         const model = info?.modelID;
-        if (
-            info?.role === "assistant" &&
-            typeof provider === "string" &&
-            typeof model === "string"
-        ) {
+        if (typeof provider === "string" && typeof model === "string") {
             return canonicalLkgModelKeys(`${provider}/${model}`, provider);
         }
     }
@@ -57,12 +57,76 @@ export interface LkgEntryProjection {
     timeCreated: number | null;
     finish: unknown;
     hasIncompleteTool: boolean;
-    /** Compute the non-enumerable digest lazily so only LKG capture or replay validation hashes message content. */
+    /** Immutable entry digest, exposed non-enumerably without retaining the live message. */
     contentDigest?: () => string | null;
 }
 
 export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
-    return messages.map((message) => {
+    return projectEntryWithDigests(messages, messages.map(lkgContentDigest));
+}
+
+/** Keep exact pristine tokens in memory: ids or rolling hashes alone cannot prove reuse. */
+export function createLkgEntryProjector() {
+    const priors = new Map<
+        string,
+        { snapshots: LkgInputSnapshot[]; digests: (string | null)[]; bytes: number }
+    >();
+    const maxBytes = 64 * 1024 * 1024;
+    let bytes = 0;
+    return (sessionId: string, messages: MessageLike[]): LkgEntryProjection[] => {
+        const prior = priors.get(sessionId);
+        const snapshots = messages.map((message) => ({
+            id: typeof message.info?.id === "string" ? message.info.id : "",
+            fields: lkgContentFields(message),
+        }));
+        const reusable = exactReusablePrefix(
+            snapshots.map((snapshot) => ({ ...snapshot, fields: snapshot.fields ?? [] })),
+            prior?.snapshots ?? null,
+        );
+        const digests = snapshots.map((snapshot, index) =>
+            index < reusable
+                ? (prior?.digests[index] ?? null)
+                : snapshot.fields
+                  ? lkgContentDigestFromFields(snapshot.fields)
+                  : null,
+        );
+        if (prior) {
+            bytes -= prior.bytes;
+            priors.delete(sessionId);
+        }
+        const retained = snapshots.map((snapshot) => ({
+            ...snapshot,
+            fields: snapshot.fields ?? [],
+        }));
+        const size = retained.reduce(
+            (total, snapshot) =>
+                total +
+                snapshot.id.length * 2 +
+                snapshot.fields.reduce<number>(
+                    (sum, field) => sum + 16 + (typeof field === "string" ? field.length * 2 : 0),
+                    0,
+                ),
+            0,
+        );
+        if (size <= maxBytes) {
+            while (priors.size >= 16 || bytes + size > maxBytes) {
+                const oldest = priors.entries().next().value;
+                if (!oldest) break;
+                bytes -= oldest[1].bytes;
+                priors.delete(oldest[0]);
+            }
+            priors.set(sessionId, { snapshots: retained, digests, bytes: size });
+            bytes += size;
+        }
+        return projectEntryWithDigests(messages, digests);
+    };
+}
+
+function projectEntryWithDigests(
+    messages: MessageLike[],
+    digests: readonly (string | null)[],
+): LkgEntryProjection[] {
+    return messages.map((message, index) => {
         const info = messageInfo(message);
         const time = info.time;
         const timeRecord =
@@ -105,8 +169,11 @@ export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
             finish: info.finish,
             hasIncompleteTool,
         };
+        // Tagging and heuristic edits mutate these same objects later in the pass.
+        // Replay sees pristine host inputs, so bind the capture to those entry bytes.
+        const contentDigest = digests[index] ?? null;
         Object.defineProperty(projection, "contentDigest", {
-            value: () => lkgContentDigest(message),
+            value: () => contentDigest,
             enumerable: false,
         });
         return projection;
@@ -401,9 +468,9 @@ function partIsOpenCodeStepMetadata(part: unknown): boolean {
  * completed non-provider-executed tool result materializes as user content and
  * starts a new assistant run, while OpenCode's step markers do not materialize
  * on the provider wire.
- * Each resulting assistant run may contain only one leading thinking block; a
- * later signed block would invalidate its provider signature, so recovery declines
- * the entire replay instead of attempting a rewrite.
+ * Leading signed thinking blocks are safe together only when they originate in
+ * the same assistant message. Thinking after content or from a later merged
+ * assistant message is declined rather than rewriting its signature.
  */
 export function validateAnthropicReasoningRuns(messages: MessageLike[]): boolean {
     let index = 0;
@@ -412,18 +479,23 @@ export function validateAnthropicReasoningRuns(messages: MessageLike[]): boolean
             index += 1;
             continue;
         }
-        let thinkingBlocks = 0;
+        // The run's first message is the first one that contributes provider content;
+        // an assistant holding only step markers does not reach the wire, so it cannot
+        // make a later message's leading thinking count as merged.
+        let firstMessageInRun: number | null = null;
         let sawOtherContent = false;
         while (index < messages.length && messageRole(messages[index]) === "assistant") {
             for (const part of messageParts(messages[index])) {
-                if (partIsAnthropicThinking(part)) {
-                    thinkingBlocks += 1;
-                    if (thinkingBlocks > 1 || sawOtherContent) return false;
-                } else if (partEndsAnthropicAssistantRun(part)) {
-                    thinkingBlocks = 0;
+                if (partEndsAnthropicAssistantRun(part)) {
+                    firstMessageInRun = null;
                     sawOtherContent = false;
                 } else if (!partIsOpenCodeStepMetadata(part)) {
-                    sawOtherContent = true;
+                    if (firstMessageInRun === null) firstMessageInRun = index;
+                    if (partIsAnthropicThinking(part)) {
+                        if (sawOtherContent || index !== firstMessageInRun) return false;
+                    } else {
+                        sawOtherContent = true;
+                    }
                 }
             }
             index += 1;
@@ -513,6 +585,8 @@ export function replayLkg(args: {
     providerKey: string | null;
     entry?: LkgEntryNote | null;
     skipSeamValidation?: boolean;
+    /** Reapply persisted thinking-strip decisions before validating the candidate's wire shape. */
+    prepareReplay?: (messages: MessageLike[]) => void;
 }): { ok: true; messages: MessageLike[] } | { ok: false; reason: LkgValidationFailure } {
     const slot = getSlot(args.sessionId);
     if (!slot) return { ok: false, reason: "lkg_invalidated_reshape" };
@@ -547,6 +621,8 @@ export function replayLkg(args: {
         dropSlot(args.sessionId, "lkg_seam_invalid");
         return { ok: false, reason: "lkg_seam_invalid" };
     }
+    const replayed = [...prefix, ...entry.pristineTail];
+    args.prepareReplay?.(replayed);
     if (!args.skipSeamValidation) {
         if (!validateLkgSeamBoundary(prefix, entry.pristineTail)) {
             dropSlot(args.sessionId, "lkg_unsafe_seam");
@@ -557,7 +633,6 @@ export function replayLkg(args: {
             return { ok: false, reason: "lkg_seam_invalid" };
         }
     }
-    const replayed = [...prefix, ...entry.pristineTail];
     if (
         requestedModelKeys.providerKey === "anthropic" &&
         !validateAnthropicReasoningRuns(replayed)

@@ -310,6 +310,9 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
                 },
             },
             {
+                // Send without holding a request open for the whole run, so the
+                // deadline below is the only timer (see prompt-async-transport.ts).
+                transport: shared.createPromptAsyncTransport(client, childSessionId),
                 // The executor owns the per-task deadline (config.timeoutMinutes);
                 // honor the remaining budget, do NOT silently re-cap at 5 minutes.
                 timeoutMs: remainingMs,
@@ -388,7 +391,18 @@ function applyReviewVerdict(
         }))
         .filter((u) => Boolean(u.memoryId) && u.content.length > 0);
     const dismissals = (parsed.dismiss_existing ?? []).filter((d) => Boolean(d.memory_id));
-    const consumeCandidateIds = parsed.consume_candidate_ids ?? [];
+    // A candidate behind a promotion or merge has been used even when the
+    // reviewer forgets to list it for consumption; leaving it in the pool lets
+    // the next review promote the same trait again.
+    const consumeCandidateIds = [
+        ...new Set([
+            ...(parsed.consume_candidate_ids ?? []),
+            ...promotions.flatMap((promotion) => promotion.candidateIds),
+            ...(parsed.update_existing ?? []).flatMap((update) =>
+                update.memory_id && update.content?.trim() ? (update.candidate_ids ?? []) : [],
+            ),
+        ]),
+    ];
 
     // Re-check the lease only after BEGIN IMMEDIATE has serialized writers.
     // A lost lease throws so the executor hot-retries instead of recording

@@ -11,6 +11,7 @@ import type {
 } from "../features/magic-context/dreamer/task-registry";
 import type { DreamerTickFailure } from "../features/magic-context/dreamer/tick-failure";
 import type { SynapseLaneDescriptor } from "../features/magic-context/memory/embedding-synapse";
+import type { RunnerRefusalCanonicalCause } from "../hooks/magic-context/historian-no-fire-cause";
 import type { ConfigParseFailure } from "./config-diagnostics";
 import type { LoggerDiagnostics } from "./logger";
 import type { UserFacingFailureKey } from "./user-facing-codes";
@@ -173,7 +174,46 @@ export interface MemoryImportanceHistogram {
     };
 }
 
+/**
+ * Which side ran (or would run) a Rust-mode completion, and why: `configured`
+ * when the user set the runner, `default_for_harness` when the harness chose it.
+ * `observed` is `last_completion` for a completion that actually ran in the
+ * module's current process, `resolved_for_route` when none has yet.
+ */
+export interface RunnerStatus {
+    runner: "host" | "broca";
+    source: "configured" | "default_for_harness";
+    harness: string;
+    observed: "last_completion" | "resolved_for_route";
+}
+
 export interface StatusDetail extends SidebarSnapshot {
+    /**
+     * Version of the Magic Context package the answering server runs. The TUI
+     * compares it with its own so the status dialog can say when the two differ
+     * (OpenCode keeps the server it started with until it restarts). Absent from
+     * servers older than this field, which the dialog reports as "older than
+     * this UI". Also sent on the `{ disabled: true }` replies.
+     */
+    pluginVersion?: string;
+    /**
+     * Set when this server migrated the shared store at startup while another
+     * OpenCode server's RPC record named a PID it could not check. If that PID
+     * was an older build still running, it now runs against a newer store.
+     */
+    unconfirmedMigrationHolders?: { pids: number[]; fromVersion: number; toVersion: number };
+    /** OpenCode 2 hidden-run model variants dropped because the host catalog did not declare them. */
+    hiddenVariantWarnings?: string[];
+    /** Runner refusal provenance reported by the Rust historian, including received text. */
+    historianRefusal?: {
+        stage: "credential" | "provider" | "model" | "resolution";
+        canonicalCause: RunnerRefusalCanonicalCause;
+        detail: string;
+    };
+    /** Which runner the Rust historian used for this session, and why. Rust mode only. */
+    historianRunner?: RunnerStatus;
+    /** Which runner the Rust module's dreamer completions resolve to, and why. Rust mode only. */
+    dreamerRunner?: RunnerStatus;
     /** ACTIVE-memory importance distribution; unclassified is a subset of total. */
     memoryImportanceHistogram: MemoryImportanceHistogram;
     /**
@@ -200,10 +240,20 @@ export interface StatusDetail extends SidebarSnapshot {
         stalled: boolean;
         code: "MC-M01" | null;
     };
+    /** Health of the pending OpenCode history-boundary marker repair. */
+    compactionMarker?: {
+        code: "MC-C11" | null;
+        attempts: number;
+        lastError: string | null;
+        pendingSinceMs: number | null;
+    };
     /** A durable host marker whose live module status no longer reports module ownership. */
     memoryAuthorityMismatch?: boolean;
     /** User-owned model profile selected for this project, or null for the base config. */
     activeProfile: string | null;
+    configGeneration?: number;
+    configAdoptedAt?: number;
+    configReloadFailure?: { path: string; message: string };
     tagCounter: number;
     activeTags: number;
     droppedTags: number;
@@ -244,7 +294,7 @@ export interface StatusDetail extends SidebarSnapshot {
     cacheExpired: boolean;
     /** Reports whether the displayed TTL came from config, persisted session metadata,
      *  or the default; cache scheduling still uses the TTL stored in session metadata. */
-    cacheTtlSource?: "config" | "session" | "default";
+    cacheTtlSource?: import("./cache-ttl-display").CacheTtlDisplaySource;
     cacheTtlModelKey?: string;
     configParseFailures?: ConfigParseFailure[];
     /** True when cacheTtl is "never" — the idle-TTL heuristic is disabled on

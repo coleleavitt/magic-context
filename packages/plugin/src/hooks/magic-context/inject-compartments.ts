@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { MEMORY_MURAL_BLOCK } from "../../agents/magic-context-prompt";
 import {
     buildCompartmentBlock,
     type Compartment,
@@ -7,9 +8,13 @@ import {
     escapeXmlContent,
     getCompartments,
     getLastCompartmentEndMessageId,
+    isPartialCompartmentEnd,
     type SessionFact,
 } from "../../features/magic-context/compartment-storage";
-import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
+import {
+    CATEGORY_PRIORITY,
+    V2_MEMORY_CATEGORIES,
+} from "../../features/magic-context/memory/constants";
 import { compareMemorySelectionPriority } from "../../features/magic-context/memory/memory-selection";
 import {
     getMaxMemoryIdForProjects,
@@ -50,14 +55,23 @@ import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { sessionLog } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
-import { reconcileForkOrphanedCompactionMarkers } from "./compaction-marker-manager";
+import {
+    MARKER_SUMMARY_TEXT,
+    reconcileForkOrphanedCompactionMarkers,
+} from "./compaction-marker-manager";
 import {
     COMPARTMENT_RENDER_EPOCH,
     decodeCachedM0UpgradeIdentity,
     encodeCachedM0UpgradeIdentity,
     MEMORY_RENDER_FORMAT_EPOCH,
+    renderBudgetIdentityChanged,
+    renderedBudgetShrinkReason,
+    renderedBudgetSnapshot,
 } from "./compartment-render-epoch";
 import { extractM0Block, renderCompartmentAtTier, renderDecayedCompartments } from "./decay-render";
+import { historyLocalBudget } from "./decision-calibration";
+import { isHostRenderedSystemMessage } from "./host-served-rows";
+import { compareRawSessionMessageOrder, resolveHostServedBoundaryId } from "./read-session-chunk";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
@@ -236,6 +250,72 @@ export function renderMemoryBlock(memories: Memory[]): string | null {
     return renderMemoryBlockV2(memories) || null;
 }
 
+/**
+ * Return the memories `renderHistorianMemoryBlock` renders, in the order it
+ * renders them (by category priority, then input order). Rendering any prefix
+ * of this list reproduces the first lines of the full block, so a caller that
+ * must shrink the block to fit a model window can drop the lowest-priority
+ * lines by taking a shorter prefix.
+ */
+export function orderHistorianMemories(memories: Memory[]): Memory[] {
+    const ordered: Memory[] = [];
+    for (const category of CATEGORY_PRIORITY) {
+        for (const memory of memories) {
+            if (memory.category === category) ordered.push(memory);
+        }
+    }
+    return ordered;
+}
+
+/**
+ * The historian's `<project-memory>` block. Canonical form: category-grouped
+ * `- <fact>` lines WITHOUT memory ids, ordered by CATEGORY_PRIORITY (v2
+ * taxonomy first, then the legacy categories so pre-v2 rows remain visible);
+ * categories outside the priority list are not rendered.
+ *
+ * Why this differs from the agent-facing wire (`renderMemoryBlockV2`, which
+ * emits `#id: fact`): the historian system prompt uses this block only for
+ * content-based fact dedup ("scan <project_memory> and silently skip any fact
+ * that overlaps") and contradiction reporting — it never addresses a memory by
+ * id. Ids exist on the m0/m1 wire so the `<memory-updates>` corrections block
+ * can point at baseline lines (`<updated id="N">`, `<removed id="N">`); the
+ * historian has no such corrections mechanism, so ids would be noise. Both
+ * lanes must emit this exact form: the Rust port
+ * (crates/mc-module/src/historian_prompt.rs `render_historian_memory_block`)
+ * renders the same bytes, and the historian prompt golden
+ * (crates/mc-module/testdata/historian-prompt-golden.json) pins byte parity.
+ */
+export function renderHistorianMemoryBlock(memories: Memory[]): string | null {
+    const byCategory = new Map<string, Memory[]>();
+    for (const m of memories) {
+        const existing = byCategory.get(m.category);
+        if (existing) {
+            existing.push(m);
+        } else {
+            byCategory.set(m.category, [m]);
+        }
+    }
+
+    const sections: string[] = [];
+    for (const category of CATEGORY_PRIORITY) {
+        const categoryMemories = byCategory.get(category);
+        if (!categoryMemories || categoryMemories.length === 0) {
+            continue;
+        }
+        sections.push(
+            `<${category}>`,
+            ...categoryMemories.map((m) => `- ${escapeXmlContent(m.content)}`),
+            `</${category}>`,
+        );
+    }
+
+    if (sections.length === 0) {
+        return null;
+    }
+
+    return `<project-memory>\n${sections.join("\n")}\n</project-memory>`;
+}
+
 /** Constraint keywords that signal a memory encodes a rule rather than a description. */
 const CONSTRAINT_KEYWORDS = /\b(must|never|always|cannot|should not|must not)\b/i;
 
@@ -370,11 +450,22 @@ export function prepareCompartmentInjection(
         } else {
             // Re-do the splice with the cached boundary (messages are rebuilt fresh each pass)
             if (prepared.compartmentEndMessageId.length > 0) {
-                const cutoffIndex = messages.findIndex(
-                    (message) => message.info.id === prepared.compartmentEndMessageId,
+                const cutoffIndex = findBoundaryIndex(
+                    sessionId,
+                    messages,
+                    prepared.compartmentEndMessageId,
                 );
                 if (cutoffIndex >= 0) {
-                    const remaining = messages.slice(cutoffIndex + 1);
+                    const remaining = messages.slice(
+                        cutoffIndex +
+                            (isPartialCompartmentEnd(
+                                db,
+                                sessionId,
+                                prepared.compartmentEndMessageId,
+                            )
+                                ? 0
+                                : 1),
+                    );
                     messages.splice(0, messages.length, ...remaining);
                 } else {
                     // Boundary message not in array — covered messages were already
@@ -513,7 +604,9 @@ export function prepareCompartmentInjection(
 
     const lastCompartment = compartments[compartments.length - 1];
     const lastEnd = lastCompartment.endMessage;
-    const lastEndMessageId = lastCompartment.endMessageId;
+    // A newest compartment without an end id cannot be placed; trim at the
+    // newest one that can (see lastCompartmentBoundaryId).
+    const lastEndMessageId = newestCompartmentEndId(compartments) ?? "";
 
     // Modern m0/m1 preparation keeps the persisted baseline boundary. Only final
     // delivery may advance it after prefix preflight, so contention cannot remove
@@ -573,13 +666,14 @@ export function prepareCompartmentInjection(
     let needsFreshMaterialization = false;
     let resultEndMessage: number = lastEnd;
     let resultEndMessageId: string | null = null;
-    const cutoffIndex = messages.findIndex((message) => message.info.id === trimEndMessageId);
+    const cutoffIndex = findBoundaryIndex(sessionId, messages, trimEndMessageId);
     if (cutoffIndex >= 0) {
         // Natural boundary is visible — normal splice, and any degraded-mode
         // bookkeeping from earlier passes is cleared.
         clearDegradedRebuild(sessionId);
-        skippedVisibleMessages = cutoffIndex + 1;
-        const remaining = messages.slice(cutoffIndex + 1);
+        skippedVisibleMessages =
+            cutoffIndex + (isPartialCompartmentEnd(db, sessionId, trimEndMessageId) ? 0 : 1);
+        const remaining = messages.slice(skippedVisibleMessages);
         messages.splice(0, messages.length, ...remaining);
         resultEndMessageId = trimEndMessageId;
     } else {
@@ -605,12 +699,18 @@ export function prepareCompartmentInjection(
             const reAnchorIndex = findVisibleReanchorIndex(compartments, visibleMessageIds);
             if (reAnchorIndex >= 0) {
                 const reAnchorCompartment = compartments[reAnchorIndex];
-                const reAnchorCutoff = messages.findIndex(
-                    (message) => message.info.id === reAnchorCompartment.endMessageId,
+                const reAnchorCutoff = findBoundaryIndex(
+                    sessionId,
+                    messages,
+                    reAnchorCompartment.endMessageId,
                 );
                 if (reAnchorCutoff >= 0) {
-                    skippedVisibleMessages = reAnchorCutoff + 1;
-                    const remaining = messages.slice(reAnchorCutoff + 1);
+                    skippedVisibleMessages =
+                        reAnchorCutoff +
+                        (isPartialCompartmentEnd(db, sessionId, reAnchorCompartment.endMessageId)
+                            ? 0
+                            : 1);
+                    const remaining = messages.slice(skippedVisibleMessages);
                     messages.splice(0, messages.length, ...remaining);
                     resultEndMessage = reAnchorCompartment.endMessage;
                     resultEndMessageId = reAnchorCompartment.endMessageId;
@@ -772,6 +872,8 @@ export interface M0SnapshotMarkers {
     muralHash?: string | null;
     muralEnabled: boolean | null;
     renderBudgetIdentity: string | null;
+    /** Numeric allowances used by the cached render; absent on older baselines. */
+    renderedBudgets?: string | null;
 }
 
 /**
@@ -790,6 +892,25 @@ export interface M0HardSignals {
     cacheExpired: boolean;
     /** Epoch ms of the last completed assistant response (end-of-turn). */
     lastResponseTime: number;
+    /**
+     * A native host compaction heading the live window, read from the messages
+     * the host served this pass before anything trimmed them. Absent when the
+     * window does not start with one.
+     */
+    hostCompaction?: HostCompactionWindow;
+}
+
+/**
+ * A native OpenCode compaction (`/compact` or automatic) heading the live window.
+ * OpenCode then serves [compaction request, summary, retained tail, newer rows]
+ * and stops loading everything older. Magic Context's own marker pair has the
+ * same shape and is never reported here.
+ */
+export interface HostCompactionWindow {
+    compactionMessageId: string;
+    summaryMessageId: string;
+    /** Epoch ms at which the host finished writing the summary. */
+    completedAt: number;
 }
 
 const EMPTY_HARD_SIGNALS: M0HardSignals = {
@@ -840,6 +961,7 @@ export interface M0M1RenderOptions {
     memoryEnabled?: boolean;
     memoryInjectionBudgetTokens?: number;
     historyBudgetTokens?: number;
+    historyBudgetPolicyIdentity?: string;
     userProfileBudgetTokens?: number;
     temporalAwareness?: boolean;
     /** Experimental image injection. The caller resolves model capability from
@@ -876,6 +998,18 @@ export interface M0M1RenderOptions {
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
     beforePhase3ForTest?: () => void;
+    /**
+     * Runs inside the transaction that records a HARD fold, just before it
+     * commits (and again on each contention retry, whose earlier attempt rolled
+     * back). Writes that must land only together with an executed fold, such as
+     * converting legacy dropped-tool skeletons, go here. `rendered` carries the
+     * bytes this fold is about to persist, so the caller can tell whether the
+     * fold changes the served prefix or re-renders it byte-identically.
+     */
+    onFoldCommit?: (
+        db: Database,
+        rendered: { m0Bytes: Buffer; m1Bytes: Buffer; muralDataUrl: string | null },
+    ) => void;
 }
 
 export interface MaterializeDecision {
@@ -906,7 +1040,24 @@ export interface MaterializeM0Result {
     renderedMemoryIds: number[];
 }
 
-export type PrefixTrimStatus = "not-attempted" | "not-required" | "applied" | "refused";
+/**
+ * - `applied`: the boundary row was found and everything through it was cut.
+ * - `boundary-precedes-window`: the boundary is not in the live array because
+ *   the live window starts after it in persisted order (a host window that
+ *   starts past the boundary). The summary covers nothing live; nothing is cut.
+ * - `refused`: no cut was made this pass and the whole window is served. For a
+ *   boundary missing from inside the window this is a counted degraded state
+ *   that the next cache-busting pass heals by moving the boundary.
+ *
+ * Only `applied` proves the trim went through the named boundary; the marker
+ * drain relies on that and treats every other status as unproven.
+ */
+export type PrefixTrimStatus =
+    | "not-attempted"
+    | "not-required"
+    | "applied"
+    | "boundary-precedes-window"
+    | "refused";
 
 export interface PrefixTrimSourceOrder {
     /** Stable IDs in the exact order supplied by the host before this transform mutates the array. */
@@ -957,20 +1108,33 @@ type M0Compartment = Compartment & {
 
 /**
  * The boundary (OpenCode message id) covered by a compartment set rendered into
- * m[0]+m[1] — the highest-sequence compartment's end message id, or null when
- * there are none / the latest has no stored boundary (legacy rows). The input
- * is ordered `sequence ASC`, so the last element is the latest compartment.
+ * m[0]+m[1] — the end message id of the newest compartment that has one, or
+ * null when none does. Newer compartments without an end id (legacy rows, or
+ * rows carried into a forked session) cannot be placed, so the rows after the
+ * boundary stay raw rather than the whole window. The input is ordered
+ * `sequence ASC`.
  */
 function lastCompartmentBoundaryId(compartments: readonly M0Compartment[]): string | null {
-    const last = compartments.at(-1);
-    return last?.endMessageId && last.endMessageId.length > 0 ? last.endMessageId : null;
+    return newestCompartmentEndId(compartments);
+}
+
+function newestCompartmentEndId(compartments: readonly Compartment[]): string | null {
+    for (let index = compartments.length - 1; index >= 0; index -= 1) {
+        const id = compartments[index]?.endMessageId;
+        if (typeof id === "string" && id.length > 0) return id;
+    }
+    return null;
 }
 
 const DEFAULT_HISTORY_BUDGET_TOKENS = 60_000;
 export const DEFAULT_MEMORY_BUDGET_TOKENS = 8_000;
 
-function renderBudgetIdentity(memoryBudget?: number, historyBudget?: number): string {
-    return `m${memoryBudget ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${historyBudget ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
+function renderBudgetIdentity(
+    memoryBudget?: number,
+    historyBudget?: number,
+    historyPolicy?: string,
+): string {
+    return `m${memoryBudget ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${historyPolicy ?? historyBudget ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
 }
 
 export const DEFAULT_USER_PROFILE_BUDGET_TOKENS = 4_000;
@@ -1189,6 +1353,7 @@ interface M0SnapshotMarkerReadArgs {
     muralEnabled?: boolean;
     memoryInjectionBudgetTokens?: number;
     historyBudgetTokens?: number;
+    historyBudgetPolicyIdentity?: string;
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
 }
@@ -1434,6 +1599,11 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
             renderBudgetIdentity: renderBudgetIdentity(
                 args.memoryInjectionBudgetTokens,
                 args.historyBudgetTokens,
+                args.historyBudgetPolicyIdentity,
+            ),
+            renderedBudgets: renderedBudgetSnapshot(
+                args.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+                args.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
             ),
         },
     };
@@ -1455,6 +1625,11 @@ function refreshVolatileMarkerInputs(
         renderBudgetIdentity: renderBudgetIdentity(
             args.memoryInjectionBudgetTokens,
             args.historyBudgetTokens,
+            args.historyBudgetPolicyIdentity,
+        ),
+        renderedBudgets: renderedBudgetSnapshot(
+            args.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+            args.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
         ),
     };
 }
@@ -1540,6 +1715,7 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
         muralHash: state.cachedM0MuralHash ?? null,
         muralEnabled: cachedUpgradeIdentity.muralEnabled,
         renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity,
+        renderedBudgets: cachedUpgradeIdentity.renderedBudgets,
     };
 }
 
@@ -1582,6 +1758,7 @@ export function mustMaterialize(args: {
     muralEnabled?: boolean;
     memoryInjectionBudgetTokens?: number;
     historyBudgetTokens?: number;
+    historyBudgetPolicyIdentity?: string;
 }): MaterializeDecision {
     if (!args.state.cachedM0Bytes) return { value: true, reason: "first_render" };
     if (!args.state.cachedM1Bytes) return { value: true, reason: "cached_m1_missing" };
@@ -1598,7 +1775,7 @@ export function mustMaterialize(args: {
     // The rendered bytes make this transition self-consuming without another
     // durable flag: once suppressed, the next pass finds no memory-derived block.
     if (args.memoryEnabled === false && cachedMemoryDerivedSurfacePresent(args.state)) {
-        return { value: true, reason: "render_config" };
+        return { value: true, reason: "render_config:memory_disabled" };
     }
 
     // Renderer-format changes must fold cached m[0] once before sanitized bytes can
@@ -1613,13 +1790,33 @@ export function mustMaterialize(args: {
     // rather than folding the whole fleet once at upgrade. Only a real change
     // against a RECORDED component triggers.
     if (
-        (cachedUpgradeIdentity.muralEnabled !== null &&
-            cachedUpgradeIdentity.muralEnabled !== current.muralEnabled) ||
-        (cachedUpgradeIdentity.renderBudgetIdentity !== null &&
-            cachedUpgradeIdentity.renderBudgetIdentity !== current.renderBudgetIdentity)
+        cachedUpgradeIdentity.muralEnabled !== null &&
+        cachedUpgradeIdentity.muralEnabled !== current.muralEnabled
     ) {
-        return { value: true, reason: "render_config" };
+        return {
+            value: true,
+            reason: `render_config:mural(${cachedUpgradeIdentity.muralEnabled}→${current.muralEnabled})`,
+        };
     }
+    if (
+        cachedUpgradeIdentity.renderBudgetIdentity !== null &&
+        current.renderBudgetIdentity != null &&
+        renderBudgetIdentityChanged(
+            cachedUpgradeIdentity.renderBudgetIdentity,
+            current.renderBudgetIdentity,
+        )
+    ) {
+        return {
+            value: true,
+            reason: `render_config:budget(${cachedUpgradeIdentity.renderBudgetIdentity}→${current.renderBudgetIdentity})`,
+        };
+    }
+
+    const budgetShrinkReason = renderedBudgetShrinkReason(
+        cachedUpgradeIdentity.renderedBudgets,
+        current.renderedBudgets,
+    );
+    if (budgetShrinkReason) return { value: true, reason: budgetShrinkReason };
 
     // ── HARD: provider-side cache eviction (the cache was already dead) ──
     // Folding m[1] into m[0] here is "free" — the prefix is being re-cached
@@ -1672,6 +1869,19 @@ export function mustMaterialize(args: {
         hard.lastResponseTime > (args.state.cachedM0MaterializedAt ?? 0)
     ) {
         return withToolSetHashComparison({ value: true, reason: "ttl_idle" });
+    }
+    // A native host compaction replaced the window after the last fold. The host
+    // summary now stands in for the history before its retained tail, and the
+    // stored baseline boundary still points at a row the host no longer serves.
+    // The compaction already changed everything after the cached prefix, so the
+    // re-anchoring fold rides that change. Self-consuming like the idle expiry:
+    // after the fold, materializedAt is newer than the summary.
+    const hostCompaction = hard.hostCompaction;
+    if (
+        hostCompaction !== undefined &&
+        hostCompaction.completedAt > (args.state.cachedM0MaterializedAt ?? 0)
+    ) {
+        return withToolSetHashComparison({ value: true, reason: "host_compaction" });
     }
 
     // ── HARD: genuine m[0] CONTENT change (the rendered baseline bytes differ) ──
@@ -1893,21 +2103,47 @@ function nullableString(value: unknown): string | null {
  * persisted bytes without consulting live timestamps.
  */
 function withCompartmentDates(
+    db: Database,
     sessionId: string,
     compartments: M0Compartment[],
     temporalAwareness: boolean | undefined,
 ): M0Compartment[] {
     if (!temporalAwareness || compartments.length === 0) return compartments;
 
-    const messageIds = new Set<string>();
+    const ordinals = new Set<number>();
     for (const compartment of compartments) {
-        if (compartment.startMessageId) messageIds.add(compartment.startMessageId);
-        if (compartment.endMessageId) messageIds.add(compartment.endMessageId);
+        ordinals.add(compartment.startMessage);
+        ordinals.add(compartment.endMessage);
     }
-    const times = getMessageTimesFromOpenCodeDb(sessionId, Array.from(messageIds));
+    const indexedRows = db
+        .prepare(
+            `SELECT message_ordinal AS ordinal, message_time_ms AS time
+               FROM message_fts_rowid_map
+              WHERE session_id = ?
+                AND message_time_ms IS NOT NULL
+                AND message_ordinal IN (SELECT value FROM json_each(?))`,
+        )
+        .all(sessionId, JSON.stringify([...ordinals])) as Array<{ ordinal: number; time: number }>;
+    const indexedTimes = new Map(indexedRows.map((row) => [row.ordinal, row.time]));
+    const fallbackIds = new Set<string>();
+    for (const compartment of compartments) {
+        if (!indexedTimes.has(compartment.startMessage) && compartment.startMessageId) {
+            fallbackIds.add(compartment.startMessageId);
+        }
+        if (!indexedTimes.has(compartment.endMessage) && compartment.endMessageId) {
+            fallbackIds.add(compartment.endMessageId);
+        }
+    }
+    const fallbackTimes =
+        fallbackIds.size > 0
+            ? getMessageTimesFromOpenCodeDb(sessionId, Array.from(fallbackIds))
+            : new Map<string, number>();
     return compartments.map((compartment) => {
-        const startMs = times.get(compartment.startMessageId);
-        const endMs = times.get(compartment.endMessageId);
+        const startMs =
+            indexedTimes.get(compartment.startMessage) ??
+            fallbackTimes.get(compartment.startMessageId);
+        const endMs =
+            indexedTimes.get(compartment.endMessage) ?? fallbackTimes.get(compartment.endMessageId);
         if (startMs === undefined || endMs === undefined) return compartment;
         return {
             ...compartment,
@@ -2057,14 +2293,14 @@ function renderSessionHistoryWithDecay(args: {
     });
 }
 
-const MEMORY_MURAL_BLOCK =
-    "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>";
-
 /** Remove a stale mural reference when a legacy cached baseline has no paired image payload. */
 export function stripMemoryMuralBlock(m0Text: string): string {
     return m0Text
         .split("\n\n")
-        .filter((section) => section !== MEMORY_MURAL_BLOCK)
+        .filter(
+            (section) =>
+                !(section.startsWith("<memory-mural>\n") && section.endsWith("\n</memory-mural>")),
+        )
         .join("\n\n")
         .trim();
 }
@@ -2080,6 +2316,7 @@ export function renderM0(args: {
     historyBudgetTokens?: number;
     userProfileBudgetTokens?: number;
     decayPressureMultiplier?: number;
+    modelKey?: string;
 }): string {
     const sections: string[] = [];
     if (args.projectDocs.length > 0) sections.push(args.projectDocs);
@@ -2094,7 +2331,10 @@ export function renderM0(args: {
     // The +15% drift "pressure multiplier" maps to a proportionally tighter
     // effective budget (lower budget → higher curve pressure → more demotion),
     // keeping decay-curve.ts the single source of pressure math.
-    const baseBudget = args.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+    const baseBudget = historyLocalBudget(
+        args.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+        args.modelKey,
+    );
     const effectiveBudget = baseBudget / Math.max(1, args.decayPressureMultiplier ?? 1);
     const sessionHistory = renderSessionHistoryWithDecay({
         compartments: args.compartments,
@@ -2142,6 +2382,7 @@ function applyMarkersToState(
         markers.muralEnabled,
         markers.renderBudgetIdentity,
         markers.memoryRenderEpoch,
+        markers.renderedBudgets ?? null,
     );
     // Runtime markers must be mirrored into flat state because the next
     // mustMaterialize pass reads cachedM0SystemHash/ToolSetHash/ModelKey directly
@@ -2229,6 +2470,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             muralEnabled: options.muralEnabled,
             memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
             historyBudgetTokens: options.historyBudgetTokens,
+            historyBudgetPolicyIdentity: options.historyBudgetPolicyIdentity,
             hardSignals: options.hardSignals,
             workspaceIdentitySet: {
                 identities: workspace.identities,
@@ -2277,7 +2519,12 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         throw error;
     }
 
-    compartments = withCompartmentDates(options.sessionId, compartments, options.temporalAwareness);
+    compartments = withCompartmentDates(
+        options.db,
+        options.sessionId,
+        compartments,
+        options.temporalAwareness,
+    );
 
     const memoryBudget = options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
     const memoryRenderOptions: MemoryRenderOptions = {
@@ -2314,13 +2561,17 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         facts,
         memoryRenderOptions,
         historyBudgetTokens: options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+        modelKey: snapshotMarkers.modelKey,
         userProfileBudgetTokens: options.userProfileBudgetTokens,
         decayPressureMultiplier,
         mural,
     });
 
     let attempts = 0;
-    const budget = options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+    const budget = historyLocalBudget(
+        options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+        snapshotMarkers.modelKey,
+    );
     while (budget > 0 && historySliceTokens(m0Text) > budget * 1.05 && attempts < 3) {
         decayPressureMultiplier *= 1.15;
         m0Text = renderM0({
@@ -2351,8 +2602,8 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
 
     let m1Text = M1_EMPTY_PLACEHOLDER;
     let m1Bytes = Buffer.from(m1Text, "utf8");
-    const transactionStartedAt = performance.now();
     options.db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     try {
         const currentWorkspace = resolveWorkspaceRenderContext({
             db: options.db,
@@ -2399,6 +2650,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             projectIdentity: projectPath ?? null,
             muralEnabled: snapshotMarkers.muralEnabled,
             renderBudgetIdentity: snapshotMarkers.renderBudgetIdentity,
+            renderedBudgets: snapshotMarkers.renderedBudgets,
         };
         // NOTE: maxMemoryId is deliberately EXCLUDED from this stale-check.
         // Additive memory writes (write/promote) do not invalidate the rendered
@@ -2461,6 +2713,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
                 snapshotMarkers.muralEnabled,
                 snapshotMarkers.renderBudgetIdentity,
                 snapshotMarkers.memoryRenderEpoch,
+                snapshotMarkers.renderedBudgets ?? null,
             ),
             systemHash: snapshotMarkers.systemHash,
             toolSetHash: snapshotMarkers.toolSetHash,
@@ -2495,6 +2748,12 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
                 "UPDATE session_meta SET cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
             )
             .run(baselineEndMessageId, options.sessionId);
+
+        options.onFoldCommit?.(options.db, {
+            m0Bytes,
+            m1Bytes,
+            muralDataUrl: frozenMuralDataUrl ?? null,
+        });
 
         options.db.exec("COMMIT");
         logSlowWriteTransaction("opencode_materialize_cache", transactionStartedAt);
@@ -2666,6 +2925,7 @@ function renderM1WithMetadata(
     if (memoryUpdates.block) blocks.push(memoryUpdates.block);
 
     const newCompartments = withCompartmentDates(
+        options.db,
         options.sessionId,
         readNewCompartments(options.db, options.sessionId, markers.maxCompartmentSeq).filter(
             (c) => !isNoContentCompartment(c),
@@ -2817,6 +3077,21 @@ function parseMemoryBlockIds(raw: string | null): number[] {
     }
 }
 
+/**
+ * Callers normally pass getOrCreateSessionMeta(), which already carries the
+ * persisted mural payload. A lean process-local state leaves it undefined; fill
+ * it from the persisted row, but only when that row holds the exact m[0] bytes
+ * the state holds, so a stale row can never pose as the served image.
+ */
+export function hydrateCachedM0Mural(db: Database, sessionId: string, state: M0M1State): void {
+    if (!state.cachedM0Bytes || state.cachedM0MuralDataUrl !== undefined) return;
+    const row = readCachedM0M1Row(db, sessionId);
+    if (row && bufferEqualsNullable(row.cached_m0_bytes, state.cachedM0Bytes)) {
+        state.cachedM0MuralDataUrl = row.cached_m0_mural_data_url ?? null;
+        state.cachedM0MuralHash = row.cached_m0_mural_hash ?? null;
+    }
+}
+
 function readCachedM0M1Row(db: Database, sessionId: string): CachedM0M1Row | null {
     return db
         .prepare(
@@ -2876,6 +3151,7 @@ function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
         muralHash: row.cached_m0_mural_hash ?? null,
         muralEnabled: cachedUpgradeIdentity.muralEnabled,
         renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity,
+        renderedBudgets: cachedUpgradeIdentity.renderedBudgets,
     };
 }
 
@@ -2931,6 +3207,7 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
         markers.muralEnabled,
         markers.renderBudgetIdentity,
         markers.memoryRenderEpoch,
+        markers.renderedBudgets ?? null,
     );
     state.cachedM0SystemHash = markers.systemHash;
     state.cachedM0ToolSetHash = markers.toolSetHash;
@@ -2947,8 +3224,8 @@ function replayCachedM1(state: M0M1State): string {
 }
 
 function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
-    const transactionStartedAt = performance.now();
     options.db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     try {
         const row = readCachedM0M1Row(options.db, options.sessionId);
         if (!row || !cachedRowMatchesState(row, options.state)) {
@@ -3091,6 +3368,7 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
         muralEnabled: options.muralEnabled,
         memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
         historyBudgetTokens: options.historyBudgetTokens,
+        historyBudgetPolicyIdentity: options.historyBudgetPolicyIdentity,
         hardSignals: options.hardSignals,
         workspaceIdentitySet: {
             identities: workspace.identities,
@@ -3111,6 +3389,7 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
     const compartments = options.compactionOff
         ? []
         : withCompartmentDates(
+              options.db,
               options.sessionId,
               readM0Compartments(options.db, options.sessionId),
               options.temporalAwareness,
@@ -3154,7 +3433,10 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
               memoryRenderOptions,
           )
         : trimMemoriesToBudgetV2(options.sessionId, memories, memoryBudget);
-    const budget = options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+    const budget = historyLocalBudget(
+        options.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+        snapshotMarkers.modelKey,
+    );
     const mural =
         options.memoryEnabled === false
             ? undefined
@@ -3203,6 +3485,222 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
     };
 }
 
+/**
+ * Locate a stored compartment boundary in the live messages. A boundary on a row
+ * the host never serves by id (OpenCode 2 instruction updates) is found through
+ * the served row it stands for; the direct lookup runs first so every host whose
+ * rows are all served by id reads nothing extra.
+ */
+function findBoundaryIndex(
+    sessionId: string,
+    messages: readonly MessageLike[],
+    boundaryId: string,
+): number {
+    const direct = messages.findIndex((message) => message.info.id === boundaryId);
+    if (direct >= 0) return direct;
+    const served = resolveHostServedBoundaryId(sessionId, boundaryId);
+    if (served === boundaryId) return -1;
+    return messages.findIndex((message) => message.info.id === served);
+}
+
+// ── Prefix trim when the boundary row is not in the live array ──────────
+//
+// The trim cuts through the boundary row by id. When that row is not in the
+// live array, nothing is cut and the whole window is served, exactly as before;
+// what changes is only how the state is named and logged:
+//   - The first persisted live row sorts after the boundary: the host window
+//     starts past it (for example a resumed session whose loaded history begins
+//     after the boundary). The summary covers nothing that is live, so there is
+//     nothing to cut. That is a successful trim, reported once per boundary.
+//   - Otherwise (the boundary sorts inside the window but its row is missing,
+//     or it cannot be placed at all): a degraded state, counted per episode.
+//     It heals without a cut here: every cache-busting pass moves the baseline
+//     boundary to the latest compartment end (soft refresh or materialization),
+//     and once that boundary is in the window the id trim applies again.
+// The served bytes never depend on this classification, so it needs no state
+// that must survive a restart.
+
+interface AbsentBoundaryEpisode {
+    boundary: string;
+    passes: number;
+}
+
+const absentBoundaryEpisodeBySession = new BoundedSessionMap<AbsentBoundaryEpisode>(
+    INJECTION_CACHE_MAX,
+);
+/**
+ * Last "does the boundary sort before the window" verdict per session, keyed by
+ * the boundary and the first persisted live row it was compared with. Both only
+ * change when the host window or the baseline changes, so steady passes skip
+ * the store lookups.
+ */
+const precedesVerdictBySession = new BoundedSessionMap<{
+    boundary: string;
+    firstLiveId: string;
+    precedes: boolean;
+}>(INJECTION_CACHE_MAX);
+/**
+ * Boundary already logged as sitting before the live window, so the "nothing to
+ * cut" outcome is logged once per boundary rather than on every pass.
+ */
+const precedesWindowLoggedBySession = new BoundedSessionMap<string>(INJECTION_CACHE_MAX);
+
+export function resetPrefixTrimFallbackState(sessionId: string): void {
+    absentBoundaryEpisodeBySession.delete(sessionId);
+    precedesVerdictBySession.delete(sessionId);
+    precedesWindowLoggedBySession.delete(sessionId);
+}
+
+/**
+ * Rows a host compaction places at the head of its window although they are
+ * newer than the retained rows after them (OpenCode's filterCompacted returns
+ * [compaction request, summary, retained tail, rest]). They say nothing about
+ * where the window starts in persisted order.
+ */
+function isHostCompactionHeadRow(message: MessageLike): boolean {
+    if ((message.info as { summary?: unknown }).summary === true) return true;
+    return message.parts.some((part) => (part as { type?: unknown }).type === "compaction");
+}
+
+function firstPersistedLiveId(messages: readonly MessageLike[]): string | null {
+    for (const message of messages) {
+        const id = message.info.id;
+        if (typeof id !== "string" || id.length === 0) continue;
+        if (isHostRenderedSystemMessage(message) || isHostCompactionHeadRow(message)) continue;
+        return id;
+    }
+    return null;
+}
+
+function textOfParts(parts: readonly unknown[]): string {
+    return parts
+        .map((part) => {
+            const text = (part as { text?: unknown }).text;
+            return typeof text === "string" ? text : "";
+        })
+        .join("");
+}
+
+/**
+ * Read a native host compaction off the head of the messages the host served,
+ * before anything in this pass trims them. `readMagicContextSummaryMessageId`
+ * returns the summary row of Magic Context's own marker, which has the same
+ * shape and is excluded along with any row carrying its placeholder text. It is
+ * only called when the head has that shape, so ordinary passes read nothing.
+ */
+export function findHostCompactionWindow(
+    messages: readonly MessageLike[],
+    readMagicContextSummaryMessageId: () => string | null,
+): HostCompactionWindow | null {
+    const persisted: MessageLike[] = [];
+    for (const message of messages) {
+        if (persisted.length === 2) break;
+        const id = message.info.id;
+        if (typeof id !== "string" || id.length === 0) continue;
+        if (isHostRenderedSystemMessage(message)) continue;
+        persisted.push(message);
+    }
+    const [request, summary] = persisted;
+    if (!request || !summary) return null;
+    if (
+        request.info.role !== "user" ||
+        !request.parts.some((part) => (part as { type?: unknown }).type === "compaction")
+    ) {
+        return null;
+    }
+    const summaryInfo = summary.info as MessageLike["info"] & {
+        parentID?: unknown;
+        time?: { created?: unknown; completed?: unknown };
+    };
+    if (
+        summaryInfo.role !== "assistant" ||
+        summaryInfo.summary !== true ||
+        summaryInfo.parentID !== request.info.id ||
+        !summaryInfo.finish ||
+        summaryInfo.error
+    ) {
+        return null;
+    }
+    const summaryMessageId = summary.info.id as string;
+    if (textOfParts(summary.parts).includes(MARKER_SUMMARY_TEXT)) return null;
+    if (summaryMessageId === readMagicContextSummaryMessageId()) return null;
+    const completedAt =
+        typeof summaryInfo.time?.completed === "number"
+            ? summaryInfo.time.completed
+            : summaryInfo.time?.created;
+    if (typeof completedAt !== "number" || !Number.isFinite(completedAt)) return null;
+    return {
+        compactionMessageId: request.info.id as string,
+        summaryMessageId,
+        completedAt,
+    };
+}
+
+function boundaryPrecedesWindow(sessionId: string, boundary: string, firstLiveId: string): boolean {
+    const cached = precedesVerdictBySession.get(sessionId);
+    if (cached && cached.boundary === boundary && cached.firstLiveId === firstLiveId) {
+        return cached.precedes;
+    }
+    let order: number | null = null;
+    try {
+        order = compareRawSessionMessageOrder(sessionId, boundary, firstLiveId);
+        const served = resolveHostServedBoundaryId(sessionId, boundary);
+        if (order === null && served !== boundary) {
+            order = compareRawSessionMessageOrder(sessionId, served, firstLiveId);
+        }
+    } catch (error) {
+        sessionLog(sessionId, `prefix trim: placing boundary ${boundary} failed:`, error);
+        order = null;
+    }
+    const precedes = order !== null && order < 0;
+    precedesVerdictBySession.set(sessionId, { boundary, firstLiveId, precedes });
+    return precedes;
+}
+
+/** Classify and log a boundary missing from the live array. Never mutates messages. */
+function classifyAbsentBoundary(
+    options: M0M1RenderOptions,
+    messages: readonly MessageLike[],
+    boundary: string,
+): PrefixTrimStatus {
+    const { sessionId } = options;
+    const pass = options.isCacheBustingPass ? "priced" : "defer";
+    const firstLiveId = firstPersistedLiveId(messages);
+    if (firstLiveId !== null && boundaryPrecedesWindow(sessionId, boundary, firstLiveId)) {
+        absentBoundaryEpisodeBySession.delete(sessionId);
+        if (precedesWindowLoggedBySession.get(sessionId) !== boundary) {
+            precedesWindowLoggedBySession.set(sessionId, boundary);
+            // Earlier in the same pass, compartment injection may already have cut
+            // the window through the boundary, and reduction may have removed
+            // messages after it (a message whose only tool calls were dropped
+            // is left empty and removed). A boundary before the first remaining
+            // message therefore does not by itself mean the host's window
+            // started after it, and the line is worded not to suggest that.
+            sessionLog(
+                sessionId,
+                `prefix trim: boundary ${boundary} precedes the first remaining message ${firstLiveId}; rows between were cut with the summarized history or removed by reduction this pass; pass=${pass}; nothing to cut`,
+            );
+        }
+        return "boundary-precedes-window";
+    }
+    precedesWindowLoggedBySession.delete(sessionId);
+
+    const current = absentBoundaryEpisodeBySession.get(sessionId);
+    const episode = current && current.boundary === boundary ? current : { boundary, passes: 0 };
+    episode.passes += 1;
+    absentBoundaryEpisodeBySession.set(sessionId, episode);
+    // Logged when the episode starts, and on every cache-busting pass: those are
+    // the passes expected to heal it by moving the baseline boundary, so one
+    // that stays degraded is worth seeing.
+    if (episode.passes === 1 || options.isCacheBustingPass) {
+        sessionLog(
+            sessionId,
+            `prefix trim: boundary ${boundary} absent from current messages; pass=${pass}; no in-pass trim applied (degraded pass ${episode.passes}; ${firstLiveId === null ? "no persisted live message to compare with" : `boundary does not sort before the first live message ${firstLiveId}`}; whole window served until a cache-busting pass moves the boundary into the window)`,
+        );
+    }
+    return "refused";
+}
+
 function isSyntheticPrefixHead(message: MessageLike): boolean {
     if (
         message.info.id !== undefined ||
@@ -3229,6 +3727,10 @@ export function capturePrefixTrimSourceOrder(
 
     for (const [index, message] of messages.entries()) {
         const id = message.info.id;
+        // OpenCode 2 renders instruction-update rows as id-less system messages
+        // anywhere in history. They carry no row identity to order, and the trim
+        // places them by their persisted neighbours.
+        if (isHostRenderedSystemMessage(message)) continue;
         if (typeof id !== "string" || id.length === 0) {
             if (!sawPersistedRow && isSyntheticPrefixHead(message)) {
                 syntheticHeadCount += 1;
@@ -3283,7 +3785,9 @@ function trimToPreparedPrefix(
                 sourceOrder.messageIds.forEach((id, index) => {
                     sourcePosition.set(id, index);
                 });
-                const boundaryPosition = sourcePosition.get(boundary);
+                const boundaryPosition =
+                    sourcePosition.get(boundary) ??
+                    sourcePosition.get(resolveHostServedBoundaryId(options.sessionId, boundary));
                 if (boundaryPosition === undefined) {
                     status = refuse("boundary absent from immutable source order");
                 } else {
@@ -3293,6 +3797,13 @@ function trimToPreparedPrefix(
                     const retained: MessageLike[] = [];
                     for (const [index, message] of options.messages.entries()) {
                         const id = message.info.id;
+                        if (isHostRenderedSystemMessage(message)) {
+                            // Belongs to the rows around its persisted neighbours:
+                            // kept exactly when the row before it is kept or is the
+                            // boundary, the same cut the id-lookup trim makes.
+                            if (lastSourcePosition >= boundaryPosition) retained.push(message);
+                            continue;
+                        }
                         if (typeof id !== "string" || id.length === 0) {
                             if (!sawPersistedRow && isSyntheticPrefixHead(message)) continue;
                             liveOrderError = `live message at index ${index} has no stable id outside the synthetic head`;
@@ -3309,7 +3820,12 @@ function trimToPreparedPrefix(
                             break;
                         }
                         lastSourcePosition = position;
-                        if (position > boundaryPosition) retained.push(message);
+                        if (
+                            position > boundaryPosition ||
+                            (position === boundaryPosition &&
+                                isPartialCompartmentEnd(options.db, options.sessionId, boundary))
+                        )
+                            retained.push(message);
                     }
                     if (liveOrderError) status = refuse(liveOrderError);
                     else {
@@ -3319,16 +3835,17 @@ function trimToPreparedPrefix(
                 }
             }
         } else {
-            const index = options.messages.findIndex((message) => message.info.id === boundary);
+            const index = findBoundaryIndex(options.sessionId, options.messages, boundary);
             if (index >= 0) {
-                options.messages.splice(0, index + 1);
+                options.messages.splice(
+                    0,
+                    index +
+                        (isPartialCompartmentEnd(options.db, options.sessionId, boundary) ? 0 : 1),
+                );
+                resetPrefixTrimFallbackState(options.sessionId);
                 status = "applied";
             } else {
-                sessionLog(
-                    options.sessionId,
-                    `prefix trim: boundary ${boundary} absent from current messages; pass=${options.isCacheBustingPass ? "priced" : "defer"}; no in-pass trim applied`,
-                );
-                status = "refused";
+                status = classifyAbsentBoundary(options, options.messages, boundary);
             }
         }
     }
@@ -3394,16 +3911,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
             prefixTrimStatus,
         };
     }
-    // Callers normally pass getOrCreateSessionMeta(), which already contains the
-    // persisted mural payload. Keep compatibility with lean process-local states
-    // by hydrating only from the exact cached row whose m0 bytes they hold.
-    if (options.state.cachedM0Bytes && options.state.cachedM0MuralDataUrl === undefined) {
-        const row = readCachedM0M1Row(options.db, options.sessionId);
-        if (row && bufferEqualsNullable(row.cached_m0_bytes, options.state.cachedM0Bytes)) {
-            options.state.cachedM0MuralDataUrl = row.cached_m0_mural_data_url ?? null;
-            options.state.cachedM0MuralHash = row.cached_m0_mural_hash ?? null;
-        }
-    }
+    hydrateCachedM0Mural(options.db, options.sessionId, options.state);
     if (!options.workspaceIdentitySet && options.projectPath) {
         options = {
             ...options,
@@ -3438,6 +3946,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
         muralEnabled: options.muralEnabled,
         memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
         historyBudgetTokens: options.historyBudgetTokens,
+        historyBudgetPolicyIdentity: options.historyBudgetPolicyIdentity,
     });
     let rematerialized = false;
     let contentionExhausted = false;

@@ -1,8 +1,10 @@
-import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { Host } from "@opencode/plugin/host";
+import * as logger from "../../shared/logger";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { setupWithJsx } from "./index";
 import type { V2SidebarState, V2SlotClaim, V2TuiContext } from "./types";
 
@@ -177,11 +179,8 @@ test("GA 2.0.5 keeps the sidebar when the app-slot keymap registration also fail
             throw new Error("Keymap.Provider is missing");
         },
     });
-    const warnings: string[] = [];
-    const originalWarn = console.warn;
-    console.warn = (...args: unknown[]) => {
-        warnings.push(args.map(String).join(" "));
-    };
+    // The gap is recorded in the plugin log; the TUI host drops console output.
+    const logged = spyOn(logger, "log");
     try {
         const cleanup = await setupWithJsx(fixture.context, (type, props) => ({ type, props }));
         expect(fixture.claims.map((claim) => claim.append)).toEqual(["sidebar.content", "app"]);
@@ -191,11 +190,11 @@ test("GA 2.0.5 keeps the sidebar when the app-slot keymap registration also fail
         appClaim.render({});
         expect(fixture.layers).toHaveLength(0);
         expect(
-            warnings.filter((line) => line.includes("keymap.layer is unavailable")),
+            logged.mock.calls.filter(([line]) => line.includes("keymap.layer is unavailable")),
         ).toHaveLength(1);
         cleanup();
     } finally {
-        console.warn = originalWarn;
+        logged.mockRestore();
     }
 });
 
@@ -225,7 +224,7 @@ test("OpenCode 1.18.30 TUI loader projection executes unchanged sidebar registra
     expect(plugin.server).toBeUndefined();
     expect(typeof plugin.setup).toBe("function");
 
-    const directory = mkdtempSync(resolve(tmpdir(), "mc-v1-tui-union-"));
+    const directory = createTestTempDirFromPath(resolve(tmpdir(), "mc-v1-tui-union-"));
     temporary.push(directory);
     const fixture = v1Api(directory);
     const previousCompactionOverride = process.env.OPENCODE_DISABLE_AUTOCOMPACT;

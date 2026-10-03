@@ -199,6 +199,47 @@ describe("status detail text", () => {
         expect(summary).toContain("(MC-M02)");
     });
 
+    test("renders historian refusal stage and received runner text", () => {
+        const detail =
+            "historian refusal stage=credential provider=google model=google/model-a received=\"open_failed: no apikey credential for provider 'google'\"";
+        const status = formatStatusDetailMarkdown({
+            ...STATUS_FIXTURE,
+            historianRefusal: {
+                stage: "credential",
+                canonicalCause: "credential_unavailable",
+                detail,
+            },
+        });
+
+        expect(status).toContain("Historian refusal:** credential (credential_unavailable)");
+        expect(status).toContain(
+            "received=\"open_failed: no apikey credential for provider 'google'\"",
+        );
+    });
+
+    test("says which runner ran the session's completions and why", () => {
+        const status = formatStatusDetailMarkdown({
+            ...STATUS_FIXTURE,
+            historianRunner: {
+                runner: "host",
+                source: "default_for_harness",
+                harness: "opencode",
+                observed: "last_completion",
+            },
+            dreamerRunner: {
+                runner: "broca",
+                source: "configured",
+                harness: "opencode",
+                observed: "resolved_for_route",
+            },
+        });
+
+        expect(status).toMatch(
+            /^- \*\*Historian runner:\*\* host \(default for harness opencode\)$/m,
+        );
+        expect(status).toContain("- **Dreamer runner:** broca (configured) · no completion yet");
+    });
+
     test("does not expose module routing in the summary", () => {
         const rustStatus = formatStatusDetailMarkdown({
             ...STATUS_FIXTURE,

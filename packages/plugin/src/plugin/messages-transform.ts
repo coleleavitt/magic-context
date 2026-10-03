@@ -5,26 +5,29 @@ import {
     shouldBypassFailClosedBlock,
 } from "../features/magic-context/fail-closed-block";
 import { getOrCreateSessionMeta, openDatabase } from "../features/magic-context/storage";
+import { getSchemaFenceRejection } from "../features/magic-context/storage-db";
 import {
     getOverflowState,
     isEmergencyRecoveryArmed,
     isProviderOverflowFailClosedProven,
 } from "../features/magic-context/storage-meta-persisted";
 import { updateSessionMeta } from "../features/magic-context/storage-meta-session";
+import { DegradedPassRefusalError } from "../hooks/magic-context/degraded-pass-refusal";
 import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-closed";
 import { InheritedMagicContextMarkerError } from "../hooks/magic-context/inherited-compaction-marker-guard";
 import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-replay";
 import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
+import { StorageBusyRefusalError } from "../hooks/magic-context/storage-busy-refusal";
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
+import { replayRustModeBindingMismatchStrips } from "../hooks/magic-context/transform-postprocess-phase";
+import { UnresolvedHistoryBoundaryError } from "../hooks/magic-context/unresolved-history-boundary";
 import { log, sessionLog } from "../shared/logger";
-
-// Error codes that SQLite raises for transient contention — should be retried
-// on next transform pass rather than surfaced as persistent failures. BUSY is
-// by far the most common in WAL mode; LOCKED is theoretically possible when a
-// shared-cache conflict occurs (extremely rare in our single-DB setup but
-// covered defensively).
-const TRANSIENT_SQLITE_CODES = new Set(["SQLITE_BUSY", "SQLITE_LOCKED"]);
+import {
+    isTransientSqliteError,
+    withAsyncPrivilegedWriter,
+    withSqliteTransformPass,
+} from "../shared/sqlite";
 
 export const ASSISTANT_TERMINAL_RETRY_MESSAGE =
     "The conversation ends with a completed assistant response and cannot be resubmitted as-is — send a new message to continue.";
@@ -36,6 +39,16 @@ export class AssistantTerminalRetryError extends Error {
     constructor() {
         super(ASSISTANT_TERMINAL_RETRY_MESSAGE);
         this.name = "AssistantTerminalRetryError";
+    }
+}
+
+export class IncompleteUserMessageError extends Error {
+    readonly code = "INCOMPLETE_USER_MESSAGE";
+    readonly recoverable = true;
+
+    constructor() {
+        super("Your message hadn't finished arriving. Send it again.");
+        this.name = "IncompleteUserMessageError";
     }
 }
 
@@ -114,6 +127,47 @@ function enforcePersistedUserTerminatedTail(messages: MessageWithParts[]): void 
     moveUserToTail(messages, messages[userIndex], userIndex);
 }
 
+/**
+ * Role the provider request will end with once OpenCode serializes `messages`:
+ * an assistant's tool parts become a trailing tool-result (user) turn, so only
+ * an assistant carrying none of them ends the request as an assistant.
+ */
+function wireTailRole(messages: readonly MessageWithParts[]): "user" | "assistant" | "none" {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message.info.role === "user") return "user";
+        if (!assistantHasCompletedContent(message)) continue;
+        return message.parts.some((part) => (part as { type?: unknown }).type === "tool")
+            ? "user"
+            : "assistant";
+    }
+    return "none";
+}
+
+/**
+ * Diagnostic backstop: models without assistant prefill support reject a request
+ * that ends with an assistant turn, and the provider error does not say which
+ * transform produced it. Log when this pass turned a user-terminated array into
+ * an assistant-terminated one so a report carries the evidence.
+ */
+function reportAssistantTerminatedTail(
+    messages: readonly MessageWithParts[],
+    inputTailRole: ReturnType<typeof wireTailRole>,
+    sessionId: string | null,
+): void {
+    if (inputTailRole !== "user" || wireTailRole(messages) !== "assistant") return;
+    const tail = messages
+        .slice(-3)
+        .map(
+            (message) =>
+                `${message.info.role}:${message.parts.map((part) => (part as { type?: unknown }).type).join("+")}`,
+        )
+        .join(", ");
+    const line = `transform produced an assistant-terminated request (input was user-terminated); providers without prefill support will reject it. tail=[${tail}]`;
+    if (sessionId) sessionLog(sessionId, line);
+    else log(`[magic-context] ${line}`);
+}
+
 function preserveUserTerminatedTail(
     messages: MessageWithParts[],
     inputMessages: readonly MessageWithParts[],
@@ -156,9 +210,8 @@ function preserveUserTerminatedTail(
 }
 
 /**
- * Top-level transform wrapper. Catches errors so OpenCode's prompt loop
- * always proceeds — without this guard, a transient DB contention event can
- * crash the user's turn through OpenCode's Effect pipeline. See issue #23:
+ * Top-level transform wrapper. Ordinary bugs remain fail-open, but unsafe
+ * storage failures deliberately refuse the turn after trying LKG. See issue #23:
  * https://github.com/cortexkit/magic-context/issues/23
  *
  * Error handling is tiered:
@@ -168,10 +221,11 @@ function preserveUserTerminatedTail(
  *   message and the turn does not silently fall through to native compaction or a
  *   provider-rejected raw prompt.
  *
- * - **SQLITE_BUSY**: Transient, expected from concurrent plugin processes
- *   (second OpenCode instance, long dreamer/historian child session, slow
- *   WAL checkpoint). Logged tersely; next pass will retry naturally. No
- *   persistent telemetry needed.
+ * - **SQLITE_BUSY / SQLITE_LOCKED**: Writer acquisition already retried before
+ *   any callback ran. Replay LKG or refuse; never retry the mutating transform.
+ *
+ * - **UnresolvedHistoryBoundaryError / DegradedPassRefusalError**: The pass
+ *   could not produce a request that is safe to send. Replay LKG or refuse.
  *
  * - **Non-BUSY errors**: Schema corruption, programming bugs, type errors.
  *   These can silently disable magic-context for the entire session if the
@@ -193,8 +247,7 @@ function preserveUserTerminatedTail(
  * blocking the user for ordinary bugs — but deterministic inoperability and an unsafe
  * assistant-terminal retry must block loudly.
  *
- * Correctness is preserved because all persistent state mutations inside
- * the inner transform are idempotent across passes.
+ * The transform is not assumed idempotent: only transaction acquisition retries.
  */
 export function createMessagesTransformHandler(args: {
     magicContext: MagicContextTransformHooks;
@@ -215,6 +268,11 @@ export function createMessagesTransformHandler(args: {
      * error it raises is converted to passthrough here.
      */
     compactionOff?: boolean;
+    /** Let the v2 hook decide whether an ordinary error needs post-fold refusal or passthrough. */
+    propagateUnexpectedErrors?: boolean;
+    onStorageBusyRefusal?: (sessionId: string, message: string) => Promise<void>;
+    /** Validate and restore host-owned prompt segments before adopting replayed messages. */
+    onLkgReplay?: () => void;
     internalChildSessions?: Set<string>;
     tryReopenStorage?: () => boolean | Promise<boolean>;
 }): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<MessageWithParts[]> {
@@ -283,6 +341,42 @@ export function createMessagesTransformHandler(args: {
               })()
             : null;
         try {
+            if (magicContext) {
+                const admissionDb = openDatabase();
+                if (admissionDb) {
+                    if (!args.compactionOff) {
+                        await withAsyncPrivilegedWriter(admissionDb, () => undefined);
+                    }
+                } else {
+                    const fence = getSchemaFenceRejection();
+                    if (fence) {
+                        // Another process migrated context.db past the newest schema this
+                        // build supports. The inner transform writes through the handle this
+                        // process cached at startup, so running it would write rows the newer
+                        // schema no longer reads the same way. Refuse the pass instead, the
+                        // way boot refuses a database it cannot open.
+                        log(
+                            `[magic-context] schema fence on a cached handle: database v${fence.persistedVersion} is newer than this build supports (v${fence.supportedVersion}); refusing to transform`,
+                        );
+                        if (args.compactionOff) {
+                            restoreCompactionOffInput();
+                            return output.messages;
+                        }
+                        if (args.failClosed) {
+                            args.failClosed.arm({ kind: "schema_fence", ...fence });
+                            await args.failClosed.enforce({
+                                blockingEnabled: args.failClosedBlockingEnabled !== false,
+                                exempt: shouldBypassFailClosedBlock({
+                                    agent,
+                                    isInternalChildSession: isInternalChild,
+                                }),
+                                tryReopen: args.tryReopenStorage,
+                            });
+                        }
+                        return output.messages;
+                    }
+                }
+            }
             await magicContext?.["experimental.chat.messages.transform"]?.(input, output);
             return output.messages;
         } catch (error) {
@@ -303,7 +397,12 @@ export function createMessagesTransformHandler(args: {
                 restoreCompactionOffInput();
                 return output.messages;
             }
-            if (!args.compactionOff && sessionId && isProviderOverflowFailClosedProven(sessionId)) {
+            if (
+                !args.compactionOff &&
+                !isTransientSqliteError(error) &&
+                sessionId &&
+                isProviderOverflowFailClosedProven(sessionId)
+            ) {
                 throw new EmergencyFailClosedError(
                     "Emergency recovery transform failed; refusing an unbounded raw fallback",
                     { cause: error },
@@ -336,8 +435,16 @@ export function createMessagesTransformHandler(args: {
                             modelKey: keys.modelKey,
                             providerKey: keys.providerKey,
                             entry,
+                            prepareReplay: (messages) =>
+                                replayRustModeBindingMismatchStrips({
+                                    db,
+                                    sessionId,
+                                    messages,
+                                    resolvedProviderID: keys.providerKey ?? undefined,
+                                }),
                         });
                         if (replay.ok) {
+                            args.onLkgReplay?.();
                             replaceMessagesInPlace(
                                 output,
                                 replay.messages as unknown as MessageWithParts[],
@@ -357,18 +464,48 @@ export function createMessagesTransformHandler(args: {
             } else if (sessionId) {
                 sessionLog(sessionId, "lkg_miss");
             }
+            // The LKG replay above (the last request this session served
+            // successfully) could not stand in, and the pass could not produce a
+            // request that is safe to send: the untrimmed request does not fit
+            // the window, or a stage the request depends on failed. Refuse the
+            // turn rather than hand the provider a request it will reject (or,
+            // on OpenCode 1, the raw input messages, which are just as large).
+            if (
+                !args.compactionOff &&
+                (error instanceof UnresolvedHistoryBoundaryError ||
+                    error instanceof DegradedPassRefusalError)
+            ) {
+                throw error;
+            }
             const code = (error as { code?: string } | null)?.code;
             const name = (error as { name?: string } | null)?.name;
             const message = error instanceof Error ? error.message : String(error);
-            const isTransient = typeof code === "string" && TRANSIENT_SQLITE_CODES.has(code);
+            const isTransient =
+                isTransientSqliteError(error) || error instanceof StorageBusyRefusalError;
 
             if (isTransient) {
+                if (!args.compactionOff) {
+                    const refusal =
+                        error instanceof StorageBusyRefusalError
+                            ? error
+                            : new StorageBusyRefusalError(error, "messages-transform");
+                    if (sessionId && args.onStorageBusyRefusal) {
+                        try {
+                            await args.onStorageBusyRefusal(sessionId, refusal.message);
+                        } catch (noticeError) {
+                            log("[magic-context] storage-busy host refusal failed:", noticeError);
+                        }
+                    }
+                    throw refusal;
+                }
                 log(
                     `[magic-context] transform skipped this pass — ${code} (transient; retrying next pass): ${message}`,
                 );
                 restoreCompactionOffInput();
                 return output.messages;
             }
+
+            if (args.propagateUnexpectedErrors) throw error;
 
             // Persistent non-transient errors are the real risk: silent forever
             // disable unless we surface them. Persist to session_meta so the
@@ -413,15 +550,35 @@ export function createMessagesTransformHandler(args: {
         return output.messages;
     };
 
-    return async (input, output): Promise<MessageWithParts[]> => {
-        const inputMessages = [...output.messages];
-        enforcePersistedUserTerminatedTail(output.messages);
-        try {
-            return await run(input, output);
-        } finally {
-            preserveUserTerminatedTail(output.messages, inputMessages);
-        }
-    };
+    return (input, output): Promise<MessageWithParts[]> =>
+        withSqliteTransformPass(async () => {
+            const tail = output.messages.at(-1);
+            // OpenCode persists the user row before its parts. Refuse before any
+            // transform or replay can turn that incomplete row into the old request.
+            // ID-less injected heads and host summary rows are not arriving prompts.
+            if (
+                tail?.info.role === "user" &&
+                tail.info.id &&
+                !(tail.info as { summary?: boolean }).summary &&
+                tail.parts.length === 0
+            ) {
+                throw new IncompleteUserMessageError();
+            }
+            const inputMessages = [...output.messages];
+            // Read before the transform runs: it mutates the shared message objects.
+            const inputTailRole = wireTailRole(output.messages);
+            enforcePersistedUserTerminatedTail(output.messages);
+            try {
+                return await run(input, output);
+            } finally {
+                preserveUserTerminatedTail(output.messages, inputMessages);
+                reportAssistantTerminatedTail(
+                    output.messages,
+                    inputTailRole,
+                    resolveSessionId(output),
+                );
+            }
+        });
 }
 
 function resolveSessionId(output: MessagesTransformOutput): string | null {

@@ -1,11 +1,12 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
 import { formatEmbedStatusText } from "../../hooks/magic-context/format-embed-status";
+import { setEmbeddingSessionBusy } from "../../shared/embedding-activity";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     chunkCanonicalText,
     loadCompartmentChunkEmbeddingsForSearch,
@@ -31,12 +32,14 @@ import {
     loadAllEmbeddings,
     saveEmbedding,
 } from "./memory/storage-memory-embeddings";
-import { recordMessageFtsRowid } from "./message-fts-rowid-map";
+import { backfillMessageFtsRowidMapBatch, recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setShadowBackfillNowForTests,
     _setTestProviderFactoryForProject,
     drainCommitBacklogForProject,
+    drainProjectEmbeddingIdentityMaintenance,
+    drainStaleEmbeddingIdentitiesForProject,
     embedSessionCompartmentChunks,
     embedTextForProject,
     embedUnembeddedCompartmentChunksForProject,
@@ -56,7 +59,12 @@ import {
     TestProviderFactoryRequiredError,
     unregisterProjectShadowEmbedding,
 } from "./project-embedding-registry";
-import { recordSessionProjectIdentity } from "./session-project-storage";
+import {
+    hasMisScopedCompartmentChunkEmbeddingsForProject,
+    MIS_SCOPED_PROJECT_CHUNK_IDS_SQL,
+    recordSessionProjectIdentity,
+    repairMisScopedCompartmentChunkEmbeddingsForProject,
+} from "./session-project-storage";
 import { closeDatabase, openDatabase } from "./storage";
 import { beginSynapseBatchLedger } from "./storage-embedding-measurements";
 
@@ -248,12 +256,16 @@ function seedOversizedCompartmentWithFts(
 describe("project embedding registry", () => {
     const tempDirs: string[] = [];
     const originalXdgDataHome = process.env.XDG_DATA_HOME;
+    const originalHfEndpoint = process.env.HF_ENDPOINT;
 
     function useTempDb() {
-        const dir = mkdtempSync(join(tmpdir(), "project-embedding-registry-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "project-embedding-registry-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
-        return openDatabase();
+        const db = openDatabase();
+        // These fixtures model upgraded stores; do not depend on startup completing synchronously.
+        if (db) backfillMessageFtsRowidMapBatch(db);
+        return db;
     }
 
     afterEach(() => {
@@ -261,6 +273,8 @@ describe("project embedding registry", () => {
         closeDatabase();
         if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
         else process.env.XDG_DATA_HOME = originalXdgDataHome;
+        if (originalHfEndpoint === undefined) delete process.env.HF_ENDPOINT;
+        else process.env.HF_ENDPOINT = originalHfEndpoint;
         for (const dir of tempDirs) {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -443,7 +457,38 @@ describe("project embedding registry", () => {
         expect(withDocumentPrefix.chunkModelId).not.toBe(withFamilyDefault.chunkModelId);
     });
 
-    it("preserves existing provider and runtime identity goldens", () => {
+    it("keeps memory and chunk identities byte-identical across HF_ENDPOINT mirrors", () => {
+        const db = useTempDb();
+        const config = localConfig("Xenova/all-MiniLM-L6-v2");
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+
+        delete process.env.HF_ENDPOINT;
+        const defaultEndpoint = registerProjectEmbedding(
+            db,
+            "identity-default-endpoint",
+            config,
+            features,
+            "/repo",
+        );
+        process.env.HF_ENDPOINT = "https://mirror.example/";
+        const mirrorEndpoint = registerProjectEmbedding(
+            db,
+            "identity-mirror-endpoint",
+            config,
+            features,
+            "/repo",
+        );
+
+        expect({
+            memory: mirrorEndpoint.modelId,
+            chunk: mirrorEndpoint.chunkModelId,
+        }).toEqual({
+            memory: defaultEndpoint.modelId,
+            chunk: defaultEndpoint.chunkModelId,
+        });
+    });
+
+    it("pins provider and runtime identity goldens", () => {
         const db = useTempDb();
         const features = { memoryEnabled: true, gitCommitEnabled: true };
         const local = registerProjectEmbedding(
@@ -478,9 +523,9 @@ describe("project embedding registry", () => {
             providerIdentity: local.providerIdentity,
             runtimeFingerprint: local.runtimeFingerprint,
         }).toEqual({
-            providerIdentity: "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357",
+            providerIdentity: "embedding-provider:ac1a4f8f0674f430a6c85a0e1a43a86a",
             runtimeFingerprint:
-                "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357:4bc2bab437bc88bc",
+                "embedding-provider:ac1a4f8f0674f430a6c85a0e1a43a86a:4bc2bab437bc88bc",
         });
         expect({
             providerIdentity: openai.providerIdentity,
@@ -543,7 +588,7 @@ describe("project embedding registry", () => {
         ).resolves.toBeNull();
     });
 
-    it("default local config (no local_dtype) keeps the golden identity — no re-embed on upgrade (#259)", () => {
+    it("default local config keeps the current runtime golden without a dtype-only re-embed (#259)", () => {
         const db = useTempDb();
         const features = { memoryEnabled: true, gitCommitEnabled: true };
         const noDtype = registerProjectEmbedding(
@@ -553,10 +598,10 @@ describe("project embedding registry", () => {
             features,
             "/repo",
         );
-        // Must match the golden local identity from the test above — adding
-        // the local_dtype field must NOT change the default identity string.
+        // Must match the runtime-versioned golden above. Omitting local_dtype
+        // does not add another identity term because fp32 remains the default.
         expect(noDtype.providerIdentity).toBe(
-            "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357",
+            "embedding-provider:ac1a4f8f0674f430a6c85a0e1a43a86a",
         );
     });
 
@@ -801,6 +846,63 @@ describe("project embedding registry", () => {
         release?.();
 
         expect(await inFlight).toBeNull();
+    });
+
+    it("defers proactive memory and history backfill during a stream but keeps query embedding available", async () => {
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
+        );
+        const db = useTempDb();
+        const projectIdentity = "git:streaming-embedding-gate";
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "Embed after the stream.",
+        });
+        seedCompartmentWithFts(db, "ses-streaming-embedding-gate");
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/streaming-embedding-gate",
+        );
+        recordSessionProjectIdentity(db, "ses-streaming-embedding-gate", projectIdentity);
+        setEmbeddingSessionBusy("ses-streaming-embedding-gate", true);
+        try {
+            expect(await embedUnembeddedMemoriesForProject(db, projectIdentity)).toBe(0);
+            expect((await sweepAllRegisteredProjects(db)).chunksEmbedded).toBe(0);
+            expect(
+                (
+                    await embedSessionCompartmentChunks(
+                        db,
+                        projectIdentity,
+                        "ses-streaming-embedding-gate",
+                    )
+                ).status,
+            ).toBe("aborted");
+            expect(
+                await embedTextForProject(
+                    projectIdentity,
+                    "search while streaming",
+                    undefined,
+                    "query",
+                ),
+            ).not.toBeNull();
+        } finally {
+            setEmbeddingSessionBusy("ses-streaming-embedding-gate", false);
+        }
+        expect(await embedUnembeddedMemoriesForProject(db, projectIdentity)).toBe(1);
+        expect(
+            (
+                await embedSessionCompartmentChunks(
+                    db,
+                    projectIdentity,
+                    "ses-streaming-embedding-gate",
+                )
+            ).embedded,
+        ).toBe(1);
     });
 
     it("stores unembedded memory vectors when the memory content stays unchanged", async () => {
@@ -1125,6 +1227,106 @@ describe("project embedding registry", () => {
         expect(loadAllEmbeddings(db, projectIdentity, first.modelId).size).toBe(1);
     });
 
+    it("discovers legacy models before admission and records at most 25 per scope per registration", () => {
+        const db = useTempDb();
+        const project = "git:legacy-bounded";
+        const memory = insertMemory(db, {
+            projectPath: project,
+            category: "CONSTRAINTS",
+            content: "Legacy vectors",
+        });
+        for (let i = 0; i < 60; i++)
+            saveEmbedding(db, memory.id, new Float32Array([1, 0]), `legacy-${i}`);
+        const prepare = db.prepare.bind(db);
+        const discoveryInTransaction: boolean[] = [];
+        const spy = spyOn(db, "prepare").mockImplementation((sql: string) => {
+            if (sql.includes("SELECT model_id FROM")) discoveryInTransaction.push(db.inTransaction);
+            return prepare(sql);
+        });
+        try {
+            const register = () =>
+                registerProjectEmbedding(
+                    db,
+                    project,
+                    localConfig("current"),
+                    { memoryEnabled: true, gitCommitEnabled: false },
+                    "/tmp/legacy",
+                );
+            const count = () =>
+                (
+                    db
+                        .prepare(
+                            "SELECT COUNT(*) AS n FROM embedding_identity_active WHERE project_path=? AND model_id LIKE 'legacy-%'",
+                        )
+                        .get(project) as { n: number }
+                ).n;
+            register();
+            expect(count()).toBe(25);
+            register();
+            expect(count()).toBe(50);
+            register();
+            expect(count()).toBe(60);
+            expect(discoveryInTransaction.length).toBeGreaterThan(0);
+            expect(discoveryInTransaction.every((inside) => !inside)).toBe(true);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    // Registration runs on every OpenCode auto-embed claim and on every
+    // maintenance tick (ensureProjectRegisteredFromOpenCodeDirectory is not
+    // cached). Once every legacy model has a marker and no chunk is mis-scoped,
+    // re-registration should cost a few indexed lookups. The legacy-model query
+    // is a DISTINCT over every memory, commit and chunk vector of the project,
+    // measured at 107-234 ms on a real store, and it runs synchronously on the
+    // host's event loop even though it no longer holds the writer lock.
+    it("does not rescan the project's vector tables for legacy models on a steady-state re-registration", () => {
+        const db = useTempDb();
+        const project = "git:steady-state";
+        const memory = insertMemory(db, {
+            projectPath: project,
+            category: "CONSTRAINTS",
+            content: "Steady state",
+        });
+        for (let i = 0; i < 3; i++)
+            saveEmbedding(db, memory.id, new Float32Array([1, 0]), `legacy-${i}`);
+        const prepare = db.prepare.bind(db);
+        let counting = false;
+        let legacyScans = 0;
+        const spy = spyOn(db, "prepare").mockImplementation((sql: string) => {
+            const statement = prepare(sql);
+            if (!sql.includes("SELECT DISTINCT e.model_id")) return statement;
+            for (const method of ["all", "run", "get", "iterate"] as const) {
+                const original = (statement as unknown as Record<string, unknown>)[method];
+                if (typeof original !== "function") continue;
+                Object.defineProperty(statement, method, {
+                    configurable: true,
+                    value: (...args: unknown[]) => {
+                        if (counting) legacyScans++;
+                        return (original as (...a: unknown[]) => unknown).apply(statement, args);
+                    },
+                });
+            }
+            return statement;
+        });
+        try {
+            const register = () =>
+                registerProjectEmbedding(
+                    db,
+                    project,
+                    localConfig("current"),
+                    { memoryEnabled: true, gitCommitEnabled: true },
+                    "/tmp/steady-state",
+                );
+            register();
+            counting = true;
+            register();
+            expect(legacyScans).toBe(0);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
     it("deletes stale embedding rows in bounded batches and resumes on the next sweep", () => {
         const db = useTempDb();
         const projectIdentity = "git:gc-batched";
@@ -1181,7 +1383,7 @@ describe("project embedding registry", () => {
         ).run(now - 15 * 24 * 60 * 60 * 1000, projectIdentity, first.chunkModelId);
 
         const firstSweep = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
-        expect(firstSweep.chunkRowsDeleted).toBe(250);
+        expect(firstSweep.chunkRowsDeleted).toBe(25);
         expect(firstSweep.trackingRowsDeleted).toBe(0);
         expect(
             db
@@ -1189,11 +1391,59 @@ describe("project embedding registry", () => {
                     "SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE project_path = ? AND model_id = ?",
                 )
                 .get(projectIdentity, first.chunkModelId),
-        ).toEqual({ count: 50 });
+        ).toEqual({ count: 275 });
 
         const secondSweep = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
-        expect(secondSweep.chunkRowsDeleted).toBe(50);
-        expect(secondSweep.trackingRowsDeleted).toBe(1);
+        expect(secondSweep.chunkRowsDeleted).toBe(25);
+        expect(secondSweep.trackingRowsDeleted).toBe(0);
+        for (let batch = 0; batch < 9; batch++) {
+            expect(
+                sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now).chunkRowsDeleted,
+            ).toBe(25);
+        }
+        const finalSweep = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity, now);
+        expect(finalSweep.chunkRowsDeleted).toBe(25);
+        expect(finalSweep.trackingRowsDeleted).toBe(1);
+    });
+
+    it("drains many stale GC batches within one maintenance tick", async () => {
+        const db = useTempDb();
+        const project = "git:gc-tick-drain";
+        registerProjectEmbedding(
+            db,
+            project,
+            localConfig("current"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/gc-tick",
+        );
+        for (let i = 0; i < 100; i++)
+            db.prepare("INSERT INTO embedding_identity_active VALUES (?, 'memory', ?, 0)").run(
+                project,
+                `expired-${i}`,
+            );
+        expect(
+            (await drainStaleEmbeddingIdentitiesForProject(db, project)).trackingRowsDeleted,
+        ).toBe(100);
+    });
+
+    it("bounds stale GC even when expired identities have no vectors", () => {
+        const db = useTempDb();
+        const project = "git:empty-gc-bounded";
+        registerProjectEmbedding(
+            db,
+            project,
+            localConfig("current"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/empty-gc",
+        );
+        for (let i = 0; i < 60; i++)
+            db.prepare("INSERT INTO embedding_identity_active VALUES (?, 'memory', ?, 0)").run(
+                project,
+                `expired-${i}`,
+            );
+        expect(sweepStaleEmbeddingIdentitiesForProject(db, project).trackingRowsDeleted).toBe(25);
+        expect(sweepStaleEmbeddingIdentitiesForProject(db, project).trackingRowsDeleted).toBe(25);
+        expect(sweepStaleEmbeddingIdentitiesForProject(db, project).trackingRowsDeleted).toBe(10);
     });
 
     it("suppresses GC while a project's last config load was untrusted", () => {
@@ -1453,6 +1703,56 @@ describe("project embedding registry", () => {
         ).toHaveLength(0);
     });
 
+    it("registers a current identity by reading and probes repairs through project indexes", () => {
+        const db = useTempDb();
+        const identity = "git:repair-read";
+        const config = localConfig("test-model");
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const prepare = spyOn(db, "prepare");
+        registerProjectEmbedding(db, identity, config, features, "/tmp/repair-read");
+        expect(
+            prepare.mock.calls.filter(([sql]) =>
+                String(sql).startsWith("UPDATE compartment_chunk_embeddings"),
+            ),
+        ).toHaveLength(0);
+        prepare.mockRestore();
+        const before = (db.prepare("SELECT total_changes() AS count").get() as { count: number })
+            .count;
+        const exec = spyOn(db, "exec");
+        for (let i = 0; i < 4; i++)
+            registerProjectEmbedding(db, identity, config, features, "/tmp/repair-read");
+        expect(
+            (db.prepare("SELECT total_changes() AS count").get() as { count: number }).count,
+        ).toBe(before);
+        expect(
+            exec.mock.calls.filter(([sql]) => String(sql).includes("BEGIN IMMEDIATE")),
+        ).toHaveLength(0);
+        exec.mockRestore();
+        expect(hasMisScopedCompartmentChunkEmbeddingsForProject(db, identity)).toBe(false);
+        expect(repairMisScopedCompartmentChunkEmbeddingsForProject(db, identity)).toBe(0);
+        const plan = db
+            .prepare(
+                `EXPLAIN QUERY PLAN SELECT 1 FROM (${MIS_SCOPED_PROJECT_CHUNK_IDS_SQL}) LIMIT 1`,
+            )
+            .all(identity, identity) as Array<{ detail: string }>;
+        expect(plan.some((row) => row.detail.includes("idx_cce_project_model"))).toBe(true);
+        expect(plan.some((row) => row.detail.includes("idx_session_projects_project"))).toBe(true);
+        expect(plan.some((row) => row.detail.includes("SCAN compartment_chunk_embeddings"))).toBe(
+            false,
+        );
+        const oldPlan = db
+            .prepare(`EXPLAIN QUERY PLAN SELECT id FROM compartment_chunk_embeddings
+            WHERE EXISTS (SELECT 1 FROM session_projects sp
+                WHERE sp.session_id = compartment_chunk_embeddings.session_id
+                AND sp.harness = compartment_chunk_embeddings.harness
+                AND sp.project_path <> compartment_chunk_embeddings.project_path
+                AND (sp.project_path = ? OR compartment_chunk_embeddings.project_path = ?))`)
+            .all(identity, identity) as Array<{ detail: string }>;
+        expect(
+            oldPlan.some((row) => row.detail.includes("SCAN compartment_chunk_embeddings")),
+        ).toBe(true);
+    });
+
     it("repairs chunk rows stamped with a different project than their session owner", async () => {
         const db = useTempDb();
         const compartmentId = seedCompartmentWithFts(db, "ses-repair");
@@ -1479,23 +1779,24 @@ describe("project embedding registry", () => {
         ).toHaveLength(1);
     });
 
-    it("caps session-scoped chunk repair work per observation", () => {
-        const db = useTempDb();
-        const compartmentId = seedCompartmentWithFts(db, "ses-repair-batched");
-        const windows = chunkCanonicalText("[1] U: hello", 1, 1, 10_000);
-        replaceCompartmentChunkEmbeddings(
-            db,
-            windows.map((window) => ({
-                compartmentId,
-                sessionId: "ses-repair-batched",
-                projectPath: "git:wrong",
-                window,
-                modelId: "chunk:model",
-                vector: new Float32Array([1, 0]),
-            })),
-        );
-        db.prepare(
-            `WITH RECURSIVE seq(n) AS (
+    for (const mode of ["session", "registration"])
+        it(`caps ${mode}-scoped chunk repair work per observation`, async () => {
+            const db = useTempDb();
+            const compartmentId = seedCompartmentWithFts(db, "ses-repair-batched");
+            const windows = chunkCanonicalText("[1] U: hello", 1, 1, 10_000);
+            replaceCompartmentChunkEmbeddings(
+                db,
+                windows.map((window) => ({
+                    compartmentId,
+                    sessionId: "ses-repair-batched",
+                    projectPath: "git:wrong",
+                    window,
+                    modelId: "chunk:model",
+                    vector: new Float32Array([1, 0]),
+                })),
+            );
+            db.prepare(
+                `WITH RECURSIVE seq(n) AS (
                  SELECT 1
                  UNION ALL
                  SELECT n + 1 FROM seq WHERE n < 149
@@ -1510,28 +1811,69 @@ describe("project embedding registry", () => {
              FROM compartment_chunk_embeddings base
              CROSS JOIN seq
              WHERE base.compartment_id = ? AND base.model_id = ? AND base.window_index = 0`,
-        ).run(compartmentId, "chunk:model");
+            ).run(compartmentId, "chunk:model");
 
-        recordSessionProjectIdentity(db, "ses-repair-batched", "git:right");
-        expect(
-            db
-                .prepare(
-                    "SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE session_id = ? AND project_path = ?",
-                )
-                .get("ses-repair-batched", "git:right"),
-        ).toEqual({ count: 100 });
+            if (mode === "session")
+                recordSessionProjectIdentity(db, "ses-repair-batched", "git:right");
+            else {
+                db.prepare(`INSERT OR IGNORE INTO session_projects(session_id, harness, project_path, updated_at)
+                SELECT session_id, harness, 'git:right', 0 FROM compartment_chunk_embeddings WHERE compartment_id=? LIMIT 1`).run(
+                    compartmentId,
+                );
+                registerProjectEmbedding(
+                    db,
+                    "git:right",
+                    localConfig("repair-model"),
+                    { memoryEnabled: true, gitCommitEnabled: false },
+                    "/tmp/repair",
+                );
+            }
+            expect(
+                db
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE session_id = ? AND project_path = ?",
+                    )
+                    .get("ses-repair-batched", "git:right"),
+            ).toEqual({ count: mode === "session" ? 100 : 25 });
 
-        recordSessionProjectIdentity(db, "ses-repair-batched", "git:right");
-        expect(
-            db
-                .prepare(
-                    "SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE session_id = ? AND project_path = ?",
-                )
-                .get("ses-repair-batched", "git:right"),
-        ).toEqual({ count: 150 });
-    });
+            if (mode === "session")
+                recordSessionProjectIdentity(db, "ses-repair-batched", "git:right");
+            else {
+                db.prepare(`INSERT OR IGNORE INTO session_projects(session_id, harness, project_path, updated_at)
+                SELECT session_id, harness, 'git:right', 0 FROM compartment_chunk_embeddings WHERE compartment_id=? LIMIT 1`).run(
+                    compartmentId,
+                );
+                registerProjectEmbedding(
+                    db,
+                    "git:right",
+                    localConfig("repair-model"),
+                    { memoryEnabled: true, gitCommitEnabled: false },
+                    "/tmp/repair",
+                );
+            }
+            expect(
+                db
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE session_id = ? AND project_path = ?",
+                    )
+                    .get("ses-repair-batched", "git:right"),
+            ).toEqual({ count: mode === "session" ? 150 : 50 });
+            if (mode === "registration") {
+                expect(await drainProjectEmbeddingIdentityMaintenance(db, "git:right")).toBe(4);
+                expect(
+                    db
+                        .prepare(
+                            "SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE session_id = ? AND project_path = ?",
+                        )
+                        .get("ses-repair-batched", "git:right"),
+                ).toEqual({ count: 150 });
+            }
+        });
 
-    it("does not backfill compartment chunks when memory is disabled", async () => {
+    // Issue 543: history embedding is not a memory feature. With memory off and
+    // a provider configured, the passive backfill still embeds compartments,
+    // but memory rows are never embedded.
+    it("backfills compartment chunks when memory is disabled but embeds no memories", async () => {
         _setTestProviderFactoryForProject(
             (config) =>
                 new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
@@ -1539,19 +1881,83 @@ describe("project embedding registry", () => {
         const db = useTempDb();
         seedCompartmentWithFts(db, "ses-memory-off");
         recordSessionProjectIdentity(db, "ses-memory-off", "git:off");
-        registerProjectEmbedding(
+        const snapshot = registerProjectEmbedding(
             db,
             "git:off",
             localConfig("model-a"),
             { memoryEnabled: false, gitCommitEnabled: false },
             "/tmp/off",
         );
+        insertMemory(db, {
+            projectPath: "git:off",
+            category: "CONSTRAINTS",
+            content: "A memory left over from before memory was turned off.",
+        });
+        expect(snapshot.enabled).toBe(false);
+        expect(snapshot.historyEnabled).toBe(true);
 
         const result = await sweepAllRegisteredProjects(db, 5);
-        expect(result.chunksEmbedded).toBe(0);
+        expect(result.chunksEmbedded).toBe(1);
+        expect(result.memoriesEmbedded).toBe(0);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(db, "ses-memory-off", "git:off", "chunk:model"),
-        ).toHaveLength(0);
+            loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                "ses-memory-off",
+                "git:off",
+                currentChunkModelId("git:off"),
+            ),
+        ).toHaveLength(1);
+        expect(db.prepare("SELECT COUNT(*) AS count FROM memory_embeddings").get()).toEqual({
+            count: 0,
+        });
+        const coverage = getEmbeddingCoverageStatus(db, "git:off", "ses-memory-off");
+        expect(coverage.enabled).toBe(true);
+        expect(coverage.session).toEqual({ embedded: 1, total: 1 });
+        expect(coverage.memories).toEqual({ embedded: 0, total: 0, memoryEnabled: false });
+    });
+
+    it("embeds nothing when the embedding provider is off", async () => {
+        let providerCalls = 0;
+        _setTestProviderFactoryForProject((config) => {
+            providerCalls += 1;
+            return new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off");
+        });
+        const db = useTempDb();
+        seedCompartmentWithFts(db, "ses-provider-off");
+        recordSessionProjectIdentity(db, "ses-provider-off", "git:provider-off");
+        const snapshot = registerProjectEmbedding(
+            db,
+            "git:provider-off",
+            { provider: "off" },
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/provider-off",
+        );
+        insertMemory(db, {
+            projectPath: "git:provider-off",
+            category: "CONSTRAINTS",
+            content: "A memory that must stay unembedded while the provider is off.",
+        });
+        expect(snapshot.enabled).toBe(false);
+        expect(snapshot.historyEnabled).toBe(false);
+
+        const result = await sweepAllRegisteredProjects(db, 5);
+        expect(result).toMatchObject({ chunksEmbedded: 0, memoriesEmbedded: 0 });
+        const outcome = await embedSessionCompartmentChunks(
+            db,
+            "git:provider-off",
+            "ses-provider-off",
+        );
+        expect(outcome.status).toBe("disabled");
+        expect(
+            db.prepare("SELECT COUNT(*) AS count FROM compartment_chunk_embeddings").get(),
+        ).toEqual({ count: 0 });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM memory_embeddings").get()).toEqual({
+            count: 0,
+        });
+        expect(providerCalls).toBe(0);
+        expect(getEmbeddingCoverageStatus(db, "git:provider-off", "ses-provider-off").enabled).toBe(
+            false,
+        );
     });
 
     it("re-embeds chunks but preserves memory vectors when max_input_tokens changes", async () => {
@@ -1794,7 +2200,9 @@ describe("project embedding registry", () => {
         expect(Math.max(...callWindowCounts)).toBeLessThanOrEqual(16);
     });
 
-    it("embedSessionCompartmentChunks returns disabled when memory is off", async () => {
+    // Issue 543: the session drain (manual /ctx-embed and the automatic
+    // per-session trigger) embeds history with memory off.
+    it("embedSessionCompartmentChunks embeds history when memory is off", async () => {
         _setTestProviderFactoryForProject(
             (config) =>
                 new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
@@ -1810,8 +2218,8 @@ describe("project embedding registry", () => {
         );
 
         const outcome = await embedSessionCompartmentChunks(db, "git:embed-off", "ses-off");
-        expect(outcome.status).toBe("disabled");
-        expect(outcome.embedded).toBe(0);
+        expect(outcome.status).toBe("done");
+        expect(outcome.embedded).toBe(1);
     });
 
     it("embedSessionCompartmentChunks aborts cleanly on signal", async () => {

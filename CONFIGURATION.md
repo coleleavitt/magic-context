@@ -15,6 +15,64 @@ Project config always merges on top of user config. The unified setup wizard (`n
 
 > **Migrating from an earlier version?** Config used to live in per-harness paths (`~/.config/opencode/`, `~/.pi/agent/`, `<project>/.opencode/`, `<project>/.pi/`, or the project root). On first run after upgrading, Magic Context moves your existing config to the CortexKit location automatically and leaves a `<old-name>.MOVED_READPLEASE` breadcrumb (preserving your original settings) at each old path. If two old locations held *different* settings it won't guess — it leaves both in place and warns you to consolidate by hand.
 
+### Changing config without a restart
+
+Keys listed below apply from the next historian or dreamer run (or dream-timer tick); a run in progress keeps its original inputs. All other keys require a host restart. On a malformed edit, the last good config remains active and `/ctx-status` reports the error. The live mark in the [JSON schema](assets/magic-context.schema.json) is authoritative; this list is checked against it.
+
+<!-- LIVE-CONFIG-KEYS-START -->
+- `commit_cluster_trigger.enabled`
+- `commit_cluster_trigger.min_clusters`
+- `dreamer.maxTokens`
+- `dreamer.omp.fallback_models`
+- `dreamer.omp.model`
+- `dreamer.omp.tasks`
+- `dreamer.omp.thinking_level`
+- `dreamer.opencode.fallback_models`
+- `dreamer.opencode.model`
+- `dreamer.opencode.tasks`
+- `dreamer.opencode.variant`
+- `dreamer.pi.fallback_models`
+- `dreamer.pi.model`
+- `dreamer.pi.tasks`
+- `dreamer.pi.thinking_level`
+- `dreamer.tasks.classify-memories.schedule`
+- `dreamer.tasks.compress-cues.schedule`
+- `dreamer.tasks.curate.schedule`
+- `dreamer.tasks.evaluate-smart-notes.schedule`
+- `dreamer.tasks.maintain-docs.max_tokens` (default 12000; combined proposed docs budget)
+- `dreamer.tasks.maintain-docs.schedule`
+- `dreamer.tasks.map-memories.schedule`
+- `dreamer.tasks.promote-primers.promotion_threshold`
+- `dreamer.tasks.promote-primers.schedule`
+- `dreamer.tasks.refresh-primers.schedule`
+- `dreamer.tasks.retrospective.recency_days`
+- `dreamer.tasks.retrospective.schedule`
+- `dreamer.tasks.review-user-memories.promotion_threshold`
+- `dreamer.tasks.review-user-memories.schedule`
+- `dreamer.tasks.verify-broad.schedule`
+- `dreamer.tasks.verify.schedule`
+- `historian.maxTokens`
+- `historian.omp.fallback_models`
+- `historian.omp.model`
+- `historian.omp.thinking_level`
+- `historian.opencode.fallback_models`
+- `historian.opencode.model`
+- `historian.opencode.variant`
+- `historian.pi.fallback_models`
+- `historian.pi.model`
+- `historian.pi.thinking_level`
+- `historian.two_pass`
+- `historian_timeout_ms`
+- `memory.auto_promote`
+- `memory.git_commit_indexing.enabled`
+- `memory.git_commit_indexing.max_commits`
+- `memory.git_commit_indexing.since_days`
+- `mural.model`
+- `toast_duration_ms`
+<!-- LIVE-CONFIG-KEYS-END -->
+
+`dreamer.<host>.tasks` is a map: each task's model, fallback chain, reasoning qualifier and timeout inherit this live behavior. Project-tier restrictions still apply; for example, historian model selection remains user-tier only.
+
 ### Per-harness model migration
 
 Historian and dreamer model execution live in independent `opencode`, `pi`, and `omp` blocks. On the first user-config read that finds the former flat model fields, Magic Context writes one exact-byte recovery copy at `<config>.pre-per-harness.bak` before rewriting the config. **Magic Context retains `<config>.pre-per-harness.bak` indefinitely and never garbage-collects it. You may delete it manually after you no longer need the recovery copy.**
@@ -77,7 +135,7 @@ Both plugins write to the same SQLite database at `~/.local/share/cortexkit/magi
 
 Project memories therefore flow across OpenCode, Pi, and OMP, while per-session state remains scoped to the OpenCode, Pi, or OMP runtime.
 
-> **OpenCode 2 hidden runs:** historian and text-only Dreamer work runs on the resolved `historian.opencode` / `dreamer.opencode` model chain in reusable unparented sessions. This keeps the user's session model and token accounting untouched while preserving the calibrated system/user prompt and request options. OpenCode 2 currently exposes no plugin removal API, so one root titled **Magic Context historian** and, when needed, one titled **Magic Context dreamer** remain visible per project. Failed and incompatible-host-generation roots can also remain. List them with `npx @cortexkit/magic-context@latest doctor list-hidden-sessions`; remove unwanted roots manually in OpenCode. Magic Context never deletes them.
+> **OpenCode 2 hidden runs:** OpenCode 2.0.22 or newer is required. Each historian and Dreamer run gets a fresh child session on the resolved `historian.opencode` / `dreamer.opencode` model chain, preserving the calibrated prompt and keeping the user's model and token accounting untouched. Children are parented to the user's session when one exists and removed through the native session API when their run ends. On upgrade, recorded legacy children are removed in bounded, resumable boot batches.
 
 For semantic search to work cross-harness, every host resolves embedding config per project identity on each retrieval path. Keep the effective `embedding` block consistent across OpenCode, Pi, and OMP for the same project.
 
@@ -125,7 +183,9 @@ Both setup wizards add this automatically.
 
 Model keys use the same progressive, case-sensitive lookup walk as `cache_ttl`: exact `provider/model` keys, less-specific model variants, then the literal `provider/*` wildcard and `default`. The first slash separates the provider; additional slashes remain part of the model ID. Missing provider/model components fall back to `default`.
 
-> **OpenCode 1.x, Pi, and OMP limitation:** per-model routing in `models` applies to the guidance block only. Tool descriptions are registered once per process by those hosts, so they always follow `prompt_surface.default`. OpenCode 2 rewrites the five `ctx_*` tool descriptions on every `context` pass from the same resolver, keyed on the draft model.
+> **OpenCode 1.x, Pi, and OMP limitation:** per-model routing in `models` applies to the guidance block only. Tool descriptions and parameter descriptions are registered once per process by those hosts, so they always follow `prompt_surface.default`. OpenCode 2 rewrites both kinds of tool prose on every `context` pass from the same resolver, keyed on the draft model.
+
+The built-in guidance treats context as a desk: tagged items stay on the desk while useful, `ctx_reduce` stamps spent items for later clearing, cleared work remains recoverable from the archive, memory is the pinboard, and notes are the tray for matters that belong later.
 
 `guidance_override_path` and `tool_descriptions` are user-level only. A project may select `default` and `models`, but repository-supplied guidance files and tool-description text are stripped with a warning.
 
@@ -177,7 +237,7 @@ Magic Context uses the runtime's built-in SQLite: `bun:sqlite` under Bun (OpenCo
 
 LLM providers cache conversation prefixes server-side. The cache window depends on your provider and subscription tier — Claude Pro offers 5 minutes, Max offers 1 hour, and pricing for cached vs. uncached tokens differs between API and subscription usage.
 
-Magic Context defers all mutations until the cached prefix expires. `cache_ttl` is how long Magic Context *assumes* a provider's cached prefix stays valid — it is MC's own deferral gate, not a control over the provider's cache. It does not change the provider's actual cache lifetime. The default `"5m"` matches Anthropic's default TTL. You can tune it:
+Magic Context defers all mutations until the cached prefix expires. `cache_ttl` is how long Magic Context *assumes* a provider's cached prefix stays valid — it is MC's own deferral gate, not a control over the provider's cache. It does not change the provider's actual cache lifetime. The generic fallback is `"5m"`. GPT-5.6 and later (including every `gpt-6*` model) instead default to **30m**, including through `openai/`, `openai-codex/`, `openrouter/openai/`, and `azure/` prefixes. [OpenAI documents](https://developers.openai.com/api/docs/guides/prompt-caching) at least 30 minutes since the latest write or reuse (see “Cache lifetime” and “Summary of model differences”). Earlier models retain the generic fallback. You can tune it:
 
 ```jsonc
 {
@@ -198,6 +258,8 @@ Per-model overrides for mixed-model workflows:
 ```
 
 Keys are matched from most to least specific: the exact `provider/model`, the bare model ID, progressively shorter dash-prefixes of the model ID (`claude-opus-4-6` also matches a `claude-opus-4` entry), then the provider wildcard `provider/*`, then `default`. A more specific entry always wins over a wildcard, so the example above keeps `60m` for Opus 4.6 and applies `never` to every other Anthropic model. Harness provider aliases resolve to the canonical name first, so one entry covers the same model on OpenCode, Pi and OMP.
+
+Precedence: explicit per-model entry → built-in known-model lifetime → object `default` → `"5m"`. For the global string form, unset or `"5m"` means defaults (so GPT-6 gets 30m); any other string, such as `"10m"`, is an explicit policy and wins over built-ins. To force 5m on GPT-6, use a per-model entry. The policy is frozen per session and survives restarts; model switches resolve against the frozen policy rather than live config. `/ctx-status` shows the effective TTL and its source.
 
 Supported formats: `"30s"`, `"5m"`, `"1h"`.
 
@@ -236,7 +298,7 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `compaction.enabled` | `boolean` | `true` | When `false`, use compaction-off mode: keep Magic Context's knowledge layer and let native compaction (or nothing) own the context window. Boot-resolved; restart after changing it. See below. |
 | `commit_cluster_trigger` | `object` | See below | Controls the commit-cluster historian trigger. |
 | `system_prompt_injection` | `object` | See below | Controls whether and where Magic Context augments the system prompt; lets you opt specific agents out. |
-| `keep_subagents` | `boolean` | `false` | OpenCode 1 debug option: keep child sessions instead of deleting them on success. On OpenCode 2 the host does not expose removal to plugins, so reusable historian/Dreamer roots are always retained and this option has no effect on them; use `doctor list-hidden-sessions` and remove unwanted roots manually. |
+| `keep_subagents` | `boolean` | `false` | Debug option: keep every settled Magic Context child session instead of deleting it after success: historian, all Dreamer tasks, smart-note evaluation and compilation, user-memory review, and memory migration. Kept Dreamer children can contain memory-pool text and user messages from other sessions of the same operator; their full transcript stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect. On OpenCode 2.0.22 or newer, every run uses a fresh child, parented when there is a user session. With this option on, settled children and historian children remain inspectable; unsettled Dreamer children are removed. With it off, each run's child is removed through the native session API, whether or not the host runs as a service. |
 | `todowrite` | `object` | See below | **Pi only.** Controls Magic Context's built-in `todowrite` tool and persistent task overlay. OpenCode has its own built-in `todowrite`, so this setting has no effect there. |
 | `sqlite` | `object` | See below | Per-connection SQLite tuning for Magic Context's own `context.db`. |
 | `storage.enforce_private_permissions` | `boolean` | `true` | User-config-only. Keep owner-only `0700` directories and `0600` files. Set `false` only for an externally managed trusted-group deployment; Magic Context will never re-tighten storage permissions. |
@@ -323,12 +385,12 @@ Controls whether and where Magic Context augments the system prompt (its guidanc
 
 ### `todowrite` (Pi only)
 
-Pi does not ship a built-in `todowrite` tool, so Magic Context registers an OpenCode-parity task-list tool by default. Disable it if another Pi extension already provides todo UX:
+Pi does not ship a built-in `todowrite` tool. Magic Context's task-list tool is off by default; enable it to use the tool, `/todos` command, and optional overlay:
 
 ```jsonc
 {
   "todowrite": {
-    "enabled": true,  // default: true
+    "enabled": true,  // default: false (opt in to Pi todowrite)
     "overlay": true   // default: true
   }
 }
@@ -336,7 +398,7 @@ Pi does not ship a built-in `todowrite` tool, so Magic Context registers an Open
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | `boolean` | `true` | Register Magic Context's Pi `todowrite` tool and `/todos` command. Set `false` when using another todo extension. |
+| `enabled` | `boolean` | `false` | Set `true` to register Magic Context's Pi `todowrite` tool and `/todos` command. |
 | `overlay` | `boolean` | `true` | Show the persistent todo overlay above the editor while tasks are active. |
 
 Pi registers tools, slash commands, and widgets once at extension boot. If you `/cd` into a project with a different `todowrite.enabled` value, run `/reload` or restart Pi for the tool surface to change.
@@ -600,7 +662,7 @@ To disable the dreamer entirely, set `dreamer.disable: true`. To disable a singl
 | `curate` | `0 4 * * 0` | Curate the whole active memory pool: consolidate duplicates, tighten wording, and archive low-value or redundant entries. |
 | `classify-memories` | `0 6 * * *` | Score memory importance, scope, and shareability so recall stays focused. |
 | `retrospective` | `0 5 * * *` | Learn from moments you had to correct or re-explain, and record the durable lesson. |
-| `maintain-docs` | `""` (off) | Keep `ARCHITECTURE.md` and `STRUCTURE.md` at project root synchronized with the codebase. |
+| `maintain-docs` | `""` (off) | Propose section corrections for `ARCHITECTURE.md` and `STRUCTURE.md` without editing either file. |
 | `promote-primers` | `0 3 * * *` | Promote recurring standing questions the historian noticed into durable primers. |
 | `refresh-primers` | `0 3 * * *` | Re-investigate stale primers against current code and refresh their answers. |
 | `evaluate-smart-notes` | `0 3 * * *` | Surface smart notes whose `ctx_note` conditions have come true. |
@@ -639,9 +701,11 @@ Controls semantic search for cross-session memories.
 
 Instruction-tuned embedding models are trained to distinguish retrieval queries from passages, so Magic Context automatically prepends the model card's query recipe for Qwen3-Embedding, gte-Qwen instruct, e5 instruct, and Nomic families. Plain local encoders are unchanged. Query instructions affect only live search vectors, not stored document vectors, so changing `query_instruction` does not re-embed the corpus; changing a non-empty `document_prefix` does because it changes every stored vector.
 
+The local provider downloads model files from Hugging Face. Set the standard `HF_ENDPOINT` environment variable to the base URL of a Hugging Face-compatible mirror when `huggingface.co` is unavailable; a trailing slash is optional. The mirror only changes where identical model files are downloaded and does not change embedding identities or trigger re-embedding.
+
 When `provider: "off"`:
 
-- No embeddings are generated. `ctx_memory(write)` skips embedding inline and the background embedding sweep becomes a no-op.
+- No embeddings are generated, for memories or session history. `ctx_memory(write)` skips embedding inline and the background embedding sweep becomes a no-op.
 - `ctx_search` and memory injection fall back to FTS5 (BM25) ranking only. Keyword matches still work; semantic similarity does not.
 - Session-start memory injection still happens when `memory.enabled` is `true` — memories are ordered by utility tier plus `seen_count` rather than semantic similarity to the current turn.
 - Memories written while `off` is active will have no embedding row; if you later re-enable `"local"` or `"openai-compatible"`, the background sweep embeds them on the next 15-minute tick.
@@ -671,7 +735,7 @@ Cross-session memory settings. All memories are scoped to the current project (i
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | `boolean` | `true` | Enable cross-session memory. When `false`, the `ctx_memory` tool is hidden, no `<project-memory>` block is injected, and historian/recomp do not promote any session facts to project memories. The `ctx_search` tool stays available but its memory source returns no results. |
+| `enabled` | `boolean` | `true` | Enable cross-session memory. When `false`, the `ctx_memory` tool is hidden, no `<project-memory>` block is injected, and historian/recomp do not promote any session facts to project memories. The `ctx_search` tool stays available but its memory source returns no results, and no memory rows are embedded. Session history is still embedded automatically and silently for semantic `ctx_search` whenever an embedding provider is configured; set `embedding.provider: "off"` to stop all embedding. |
 | `injection_budget_tokens` | `number` (500–20000) | `4000` | Token budget for memory injection into `<session-history>`. |
 | `auto_promote` | `boolean` | `true` | Promote eligible session facts to project memories automatically after historian or `/ctx-recomp` runs. When `false`, historian and recomp do not write any new memories — agents can still create memories explicitly via `ctx_memory write`, and existing memories continue to be injected and searched normally. |
 | `retrieval_count_promotion_threshold` | `number` | `3` | Retrievals needed before a memory is auto-promoted to permanent. |

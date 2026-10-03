@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 
 setDefaultTimeout(30_000);
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
@@ -12,6 +12,7 @@ import { closeDatabase, openDatabase } from "../../features/magic-context/storag
 import { setPersistedCompactionMarkerState } from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     assertNoInheritedMagicContextMarker,
     InheritedMagicContextMarkerError,
@@ -25,7 +26,7 @@ function setup(): {
     contextDb: ReturnType<typeof openDatabase>;
     openCodeDb: Database;
 } {
-    const dir = mkdtempSync(join(tmpdir(), "mc-inherited-marker-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "mc-inherited-marker-"));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
     mkdirSync(join(dir, "opencode"), { recursive: true });

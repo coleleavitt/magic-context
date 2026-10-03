@@ -7,10 +7,23 @@ export const USER_FACING_FAILURES = {
         sentence: "History compression could not finish this turn.",
         action: "It will retry automatically.",
     },
-    hidden_cleanup_unbound: {
-        code: "MC-H02",
-        sentence: "Some finished background sessions could not be removed from this host.",
-        action: "They are removed automatically the next time Magic Context runs inside a registered OpenCode service.",
+    historian_saved_history_misaligned: {
+        code: "MC-H03",
+        sentence:
+            "History compression is paused because this session's saved summaries no longer line up with its messages.",
+        action: "Run /ctx-recomp to rebuild them.",
+    },
+    history_boundary_unresolved: {
+        code: "MC-H04",
+        sentence:
+            "This request was not sent: the message that marks where this session's history summary ends is missing from the OpenCode store, and without it the request is larger than the model's context window.",
+        action: "Run /ctx-recomp to rebuild the history summary.",
+    },
+    historian_window_too_small: {
+        code: "MC-H05",
+        sentence:
+            "History compression is paused because the history model's context window is too small for its instructions.",
+        action: "Set historian.model in magic-context.jsonc to a model with a larger context window.",
     },
     recomp_unavailable: {
         code: "MC-R01",
@@ -26,6 +39,16 @@ export const USER_FACING_FAILURES = {
         code: "MC-D02",
         sentence: "Memory maintenance could not reach its model.",
         action: "Check the model connection, then run /ctx-dream again.",
+    },
+    dream_step_limit: {
+        code: "MC-D10",
+        sentence: "Memory maintenance stopped at its hidden agent step limit.",
+        action: "This task needs less work per run; changing the model connection will not help.",
+    },
+    dream_token_budget: {
+        code: "MC-D11",
+        sentence: "Memory maintenance reached its prompt-token budget.",
+        action: "The unfinished items will be retried on the next run.",
     },
     dream_empty_completion: {
         code: "MC-D03",
@@ -133,6 +156,12 @@ export const USER_FACING_FAILURES = {
         sentence: "The last context update did not finish.",
         action: "Send another message to retry.",
     },
+    transform_pass_degraded: {
+        code: "MC-S06",
+        sentence:
+            "This request was not sent: Magic Context could not finish preparing it, and without that preparation it could be far larger than the previous request.",
+        action: "Send your message again.",
+    },
     configuration_warning: {
         code: "MC-S03",
         sentence: "Some configuration settings could not be applied.",
@@ -183,10 +212,37 @@ export const USER_FACING_FAILURES = {
         sentence: "History compression is paused while the engine syncs.",
         action: "Retry in a moment.",
     },
+    history_compression_needs_message: {
+        code: "MC-C12",
+        sentence: "History compression has not seen this session since Magic Context reconnected.",
+        action: "Send a message in this session first, then run /ctx-wrapup again.",
+    },
     context_service_unavailable: {
         code: "MC-C10",
         sentence: "Magic Context is temporarily unavailable.",
         action: "Retry in a moment.",
+    },
+    context_db_missing: {
+        code: "MC-C15",
+        sentence: "Magic Context has no context.db.",
+        action: "Run `npx @cortexkit/magic-context doctor store init`, then restart ck-mc.",
+    },
+    single_store_migration_required: {
+        code: "MC-C14",
+        sentence: "Magic Context's Rust mode needs a one-time migration of its store.",
+        action: "Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`.",
+    },
+    store_ahead_of_binary: {
+        code: "MC-C13",
+        sentence:
+            "Magic Context refused to start: its store (store.db) was migrated by a newer ck-mc build than the one running.",
+        action: "Update ck-mc, or roll back by restoring ck-mc together with context.db and store.db from the same backup.",
+    },
+    compaction_marker_missing: {
+        code: "MC-C11",
+        sentence:
+            "The history boundary marker is missing from the OpenCode store, so requests carry the full session.",
+        action: "It is retried on every message; if this persists, run `/ctx-flush`.",
     },
     memory_mirror_stalled: {
         code: "MC-M01",
@@ -197,11 +253,6 @@ export const USER_FACING_FAILURES = {
         code: "MC-M02",
         sentence: "Memory authority is inconsistent between the host and module.",
         action: "Run `ck doctor drain-authority` before changing Rust mode.",
-    },
-    rust_mode_unsupported: {
-        code: "MC-S06",
-        sentence: "Experimental Rust transform mode is not available on this OpenCode host.",
-        action: 'Magic Context is running its TypeScript mode instead; set `transform_mode` to "ts" to stop requesting Rust.',
     },
     dreamer_task_failing: {
         code: "MC-S05",
@@ -261,6 +312,8 @@ export function capabilityRefusalCode(capability: CapabilityRefusal): string {
 const DREAM_FAILURE_KEYS = {
     provider_timeout: "dream_provider_timeout",
     provider_error: "dream_provider_error",
+    step_limit: "dream_step_limit",
+    token_budget: "dream_token_budget",
     empty_completion: "dream_empty_completion",
     no_models: "dream_no_models",
     child_aborted: "dream_child_aborted",

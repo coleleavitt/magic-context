@@ -1,6 +1,5 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { DREAMER_AGENT } from "../../agents/dreamer";
-import { getAuthorityManagedMarker } from "../../features/magic-context/context-authority";
 import {
     curateCategoryForMemoryCategory,
     getActiveCurateCategory,
@@ -44,15 +43,19 @@ import {
     normalizeStoredProjectPath,
     queueMemoryMutation,
 } from "../../features/magic-context/storage";
-import { planRustMemoryRouting, routeHostMemoryIds } from "../../plugin/memory-id-translation";
 import {
-    isRustAuthorityDrainingError,
-    toolCallIdFromContext,
-} from "../../plugin/rust-tool-backends";
+    projectNeedsSingleStoreMigration,
+    renderSingleStoreMigrationRequiredRefusal,
+} from "../../hooks/magic-context/single-store-refusal";
 import { sessionLog } from "../../shared/logger";
-import { renderCapabilityRefusal, renderUserFacingFailure } from "../../shared/user-facing-codes";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
-import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_TOOL_NAME, DEFAULT_SEARCH_LIMIT } from "./constants";
+import {
+    CTX_MEMORY_DESCRIPTION,
+    CTX_MEMORY_LIST_DESCRIPTION,
+    CTX_MEMORY_LIST_TOOL_NAME,
+    CTX_MEMORY_TOOL_NAME,
+    DEFAULT_SEARCH_LIMIT,
+} from "./constants";
 import {
     CTX_MEMORY_ACTIONS,
     CTX_MEMORY_DREAMER_ACTIONS,
@@ -94,48 +97,6 @@ function getAllowedActions(deps: CtxMemoryToolDeps): [CtxMemoryAction, ...CtxMem
 function normalizeCategory(category?: string): string | undefined {
     const trimmed = category?.trim();
     return trimmed ? trimmed : undefined;
-}
-
-function memoryAuthorityRefusal(args: CtxMemoryArgs): string {
-    const isMutation =
-        args.action !== undefined && ["write", "update", "archive", "merge"].includes(args.action);
-    return renderCapabilityRefusal(isMutation ? "memory_write" : "memory_access");
-}
-
-function memoryAuthorityMismatchRefusal(): string {
-    return renderUserFacingFailure("memory_authority_mismatch");
-}
-
-function moduleMemoryText(response: unknown, args: CtxMemoryArgs): string | null {
-    let value = response;
-    if (value !== null && typeof value === "object" && "result" in value) {
-        value = (value as { result?: unknown }).result;
-    }
-    if (isRustAuthorityDrainingError(value)) {
-        return memoryAuthorityRefusal(args);
-    }
-    if (typeof value === "string") return value;
-    if (value !== null && typeof value === "object") {
-        const record = value as Record<string, unknown>;
-        if (record.ok === false || record.error || typeof record.message === "string") {
-            const detail = record.error ?? record.message ?? "module rejected ctx_memory";
-            const message =
-                detail !== null && typeof detail === "object" && "message" in detail
-                    ? String((detail as { message?: unknown }).message)
-                    : String(detail);
-            return `Error: ${message}`;
-        }
-        if (Array.isArray(record.content)) {
-            const text = record.content.find(
-                (item): item is { text: string } =>
-                    item !== null &&
-                    typeof item === "object" &&
-                    typeof (item as { text?: unknown }).text === "string",
-            )?.text;
-            if (text) return text;
-        }
-    }
-    return null;
 }
 
 function formatMemoryList(memories: Memory[]): string {
@@ -431,35 +392,41 @@ function updateMemoryContentInCurrentTransaction(
 }
 
 const ctxMemoryArgsShape = {
-    // Keep the complete action argument shape available to execute(); it can reject
-    // actions that are unsafe for the current agent once that agent is known. The
-    // passthrough parser also retains extra arguments sent by older callers.
+    // Advertise only primary actions. The separate ctx_memory_list tool reuses this
+    // handler with the internal list action, while passthrough parsing keeps older
+    // callers compatible without publishing that action here.
     action: tool.schema
-        .enum([...CTX_MEMORY_DREAMER_ACTIONS])
+        .enum([...CTX_MEMORY_ACTIONS])
         .optional()
-        .describe("What to do: write, update, archive, merge, get, or list"),
+        .describe("write | update | archive | merge | get"),
     content: tool.schema
         .string()
         .optional()
-        .describe("The memory text — one standalone fact (required for write, update, merge)"),
+        .describe("The memory text — one standalone fact (write, update, merge)."),
     category: tool.schema
         .enum([...V2_MEMORY_CATEGORIES])
         .optional()
         .describe(
-            "What kind of fact this is (required for write; optional on update to recategorize, omitted keeps the current category; optional merge override)",
+            "Kind of fact (required for write; on update/merge optional, omitted keeps the current category).",
         ),
     ids: tool.schema
         .array(tool.schema.number())
         .optional()
         .describe(
-            "Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty",
+            "Memory ids from <project-memory>: one for update, one or more for archive, two or more for merge, 1–20 for get.",
         ),
-    limit: tool.schema.number().optional().describe("Max results for list (default: 10)"),
-    reason: tool.schema
-        .string()
-        .optional()
-        .describe("Why the memory is being archived (optional, recommended)"),
+    reason: tool.schema.string().optional().describe("Why it is being archived (optional)."),
 };
+const ctxMemoryListArgsShape = {
+    category: tool.schema
+        .enum([...V2_MEMORY_CATEGORIES])
+        .optional()
+        .describe(
+            "Kind of fact (required for write; on update/merge optional, omitted keeps the current category).",
+        ),
+    limit: tool.schema.number().optional().describe("Max results for list (default 10)."),
+};
+
 const ctxMemoryArgsSchema = tool.schema
     .object({
         ...ctxMemoryArgsShape,
@@ -467,6 +434,10 @@ const ctxMemoryArgsSchema = tool.schema
         // field. Exclude it from the standard provider schema, but validate its
         // type when Curate sends it.
         superseded_by: tool.schema.number().optional(),
+        // `limit` only sizes the internal list action, which primary agents cannot
+        // run; ctx_memory_list advertises it. It stays validated here so the list
+        // tool's forwarded value and older calls that still carry it keep parsing.
+        limit: tool.schema.number().optional(),
     })
     .passthrough();
 
@@ -543,113 +514,8 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
 
             const visibility = createMemoryVisibilityPolicy(deps.db, projectPath);
 
-            {
-                const marker = getAuthorityManagedMarker(deps.db, projectPath);
-                let authorityState: "TS" | "PREPARING" | "MODULE" | "DRAINING" | null = null;
-                try {
-                    authorityState =
-                        (await deps.rustToolBackends?.authorityState?.({
-                            projectPath,
-                            projectRoot: toolContext.directory,
-                            sessionId: toolContext.sessionID,
-                            domain: "memories",
-                        })) ?? null;
-                } catch (error) {
-                    if (marker) {
-                        sessionLog(toolContext.sessionID, "ctx_memory capability refusal", error);
-                        return memoryAuthorityRefusal(args);
-                    }
-                }
-                if (authorityState === "MODULE") {
-                    const memoryBackend = deps.rustToolBackends?.memory;
-                    if (!memoryBackend) {
-                        return memoryAuthorityRefusal(args);
-                    }
-                    try {
-                        const commandId = toolCallIdFromContext(toolContext);
-                        const moduleArgs: CtxMemoryArgs =
-                            args.action === "archive" && curatePreflight.successor
-                                ? {
-                                      action: "merge",
-                                      ids: [
-                                          ...new Set([
-                                              ...(args.ids ?? []),
-                                              curatePreflight.successor.id,
-                                          ]),
-                                      ],
-                                      content: curatePreflight.successor.content,
-                                      category: curatePreflight.successor.category,
-                                  }
-                                : args;
-                        // <project-memory> renders workspace-shared memories from
-                        // other projects, which the module never mirrors. Classify
-                        // every requested id first so those are served from the host
-                        // read model (reads) or refused as read-only (mutations),
-                        // instead of failing the whole batch on the first one.
-                        const routing = routeHostMemoryIds({
-                            db: deps.db,
-                            projectIdentity: projectPath,
-                            hostIds: moduleArgs.ids ?? [],
-                            visibility,
-                        });
-                        const plan = planRustMemoryRouting({
-                            action: moduleArgs.action ?? "",
-                            routes: routing.routes,
-                        });
-                        if (plan.refusal) return plan.refusal;
-                        const hostServed = plan.hostReadIds.map((hostId) =>
-                            routing.hostReadable.get(hostId),
-                        );
-                        const localBlocks = [
-                            ...hostServed
-                                .filter((memory): memory is Memory => memory !== undefined)
-                                .map((memory) => formatMemoryList([memory])),
-                            ...plan.unaddressableLines,
-                        ];
-                        if (plan.skipModuleCall) {
-                            return localBlocks.join("\n\n");
-                        }
-                        const text = moduleMemoryText(
-                            await memoryBackend({
-                                ...(commandId ? { commandId } : {}),
-                                sessionId: toolContext.sessionID,
-                                projectRoot: toolContext.directory,
-                                projectPath,
-                                memoryProject: projectPath,
-                                action: moduleArgs.action as
-                                    | "write"
-                                    | "update"
-                                    | "archive"
-                                    | "merge"
-                                    | "list"
-                                    | "get",
-                                content: moduleArgs.content,
-                                category: moduleArgs.category,
-                                ids: moduleArgs.ids ? plan.moduleHostIds : undefined,
-                                reason: moduleArgs.reason,
-                                limit:
-                                    moduleArgs.action === "list"
-                                        ? normalizeLimit(moduleArgs.limit)
-                                        : undefined,
-                            }),
-                            moduleArgs,
-                        );
-                        if (text === null) return memoryAuthorityRefusal(args);
-                        return localBlocks.length > 0 ? [text, ...localBlocks].join("\n\n") : text;
-                    } catch (error) {
-                        if (isRustAuthorityDrainingError(error)) {
-                            return memoryAuthorityRefusal(args);
-                        }
-                        sessionLog(toolContext.sessionID, "ctx_memory capability refusal", error);
-                        return memoryAuthorityRefusal(args);
-                    }
-                }
-                if (marker && (authorityState === null || authorityState === "TS")) {
-                    return memoryAuthorityMismatchRefusal();
-                }
-                if (marker || authorityState === "PREPARING" || authorityState === "DRAINING") {
-                    return memoryAuthorityRefusal(args);
-                }
+            if (projectNeedsSingleStoreMigration(deps.db, projectPath)) {
+                return renderSingleStoreMigrationRequiredRefusal();
             }
             // Visibility is the READ contract: own memories are visible in every
             // category, while foreign workspace memories are visible only in
@@ -1140,8 +1006,31 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
     });
 }
 
+function createCtxMemoryListTool(deps: CtxMemoryToolDeps): ToolDefinition {
+    const memoryTool = createCtxMemoryTool({
+        ...deps,
+        allowedActions: [...CTX_MEMORY_DREAMER_ACTIONS],
+    });
+    return tool({
+        description: CTX_MEMORY_LIST_DESCRIPTION,
+        args: ctxMemoryListArgsShape,
+        async execute(args, toolContext) {
+            if (toolContext.agent !== DREAMER_AGENT) {
+                return "Error: ctx_memory_list is only available to the dreamer agent.";
+            }
+            return memoryTool.execute({ ...args, action: "list" }, toolContext);
+        },
+    });
+}
+
 export function createCtxMemoryTools(deps: CtxMemoryToolDeps): Record<string, ToolDefinition> {
     return {
         [CTX_MEMORY_TOOL_NAME]: createCtxMemoryTool(deps),
+    };
+}
+
+export function createCtxMemoryListTools(deps: CtxMemoryToolDeps): Record<string, ToolDefinition> {
+    return {
+        [CTX_MEMORY_LIST_TOOL_NAME]: createCtxMemoryListTool(deps),
     };
 }

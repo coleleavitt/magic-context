@@ -1,9 +1,10 @@
 import { drainNotifications, registerNotificationSink } from "../../shared/rpc-notifications";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -22,6 +23,7 @@ import {
     clearPendingOps,
     closeDatabase,
     getChannel1NudgeState,
+    getDroppedTagsByNumbers,
     getHistorianFailureState,
     getLastNudgeUndropped,
     getOrCreateSessionMeta,
@@ -64,6 +66,8 @@ import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/mod
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import type { MarkerUpdateOutcome } from "./compaction-marker-manager";
+import { registerActiveCompartmentRun } from "./compartment-runner";
+import { createToolExecuteAfterHook } from "./hook-handlers";
 import { injectM0M1 } from "./inject-compartments";
 import { captureSlot, getSlot, resetLkgSlotsForTest } from "./lkg-slot";
 import { __ignoredNotificationTest } from "./send-session-notification";
@@ -135,7 +139,7 @@ afterEach(() => {
 });
 
 function makeTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -895,7 +899,7 @@ describe("createTransform", () => {
         }
     });
 
-    it("hydrates only dropped rows for visible-target replay with 98% active tags", async () => {
+    it("hydrates only dropped rows for visible-target replay with 98% active tags", () => {
         useTempDataHome("context-transform-replay-rows-");
         const realDb = openDatabase();
         const replayRows: Array<{ status: string }> = [];
@@ -933,42 +937,27 @@ describe("createTransform", () => {
             },
         }) as typeof realDb;
         const sessionId = "ses-replay-row-count";
-        const transform = createTransform({
-            tagger: createTagger(),
-            scheduler: { shouldExecute: () => "defer" },
-            contextUsageMap: new Map(),
-            db,
-            historyRefreshSessions: new Set(),
-            pendingMaterializationSessions: new Set(),
-            lastHeuristicsTurnId: new Map(),
-            clearReasoningAge: 50,
-            protectedTokens: 0,
-            historianRunnable: false,
-        });
-        const input: TestMessage[] = Array.from({ length: 2000 }, (_, i) => ({
-            info: {
-                id: `replay-${i}`,
-                role: i % 2 === 0 ? "user" : "assistant",
-                sessionID: sessionId,
-            },
-            parts: [{ type: "text", text: `Stable result ${i}.` }],
-        }));
-        await transform({}, { messages: structuredClone(input) });
+        // Only the visible-target lookup needs 2,000 tags; two full transforms add unrelated work.
+        realDb.transaction(() => {
+            for (let number = 1; number <= 2000; number++) {
+                insertTag(realDb, sessionId, `replay-${number}`, "message", 20, number);
+                if (number % 50 === 0) updateTagStatus(realDb, sessionId, number, "dropped");
+            }
+        })();
         const tags = getTagsBySession(realDb, sessionId);
         expect(tags).toHaveLength(2000);
-        for (let i = 49; i < tags.length; i += 50) {
-            updateTagStatus(realDb, sessionId, tags[i].tagNumber, "dropped");
-        }
         expect(
-            getTagsBySession(realDb, sessionId).filter(
-                (tag) => tag.status === "active" && tag.cavemanDepth === 0,
-            ),
+            tags.filter((tag) => tag.status === "active" && tag.cavemanDepth === 0),
         ).toHaveLength(1960);
-        replayRows.length = 0;
-        replayChunkSizes.length = 0;
-        await transform({}, { messages: structuredClone(input) });
+
+        const hydrated = getDroppedTagsByNumbers(
+            db,
+            sessionId,
+            tags.map((tag) => tag.tagNumber),
+        );
         expect(replayChunkSizes).toEqual([900, 900, 200]);
         expect(replayRows).toHaveLength(40);
+        expect(hydrated).toHaveLength(40);
         expect(replayRows.every((row) => row.status === "dropped")).toBe(true);
     });
 
@@ -1170,7 +1159,7 @@ describe("createTransform", () => {
         ).toBe(true);
     });
 
-    it("keeps the raw array untouched when session metadata is unreadable", async () => {
+    it("refuses the pass and leaves the raw array untouched when session metadata is unreadable", async () => {
         useTempDataHome("context-transform-meta-fault-");
         const db = openDatabase();
         const transform = createTransform({
@@ -1194,7 +1183,12 @@ describe("createTransform", () => {
         const output = { messages };
         db.exec("DROP TABLE session_meta");
 
-        await transform({}, output);
+        // Returning would serve these raw messages without the session's
+        // reductions; the pass stops so the wrapper replays or refuses.
+        await expect(transform({}, output)).rejects.toMatchObject({
+            name: "DegradedPassRefusalError",
+            site: "session-meta-early-return",
+        });
 
         expect(output.messages).toBe(messages);
         expect(messages).toEqual(original);
@@ -1867,6 +1861,12 @@ describe("createTransform", () => {
                 info: { id: "m-assistant", role: "assistant" },
                 parts: [{ type: "tool", callID: "call-1", state: { output: bigOutput } }],
             },
+            // A later prompt, so this call does not end the conversation (drop()
+            // keeps that one as a skeleton instead of removing it).
+            {
+                info: { id: "m-next", role: "user", sessionID: "ses-force-materialize" },
+                parts: [{ type: "text", text: "next prompt" }],
+            },
         ];
 
         //#when
@@ -1874,8 +1874,7 @@ describe("createTransform", () => {
 
         //#then — absolute emergency pressure yields the token window, so the
         // tool-only assistant shell is removed by the full-drop path.
-        expect(messages).toHaveLength(1);
-        expect(messages[0]?.info.id).toBe("m-user");
+        expect(messages.map((message) => message.info.id)).toEqual(["m-user", "m-next"]);
         const tags = getTagsBySession(db, "ses-force-materialize");
         expect(tags.find((tag) => tag.type === "tool")?.status).toBe("dropped");
         expect(tags.find((tag) => tag.type === "tool")?.dropMode).toBe("full");
@@ -2194,6 +2193,12 @@ describe("createTransform", () => {
                 info: { id: "m-assistant", role: "assistant" },
                 parts: [{ type: "tool", callID: "call-1", state: { output: "very long output" } }],
             },
+            // A later prompt, so the tool call does not end the conversation (drop()
+            // keeps that one as a skeleton instead of removing it).
+            {
+                info: { id: "m-next", role: "user", sessionID: "ses-1" },
+                parts: [{ type: "text", text: "next prompt" }],
+            },
         ];
         await transform({}, { messages: firstPass });
 
@@ -2205,7 +2210,7 @@ describe("createTransform", () => {
         // apply-operations.tool-drop.test.ts — upstream updated that file's
         // tests for the new behavior but missed this one.
         for (let i = 1; i <= 20; i += 1) {
-            insertTag(db, "ses-1", `call-pad-${i}`, "tool", 10, 2 + i, 0, null, 0, null, null, {
+            insertTag(db, "ses-1", `call-pad-${i}`, "tool", 10, 3 + i, 0, null, 0, null, null, {
                 tokenCount: 1_000,
                 inputTokenCount: 0,
                 reasoningTokenCount: 0,
@@ -2226,6 +2231,12 @@ describe("createTransform", () => {
                 info: { id: "m-assistant", role: "assistant" },
                 parts: [{ type: "tool", callID: "call-1", state: { output: "very long output" } }],
             },
+            // A later prompt, so the tool call does not end the conversation (drop()
+            // keeps that one as a skeleton instead of removing it).
+            {
+                info: { id: "m-next", role: "user", sessionID: "ses-1" },
+                parts: [{ type: "text", text: "next prompt" }],
+            },
         ];
 
         //#when
@@ -2236,7 +2247,7 @@ describe("createTransform", () => {
         // skeleton window above, so the tool-only assistant takes the legacy
         // FULL-removal path and its shell is stripped. (The in-window skeleton path
         // is covered in apply-operations.tool-drop.test.ts.)
-        expect(secondPass).toHaveLength(1);
+        expect(secondPass.map((message) => message.info.id)).toEqual(["m-user", "m-next"]);
         expect(secondPass[0]?.info.role).toBe("user");
         const userShellText = (secondPass[0]?.parts[0] as { text: string }).text;
         expect(userShellText).toBe("[dropped \u00a71\u00a7]");
@@ -3159,7 +3170,7 @@ describe("createTransform", () => {
         expect(secondPass[1].parts).toEqual([{ type: "text", text: "" }]);
     });
 
-    it("fails open when session meta lookup throws", async () => {
+    it("refuses the pass when session meta lookup throws", async () => {
         //#given
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
         const tagger = createTagger();
@@ -3187,23 +3198,27 @@ describe("createTransform", () => {
             },
         ];
 
-        //#when
-        await transform({}, { messages });
-
-        //#then
+        //#when / #then: an unreadable session meta stops the pass; the messages
+        // wrapper then replays the last good request or refuses the turn.
+        await expect(transform({}, { messages })).rejects.toMatchObject({
+            name: "DegradedPassRefusalError",
+            site: "session-meta-early-return",
+        });
         expect(text(messages[0], 0)).toBe("keep");
     });
 
-    it("fails open when tagger init fails", async () => {
+    it("refuses the pass and resets tagger state when tagger init fails", async () => {
         //#given
         useTempDataHome("context-transform-tagger-error-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
         const db = openDatabase();
+        const baseTagger = createTagger();
         const tagger = {
-            ...createTagger(),
+            ...baseTagger,
             initFromDb: mock(() => {
                 throw new Error("tagger broken");
             }),
+            cleanup: mock((sessionId: string) => baseTagger.cleanup(sessionId)),
         };
         const transform = createTransform({
             tagger,
@@ -3228,10 +3243,14 @@ describe("createTransform", () => {
             },
         ];
 
-        //#when
-        await transform({}, { messages });
-
-        //#then — fail-open: message preserved despite tagger init failure.
+        //#when / #then: without tag targets the session's persisted drops
+        // cannot be replayed, so the pass is not served. The tagger is reset
+        // so the next pass reloads it from the database.
+        await expect(transform({}, { messages })).rejects.toMatchObject({
+            name: "DegradedPassRefusalError",
+            site: "tagging-persistence-failure",
+        });
+        expect(tagger.cleanup).toHaveBeenCalledWith("ses-tagger-fail");
         expect(text(messages[0], 0)).toBe("still works");
     });
 
@@ -3379,8 +3398,11 @@ describe("createTransform", () => {
 
         await transform({}, { messages });
 
-        //#then — dropped tag's content is replaced even without usage data
-        expect(toolOutput(messages[1], 1)).toBe("");
+        //#then — dropped tag's content is replaced even without usage data. The
+        // tool ends the conversation, so the drop keeps its skeleton: removing it
+        // would leave a text-only assistant as the last message, which providers
+        // without assistant prefill support reject.
+        expect(toolOutput(messages[1], 1)).toBe(`[dropped \u00a7${toolTag?.tagNumber}\u00a7]`);
     });
 });
 
@@ -3734,6 +3756,35 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
         expect(abort).not.toHaveBeenCalled();
     });
 
+    it("preserves a provider limit detected for the outgoing model when stored usage is stale", async () => {
+        useTempDataHome("transform-switch-preserve-detected-");
+        const sessionId = "ses-preserve-detected";
+        createOpenCodeDbForTransform(sessionId, [
+            { id: "m-raw-1", role: "user", text: "recent 1" },
+            { id: "m-raw-2", role: "assistant", text: "recent 2" },
+        ]);
+        const db = openDatabase();
+        updateSessionMeta(db, sessionId, {
+            lastContextPercentage: 0.6,
+            lastInputTokens: 1_200,
+            lastObservedModelKey: OLD_KEY,
+            lastUsageContextLimit: 200_000,
+        });
+        recordOverflowDetected(db, sessionId, 1_048_576, NEW_KEY, "provider_overflow");
+        await seedNewModelLimit(1_200_000);
+
+        const { transform } = makeTransform(db, sessionId, NEW_MODEL, {
+            percentage: 0.6,
+            inputTokens: 1_200,
+        });
+        await transform({}, { messages: switchTurnMessages(sessionId) });
+
+        const overflow = getOverflowState(db, sessionId, NEW_KEY);
+        expect(overflow.detectedContextLimit).toBe(1_048_576);
+        expect(overflow.detectedContextLimitModelKey).toBe(NEW_KEY);
+        expect(overflow.needsEmergencyRecovery).toBe(true);
+    });
+
     it("does not abort a stale proactive arm after restart zeroed the input sample", async () => {
         useTempDataHome("transform-shrink-switch-stale-restart-");
         const sessionId = "ses-stale-proactive";
@@ -4039,6 +4090,93 @@ describe("createTransform historian failure handling", () => {
         expect(
             loadProtectedTailMeta(db, "ses-empty-head-escape-95").recoveryNoEligibleHeadCount,
         ).toBe(2);
+    });
+
+    it("fails closed with a visible reason when a bounded historian join cannot prove fit", async () => {
+        useTempDataHome("transform-bounded-historian-fail-closed-");
+        const sessionId = "ses-bounded-historian-fail-closed";
+        createOpenCodeDbForTransform(sessionId, [
+            { id: "m-raw-1", role: "user", text: "recent history" },
+        ]);
+        await refreshModelLimitsFromApi({
+            config: {
+                providers: async () => ({
+                    data: {
+                        providers: [
+                            {
+                                id: "test-provider",
+                                models: { "join-100k": { limit: { input: 100_000 } } },
+                            },
+                        ],
+                    },
+                }),
+            },
+        });
+        recordToolDefinition("test-provider", "join-100k", "build", "read", "Read a file", {
+            type: "object",
+        });
+        const db = openDatabase();
+        updateSessionMeta(db, sessionId, { systemPromptTokens: 110_000 });
+        let finishHistorian!: () => void;
+        registerActiveCompartmentRun(
+            sessionId,
+            new Promise<void>((resolve) => {
+                finishHistorian = resolve;
+            }),
+        );
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: mock(() => "defer" as const) },
+            contextUsageMap: new Map([
+                [
+                    sessionId,
+                    { usage: { percentage: 96, inputTokens: 96_000 }, updatedAt: Date.now() },
+                ],
+            ]),
+            db,
+            historyRefreshSessions: new Set<string>(),
+            pendingMaterializationSessions: new Set<string>(),
+            lastHeuristicsTurnId: new Map<string, string>(),
+            clearReasoningAge: 50,
+            protectedTokens: 0,
+            historianTimeoutMs: 5,
+            client: {
+                session: {
+                    get: mock(async () => ({ data: { directory: "/tmp", title: "Join" } })),
+                    prompt: mock(async () => ({})),
+                },
+            } as unknown as PluginContext["client"],
+            directory: "/tmp",
+            liveModelBySession: new Map([
+                [sessionId, { providerID: "test-provider", modelID: "join-100k" }],
+            ]),
+            getModelKey: () => "test-provider/join-100k",
+            getNotificationParams: () => ({
+                agent: "build",
+                providerId: "test-provider",
+                modelId: "join-100k",
+            }),
+        });
+
+        try {
+            await expect(
+                transform(
+                    {},
+                    {
+                        messages: [
+                            {
+                                info: { id: "m-user", role: "user", sessionID: sessionId },
+                                parts: [{ type: "text", text: "continue" }],
+                            },
+                        ],
+                    },
+                ),
+            ).rejects.toThrow(
+                "historian did not complete within 0.005 s: background historian is still running",
+            );
+        } finally {
+            finishHistorian();
+        }
     });
 
     it("does not abort solely because historian failures exist at 95%", async () => {
@@ -4363,9 +4501,28 @@ describe("createTransform historian failure handling", () => {
         const db = openDatabase();
         incrementHistorianFailure(db, "ses-recovery", "503 overloaded");
 
+        await refreshModelLimitsFromApi({
+            config: {
+                providers: async () => ({
+                    data: {
+                        providers: [
+                            {
+                                id: "test",
+                                models: {
+                                    "recovery-producer": {
+                                        limit: { context: 200_000, output: 32000 },
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                }),
+            },
+        });
         const createSession = mock(async () => ({ data: { id: "ses-recovery-child" } }));
         const prompt = mock(async () => ({}));
         const transform = createTransform({
+            historianModel: "test/recovery-producer",
             tagger: createTagger(),
             scheduler: { shouldExecute: mock(() => "defer" as const) },
             contextUsageMap: new Map([
@@ -4566,5 +4723,109 @@ describe("live transform protected-token window", () => {
                 deprecatedProtectedTagCount: 5,
             }),
         ).toEqual(Array.from({ length: 16 }, (_, index) => index + 15));
+    });
+});
+
+describe("Channel 1 reminder copy changes", () => {
+    // A reminder is appended to the tool output when it fires, and OpenCode stores that
+    // output. Every later pass serves the stored bytes, so a reminder worded with the
+    // copy of an earlier release must keep replaying verbatim; only a newly fired
+    // reminder may carry the current copy.
+    const SUPERSEDED_REMINDER =
+        "\n\n<system-reminder>\nHousekeeping: 16 spent tool outputs (~90k tokens) are reclaimable — make a ctx_reduce pass at a natural stopping point.\noldest reclaimable: §1§ read.\n</system-reminder>";
+
+    it("replays a reminder served with superseded copy byte-identically and mints new ones with the current copy", async () => {
+        useTempDataHome("context-transform-reminder-copy-");
+        const sessionId = "ses-reminder-copy";
+        const db = openDatabase();
+        const contextUsageMap = new Map<string, { usage: ContextUsage; updatedAt: number }>();
+        let decision: "execute" | "defer" = "execute";
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: () => decision },
+            contextUsageMap,
+            db,
+            historyRefreshSessions: new Set<string>(),
+            deferredHistoryRefreshSessions: new Set<string>(),
+            pendingMaterializationSessions: new Set(),
+            lastHeuristicsTurnId: new Map(),
+            clearReasoningAge: 1000,
+            protectedTokens: 0,
+            historianRunnable: false,
+            liveModelBySession: new Map([
+                [sessionId, { providerID: "anthropic", modelID: "claude-opus-5" }],
+            ]),
+        });
+        const source: TestMessage[] = [
+            {
+                info: { id: "copy-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "start" }],
+            },
+            {
+                info: { id: "copy-tool", role: "assistant" },
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "read",
+                        callID: "copy-call",
+                        state: {
+                            status: "completed",
+                            output: `file contents${SUPERSEDED_REMINDER}`,
+                        },
+                    },
+                ],
+            },
+            {
+                info: { id: "copy-reply", role: "assistant" },
+                parts: [{ type: "text", text: "read it" }],
+            },
+        ];
+        const run = async () => {
+            const output = { messages: structuredClone(source) };
+            await transform({}, output);
+            return output.messages;
+        };
+        const sha = (value: unknown) =>
+            createHash("sha256").update(JSON.stringify(value)).digest("hex");
+
+        await run();
+        decision = "defer";
+        const passA = await run();
+        const passB = await run();
+        expect(toolOutput(passA[1], 0)).toEndWith(SUPERSEDED_REMINDER);
+        expect(sha(passB)).toBe(sha(passA));
+        expect(toolOutput(passB[1], 0)).toEndWith(SUPERSEDED_REMINDER);
+
+        const channel1State = {
+            baselineU: 80_000,
+            baselineT: 180_000,
+            turnDeltaU: 0,
+            turnDeltaT: 0,
+            usableWindow: 128_000,
+            realUserTurnCount: 1,
+            baselineGeneration: 1,
+            computedAt: 1,
+            evaluable: true,
+            generationInvalidated: false,
+            baselineParts: [],
+            contentSignature: "copy",
+            reducedSinceRefresh: false,
+            oldestReclaimableToolTags: [],
+        };
+        const hook = createToolExecuteAfterHook({
+            db,
+            channel1StateBySession: new Map([[sessionId, channel1State]]),
+        });
+        // An output that already carries a reminder is never re-worded.
+        const replayed = { output: `file contents${SUPERSEDED_REMINDER}` };
+        await hook({ tool: "read", sessionID: sessionId }, replayed);
+        expect(replayed.output).toBe(`file contents${SUPERSEDED_REMINDER}`);
+
+        const fresh = { output: "next file" };
+        await hook({ tool: "read", sessionID: sessionId }, fresh);
+        expect(fresh.output).toContain(
+            "spent tool outputs (~80k tokens) are reclaimable. Make a ctx_reduce pass now over the outputs you've already used, then continue.",
+        );
+        expect(fresh.output).not.toContain("natural stopping point");
     });
 });

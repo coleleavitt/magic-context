@@ -15,7 +15,8 @@ export type LogLevel = "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR";
  */
 export type LogGrammar = "fleet-r2" | "fleet-r1" | "legacy";
 export type DetectedLogGrammar = LogGrammar | "mixed" | "unknown";
-export type LogHarness = "opencode" | "pi" | "omp";
+/** `opencode2` is the OpenCode 2 plugin, which logs under its own temp subtree. */
+export type LogHarness = "opencode" | "opencode2" | "pi" | "omp";
 
 export interface LogLineRecord {
     ts: string;
@@ -111,7 +112,12 @@ function decodeEscapes(value: string): string | null {
         if (next === "n") decoded += "\n";
         else if (next === '"') decoded += '"';
         else if (next === "\\") decoded += "\\";
-        else return null;
+        else if (next === "u") {
+            const hex = value.slice(index + 2, index + 6);
+            if (!/^[0-9a-f]{4}$/.test(hex)) return null;
+            decoded += String.fromCharCode(Number.parseInt(hex, 16));
+            index += 4;
+        } else return null;
         index += 1;
     }
     return decoded;

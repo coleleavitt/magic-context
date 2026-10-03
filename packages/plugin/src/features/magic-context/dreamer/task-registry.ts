@@ -29,6 +29,21 @@ export const CANONICAL_DREAM_TASKS = [
 
 export type DreamTaskName = (typeof CANONICAL_DREAM_TASKS)[number];
 
+/** Prompt-token ceilings informed by docs/reports/dreamer-token-usage.md.
+ * Completed Gemini run usage predicts 20-memory mapping/verification batches
+ * at about 70% of their allowance
+ * (docs/reports/verify-token-budget-2026-09-30.md); curate and other tasks retain
+ * their separate allowances. */
+export const DREAM_TOOL_LOOP_TOKEN_BUDGETS = {
+    "map-memories": 2_500_000,
+    verify: 2_500_000,
+    "verify-broad": 3_000_000,
+    curate: 1_500_000,
+    retrospective: 300_000,
+    "maintain-docs": 1_600_000,
+    "refresh-primers": 350_000,
+} as const;
+
 /**
  * How a Dreamer task reaches its result, which is what decides whether a host
  * without a tool loop can run it:
@@ -89,7 +104,7 @@ export const DREAM_TASK_CAPABILITIES: Record<DreamTaskName, DreamTaskCapability>
     "maintain-docs": {
         requiresTools: true,
         transport: "tool-loop",
-        toolLoopPurpose: "needs file read and write tools to update project documentation",
+        toolLoopPurpose: "needs read-only file tools to investigate documentation corrections",
     },
     // The evaluator is a no-tool compiler plus a no-tool confirmation prompt; the
     // generated check runs in the local capability sandbox, never as model tools.

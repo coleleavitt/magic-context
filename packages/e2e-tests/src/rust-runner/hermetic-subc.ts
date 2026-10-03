@@ -47,6 +47,8 @@ import {
     type RouteTarget,
 } from "@cortexkit/subc-client";
 
+import { prepareContextDatabase } from "../prepare-context-db";
+
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const MODULE_ID = "magic-context";
 const HERMETIC_DAEMON_RUST_LOG = "info";
@@ -305,16 +307,11 @@ function committedSiblingSource(subconsciousRoot: string): { root: string; sha: 
 }
 
 /**
- * Build the module and daemon from their current workspaces, incrementally.
- *
- * `ck-mc` links protocol/client path dependencies from the sibling workspace, so
- * pairing it with any prebuilt component can exercise different source revisions.
- * Running Cargo for both workspaces keeps the hermetic pair coherent. The module
- * build always targets this checkout, even when a release preflight exported a
- * PATH fallback through `MC_E2E_CK_MC_BIN`; Cargo still reuses valid incremental
- * artifacts. Both builds use the e2e-owned target directory, avoiding either live
- * workspace's Cargo target lock. Builds are memoized by feature set for this test
- * process, because the drive-fault build below is a different binary.
+ * Use an explicitly supplied CI-built module/daemon pair, or build both from
+ * their current workspaces incrementally for local release runs. The fault-feature
+ * variant is a separate binary; never pair only one prebuilt component with a
+ * locally rebuilt counterpart. Local builds use the e2e-owned Cargo target and
+ * are memoized by feature set for this test process.
  */
 export async function buildHermeticBinaries(
     subconsciousRoot: string,
@@ -328,6 +325,16 @@ export async function buildHermeticBinaries(
     const existing = buildPromises.get(buildKey);
     if (existing) return existing;
     const buildPromise = (async () => {
+        const prebuiltModule = options.driveFault
+            ? process.env.MC_E2E_CK_MC_DRIVE_FAULT_BIN
+            : process.env.MC_E2E_CK_MC_PREBUILT_BIN;
+        const prebuiltDaemon = process.env.MC_E2E_CK_SUBC_BIN;
+        if (prebuiltModule || prebuiltDaemon) {
+            if (!prebuiltModule || !prebuiltDaemon || !existsSync(prebuiltModule) || !existsSync(prebuiltDaemon)) {
+                throw new Error(`incomplete hermetic prebuilt binary pair for ${buildKey}`);
+            }
+            return { ckMcBin: prebuiltModule, ckSubcBin: prebuiltDaemon };
+        }
         const cargoEnv = rustE2eCargoEnv();
         let ckMcBin = currentTreeCkMcBinary(process.env.MC_E2E_CK_MC_BIN);
         const moduleArgs = ["build", "--release", "-p", "mc-module"];
@@ -376,6 +383,19 @@ export async function buildHermeticBinaries(
     return buildPromise;
 }
 
+/** Build the test-only module that delays synchronous MC dispatch for health probes. */
+export async function buildSlowTransformProbe(): Promise<string> {
+    const configured = process.env.MC_E2E_SLOW_TRANSFORM_PROBE_BIN;
+    if (configured && existsSync(configured)) return configured;
+    const args = ["build", "--release", "-p", "mc-module", "--example", "slow_transform_probe"];
+    const result = await runCargo(args, REPO_ROOT, rustE2eCargoEnv());
+    const binary = join(RUST_E2E_CARGO_TARGET_DIR, "release/examples/slow_transform_probe");
+    if (!result.ok || !existsSync(binary)) {
+        throw new Error(`failed to build slow transform probe: ${result.stderr.slice(-4000)}`);
+    }
+    return binary;
+}
+
 // ── daemon + module lifecycle ─────────────────────────────────────────────────
 
 function sleep(ms: number): Promise<void> {
@@ -415,7 +435,17 @@ export interface HermeticSubcOptions {
     startProducer?: boolean;
     /** Environment supplied only to the hermetic module process. */
     moduleEnv?: Record<string, string>;
+    /**
+     * The completion runner the module's user tier names for the historian and the
+     * dreamer. Default "broca": this stack registers a Broca producer, and the
+     * scenarios built on it exercise the Broca lane, so they name it explicitly now
+     * that an unconfigured OpenCode request defaults to the host runner. `null`
+     * writes no runner, so the module decides per request from the harness.
+     */
+    historianRunner?: HermeticHistorianRunner;
 }
+
+export type HermeticHistorianRunner = "broca" | "host" | null;
 
 /**
  * A running hermetic daemon + module pair. `connectionFile` is the path the
@@ -436,6 +466,7 @@ export class HermeticSubcStack {
     private readonly pidFilePath: string;
     private readonly startTimeoutMs: number;
     private readonly startProducer: boolean;
+    private readonly historianRunner: HermeticHistorianRunner;
     /** Mutable so a restart can arm or disarm module-only settings between passes. */
     private readonly moduleEnv: Record<string, string>;
     private pidFileCreatedAtMs = 0;
@@ -455,6 +486,7 @@ export class HermeticSubcStack {
         this.ckSubcBin = opts.ckSubcBin;
         this.startTimeoutMs = opts.startTimeoutMs;
         this.startProducer = opts.startProducer;
+        this.historianRunner = opts.historianRunner;
         this.moduleEnv = opts.moduleEnv;
         // The plugin's Rust client reads exactly this path (getDefaultConnectionFile
         // in module-transport.ts). The daemon derives the same run directory from its
@@ -470,6 +502,9 @@ export class HermeticSubcStack {
     }
 
     static async start(opts: HermeticSubcOptions): Promise<HermeticSubcStack> {
+        // The module reads domain rows from context.db at startup; the host must
+        // not race its schema initialization against the module's first open.
+        prepareContextDatabase(opts.dataDir);
         reapRecordedRustProcesses();
         const stack = new HermeticSubcStack({
             dataDir: opts.dataDir,
@@ -478,6 +513,7 @@ export class HermeticSubcStack {
             startTimeoutMs: opts.startTimeoutMs ?? 60_000,
             startProducer: opts.startProducer ?? true,
             moduleEnv: opts.moduleEnv ?? {},
+            historianRunner: opts.historianRunner === undefined ? "broca" : opts.historianRunner,
         });
         try {
             await stack.boot();
@@ -550,6 +586,7 @@ export class HermeticSubcStack {
         // before the independent Broca producer joins the daemon. The producer is
         // still ready before the harness returns, so no historian request can race
         // boot and the module's initial route is not starved by daemon startup.
+        this.writeModuleConfig({});
         await this.spawnModule();
         await this.waitForModuleRegistration();
         if (this.startProducer) {
@@ -575,6 +612,31 @@ export class HermeticSubcStack {
                 `hermetic subc: no daemon log (subc*.log) was created under the hermetic data home: ${this.daemonLogDir}`,
             );
         }
+    }
+
+    /** The module's hermetic user-tier config file (its XDG_CONFIG_HOME). */
+    get moduleConfigPath(): string {
+        return join(this.dataDir, "module-config", "cortexkit", "magic-context.jsonc");
+    }
+
+    /**
+     * Replace the module's user-tier config. The runner this stack was started with
+     * is added unless `config.historian.runner` names one, so a scenario that writes
+     * its own module settings stays on the lane it was built for. The module rereads
+     * this file on each request, but the manifest's routes are fixed at boot, so a
+     * runner change also needs `restartModule()`.
+     */
+    writeModuleConfig(config: Record<string, unknown>): void {
+        const historian =
+            config.historian && typeof config.historian === "object"
+                ? (config.historian as Record<string, unknown>)
+                : {};
+        const pinned =
+            this.historianRunner !== null && historian.runner === undefined
+                ? { ...config, historian: { ...historian, runner: this.historianRunner } }
+                : config;
+        mkdirSync(dirname(this.moduleConfigPath), { recursive: true });
+        writeFileSync(this.moduleConfigPath, JSON.stringify(pinned, null, 2));
     }
 
     private async spawnProducer(): Promise<void> {
@@ -625,6 +687,7 @@ export class HermeticSubcStack {
                 // The module opens its store under this data home — the SAME dir
                 // opencode uses, matching production's shared cortexkit layout.
                 XDG_DATA_HOME: this.dataDir,
+                MAGIC_CONTEXT_STORAGE_DIR: join(this.dataDir, "cortexkit", "magic-context"),
             },
         });
         this.module = module;
@@ -826,10 +889,12 @@ export class HermeticSubcStack {
         sessionId: string,
         projectRoot: string,
         request: Record<string, unknown>,
+        /** Harness name the route binds with; the module's runner default follows it. */
+        harness = "opencode",
     ): Promise<Record<string, unknown>> {
         const identity: BindIdentity = {
             project_root: resolve(projectRoot),
-            harness: "opencode",
+            harness,
             session: sessionId,
         };
         let client = this.statusClient;
@@ -982,22 +1047,43 @@ export class HermeticSubcStack {
         child.stderr?.on("data", append);
     }
 
-    /** Best-effort read of the daemon log (diagnostics on failure). */
+    /** Read the daemon's dated file sink as well as captured stdout/stderr. */
     daemonLog(): string {
-        try {
-            return readFileSync(this.daemonLogPath, "utf8");
-        } catch {
-            return "";
+        const segments = existsSync(this.daemonLogDir)
+            ? readdirSync(this.daemonLogDir)
+                  .filter((name) => name.startsWith("subc") && name.endsWith(".log"))
+                  .sort()
+                  .map((name) => join(this.daemonLogDir, name))
+            : [];
+        let output = "";
+        for (const path of [...segments, this.daemonLogPath]) {
+            try {
+                output += readFileSync(path, "utf8");
+            } catch {
+                // Startup failures can precede either log sink's creation.
+            }
         }
+        return output;
     }
 
-    /** Best-effort read of the module log (diagnostics on failure). */
+    /** Read the module's dated file sink and its separately captured stderr. */
     moduleLog(): string {
-        try {
-            return readFileSync(this.moduleLogPath, "utf8");
-        } catch {
-            return "";
+        const logDir = join(this.dataDir, "cortexkit", "magic-context", "logs");
+        const segments = existsSync(logDir)
+            ? readdirSync(logDir)
+                  .filter((name) => name.startsWith("magic-context.") && name.endsWith(".log"))
+                  .sort()
+                  .map((name) => join(logDir, name))
+            : [];
+        let output = "";
+        for (const path of [...segments, this.moduleLogPath]) {
+            try {
+                output += readFileSync(path, "utf8");
+            } catch {
+                // A module that died before creating its sink can still have stderr.
+            }
         }
+        return output;
     }
 
     /** Hard teardown. Safe to call more than once; never throws. */

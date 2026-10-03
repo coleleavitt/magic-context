@@ -15,9 +15,13 @@ import { makeToolCompositeKey, type Tagger } from "../../features/magic-context/
 import { textMentionsRecentCommit } from "../../shared/commit-detection";
 import { isRecord } from "../../shared/record-type-guard";
 import { isReduceToolPart } from "./drop-stale-reduce-calls";
-import { estimateImageTokensFromDataUrl } from "./image-token-estimate";
+import {
+    estimateImageTokensFromDataUrl,
+    estimateToolAttachmentImageTokens,
+} from "./image-token-estimate";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
+import { neutralizeDroppedReasoningPart } from "./sentinel";
 import { byteSize, isThinkingPart, prependTag } from "./tag-content-primitives";
 import { createExistingTagResolver } from "./tag-id-fallback";
 import {
@@ -52,16 +56,22 @@ const TOOL_OWNER_CACHE_KEY_SEP = "\x00";
 type InertWhitespaceTag = ReturnType<typeof getInertWhitespaceAssistantTags>[number];
 const inertWhitespaceCache = new WeakMap<
     ContextDatabase,
-    Map<string, { tagsVersion: number; tags: InertWhitespaceTag[] }>
+    Map<string, { tagsVersion: number; ownersKey: string; tags: InertWhitespaceTag[] }>
 >();
 
 function getCachedInertWhitespaceAssistantTags(
     db: ContextDatabase,
     sessionId: string,
     tagger: Tagger,
+    messages: readonly MessageLike[],
 ): InertWhitespaceTag[] {
+    const messageIds = messages.flatMap((message) =>
+        typeof message.info.id === "string" ? [message.info.id] : [],
+    );
+    const ownersKey = JSON.stringify(messageIds);
     const tagsVersion = tagger.getLoadedTagsVersion?.(sessionId, db);
-    if (tagsVersion === undefined) return getInertWhitespaceAssistantTags(db, sessionId);
+    if (tagsVersion === undefined)
+        return getInertWhitespaceAssistantTags(db, sessionId, messageIds);
 
     let bySession = inertWhitespaceCache.get(db);
     if (!bySession) {
@@ -69,10 +79,10 @@ function getCachedInertWhitespaceAssistantTags(
         inertWhitespaceCache.set(db, bySession);
     }
     const cached = bySession.get(sessionId);
-    if (cached?.tagsVersion === tagsVersion) return cached.tags;
+    if (cached?.tagsVersion === tagsVersion && cached.ownersKey === ownersKey) return cached.tags;
 
-    const tags = getInertWhitespaceAssistantTags(db, sessionId);
-    bySession.set(sessionId, { tagsVersion, tags });
+    const tags = getInertWhitespaceAssistantTags(db, sessionId, messageIds);
+    bySession.set(sessionId, { tagsVersion, ownersKey, tags });
     return tags;
 }
 
@@ -250,14 +260,40 @@ export interface TagNormalizationTarget {
 }
 
 export type TagTarget = {
+    /** Non-mutating count of current and replacement token-bearing fields for a planned drop. */
+    measureReclaim?: (skeleton: boolean) => {
+        beforeTools: number;
+        afterTools: number;
+        beforeProse: number;
+        afterProse: number;
+    };
     setContent: (content: string) => boolean;
     getContent?: () => string | null;
     drop?: () => ToolDropResult;
+    /** Legacy skeleton: arguments replaced by the `{"dropped": …}` marker.
+     * Replay-only, for `drop_mode = 'truncated'` tags not yet converted. */
     truncate?: () => ToolDropResult;
+    /** Real-argument skeleton: the call keeps the arguments the host gave it,
+     * only the output becomes `[dropped §N§]` (`drop_mode = 'skeleton_real'`). */
+    skeletonReal?: () => ToolDropResult;
+    /** New attachment-bearing skeletons omit media; legacy skeletons retain it. */
+    skeletonStripped?: () => ToolDropResult;
+    hasAttachments?: () => boolean;
+    /** Total UTF-8 bytes of the string values in the call's input (see
+     * tool-input-size.ts); null when the call is not on this pass's wire. */
+    inputStringBytes?: () => number | null;
+    /** Non-mutating: would removing this call leave the request ending on an
+     * assistant turn (given what this pass already removed)? */
+    wouldStrandConversationEnd?: () => boolean;
+    /** Non-mutating: the host adapter cannot remove this call structurally, so
+     * drop() would keep a paired shell instead. A new drop then keeps the real
+     * arguments (skeletonReal) rather than any placeholder. */
+    cannotRemove?: () => boolean;
     /** Edit-marker compression for an edit/write superseded by a later edit to
      * the same file: keep the call + filePath + a region hint of the diff,
      * output → [dropped §N§]. Used by smart-drops. */
     editMarker?: () => ToolDropResult;
+    editMarkerStripped?: () => ToolDropResult;
     /** Non-mutating: would drop()/truncate() actually reclaim bytes? Tool
      * targets only; absent on message/file targets. */
     canDrop?: () => boolean;
@@ -483,7 +519,7 @@ export function tagMessages(
         string,
         Array<{ partIndex: number; tagNumber: number }>
     >();
-    for (const tag of getCachedInertWhitespaceAssistantTags(db, sessionId, tagger)) {
+    for (const tag of getCachedInertWhitespaceAssistantTags(db, sessionId, tagger, messages)) {
         inertWhitespaceTagNumbers.add(tag.tagNumber);
         tagger.bindTag(sessionId, tag.contentId, tag.tagNumber);
         const scoped = /^(.*):p(\d+)$/.exec(tag.contentId);
@@ -843,10 +879,24 @@ export function tagMessages(
                     message,
                     setContent: (content) => {
                         if (textPart.text === content) return false;
+                        const partialEnd = messageId
+                            ? (db
+                                  .prepare(
+                                      "SELECT end_block_index FROM compartments WHERE session_id=? AND end_message_id=? AND end_block_index IS NOT NULL LIMIT 1",
+                                  )
+                                  .get(sessionId, messageId) as
+                                  | { end_block_index: number }
+                                  | undefined)
+                            : undefined;
+                        if (partialEnd && partIndex > partialEnd.end_block_index) return false;
                         textPart.text = content;
                         for (const tp of thinkingParts) {
-                            if (tp.thinking !== undefined) tp.thinking = "[cleared]";
-                            if (tp.text !== undefined) tp.text = "[cleared]";
+                            if (
+                                partialEnd &&
+                                message.parts.indexOf(tp) > partialEnd.end_block_index
+                            )
+                                continue;
+                            neutralizeDroppedReasoningPart(tp);
                         }
                         return true;
                     },
@@ -900,9 +950,9 @@ export function tagMessages(
                         // Lazy: fires only on fresh insert. token_count = output tokens
                         // (mirrors byte_size=output); input/reasoning stored separately.
                         () => ({
-                            tokenCount: estimateTextTagTokenCount(
-                                stripTagPrefix(toolPart.state.output),
-                            ),
+                            tokenCount:
+                                estimateTextTagTokenCount(stripTagPrefix(toolPart.state.output)) +
+                                estimateToolAttachmentImageTokens(toolPart.state),
                             inputTokenCount,
                             reasoningTokenCount: getReasoningTokenCount(thinkingParts),
                         }),
@@ -980,6 +1030,16 @@ export function tagMessages(
                                 ? (prev as { text: string }).text
                                 : "";
                         if (prevText === content) return false;
+                        if (messageId) {
+                            const partialEnd = db
+                                .prepare(
+                                    "SELECT end_block_index FROM compartments WHERE session_id=? AND end_message_id=? AND end_block_index IS NOT NULL LIMIT 1",
+                                )
+                                .get(sessionId, messageId) as
+                                | { end_block_index: number }
+                                | undefined;
+                            if (partialEnd && partIndex > partialEnd.end_block_index) return false;
+                        }
                         messageParts[partIndex] = {
                             type: "text",
                             text: content,
@@ -1003,7 +1063,30 @@ export function tagMessages(
     logTransformTiming(sessionId, "tag.assignToolTag", performance.now() - accAssignToolTag);
     logTransformTiming(sessionId, "tag.saveSource", performance.now() - accSaveSource);
 
+    const partialEnds =
+        toolTagByCallId.size > 0
+            ? new Map(
+                  (
+                      db
+                          .prepare(
+                              "SELECT end_message_id, end_block_index FROM compartments WHERE session_id=? AND end_block_index IS NOT NULL",
+                          )
+                          .all(sessionId) as Array<{
+                          end_message_id: string;
+                          end_block_index: number;
+                      }>
+                  ).map((row) => [row.end_message_id, row.end_block_index]),
+              )
+            : new Map<string, number>();
     for (const [compositeKey, tagId] of toolTagByCallId) {
+        const occurrences = toolCallIndex.get(compositeKey)?.occurrences ?? [];
+        const touchesUncoveredPart = occurrences.some(({ message, part }) => {
+            const messageId = message.info.id;
+            if (typeof messageId !== "string") return false;
+            const partialEnd = partialEnds.get(messageId);
+            return partialEnd !== undefined && message.parts.indexOf(part) > partialEnd;
+        });
+        if (touchesUncoveredPart) continue;
         const thinkingParts = toolThinkingByCallId.get(compositeKey) ?? [];
         targets.set(
             tagId,

@@ -1,17 +1,17 @@
 /// <reference types="bun-types" />
 
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import type { Database as DatabaseType } from "../../shared/sqlite";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
-    applyMirrorPage,
     ensureContextStoreUuid,
     installAuthorityManagedMarker,
-} from "./context-authority";
+} from "./legacy-authority-fixture.test-support";
 import { getMemoriesByProject, insertMemory } from "./memory/storage-memory";
 import { MIGRATIONS, runMigrations } from "./migrations";
 import { recordSessionProjectIdentity } from "./session-project-storage";
@@ -332,7 +332,9 @@ function populateHarnessEvidenceAtV86(db: DatabaseType, state: ReplayState): voi
     if (!shape) throw new Error("captured store shapes are missing migrated_v1_v2");
 
     const storePath = join(
-        mkdtempSync(join(process.env.MAGIC_CONTEXT_TEST_DATA_DIR as string, "armed-host-")),
+        createTestTempDirFromPath(
+            join(process.env.MAGIC_CONTEXT_TEST_DATA_DIR as string, "armed-host-"),
+        ),
         "opencode.db",
     );
     const store = new Database(storePath);
@@ -438,59 +440,51 @@ function assertV88CoordinateArm(db: DatabaseType): void {
     ).toEqual({ generation: null });
 }
 
-function populateModuleOwnedRows(db: DatabaseType, version: number, state: ReplayState): void {
-    if (!state.contextStoreUuid) throw new Error("armed replay has no context store identity");
+function assertV91EmbeddingWatermarkArm(db: DatabaseType): void {
+    // The mark starts empty on an upgraded install: no other writer has produced a
+    // memory yet, so there is no backlog to claim. It must also accept a row — an
+    // upgrade that created an unusable table would look identical until the first
+    // module-written memory arrived.
+    expect(db.prepare("SELECT COUNT(*) AS count FROM memory_embedding_watermarks").get()).toEqual({
+        count: 0,
+    });
+    db.prepare(
+        `INSERT INTO memory_embedding_watermarks
+            (project_path, written_memory_id, embedded_memory_id, updated_at)
+         VALUES ('git:armed-replay', 9, 4, 1)`,
+    ).run();
+    expect(
+        db
+            .prepare(
+                "SELECT written_memory_id, embedded_memory_id FROM memory_embedding_watermarks WHERE project_path = 'git:armed-replay'",
+            )
+            .get(),
+    ).toEqual({ written_memory_id: 9, embedded_memory_id: 4 });
+    db.prepare(
+        "DELETE FROM memory_embedding_watermarks WHERE project_path = 'git:armed-replay'",
+    ).run();
+}
 
+function populateModuleOwnedRows(db: DatabaseType, version: number, state: ReplayState): void {
     const memoryContent = `module memory populated after v${version}`;
     const noteContent = `module note populated after v${version}`;
-    const nextCursor = state.memoryMirrorCursor + 1;
-    applyMirrorPage({
-        db,
-        page: {
-            domain: "memories",
-            cursor: state.memoryMirrorCursor,
-            next_cursor: nextCursor,
-            has_more: false,
-            rows: [
-                {
-                    feed_seq: nextCursor,
-                    domain: "memories",
-                    op: "insert",
-                    module_row_id: state.nextModuleMemoryId,
-                    content_hash: `module-memory-hash-v${version}`,
-                    full_row_snapshot: {
-                        context_store_uuid: state.contextStoreUuid,
-                        project_path: PROJECT_PATH,
-                        category: "CONSTRAINTS",
-                        content: memoryContent,
-                        normalized_hash: `module-memory-hash-v${version}`,
-                        importance: 50,
-                        scope: "project",
-                        shareable: 0,
-                        source_type: "historian",
-                        seen_count: 1,
-                        retrieval_count: 0,
-                        first_seen_at: version,
-                        created_at: version,
-                        updated_at: version,
-                        last_seen_at: version,
-                        status: "active",
-                        verification_status: "unverified",
-                    },
-                },
-            ],
-        },
-    });
     withPrivilegedWriter(db, () => {
+        db.prepare(`INSERT INTO memories(project_path, category, content, normalized_hash, source_type, first_seen_at, last_seen_at, created_at, updated_at)
+            VALUES (?, 'CONSTRAINTS', ?, ?, 'historian', ?, ?, ?, ?)`).run(
+            PROJECT_PATH,
+            memoryContent,
+            `module-memory-hash-v${version}`,
+            version,
+            version,
+            version,
+            version,
+        );
         addNote(db, "smart", {
             projectPath: PROJECT_PATH,
             content: noteContent,
             surfaceCondition: "always",
         });
     });
-
-    state.memoryMirrorCursor = nextCursor;
-    state.nextModuleMemoryId += 1;
     state.expectedMemoryContents.add(memoryContent);
     state.expectedNoteContents.add(noteContent);
     assertPrivilegeClosed(db);
@@ -641,6 +635,79 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
         case 88:
             if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
             assertV88CoordinateArm(db);
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 89:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            expect(
+                (
+                    db.prepare("PRAGMA table_info(message_fts_rowid_map)").all() as Array<{
+                        name: string;
+                    }>
+                ).map((column) => column.name),
+            ).toContain("message_time_ms");
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 90:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            expect(
+                (
+                    db.prepare("PRAGMA table_info(compartment_state_lease)").all() as Array<{
+                        name: string;
+                    }>
+                ).map((column) => column.name),
+            ).toContain("owner_pid");
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 91:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            assertV91EmbeddingWatermarkArm(db);
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 92:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            expect(db.prepare("SELECT id, state FROM single_store_state").all()).toEqual([
+                { id: 1, state: "required" },
+            ]);
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 93:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            expect(
+                db
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'compartment_history_%' ORDER BY name",
+                    )
+                    .all(),
+            ).toEqual([
+                { name: "compartment_history_ad" },
+                { name: "compartment_history_ai" },
+                { name: "compartment_history_au" },
+            ]);
+            populateModuleOwnedRows(db, version, state);
+            expect(
+                db
+                    .prepare(
+                        "SELECT count(*) AS n FROM compartments c LEFT JOIN compartment_history_versions v ON v.session_id=c.session_id WHERE v.session_id IS NULL",
+                    )
+                    .get(),
+            ).toEqual({ n: 0 });
+            return;
+        case 94:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            // The LKG prefix and the trailing-blank decisions live in their own tables.
+            expect(
+                (db.prepare("PRAGMA table_info(lkg_slots)").all() as Array<{ name: string }>).map(
+                    (column) => column.name,
+                ),
+            ).not.toContain("json_prefix");
+            expect(
+                db
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('lkg_slot_chunks', 'session_replay_decisions') ORDER BY name",
+                    )
+                    .all(),
+            ).toEqual([{ name: "lkg_slot_chunks" }, { name: "session_replay_decisions" }]);
             populateModuleOwnedRows(db, version, state);
             return;
         default:

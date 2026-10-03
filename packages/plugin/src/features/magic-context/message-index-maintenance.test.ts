@@ -1,12 +1,13 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
+import { _resetHarnessForTesting, getHarness, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS,
@@ -14,12 +15,13 @@ import {
     sweepOrphanedOpenCodeMessageIndexes,
 } from "./message-index";
 import { runMigrations } from "./migrations";
+import { advanceSessionActivity, readSessionActivity } from "./session-activity";
 import { initializeDatabase } from "./storage-db";
 
 const tempDirectories: string[] = [];
 
 function createOpenCodeDb(liveSessionIds: string[]): string {
-    const directory = mkdtempSync(join(tmpdir(), "message-index-orphan-source-"));
+    const directory = createTestTempDirFromPath(join(tmpdir(), "message-index-orphan-source-"));
     tempDirectories.push(directory);
     const path = join(directory, "opencode.db");
     const db = new Database(path);
@@ -88,6 +90,39 @@ afterEach(() => {
 });
 
 describe("message history orphan maintenance", () => {
+    test("removes activity for a missing host session but retains the live session and backfill marker", () => {
+        const db = createStoreDb();
+        const now = 2_000_000_000_000;
+        const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
+        seedSessionScopedRows(db, "missing", old);
+        seedSessionScopedRows(db, "live", old);
+        advanceSessionActivity(db, "missing", old);
+        advanceSessionActivity(db, "live", old);
+        db.prepare(
+            "INSERT INTO schema_migrations_meta(key, value) VALUES ('retrospective_activity_backfill:opencode:v1', 'completed')",
+        ).run();
+        const hostPath = createOpenCodeDb(["live"]);
+        try {
+            expect(
+                sweepOrphanedOpenCodeMessageIndexes(
+                    db,
+                    () => new Database(hostPath, { readonly: true }),
+                    { now },
+                ),
+            ).toMatchObject({ status: "swept", deleted: 1 });
+            expect(readSessionActivity(db, "missing")).toBeUndefined();
+            expect(readSessionActivity(db, "live")).toBe(old);
+            expect(
+                db
+                    .prepare(
+                        "SELECT value FROM schema_migrations_meta WHERE key = 'retrospective_activity_backfill:opencode:v1'",
+                    )
+                    .get(),
+            ).toEqual({ value: "completed" });
+        } finally {
+            closeQuietly(db);
+        }
+    });
     test("sweeps every old orphan row while retaining live, young, and Pi rows", () => {
         const db = createStoreDb();
         const now = 2_000_000_000_000;
@@ -139,6 +174,7 @@ describe("message history orphan maintenance", () => {
         const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
         const sessionId = "ses-rust-cleanup-orphan";
         seedSessionScopedRows(db, sessionId, old);
+        advanceSessionActivity(db, sessionId, old);
         db.prepare(
             "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, 'opencode', 'git:rust-cleanup-orphan', ?)",
         ).run(sessionId, old);
@@ -155,6 +191,7 @@ describe("message history orphan maintenance", () => {
             );
 
             expect(result).toMatchObject({ status: "swept", scanned: 1, deleted: 0 });
+            expect(readSessionActivity(db, sessionId)).toBe(old);
             for (const table of [
                 "message_history_fts",
                 "message_history_index",
@@ -321,5 +358,54 @@ describe("message history orphan sweep on a host without an OpenCode store", () 
                 closeQuietly(db);
             }
         });
+    }
+});
+
+test("a harness-scoped orphan sweep retains counters until the last harness's compartments are gone", () => {
+    const previousHarness = getHarness();
+    const db = createStoreDb();
+    try {
+        setHarness("opencode");
+        const source = createOpenCodeDb([]);
+        const sweep = () =>
+            sweepOrphanedOpenCodeMessageIndexes(db, () => new Database(source), {
+                now: 10_000,
+                safetyAgeMs: 0,
+                cooldownMs: 0,
+            });
+        db.prepare(`INSERT INTO compartments(session_id,sequence,start_message,end_message,title,content,created_at,harness)
+            VALUES (?,0,1,4,'title','opencode body',1,'opencode')`).run("shared-session");
+        db.prepare(`INSERT INTO compartments(session_id,sequence,start_message,end_message,title,content,created_at,harness)
+            VALUES (?,1,5,8,'title','claude body',1,'opencode2')`).run("shared-session");
+        const before = db
+            .prepare(
+                "SELECT generation,version FROM compartment_history_versions WHERE session_id=?",
+            )
+            .get("shared-session") as { generation: string; version: number };
+        expect(sweep().deleted).toBe(1);
+        expect(
+            db
+                .prepare("SELECT harness,content FROM compartments WHERE session_id=?")
+                .all("shared-session"),
+        ).toEqual([{ harness: "opencode2", content: "claude body" }]);
+        expect(
+            db
+                .prepare(
+                    "SELECT generation,version FROM compartment_history_versions WHERE session_id=?",
+                )
+                .get("shared-session"),
+        ).toEqual({ ...before, version: before.version + 1 });
+        _resetHarnessForTesting();
+        setHarness("opencode2");
+        expect(sweep().deleted).toBe(1);
+        expect(
+            db
+                .prepare("SELECT generation FROM compartment_history_versions WHERE session_id=?")
+                .get("shared-session"),
+        ).toBeNull();
+    } finally {
+        db.close();
+        _resetHarnessForTesting();
+        setHarness(previousHarness);
     }
 });

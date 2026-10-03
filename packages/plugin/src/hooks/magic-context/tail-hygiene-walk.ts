@@ -2,7 +2,11 @@ import { newestCtxReduceTagNumbers } from "../../features/magic-context/reclaim-
 import type { TagEntry } from "../../features/magic-context/types";
 import { isRecord } from "../../shared/record-type-guard";
 import { stableStringify } from "../../shared/stable-json";
-import { estimateImageTokensFromDataUrl } from "./image-token-estimate";
+import { contentTagOwnerMessageId } from "../../shared/tag-owner-id";
+import {
+    estimateImageTokensFromDataUrl,
+    estimateToolAttachmentImageTokens,
+} from "./image-token-estimate";
 import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 import { isSyntheticTodoPart } from "./todo-view";
@@ -91,6 +95,10 @@ export interface TailHygieneBaseline {
     baselineT: number;
     turnDeltaU: number;
     turnDeltaT: number;
+    /** Unit epoch and frozen ratios used for every baseline/delta value in this generation. */
+    hygieneUnitsVersion: number;
+    toolsRatio: number;
+    proseRatio: number;
     baselineGeneration: number;
     computedAt: number;
     evaluable: boolean;
@@ -354,7 +362,7 @@ function toolInputText(part: Record<string, unknown>): string | null {
 
 function messageIdForTag(tag: TagEntry): string | null {
     if (tag.type === "tool") return tag.toolOwnerMessageId;
-    return tag.messageId.replace(/:(?:p|file)\d+$/, "");
+    return contentTagOwnerMessageId(tag.messageId);
 }
 
 /**
@@ -725,7 +733,12 @@ export function measureTailHygiene(input: {
                     if (isDropSentinel(output)) {
                         parts.push(excludedSnapshot(`${key}\0excludedOutput`, output));
                     } else {
-                        const tokens = memoizedTokens("toolOutput", output);
+                        // Images the tool returned beside its text are billed as images.
+                        const tokens =
+                            memoizedTokens("toolOutput", output) +
+                            (part.type === "tool"
+                                ? estimateToolAttachmentImageTokens(part.state)
+                                : 0);
                         const measured = snapshot({
                             key: `${key}\0toolOutput`,
                             kind: "toolOutput",
@@ -1003,6 +1016,9 @@ export function refreshTailHygieneBaseline(input: {
     pendingDropTagNumbers?: ReadonlySet<number>;
     cacheBusting: boolean;
     previous?: TailHygieneBaseline;
+    /** Frozen decision ratios. They change only on an authorized bust. */
+    calibration?: { toolsRatio: number; proseRatio: number };
+    hygieneUnitsVersion?: number;
     now?: number;
 }): TailHygieneBaseline {
     const pendingDropTagNumbers = input.pendingDropTagNumbers ?? new Set<number>();
@@ -1016,7 +1032,33 @@ export function refreshTailHygieneBaseline(input: {
         sameReplayValue(cached.tags, input.tags) &&
         sameNumbers(cached.protectedTagNumbers, input.protectedTagNumbers) &&
         sameNumbers(cached.pendingDropTagNumbers, pendingDropTagNumbers);
-    const measured = hit ? cached.measured : measureTailHygiene(input);
+    const rawMeasured = hit ? cached.measured : measureTailHygiene(input);
+    const frozenCalibration =
+        !input.cacheBusting && input.previous
+            ? {
+                  toolsRatio: input.previous.toolsRatio,
+                  proseRatio: input.previous.proseRatio,
+                  hygieneUnitsVersion: input.previous.hygieneUnitsVersion,
+              }
+            : {
+                  toolsRatio: input.calibration?.toolsRatio ?? 1,
+                  proseRatio: input.calibration?.proseRatio ?? 1,
+                  hygieneUnitsVersion: input.hygieneUnitsVersion ?? 1,
+              };
+    const ratioFor = (kind: TailHygienePartKind): number =>
+        kind === "toolInput" || kind === "toolOutput"
+            ? frozenCalibration.toolsRatio
+            : kind === "text" || kind === "file"
+              ? frozenCalibration.proseRatio
+              : 1;
+    // Keep fractional part mass and round once in effectiveTailHygiene.
+    const measured: TailHygieneMeasurement = {
+        ...rawMeasured,
+        parts: rawMeasured.parts.map((part) => {
+            const ratio = ratioFor(part.kind);
+            return { ...part, tokens: part.tokens * ratio, uTokens: part.uTokens * ratio };
+        }),
+    };
     const memo = hit
         ? cached
         : {
@@ -1033,7 +1075,7 @@ export function refreshTailHygieneBaseline(input: {
               tags: structuredClone(input.tags),
               protectedTagNumbers: new Set(input.protectedTagNumbers),
               pendingDropTagNumbers: new Set(pendingDropTagNumbers),
-              measured,
+              measured: rawMeasured,
               size: 2 * structuralSize(input.messages) + 512 * input.tags.length,
           };
     const now = input.now ?? Date.now();
@@ -1042,6 +1084,9 @@ export function refreshTailHygieneBaseline(input: {
         retainBaselineMeasurement(frozen.baselineParts, memo);
         return {
             ...frozen,
+            hygieneUnitsVersion: frozenCalibration.hygieneUnitsVersion,
+            toolsRatio: frozenCalibration.toolsRatio,
+            proseRatio: frozenCalibration.proseRatio,
             baselineGeneration: (input.previous?.baselineGeneration ?? 0) + 1,
             computedAt: now,
             evaluable: true,
@@ -1089,8 +1134,8 @@ export function refreshTailHygieneBaseline(input: {
 export function effectiveTailHygiene(
     baseline: Pick<TailHygieneBaseline, "baselineU" | "baselineT" | "turnDeltaU" | "turnDeltaT">,
 ): { u: number; t: number } {
-    const t = Math.max(0, baseline.baselineT + baseline.turnDeltaT);
-    const u = Math.min(t, Math.max(0, baseline.baselineU + baseline.turnDeltaU));
+    const t = Math.ceil(Math.max(0, baseline.baselineT + baseline.turnDeltaT));
+    const u = Math.min(t, Math.ceil(Math.max(0, baseline.baselineU + baseline.turnDeltaU)));
     return { u, t };
 }
 

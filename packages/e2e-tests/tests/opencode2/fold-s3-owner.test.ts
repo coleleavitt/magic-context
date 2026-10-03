@@ -8,14 +8,18 @@ import { join } from "node:path";
 import { OpenCode } from "@opencode/client";
 import { gaDatabasePath, V2StoreReader } from "../../../plugin/src/v2/store-reader";
 import { rawMessages } from "../../../plugin/src/v2/hooks/store";
-import { spawnOpencode2, waitForPluginActive } from '../../src/opencode2-runner/spawn';
+import { spawnOpencode2, waitForPluginActive, waitForPluginLog } from '../../src/opencode2-runner/spawn';
 
 const sha = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 for (const mode of ["local", "provider"] as const) {
     test(`I6a I7 I8 I9 R39 ${mode}: host fold costs zero requests and restores unarchived tail`, async () => {
         const root = mkdtempSync(join(tmpdir(), "mc-s3-fold-"));
-        const build = await Bun.build({ entrypoints: [join(import.meta.dir, "fold-s3-probe.ts")], outdir: root, naming: "index.js", target: "node", format: "esm", define: { "process.env.NODE_ENV": '"production"' }, external: ["bun:sqlite", "node:sqlite"] });
+        const build = await Bun.build({ entrypoints: [join(import.meta.dir, "fold-s3-probe.ts")], outdir: root, naming: "index.js", target: "bun", format: "esm", define: { "process.env.NODE_ENV": '"production"' }, external: ["bun:sqlite", "node:sqlite"] });
         if (!build.success) throw new Error(build.logs.join("\n"));
+        // Bun emits an undefined __promiseAll helper for bundled top-level
+        // asynchronous initializers. Replace it in this temporary probe only.
+        const probe = join(root, "index.js");
+        writeFileSync(probe, readFileSync(probe, "utf8").replaceAll("__promiseAll(", "Promise.all("));
         const host = await spawnOpencode2({ probePlugin: root, modelContextLimit: 16_000, modelOutputLimit: 1024 });
         const trace = join(host.cwd, "s3-fold.jsonl");
         try {
@@ -51,7 +55,9 @@ for (const mode of ["local", "provider"] as const) {
             expect(cut?.data.status).toBe("completed");
             expect(cut?.data.summary).toBe(compactions[0].result.summary);
             expect(cut?.data.summary).toContain("<session-history>");
-            if (mode === "provider") expect(cut?.data.recent).toBe("");
+            // In provider mode, the host saves messages not yet included in
+            // the summary in `recent`; the next request includes those messages.
+            if (mode === "provider") expect(cut?.data.recent).toContain(markers[2]);
             const wire = JSON.stringify(host.mock.requests().at(-1)!.body);
             for (const marker of markers) {
                 expect(wire).toContain(marker);
@@ -152,7 +158,7 @@ for (const mode of ["local", "provider"] as const) {
             hostDb.prepare("UPDATE session_message SET data = json_set(data, '$.summary', ?) WHERE id = ?").run("CORRUPTED-PERSISTED-SUMMARY", cut!.id);
             hostDb.close();
             await turn("Detect persisted checkpoint divergence");
-            expect(host.stderr()).toContain("HARD reason=host_rerender");
+            expect(await waitForPluginLog(host.env, "HARD reason=host_rerender")).toContain("HARD reason=host_rerender");
             expect(JSON.stringify(host.mock.requests().at(-1)!.body)).not.toContain("CORRUPTED-PERSISTED-SUMMARY");
             const recovered = frames().filter(frame => frame.kind === "context").at(-1);
             await turn("Defer after divergence recovery");

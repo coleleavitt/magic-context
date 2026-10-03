@@ -25,6 +25,8 @@
  *     historyRefreshSessions signal.
  */
 
+import { MEMORY_MURAL_BLOCK } from "@magic-context/core/agents/magic-context-prompt";
+import { isPartialCompartmentEnd } from "@magic-context/core/features/magic-context/compartment-storage";
 import {
 	getMaxMemoryIdForProjects,
 	getMemoriesByProject,
@@ -67,6 +69,9 @@ import {
 	decodeCachedM0UpgradeIdentity,
 	encodeCachedM0UpgradeIdentity,
 	MEMORY_RENDER_FORMAT_EPOCH,
+	renderBudgetIdentityChanged,
+	renderedBudgetShrinkReason,
+	renderedBudgetSnapshot,
 } from "@magic-context/core/hooks/magic-context/compartment-render-epoch";
 import {
 	DEFAULT_HISTORY_BUDGET_TOKENS,
@@ -74,6 +79,7 @@ import {
 	renderCompartmentAtTier,
 	renderDecayedCompartments,
 } from "@magic-context/core/hooks/magic-context/decay-render";
+import { historyLocalBudget } from "@magic-context/core/hooks/magic-context/decision-calibration";
 import {
 	DEFAULT_MEMORY_BUDGET_TOKENS,
 	DEFAULT_USER_PROFILE_BUDGET_TOKENS,
@@ -165,8 +171,12 @@ function trimPiMessagesToBoundary(
 	cutoffMessageId: string,
 	trimMutableEntryIds = false,
 	sessionId?: string,
+	preserveBoundary = false,
 ): number {
-	if (cutoffMessageId.length === 0) return 0;
+	// Pi tool calls and results occupy separate entries. If only part of the
+	// boundary message was summarized, keep the prefix: removing an earlier call
+	// could make orphan cleanup also delete its still-needed result.
+	if (cutoffMessageId.length === 0 || preserveBoundary) return 0;
 	// Resolve a synthetic-user (folded toolResult) cutoff to the real entry id
 	// of the underlying toolResult, which is what the live message carries.
 	const effectiveCutoffId = cutoffMessageId.startsWith(SYNTH_USER_ID_PREFIX)
@@ -407,6 +417,7 @@ export interface PiM0M1State {
 	 *  Distinct from injectionBudgetTokens — using the memory budget here would
 	 *  over-demote every compartment. */
 	historyBudgetTokens?: number;
+	historyBudgetPolicyIdentity?: string;
 	/** User-profile block budget (~4K). The m[1] new-user-profile delta is
 	 *  trimmed to 25% of this (matches OpenCode renderM1). Defaults when unset. */
 	userProfileBudgetTokens?: number;
@@ -554,6 +565,8 @@ export interface PiM0SnapshotMarkers {
 	projectIdentity: string | null;
 	muralEnabled: boolean;
 	renderBudgetIdentity: string;
+	/** Numeric allowances used by the cached render; absent on older baselines. */
+	renderedBudgets?: string | null;
 }
 
 /**
@@ -577,7 +590,7 @@ const EMPTY_PI_HARD_SIGNALS: PiM0HardSignals = {
 };
 
 function renderBudgetIdentityPi(state: PiM0M1State): string {
-	return `m${state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
+	return `m${state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${state.historyBudgetPolicyIdentity ?? state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
 }
 
 export interface PiMaterializeMismatch {
@@ -836,7 +849,16 @@ export function trimPiMessagesToCachedBoundary(
 		(compartment) => compartment.endMessageId === boundary,
 	);
 	if (!boundaryIsLive) return 0;
-	return trimPiMessagesToBoundary(piMessages, entryIds, boundary, true);
+	return trimPiMessagesToBoundary(
+		piMessages,
+		entryIds,
+		boundary,
+		true,
+		sessionId,
+		compartments.some(
+			(c) => c.endMessageId === boundary && c.endBlockIndex != null,
+		),
+	);
 }
 
 function setCachedBoundary(
@@ -928,6 +950,7 @@ function getCachedMarkers(
 		projectIdentity: meta.cachedM0ProjectIdentity ?? null,
 		muralEnabled: cachedUpgradeIdentity.muralEnabled ?? false,
 		renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity ?? "",
+		renderedBudgets: cachedUpgradeIdentity.renderedBudgets,
 	};
 }
 
@@ -1023,6 +1046,10 @@ function readCurrentMarkersFromCompartments(
 		projectIdentity: state.projectIdentity,
 		muralEnabled: state.muralEnabled === true,
 		renderBudgetIdentity: renderBudgetIdentityPi(state),
+		renderedBudgets: renderedBudgetSnapshot(
+			state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+			state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+		),
 	};
 }
 
@@ -1082,18 +1109,35 @@ export function mustMaterializePi(
 	}
 	if (cached.muralEnabled !== current.muralEnabled) {
 		return piMaterializeMismatch(
-			"render_config",
+			`render_config:mural(${cached.muralEnabled}→${current.muralEnabled})`,
 			"muralEnabled",
 			cached.muralEnabled,
 			current.muralEnabled,
 		);
 	}
-	if (cached.renderBudgetIdentity !== current.renderBudgetIdentity) {
+	if (
+		renderBudgetIdentityChanged(
+			cached.renderBudgetIdentity,
+			current.renderBudgetIdentity,
+		)
+	) {
 		return piMaterializeMismatch(
-			"render_config",
+			`render_config:budget(${cached.renderBudgetIdentity}→${current.renderBudgetIdentity})`,
 			"renderBudgetIdentity",
 			cached.renderBudgetIdentity,
 			current.renderBudgetIdentity,
+		);
+	}
+	const budgetShrinkReason = renderedBudgetShrinkReason(
+		cached.renderedBudgets,
+		current.renderedBudgets,
+	);
+	if (budgetShrinkReason) {
+		return piMaterializeMismatch(
+			budgetShrinkReason,
+			"renderedBudgets",
+			cached.renderedBudgets ?? null,
+			current.renderedBudgets ?? null,
 		);
 	}
 	// ── HARD: provider-side cache eviction (the cache was already dead) ──
@@ -1313,8 +1357,10 @@ export function renderM0Pi(
 	// budget (lower budget → higher curve pressure → more demotion), keeping the
 	// shared decay-curve as the single source of pressure math — same approach as
 	// OpenCode renderM0. The materialize loop escalates it when m[0] is over budget.
-	const baseHistoryBudget =
-		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+	const baseHistoryBudget = historyLocalBudget(
+		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+		piModelRefToCanonical(state.hardSignals?.modelKey ?? ""),
+	);
 	const decayed = renderDecayedCompartments({
 		compartments:
 			compartmentsOverride ?? getRenderableCompartmentsPi(db, state),
@@ -1360,9 +1406,7 @@ export function renderM0Pi(
 	if (memoryBlock) sections.push(memoryBlock);
 	// Sibling layout parity with OpenCode renderM0: mural marker after memories.
 	if (mural?.enabled && mural.supportsVision && mural.dataUrl) {
-		sections.push(
-			"<memory-mural>\nThe project memory mural image follows.\n</memory-mural>",
-		);
+		sections.push(MEMORY_MURAL_BLOCK);
 	}
 	return sections.join("\n\n").trim();
 }
@@ -1513,10 +1557,14 @@ function readFrozenM0InputsPi(
 			muralEnabled:
 				state.memoryEnabled !== false && state.muralEnabled === true,
 			renderBudgetIdentity: renderBudgetIdentityPi(state),
+			renderedBudgets: renderedBudgetSnapshot(
+				state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+				state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+			),
 		};
 		return { docs, markers, compartments, memories, userProfile, workspace };
 	});
-	return read();
+	return read.deferred();
 }
 
 function renderFreshM0PiNonPersisted(
@@ -1535,8 +1583,10 @@ function renderFreshM0PiNonPersisted(
 	// stable across consecutive fallback passes, so reuse the last persisted value
 	// (or 0 when no cached baseline exists) rather than live Date.now().
 	frozen.markers.materializedAt = cachedMaterializedAt;
-	const historyBudget =
-		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+	const historyBudget = historyLocalBudget(
+		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+		piModelRefToCanonical(state.hardSignals?.modelKey ?? ""),
+	);
 	const memoryBudget =
 		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
 	// Fresh fallback is a last-resort HARD-equivalent render: resolve mural once
@@ -1658,8 +1708,10 @@ export function materializeM0Pi(
 		frozen.workspace,
 		mural,
 	);
-	const historyBudget =
-		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+	const historyBudget = historyLocalBudget(
+		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+		piModelRefToCanonical(state.hardSignals?.modelKey ?? ""),
+	);
 	let attempts = 0;
 	while (
 		historyBudget > 0 &&
@@ -1686,7 +1738,6 @@ export function materializeM0Pi(
 	// changed since Phase 1, the rendered bytes are stale — roll back and let the
 	// caller retry. m[1] is rendered and persisted INSIDE the same transaction as
 	// m[0] so cached_m0_bytes/cached_m1_bytes/markers/memory_block_ids stay paired.
-	const transactionStartedAt = performance.now();
 	try {
 		db.exec("BEGIN IMMEDIATE");
 	} catch (error) {
@@ -1695,6 +1746,7 @@ export function materializeM0Pi(
 		}
 		throw error;
 	}
+	const transactionStartedAt = performance.now();
 	try {
 		// The lock-time marker check must describe the bytes rendered above. Reusing
 		// that HARD-fold document snapshot avoids a second stat/read pair and prevents
@@ -1759,6 +1811,7 @@ export function materializeM0Pi(
 				snapshotMarkers.muralEnabled,
 				snapshotMarkers.renderBudgetIdentity,
 				snapshotMarkers.memoryRenderEpoch,
+				snapshotMarkers.renderedBudgets ?? null,
 			),
 			systemHash: snapshotMarkers.systemHash,
 			modelKey: snapshotMarkers.modelKey,
@@ -2248,6 +2301,7 @@ function markersFromCachedPiRow(
 		projectIdentity: row.cached_m0_project_identity ?? null,
 		muralEnabled: cachedUpgradeIdentity.muralEnabled ?? false,
 		renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity ?? "",
+		renderedBudgets: cachedUpgradeIdentity.renderedBudgets,
 	};
 }
 
@@ -2373,8 +2427,8 @@ function softRefreshCachedM1Pi(args: {
 	memoryUpdateCount: number;
 	recomputed: boolean;
 } {
-	const transactionStartedAt = performance.now();
 	args.db.exec("BEGIN IMMEDIATE");
+	const transactionStartedAt = performance.now();
 	try {
 		const row = readCachedPiM0M1Row(args.db, args.state.sessionId);
 		if (
@@ -2483,6 +2537,8 @@ function resolveRenderedCompartmentBoundary(
 	const boundary = compartments.find(
 		(compartment) => compartment.endMessageId === boundaryId,
 	);
+	if (boundary?.endBlockIndex != null)
+		return { endMessageId: null, ordinal: null };
 	return {
 		endMessageId: boundaryId,
 		ordinal:
@@ -2558,6 +2614,9 @@ function replayCompletePiPrefix(
 				trimBoundaryId,
 				false,
 				state.sessionId,
+				compartments.some(
+					(c) => c.endMessageId === trimBoundaryId && c.endBlockIndex != null,
+				),
 			)
 		: 0;
 	const head: PiAgentMessage[] = [];
@@ -2623,6 +2682,7 @@ export function injectM0M1Pi(
 					prepared.trimBoundaryId,
 					false,
 					state.sessionId,
+					isPartialCompartmentEnd(db, state.sessionId, prepared.trimBoundaryId),
 				)
 			: 0;
 		const head = structuredClone(prepared.messages);
@@ -2913,7 +2973,8 @@ export function injectM0M1Pi(
 		if (
 			latestM1Compartment &&
 			latestM1Compartment.sequence > markers.maxCompartmentSeq &&
-			latestM1Compartment.endMessageId.length > 0
+			latestM1Compartment.endMessageId.length > 0 &&
+			latestM1Compartment.endBlockIndex == null
 		) {
 			m1RenderedCoverage = {
 				endMessageId: latestM1Compartment.endMessageId,
@@ -2931,6 +2992,7 @@ export function injectM0M1Pi(
 				trimBoundaryId,
 				false,
 				state.sessionId,
+				isPartialCompartmentEnd(db, state.sessionId, trimBoundaryId),
 			)
 		: 0;
 	const muralWire = m0.includes("<memory-mural>")

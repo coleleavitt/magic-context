@@ -1,8 +1,12 @@
 import { isRecord } from "../../shared/record-type-guard";
+import { toolPartHasUserAnswer } from "../../shared/user-answer";
 import { droppedInputMarker } from "./dropped-input-guard";
 import { applyEditMarkerToInput } from "./edit-marker";
+import { estimateMessageTokens } from "./final-wire-token-estimate";
+import { neutralizeDroppedReasoningPart } from "./sentinel";
 import { stripTagPrefix } from "./tag-content-primitives";
 import type { MessageLike, ThinkingLikePart } from "./tag-messages";
+import { toolInputStringBytes } from "./tool-input-size";
 
 export type ToolDropResult = "removed" | "truncated" | "absent" | "incomplete";
 
@@ -15,6 +19,14 @@ export interface IndexedOccurrence {
     message: MessageLike;
     part: unknown;
     kind: "invocation" | "result";
+    /**
+     * The rewritten clone currently standing in for `part` in the message's
+     * parts array, when a clamp swapped one in this pass. `part` itself stays
+     * the untouched host object, so a later rewrite in the same pass (a legacy
+     * skeleton converted on a HARD fold) still starts from the real input and
+     * knows which array entry to replace or remove.
+     */
+    served?: unknown;
 }
 
 export interface ToolCallIndexEntry {
@@ -101,16 +113,53 @@ function clampCloneInPlace(occurrence: IndexedOccurrence, clamp: (part: unknown)
     const clone = clonePart(occurrence.part);
     clamp(clone);
     const parts = occurrence.message.parts;
-    const index = parts.indexOf(occurrence.part);
-    if (index >= 0) parts[index] = clone;
+    const index = parts.indexOf(servedPart(occurrence));
+    if (index >= 0) {
+        parts[index] = clone;
+        occurrence.served = clone;
+    }
+}
+
+/** The object that currently represents this occurrence in its message. */
+function servedPart(occurrence: IndexedOccurrence): unknown {
+    return occurrence.served ?? occurrence.part;
+}
+
+/**
+ * Real-argument skeleton: keep the call exactly as the host gave it and
+ * replace only the output with the canonical `[dropped §N§]`. Nothing is ever
+ * written into the argument position, so a model copying this call from its
+ * history copies real, executable arguments.
+ */
+function skeletonRealToolPart(part: unknown, tagId: number, stripAttachments = false): void {
+    if (!isRecord(part)) return;
+    const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
+    if (part.type === "tool" && isRecord(part.state)) {
+        part.state.output = sentinel;
+        if (stripAttachments) part.state.attachments = [];
+        return;
+    }
+    if (part.type === "tool_result") {
+        part.content = sentinel;
+    }
+}
+
+/** Read a tool part's input of any JSON shape, without touching it. */
+function readToolPartRawInput(part: unknown): unknown {
+    if (!isRecord(part)) return undefined;
+    if (part.type === "tool" && isRecord(part.state)) return part.state.input;
+    if (part.type === "tool-invocation") return part.args;
+    if (part.type === "tool_use") return part.input;
+    return undefined;
 }
 
 function truncateToolPart(part: unknown, tagId: number): void {
     if (!isRecord(part)) return;
 
-    // Keep the call/result structure for provider pairing, but remove every
-    // executable argument key. The marker is derived only from the durable tag,
-    // so a frozen truncated drop replays byte-identically.
+    // Legacy `truncated` render, kept only so sessions that already serve it
+    // replay the same bytes until a HARD fold converts them (see
+    // convertLegacyToolSkeletons). New drops never use it. The marker is
+    // derived only from the durable tag, so it replays byte-identically.
     const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
 
     // OpenCode format: { type: "tool", state: { input: {...}, output: "..." } }
@@ -148,12 +197,13 @@ function truncateToolPart(part: unknown, tagId: number): void {
  * A SEPARATE path from `truncateToolPart`: it must never alter the existing
  * skeleton bytes. Deterministic + idempotent (see edit-marker.ts).
  */
-function editMarkerToolPart(part: unknown, tagId: number): void {
+function editMarkerToolPart(part: unknown, tagId: number, stripAttachments = false): void {
     if (!isRecord(part)) return;
     const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
 
     if (part.type === "tool" && isRecord(part.state)) {
         part.state.output = sentinel;
+        if (stripAttachments) part.state.attachments = [];
         if (isRecord(part.state.input)) applyEditMarkerToInput(part.state.input);
         return;
     }
@@ -198,11 +248,13 @@ export function hasMeaningfulPart(part: unknown): boolean {
     return true;
 }
 
+/**
+ * A drop invalidates the reasoning that led to the dropped call. Take it off
+ * the wire whole (see neutralizeDroppedReasoningPart); never rewrite its text,
+ * which would leave a signature, opaque payload or encrypted content behind.
+ */
 function clearThinkingParts(thinkingParts: ThinkingLikePart[]): void {
-    for (const part of thinkingParts) {
-        if (part.thinking !== undefined) part.thinking = "[cleared]";
-        if (part.text !== undefined) part.text = "[cleared]";
-    }
+    for (const part of thinkingParts) neutralizeDroppedReasoningPart(part);
 }
 
 function messageHasNativeReasoning(message: MessageLike): boolean {
@@ -295,8 +347,33 @@ export class ToolMutationBatch {
     }
 
     markForRemoval(occurrence: IndexedOccurrence): void {
-        this.partsToRemove.add(occurrence.part);
+        this.partsToRemove.add(servedPart(occurrence));
         this.affectedMessages.add(occurrence.message);
+    }
+
+    /**
+     * Would removing `occurrences` (on top of everything already marked in this
+     * batch) leave the provider request ending on an assistant turn?
+     *
+     * The request ends with the newest message that has any content (a blank
+     * pending assistant shell after it does not count). When that message is an
+     * assistant, its tool results are what the provider sees as the closing user
+     * turn, so at least one must survive. Any other role must keep some content,
+     * or the sweep removes it and an earlier assistant becomes the end. Models
+     * without assistant prefill support reject an assistant-terminated request.
+     */
+    wouldStrandConversationEnd(occurrences: readonly IndexedOccurrence[]): boolean {
+        const served = this.servedMessages ?? this.messages;
+        let end: MessageLike | undefined;
+        for (let i = served.length - 1; i >= 0 && end === undefined; i -= 1) {
+            if (served[i].parts.some(hasMeaningfulPart)) end = served[i];
+        }
+        if (!end || !occurrences.some((occurrence) => occurrence.message === end)) return false;
+        const leaving = new Set(occurrences.map(servedPart));
+        const survives = (part: unknown) => !leaving.has(part) && !this.partsToRemove.has(part);
+        return end.info.role === "assistant"
+            ? !end.parts.some((part) => partHasCompletedResult(part) && survives(part))
+            : !end.parts.some((part) => hasMeaningfulPart(part) && survives(part));
     }
 
     finalize(): void {
@@ -385,7 +462,13 @@ export function createToolDropTarget(
     setContent: (content: string) => boolean;
     drop: () => ToolDropResult;
     truncate: () => ToolDropResult;
+    skeletonReal: () => ToolDropResult;
     editMarker: () => ToolDropResult;
+    editMarkerStripped: () => ToolDropResult;
+    skeletonStripped: () => ToolDropResult;
+    hasAttachments: () => boolean;
+    inputStringBytes: () => number | null;
+    wouldStrandConversationEnd: () => boolean;
     /**
      * Non-mutating predicate: would drop()/truncate() actually remove bytes?
      * False for an absent (compacted-away) or incomplete (invocation present,
@@ -397,11 +480,23 @@ export function createToolDropTarget(
     canDrop: () => boolean;
     requiresToolArcSkeleton: boolean;
     readInput: () => Record<string, unknown> | null;
+    measureReclaim: (skeleton: boolean) => {
+        beforeTools: number;
+        afterTools: number;
+        beforeProse: number;
+        afterProse: number;
+    };
 } {
     const drop = (): ToolDropResult => {
         const entry = index.get(compositeKey);
         if (!entry || entry.occurrences.length === 0) return "absent";
         if (!entry.hasResult) return "incomplete";
+        // If removing this call's result would leave the provider request ending
+        // on an assistant turn, keep the call with its REAL arguments plus the
+        // placeholder result instead. "truncated" tells callers to persist that
+        // mode (`skeleton_real`), so later passes serve the same bytes once newer
+        // turns follow.
+        if (batch.wouldStrandConversationEnd(entry.occurrences)) return skeletonReal();
 
         for (const occurrence of entry.occurrences) {
             batch.markForRemoval(occurrence);
@@ -426,7 +521,53 @@ export function createToolDropTarget(
         return "truncated";
     };
 
-    const editMarker = (): ToolDropResult => {
+    const skeletonReal = (): ToolDropResult => {
+        const entry = index.get(compositeKey);
+        if (!entry || entry.occurrences.length === 0) return "absent";
+        if (!entry.hasResult) return "incomplete";
+
+        for (const occurrence of entry.occurrences) {
+            // Invocation-only parts keep their real arguments untouched; a
+            // clone still replaces any earlier clamp from this pass.
+            clampCloneInPlace(occurrence, (part) => skeletonRealToolPart(part, tagId));
+        }
+        clearThinkingParts(thinkingParts);
+        return "truncated";
+    };
+
+    const skeletonStripped = (): ToolDropResult => {
+        const entry = index.get(compositeKey);
+        if (!entry || entry.occurrences.length === 0) return "absent";
+        if (!entry.hasResult) return "incomplete";
+        for (const occurrence of entry.occurrences) {
+            clampCloneInPlace(occurrence, (part) => skeletonRealToolPart(part, tagId, true));
+        }
+        clearThinkingParts(thinkingParts);
+        return "truncated";
+    };
+
+    const hasAttachments = (): boolean =>
+        index
+            .get(compositeKey)
+            ?.occurrences.some(
+                ({ part }) =>
+                    isRecord(part) &&
+                    isRecord(part.state) &&
+                    Array.isArray(part.state.attachments) &&
+                    part.state.attachments.length > 0,
+            ) ?? false;
+
+    const readRawInput = (): unknown => {
+        const entry = index.get(compositeKey);
+        if (!entry) return undefined;
+        for (const occurrence of entry.occurrences) {
+            const input = readToolPartRawInput(occurrence.part);
+            if (input !== undefined) return input;
+        }
+        return undefined;
+    };
+
+    const applyEditMarker = (stripAttachments: boolean): ToolDropResult => {
         const entry = index.get(compositeKey);
         if (!entry || entry.occurrences.length === 0) return "absent";
         if (!entry.hasResult) return "incomplete";
@@ -434,13 +575,35 @@ export function createToolDropTarget(
         for (const occurrence of entry.occurrences) {
             // Same mutation-safety guarantee as truncate(): clamp a clone, never
             // the live part object.
-            clampCloneInPlace(occurrence, (part) => editMarkerToolPart(part, tagId));
+            clampCloneInPlace(occurrence, (part) =>
+                editMarkerToolPart(part, tagId, stripAttachments),
+            );
         }
         clearThinkingParts(thinkingParts);
         return "truncated";
     };
 
     return {
+        measureReclaim: (skeleton) => {
+            const entry = index.get(compositeKey);
+            const parts = entry?.occurrences.map((occ) => occ.part) ?? [];
+            const count = (parts: unknown[]) =>
+                estimateMessageTokens({
+                    info: { id: "reclaim", role: "assistant" },
+                    parts,
+                } as MessageLike);
+            const before = count(parts);
+            const retained = skeleton ? structuredClone(parts) : [];
+            for (const part of retained) skeletonRealToolPart(part, tagId);
+            const after = count(retained);
+            // Several calls can share one thinking block; credit only tool I/O here to avoid reclaiming it twice.
+            return {
+                beforeTools: before.toolCall,
+                afterTools: after.toolCall,
+                beforeProse: 0,
+                afterProse: 0,
+            };
+        },
         setContent: (content: string): boolean => {
             if (isDropContent(content)) {
                 drop();
@@ -463,10 +626,29 @@ export function createToolDropTarget(
         },
         drop,
         truncate,
-        editMarker,
+        skeletonReal,
+        skeletonStripped,
+        hasAttachments,
+        editMarker: () => applyEditMarker(false),
+        editMarkerStripped: () => applyEditMarker(true),
+        inputStringBytes: (): number | null => {
+            const entry = index.get(compositeKey);
+            if (!entry || entry.occurrences.length === 0) return null;
+            return toolInputStringBytes(readRawInput());
+        },
+        wouldStrandConversationEnd: (): boolean => {
+            const entry = index.get(compositeKey);
+            if (!entry || entry.occurrences.length === 0) return false;
+            return batch.wouldStrandConversationEnd(entry.occurrences);
+        },
         canDrop: (): boolean => {
             const entry = index.get(compositeKey);
-            return !!entry && entry.occurrences.length > 0 && entry.hasResult;
+            return (
+                !!entry &&
+                entry.occurrences.length > 0 &&
+                entry.hasResult &&
+                !entry.occurrences.some((occurrence) => toolPartHasUserAnswer(occurrence.part))
+            );
         },
         requiresToolArcSkeleton:
             thinkingParts.length > 0 ||

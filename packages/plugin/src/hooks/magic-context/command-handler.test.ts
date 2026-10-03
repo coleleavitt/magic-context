@@ -1,6 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { CANONICAL_DREAM_TASKS } from "../../features/magic-context/dreamer/task-registry";
+import { runMigrations } from "../../features/magic-context/migrations";
+import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     __resetNotificationStateForTests,
     drainNotifications,
@@ -1194,6 +1197,68 @@ describe("createMagicContextCommandHandler", () => {
             expect(texts).not.toContain("— Failed");
         });
 
+        it("renders each retryable Rust wrapup reason with what unblocks it", async () => {
+            const sendMessageFirst =
+                "Send a message in this session first, then run /ctx-wrapup again. (MC-C12)";
+            const retry = "Retry in a moment. (MC-C09)";
+            const cases = [
+                {
+                    reason: "transform_not_observed",
+                    summary: "anything",
+                    expected: sendMessageFirst,
+                },
+                // A module that predates `transform_not_observed` reports the missing
+                // snapshot under the generic reason with this summary.
+                {
+                    reason: "snapshot_unavailable",
+                    summary: "wrapup unavailable until a full session transform has been observed",
+                    expected: sendMessageFirst,
+                },
+                {
+                    reason: "snapshot_unavailable",
+                    summary: "too many concurrent wrapups",
+                    expected: retry,
+                },
+                { reason: "budget_exhausted", summary: "budget expired", expected: retry },
+                { reason: "snapshot_stale", summary: "stale", expected: retry },
+                { reason: "backoff_active", summary: "backoff", expected: retry },
+                { reason: "some_future_reason", summary: "future", expected: retry },
+            ];
+            for (const [index, row] of cases.entries()) {
+                const sendNotification = mock(async () => {});
+                const moduleCall = mock(async () => ({
+                    ok: false,
+                    disposition: "retryable",
+                    reason: row.reason,
+                    summary: row.summary,
+                }));
+                const handler = createMagicContextCommandHandler({
+                    db,
+                    transformMode: "rust",
+                    rustModeModuleClient: { call: moduleCall },
+                    sendNotification,
+                });
+                const sessionId = `ses-rust-wrapup-reason-${index}`;
+                await expectSentinel(
+                    handler["command.execute.before"](
+                        { command: "ctx-wrapup", sessionID: sessionId, arguments: "" },
+                        makeOutput(""),
+                        {},
+                    ),
+                    "__CONTEXT_MANAGEMENT_CTX-WRAPUP_HANDLED__",
+                );
+                const text = (sendNotification.mock.calls as unknown as Array<[string, string]>)
+                    .filter(([notified]) => notified === sessionId)
+                    .map(([, notification]) => notification)
+                    .join("\n");
+                const label = `${row.reason}/${row.summary}`;
+                expect(text, label).toContain("## Magic Wrapup — Partial");
+                expect(text, label).toContain(row.expected);
+                const other = row.expected === retry ? sendMessageFirst : retry;
+                expect(text, label).not.toContain(other);
+            }
+        });
+
         it("keeps /ctx-embed on the TypeScript subsystem in Rust mode", async () => {
             const sendNotification = mock(async () => {});
             const moduleCall = mock(async () => {
@@ -1352,6 +1417,10 @@ describe("createMagicContextCommandHandler", () => {
     });
     describe("ctx-dream", () => {
         it("runs all enabled tasks, sends summary, and throws the sentinel", async () => {
+            // A migrated store, so the backlog panels have real rows to count.
+            const dreamDb = new Database(":memory:");
+            initializeDatabase(dreamDb);
+            runMigrations(dreamDb);
             const sendNotification = mock(async () => {});
             const runManual = mock(async () => ({
                 ran: ["verify"],
@@ -1359,9 +1428,11 @@ describe("createMagicContextCommandHandler", () => {
                 skippedNoWork: [],
                 deferredBusy: [],
                 failed: [],
+                // The runner reports only the task it selected.
+                backlogAfter: { verify: { pending: 0, total: 0 } },
             }));
             const handler = createMagicContextCommandHandler({
-                db,
+                db: dreamDb,
                 sendNotification,
                 dreamer: {
                     // command handler only reads `config` for presence; runManual is the entry.
@@ -1393,6 +1464,69 @@ describe("createMagicContextCommandHandler", () => {
             expect(sendNotification.mock.calls[1]?.[1]).toContain(
                 "curate: 8 memory operations applied",
             );
+            const before = String(sendNotification.mock.calls[0]?.[1]);
+            const after = String(sendNotification.mock.calls[1]?.[1]);
+            // The end panel appears once and lists exactly the tasks the start panel listed,
+            // even though the runner only reported the task it ran.
+            expect(after.split("Backlog at run end:").length - 1).toBe(1);
+            expect(after).not.toContain("Backlog at run start:");
+            const taskNames = (panel: string) =>
+                panel
+                    .split("\n")
+                    .map((line) => /^\s*[-*]?\s*([a-z-]+):/.exec(line)?.[1])
+                    .filter((name): name is string =>
+                        CANONICAL_DREAM_TASKS.includes(name as never),
+                    );
+            const beforeTasks = taskNames(before.split("Backlog before starting:")[1] ?? "");
+            const afterTasks = taskNames(after.split("Backlog at run end:")[1] ?? "");
+            expect(beforeTasks.length).toBe(CANONICAL_DREAM_TASKS.length);
+            expect(afterTasks).toEqual(beforeTasks);
+        });
+
+        it("samples toast duration once when a dream run starts", async () => {
+            let duration = 3000;
+            const sampleToastDurationMs = mock(() => duration);
+            const sendNotification = mock(async () => {});
+            const handler = createMagicContextCommandHandler({
+                db,
+                sendNotification,
+                sampleToastDurationMs,
+                dreamer: {
+                    config: {} as never,
+                    projectPath: "/repo/project",
+                    runManual: async () => {
+                        duration = 9000;
+                        return {
+                            ran: ["verify"],
+                            details: [],
+                            skippedNoWork: [],
+                            deferredBusy: [],
+                            failed: [],
+                        };
+                    },
+                },
+            });
+            const run = () =>
+                expectSentinel(
+                    handler["command.execute.before"](
+                        { command: "ctx-dream", sessionID: "ses-dream", arguments: "" },
+                        makeOutput(""),
+                        {},
+                    ),
+                    "__CONTEXT_MANAGEMENT_CTX-DREAM_HANDLED__",
+                );
+            await run();
+            expect(sampleToastDurationMs).toHaveBeenCalledTimes(1);
+            expect(sendNotification.mock.calls.slice(0, 2).map((call) => call[2])).toEqual([
+                { toastDurationMs: 3000 },
+                { toastDurationMs: 3000 },
+            ]);
+            await run();
+            expect(sampleToastDurationMs).toHaveBeenCalledTimes(2);
+            expect(sendNotification.mock.calls.slice(2, 4).map((call) => call[2])).toEqual([
+                { toastDurationMs: 9000 },
+                { toastDurationMs: 9000 },
+            ]);
         });
 
         it("force-runs a single named task when given an argument", async () => {

@@ -108,7 +108,12 @@ export function hasLengthCappedOutput(value: unknown): boolean {
     if (!isRecord(value)) return false;
 
     if (value.length_capped === true || value.lengthCapped === true) return true;
-    const finishReason = value.finish_reason ?? value.finishReason;
+    const finishReason =
+        value.finish_reason ??
+        value.finishReason ??
+        value.finish ??
+        (value.type === "step-finish" ? value.reason : undefined) ??
+        value.stopReason;
     if (typeof finishReason === "string") {
         const normalized = finishReason.toLowerCase();
         if (
@@ -121,4 +126,31 @@ export function hasLengthCappedOutput(value: unknown): boolean {
     }
 
     return Object.values(value).some((item) => hasLengthCappedOutput(item));
+}
+
+/** Settlement metadata for diagnostics, never private reasoning as task output. */
+export function describeAssistantSettlement(output: unknown): string {
+    if (isRecord(output) && isRecord(output.tokenLog)) {
+        return `finish=${String(output.tokenLog.finish_reason ?? "unknown")}, reasoning=${typeof output.reasoning === "string" && output.reasoning.length > 0}`;
+    }
+    const latest = getLatestAssistantMessage(output);
+    const parts = Array.isArray(latest?.parts) ? latest.parts.filter(isRecord) : [];
+    return `finish=${latest?.info?.finish ?? "unknown"}, reasoning=${parts.some((part) => part.type === "reasoning")}, tools=${parts.filter((part) => part.type === "tool").length}`;
+}
+
+/** Describe persisted host/provider errors without losing structured status or message fields. */
+export function describeAssistantError(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    if (!isRecord(error)) return String(error);
+    const data = isRecord(error.data) ? error.data : error;
+    const message = typeof data.message === "string" ? data.message : undefined;
+    const status = data.statusCode ?? data.status;
+    const name =
+        typeof error.name === "string"
+            ? error.name
+            : typeof error.type === "string"
+              ? error.type
+              : undefined;
+    const description = [name, message].filter(Boolean).join(": ") || JSON.stringify(error);
+    return status === undefined ? description : `${description} (status=${String(status)})`;
 }

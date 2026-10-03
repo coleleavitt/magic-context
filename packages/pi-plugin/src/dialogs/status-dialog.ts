@@ -37,9 +37,11 @@ import {
 	readEpochFloorSnapshot,
 } from "@magic-context/core/features/magic-context/protection-window";
 import { parseCacheTtl } from "@magic-context/core/features/magic-context/scheduler";
+import { readSessionCacheTtl } from "@magic-context/core/features/magic-context/session-cache-ttl";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
 import {
+	getCompactionMarkerHealth,
 	getOverflowState,
 	getSessionWorkMetrics,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
@@ -61,12 +63,18 @@ import type {
 } from "@magic-context/core/shared/rpc-types";
 import { renderUserStatusSummary } from "@magic-context/core/shared/status-summary";
 import {
-	buildStatusView,
+	buildStatusViewFor,
+	distributeBarWidths,
+	STATUS_COLUMN_GAP,
 	type StatusBarSegment,
+	type StatusColumnLayout,
 	type StatusRow,
+	type StatusSection,
 	type StatusTone,
 	type StatusViewSource,
+	statusColumnsFor,
 } from "@magic-context/core/shared/status-view";
+import { checkLocalStatusSource } from "@magic-context/core/shared/status-view-check";
 import { resolveTailHygieneStatus } from "@magic-context/core/shared/tail-hygiene-status";
 import type { UserFacingFailureKey } from "@magic-context/core/shared/user-facing-codes";
 import type { WindowGeometryResult } from "@magic-context/core/shared/window-geometry";
@@ -74,7 +82,7 @@ import packageJson from "../../package.json";
 import { resolveSessionId } from "../commands/pi-command-utils";
 import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
 import { resolvePiWindowGeometry } from "../pi-context-limit";
-import { resolvePiPressureSnapshot } from "../pi-pressure";
+import { resolvePiStatusPressureSnapshot } from "../pi-pressure";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 
 /** Refresh cadence while dialog is open. */
@@ -93,6 +101,9 @@ export interface StatusDialogDeps {
 	injectionBudgetTokens?: number;
 	/** User-owned profile selected for the project, after config resolution. */
 	activeProfile?: string;
+	configGeneration?: number;
+	configAdoptedAt?: number;
+	configReloadFailure?: { path: string; message: string };
 	dreamer?: { runnable?: boolean; scheduleSummary?: string };
 	executeThresholdTokens?: {
 		default?: number;
@@ -108,6 +119,9 @@ export interface StatusDialogDeps {
 export interface StatusDialogDetail {
 	sessionId: string;
 	activeProfile: string | null;
+	configGeneration?: number;
+	configAdoptedAt?: number;
+	configReloadFailure?: { path: string; message: string };
 	usagePercentage: number;
 	inputTokens: number;
 	systemPromptTokens: number;
@@ -119,13 +133,19 @@ export interface StatusDialogDetail {
 	sessionNoteCount: number;
 	readySmartNoteCount: number;
 	pendingOpsCount: number;
+	compactionMarker: {
+		code: "MC-C11" | null;
+		attempts: number;
+		lastError: string | null;
+		pendingSinceMs: number | null;
+	};
 	historianRunning: boolean;
 	timesExecuteThresholdReached: number;
 	historianFailureCount: number;
 	historianLastFailureAt: number | null;
 	historianLastError: string | null;
 	cacheTtl: string;
-	cacheTtlSource: "config" | "session" | "default";
+	cacheTtlSource: import("@magic-context/core/shared/cache-ttl-display").CacheTtlDisplaySource;
 	cacheTtlModelKey?: string;
 	configParseFailures: ConfigParseFailure[];
 	lastResponseTime: number;
@@ -233,6 +253,12 @@ interface StatusDialogProps {
  *  - rebuilds detail and re-renders on a 1s timer so live values stay current
  *  - cleans up timer on close
  */
+const openStatusDialogs = new Set<StatusDialogComponent>();
+
+export function stopStatusDialogRefresh(): void {
+	for (const dialog of openStatusDialogs) dialog.close();
+}
+
 class StatusDialogComponent implements Component {
 	private readonly props: StatusDialogProps;
 	private detail: StatusDialogDetail;
@@ -247,6 +273,7 @@ class StatusDialogComponent implements Component {
 			props.deps,
 			props.sessionId,
 		);
+		openStatusDialogs.add(this);
 		this.refreshTimer = setInterval(() => {
 			if (this.closed) return;
 			try {
@@ -273,13 +300,9 @@ class StatusDialogComponent implements Component {
 		}
 	}
 
-	private close(): void {
+	close(): void {
 		if (this.closed) return;
-		this.closed = true;
-		if (this.refreshTimer) {
-			clearInterval(this.refreshTimer);
-			this.refreshTimer = null;
-		}
+		this.dispose();
 		this.props.done(undefined);
 	}
 
@@ -302,6 +325,8 @@ class StatusDialogComponent implements Component {
 	}
 
 	dispose(): void {
+		this.closed = true;
+		openStatusDialogs.delete(this);
 		if (this.refreshTimer) {
 			clearInterval(this.refreshTimer);
 			this.refreshTimer = null;
@@ -320,12 +345,13 @@ function piStatusWarnings(s: StatusDialogDetail): UserFacingFailureKey[] {
 		warnings.push("configuration_warning");
 	}
 	if (s.embedding.state === "stopped") warnings.push("embedding_unavailable");
+	if (s.compactionMarker.code) warnings.push("compaction_marker_missing");
 	return warnings;
 }
 
 /** Chat-text status for a Pi host without an interactive UI to draw a dialog on. */
 export function formatPiStatusSummary(s: StatusDialogDetail): string {
-	return renderUserStatusSummary(
+	const summary = renderUserStatusSummary(
 		{
 			inputTokens: s.inputTokens,
 			usableContextTokens: s.contextLimit,
@@ -357,6 +383,9 @@ export function formatPiStatusSummary(s: StatusDialogDetail): string {
 		},
 		"plain",
 	);
+	return s.configGeneration === undefined
+		? summary
+		: `${summary}\nConfig generation: ${s.configGeneration} (adopted ${s.configAdoptedAt ? new Date(s.configAdoptedAt).toLocaleString() : "unknown"})${s.configReloadFailure ? `\nConfig reload failed ${s.configReloadFailure.path}: ${s.configReloadFailure.message}` : ""}`;
 }
 
 /**
@@ -409,6 +438,60 @@ function renderSplitRow(left: string, right: string, width: number): string {
 	return `${left}${" ".repeat(gap)}${right}`;
 }
 
+/** Pads one already-coloured cell to a fixed column width, ANSI-aware. */
+function padCell(text: string, width: number): string {
+	const pad = Math.max(0, width - visibleWidth(text));
+	return `${text}${" ".repeat(pad)}`;
+}
+
+/**
+ * Draws the sections as a two-column grid: sections pair up left/right in model
+ * order, each pair sharing one title line and then one line per row, with the
+ * taller column deciding how many lines the pair takes. A trailing odd section
+ * sits alone in the left column. The shared model decides whether two columns
+ * fit and how wide each has to be, so a value is never squeezed into a wrap and
+ * this overlay and the OpenCode dialog lay the sections out the same way.
+ */
+function renderSectionGrid(
+	sections: readonly StatusSection[],
+	layout: StatusColumnLayout,
+	theme: Theme,
+): string[] {
+	const gap = " ".repeat(STATUS_COLUMN_GAP);
+	const lines: string[] = [];
+	for (let i = 0; i < sections.length; i += 2) {
+		const left = sections[i];
+		if (!left) break;
+		const right = sections[i + 1];
+		lines.push("");
+		const leftTitle = theme.fg("text", theme.bold(left.title));
+		lines.push(
+			right
+				? `${padCell(leftTitle, layout.leftWidth)}${gap}${theme.fg("text", theme.bold(right.title))}`
+				: leftTitle,
+		);
+		const rowCount = Math.max(left.rows.length, right?.rows.length ?? 0);
+		for (let r = 0; r < rowCount; r++) {
+			const leftRow = left.rows[r];
+			const leftCell = leftRow
+				? padCell(
+						renderStatusRow(leftRow, left.labelWidth, layout.leftWidth, theme),
+						layout.leftWidth,
+					)
+				: " ".repeat(layout.leftWidth);
+			const rightRow = right?.rows[r];
+			if (!right || !rightRow) {
+				lines.push(leftCell);
+				continue;
+			}
+			lines.push(
+				`${leftCell}${gap}${renderStatusRow(rightRow, right.labelWidth, layout.rightWidth, theme)}`,
+			);
+		}
+	}
+	return lines;
+}
+
 /** The overlay's content lines, before the border is drawn around them. */
 export function renderPiStatusOverlay(
 	s: StatusDialogDetail,
@@ -417,8 +500,12 @@ export function renderPiStatusOverlay(
 ): string[] {
 	// Which rows exist, their labels, order and colours come from the shared
 	// model, so this overlay and the OpenCode dialog cannot drift apart. Only
-	// the drawing is Pi's own.
-	const view = buildStatusView(statusViewSourceFromPiDetail(s), {
+	// the drawing is Pi's own. The snapshot passes the same check the OpenCode
+	// dialog applies to its RPC reply; one the model cannot draw becomes the
+	// "status unavailable" view naming the missing fields instead of an
+	// exception thrown out of Pi's render loop.
+	const status = checkLocalStatusSource(statusViewSourceFromPiDetail(s));
+	const view = buildStatusViewFor(status, {
 		version: packageJson.version,
 	});
 	const lines: string[] = [];
@@ -446,7 +533,7 @@ export function renderPiStatusOverlay(
 	);
 	if (view.windowLine) lines.push(theme.fg("muted", view.windowLine));
 
-	const bar = renderBar(view.bar, s.inputTokens, innerWidth);
+	const bar = renderBar(view.bar, innerWidth);
 	if (bar) lines.push(bar);
 	for (const row of view.breakdown) {
 		lines.push(
@@ -465,24 +552,36 @@ export function renderPiStatusOverlay(
 	// pre-v2 layout have nowhere else to surface. This is live run state
 	// rather than status content, which is why it is not one of the shared
 	// sections.
-	const upgrade: StatusRow | null = s.recompInFlight
-		? { label: "Recomp", value: "running…", tone: "warning" }
-		: s.upgradeNeededCount > 0
-			? {
-					label: "Recomp",
-					value: `${s.upgradeNeededCount} compartment${
-						s.upgradeNeededCount === 1 ? "" : "s"
-					} in the old layout · run /ctx-recomp`,
-					tone: "warning",
-				}
-			: null;
+	const upgrade: StatusRow | null =
+		status.state !== "ready"
+			? null
+			: s.recompInFlight
+				? { label: "Recomp", value: "running…", tone: "warning" }
+				: s.upgradeNeededCount > 0
+					? {
+							label: "Recomp",
+							value: `${s.upgradeNeededCount} compartment${
+								s.upgradeNeededCount === 1 ? "" : "s"
+							} in the old layout · run /ctx-recomp`,
+							tone: "warning",
+						}
+					: null;
 	if (upgrade) lines.push(renderStatusRow(upgrade, 9, innerWidth, theme));
 
-	for (const section of view.sections) {
-		lines.push("");
-		lines.push(theme.fg("text", theme.bold(section.title)));
-		for (const row of section.rows) {
-			lines.push(renderStatusRow(row, section.labelWidth, innerWidth, theme));
+	// The shared model decides whether the sections fit in two columns at this
+	// width, and how wide each column has to be; below that the same sections
+	// are drawn in one column, in the same order, instead of being squeezed
+	// into mid-word wraps.
+	const layout = statusColumnsFor(view.sections, innerWidth);
+	if (layout.twoColumn) {
+		lines.push(...renderSectionGrid(view.sections, layout, theme));
+	} else {
+		for (const section of view.sections) {
+			lines.push("");
+			lines.push(theme.fg("text", theme.bold(section.title)));
+			for (const row of section.rows) {
+				lines.push(renderStatusRow(row, section.labelWidth, innerWidth, theme));
+			}
 		}
 	}
 
@@ -557,7 +656,8 @@ export function buildPiStatusDetail(
 		persistedInputTokens: meta.lastInputTokens,
 		persistedPercentage: meta.lastContextPercentage,
 	});
-	const pressure = resolvePiPressureSnapshot({
+	const pressure = resolvePiStatusPressureSnapshot({
+		sessionId,
 		persistedPercentage: meta.lastContextPercentage,
 		persistedInputTokens: meta.lastInputTokens,
 		liveInputTokens: usage?.tokens,
@@ -573,17 +673,20 @@ export function buildPiStatusDetail(
 
 	// v2 m[0] per-block attribution via the SHARED core helper so the Pi dialog
 	// renders byte-identical categories to OpenCode's sidebar (Docs / User
-	// Profile / Memories / Compartments measured from the real cached_m0 slice;
+	// Profile / Memories / Compartments measured from the real cached_m0 slice,
+	// with Compartments also counting those still served in cached_m1;
 	// Facts retired → 0). Falls back to Σp1 / on-demand v2 memory render cold.
-	const m0Bytes = metaRow?.cached_m0_bytes;
-	const m0Text =
-		m0Bytes instanceof Uint8Array
-			? Buffer.from(m0Bytes).toString("utf8")
-			: typeof m0Bytes === "string"
-				? m0Bytes
+	const decodeCachedBytes = (
+		bytes: Buffer | Uint8Array | string | null | undefined,
+	): string =>
+		bytes instanceof Uint8Array
+			? Buffer.from(bytes).toString("utf8")
+			: typeof bytes === "string"
+				? bytes
 				: "";
 	const m0Blocks = computeM0BlockTokens(deps.db, sessionId, {
-		m0Text,
+		m0Text: decodeCachedBytes(metaRow?.cached_m0_bytes),
+		m1Text: decodeCachedBytes(metaRow?.cached_m1_bytes),
 		projectIdentity: deps.projectIdentity,
 		injectionBudgetTokens: deps.injectionBudgetTokens,
 		memoryBlockCount,
@@ -680,6 +783,7 @@ export function buildPiStatusDetail(
 		},
 	);
 	const cacheTtlDisplay = resolveCacheTtlDisplay({
+		frozen: readSessionCacheTtl(deps.db, sessionId),
 		configured: deps.cacheTtlConfig ?? "5m",
 		configuredExplicitly: deps.cacheTtlConfigured === true,
 		modelKey,
@@ -741,6 +845,9 @@ export function buildPiStatusDetail(
 	return {
 		sessionId,
 		activeProfile: deps.activeProfile ?? null,
+		configGeneration: deps.configGeneration,
+		configAdoptedAt: deps.configAdoptedAt,
+		configReloadFailure: deps.configReloadFailure,
 		usagePercentage,
 		inputTokens,
 		systemPromptTokens,
@@ -771,6 +878,7 @@ export function buildPiStatusDetail(
 			0,
 		),
 		pendingOpsCount: pendingOps,
+		compactionMarker: getCompactionMarkerHealth(deps.db, sessionId),
 		historianRunning: meta.compartmentInProgress,
 		timesExecuteThresholdReached: meta.timesExecuteThresholdReached,
 		historianFailureCount: Number(metaRow?.historian_failure_count ?? 0),
@@ -880,10 +988,12 @@ function safeStringify(value: unknown): string {
  * Draws the breakdown bar with block characters, one coloured run per segment,
  * filling the row. Pi's renderer emits truecolor escapes (see `colorHex`), so
  * the bar carries the same category colours as the legend below it.
+ *
+ * The segment widths come from the shared `distributeBarWidths`, so the runs
+ * always add up to the bar width and no blank cell can appear between them.
  */
 function renderBar(
 	segments: readonly StatusBarSegment[],
-	inputTokens: number,
 	innerWidth: number,
 ): string {
 	// Fill the full inner content row. Clamp to a sensible minimum so
@@ -891,22 +1001,10 @@ function renderBar(
 	// collapsing all segments to width 1.
 	const barWidth = Math.max(20, innerWidth);
 	if (segments.length === 0) return "";
-	const widths = segments.map((seg) =>
-		Math.max(1, Math.round((seg.tokens / (inputTokens || 1)) * barWidth)),
+	const widths = distributeBarWidths(
+		segments.map((seg) => seg.tokens),
+		barWidth,
 	);
-	let sum = widths.reduce((a, b) => a + b, 0);
-	while (sum > barWidth) {
-		const maxIdx = widths.indexOf(Math.max(...widths));
-		if ((widths[maxIdx] ?? 0) > 1) {
-			widths[maxIdx] -= 1;
-			sum--;
-		} else break;
-	}
-	while (sum < barWidth) {
-		const maxIdx = widths.indexOf(Math.max(...widths));
-		widths[maxIdx] = (widths[maxIdx] ?? 0) + 1;
-		sum++;
-	}
 	return segments
 		.map((seg, i) => colorHex(seg.color, "\u2588".repeat(widths[i] ?? 0)))
 		.join("");
@@ -920,12 +1018,13 @@ function readSessionMetaRow(db: ContextDatabase, sessionId: string) {
 				memory_block_cache: string | null;
 				memory_block_count: number | null;
 				cached_m0_bytes: Buffer | Uint8Array | string | null;
+				cached_m1_bytes: Buffer | Uint8Array | string | null;
 				historian_failure_count: number | null;
 				historian_last_failure_at: number | null;
 				historian_last_error: string | null;
 			}
 		>(
-			"SELECT memory_block_cache, memory_block_count, cached_m0_bytes, historian_failure_count, historian_last_failure_at, historian_last_error FROM session_meta WHERE session_id = ?",
+			"SELECT memory_block_cache, memory_block_count, cached_m0_bytes, cached_m1_bytes, historian_failure_count, historian_last_failure_at, historian_last_error FROM session_meta WHERE session_id = ?",
 		)
 		.get(sessionId);
 }

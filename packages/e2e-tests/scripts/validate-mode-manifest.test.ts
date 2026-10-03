@@ -19,10 +19,9 @@ function manifestWith(entries: ModeManifest["entries"]): ModeManifest {
 describe("mode manifest validator", () => {
     it("covers every live e2e test exactly once", () => {
         // Bump this with the manifest whenever a tests/**/*.test.ts file is added or
-        // removed. Adding an OpenCode 2 lane file moves this number and the excluded
-        // list below and nothing else, because those files carry tier "excluded" and
-        // so never enter a TS or Rust invocation list.
-        expect(validation.files.length).toBe(87);
+        // removed. Moving a file between excluded and ts-only changes the invocation
+        // counts and excluded list below, but not the total number of files.
+        expect(validation.files.length).toBe(155);
         expect(validation.manifest.entries).toHaveLength(validation.files.length);
         expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
             validation.files.length,
@@ -33,12 +32,26 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(27);
-        expect(rust).toHaveLength(47);
-        expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(1);
-        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(25);
-        expect(filesForMode(validation, "ts", "pi")).toHaveLength(22);
-        expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(20);
+        expect(ts).toHaveLength(47);
+        expect(rust).toHaveLength(55);
+        expect(rust).toContain("tests/subagent-behavior.test.ts");
+        expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(3);
+        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(35);
+        expect(filesForMode(validation, "ts", "pi")).toHaveLength(26);
+        expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(28);
+        // These six OpenCode 2 files are ts-only with hosts ["opencode2"], so only the
+        // OpenCode 2 host lane runs them; the other host lanes never select them.
+        for (const path of [
+            "tests/opencode2/adapters-s2-contracts.test.ts",
+            "tests/opencode2/adapters-s3-marker-policy.test.ts",
+            "tests/opencode2/pins.test.ts",
+            "tests/opencode2/reporter-emergency-drop.test.ts",
+            "tests/opencode2/storage-busy.test.ts",
+            "tests/opencode2/generate.test.ts",
+        ]) {
+            expect(filesForMode(validation, "ts", "opencode2")).toContain(path);
+            expect(filesForMode(validation, "ts", "opencode")).not.toContain(path);
+        }
         // OMP hashes each request into its system header, breaking within-session byte identity
         // in cache-stability and long-running-session; their manifest entries declare the omission.
         expect(filesForMode(validation, "ts", "omp")).toHaveLength(19);
@@ -46,31 +59,72 @@ describe("mode manifest validator", () => {
             .filter((entry) => entry.tier === "excluded")
             .map((entry) => entry.path);
         expect([...excluded].sort()).toEqual([
-            "tests/opencode2/adapters-s2-contracts.test.ts",
-            "tests/opencode2/adapters-s3-marker-policy.test.ts",
+            "tests/adv-identical-bytes-hard.test.ts",
+            "tests/degraded-pass-lock.test.ts",
+            "tests/dreamer-host-timeout.test.ts",
+            "tests/dreamer-token-budget-oc1.test.ts",
+            "tests/dreamer-verify-budget.test.ts",
+            "tests/dreamer-verify-token-budget-oc1.test.ts",
+            "tests/historian-host-timeout.test.ts",
+            "tests/historian-no-tools.test.ts",
+            "tests/historian-window-fit.test.ts",
+            "tests/issue-538-engine-wall.test.ts",
+            "tests/issue-570-home-project.test.ts",
+            "tests/issue-574-unborn-project.test.ts",
+            "tests/issue-586-pi-responses-orphans.test.ts",
+            "tests/live-providers.test.ts",
             "tests/opencode2/automatic-s3-paths.test.ts",
+            "tests/opencode2/bounded-raw-reads.test.ts",
             "tests/opencode2/commands-s2-flush.test.ts",
             "tests/opencode2/commands-s2-host-registration.test.ts",
             "tests/opencode2/commands-s2-keymap.test.ts",
+            "tests/opencode2/commands-s2-wrapup.test.ts",
+            "tests/opencode2/compaction-off-host-compaction.test.ts",
+            "tests/opencode2/compartment-boundary-host-row.test.ts",
             "tests/opencode2/context-s2-lanes.test.ts",
+            "tests/opencode2/converted-drop-replay.test.ts",
+            "tests/opencode2/converted-store-overwindow.test.ts",
+            "tests/opencode2/dream-loop.test.ts",
             "tests/opencode2/dreamer-s2-carrier.test.ts",
+            "tests/opencode2/emergency-refusal-visible.test.ts",
             "tests/opencode2/entry-s2-context.test.ts",
+            "tests/opencode2/execute-threshold-tokens.test.ts",
             "tests/opencode2/fold-s3-owner.test.ts",
             "tests/opencode2/harness-s3-identity.test.ts",
-            "tests/opencode2/hidden-child-ga.test.ts",
-            "tests/opencode2/hidden-child-unbound.test.ts",
+            "tests/opencode2/hidden-child-host-compaction.test.ts",
+            "tests/opencode2/hidden-child-native-remove.test.ts",
+            "tests/opencode2/hidden-child-terminal-failure.test.ts",
+            "tests/opencode2/hidden-child-two-directories.test.ts",
+            "tests/opencode2/hidden-step-limit.test.ts",
+            "tests/opencode2/image-attachment.test.ts",
             "tests/opencode2/marker-s3-runtime.test.ts",
-            "tests/opencode2/pins.test.ts",
+            "tests/opencode2/missing-history-boundary.test.ts",
+            "tests/opencode2/mural-media-schema.test.ts",
+            "tests/opencode2/output-cap.test.ts",
+            "tests/opencode2/over-limit-recovery.test.ts",
+            "tests/opencode2/overflow-reading-retention.test.ts",
             "tests/opencode2/probes.test.ts",
             "tests/opencode2/prompt-surface-s6.test.ts",
+            "tests/opencode2/recomp-hidden-executor.test.ts",
+            "tests/opencode2/restart-system-prompt-change.test.ts",
             "tests/opencode2/rpc-s2-listener.test.ts",
             "tests/opencode2/runner.test.ts",
+            "tests/opencode2/rust-mode-boundary-restart-gate.test.ts",
             "tests/opencode2/rust-mode-limitation.test.ts",
+            "tests/opencode2/session-api-cutover.test.ts",
+            "tests/opencode2/session-project-binding.test.ts",
             "tests/opencode2/sidebar-component.test.ts",
             "tests/opencode2/status-dialog.test.ts",
+            "tests/opencode2/storage-refusal-reason.test.ts",
+            "tests/opencode2/store-directories.test.ts",
             "tests/opencode2/store-generation-conversion.test.ts",
             "tests/opencode2/store-reader.test.ts",
+            "tests/opencode2/synthetic-todo-schema.test.ts",
             "tests/opencode2/tool-definition-telemetry.test.ts",
+            "tests/opencode2/tool-result-image.test.ts",
+            "tests/opencode2/ts-mode-on-migrated-real-store.test.ts",
+            "tests/opencode2/v1-v2-reconversion.test.ts",
+            "tests/rust-classify-host-runner.test.ts",
             "tests/window-overlay-reload.test.ts",
         ]);
         expect(new Set([...ts, ...rust]).size).toBe(validation.files.length - excluded.length);

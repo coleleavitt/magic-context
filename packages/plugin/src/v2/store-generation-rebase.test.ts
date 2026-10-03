@@ -1,5 +1,6 @@
 import { beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+
 import {
     getCompartments,
     getLastCompartmentEndMessage,
@@ -9,6 +10,7 @@ import {
     getLastIndexedOrdinal,
 } from "../features/magic-context/message-index";
 import { runMigrations } from "../features/magic-context/migrations";
+import { getOrCreateSessionMeta } from "../features/magic-context/storage";
 import { initializeDatabase } from "../features/magic-context/storage-db";
 import {
     type CoordinateGeneration,
@@ -18,7 +20,17 @@ import {
     readCoordinateRebaseNotice,
     rebaseSessionCoordinates,
 } from "../features/magic-context/store-generation-rebase";
+import { v2NonNarrativeStoredGapRanges } from "../hooks/magic-context/compartment-runner-incremental";
+import { validateStoredCompartments } from "../hooks/magic-context/compartment-runner-validation";
+import {
+    clearCtxReduceAvailability,
+    resolveCtxReduceAvailabilityFromMessages,
+} from "../hooks/magic-context/ctx-reduce-availability";
+import { clearInjectionCache, injectM0M1 } from "../hooks/magic-context/inject-compartments";
+import { saveLkgSlotToDb } from "../hooks/magic-context/lkg-persist";
+import { withRawMessageProvider } from "../hooks/magic-context/read-session-chunk";
 import type { RawMessage } from "../hooks/magic-context/read-session-raw";
+import { createSystemPromptHashHandler } from "../hooks/magic-context/system-prompt-hash";
 import { Database } from "../shared/sqlite";
 import { rawMessages } from "./hooks/store";
 import type { StoreRow } from "./store-reader";
@@ -172,6 +184,8 @@ function v2Projection(rows: StoreRow[]): RawMessage[] {
 let db: Database;
 
 beforeEach(() => {
+    clearCtxReduceAvailability("ses_a");
+    clearInjectionCache("ses_a");
     db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
@@ -209,6 +223,21 @@ function ensureSession(sessionId: string, harness = "opencode"): void {
         sessionId,
         harness,
     );
+}
+
+/** A persisted replay slot whose prefix embeds the session's current ranges. */
+function seedLkgSlot(sessionId: string): void {
+    expect(
+        saveLkgSlotToDb(db, sessionId, {
+            jsonPrefix: "[]",
+            inputIdSeq: [],
+            inputContentDigests: [],
+            lastInputMessageId: "msg_a_006_a3",
+            modelKey: null,
+            providerKey: null,
+            capturedAt: 1,
+        }),
+    ).toBe(true);
 }
 
 function runRebase(sessionId: string, generation: CoordinateGeneration, messages: RawMessage[]) {
@@ -255,6 +284,121 @@ function sessionDigest(sessionId: string): string {
     ]);
     return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
 }
+
+test("a synthetic split between adjacent compartments is absorbed into the earlier range", () => {
+    ensureSession("ses_a");
+    insertCompartment("ses_a", {
+        sequence: 1,
+        start: 1,
+        end: 3,
+        startMessageId: "msg_a_001_u1",
+        endMessageId: "msg_a_003_u2",
+    });
+    insertCompartment("ses_a", {
+        sequence: 2,
+        start: 4,
+        end: 6,
+        startMessageId: "msg_a_004_a2",
+        endMessageId: "msg_a_006_a3",
+    });
+    db.prepare("UPDATE session_meta SET coordinate_generation = 'v1' WHERE session_id = ?").run(
+        "ses_a",
+    );
+
+    const outcome = runRebase("ses_a", "v2", v2Projection(syntheticSplit));
+    const compartments = getCompartments(db, "ses_a");
+
+    expect(outcome.healedGaps).toBe(1);
+    expect(outcome.narrativeGaps).toBe(0);
+    expect(compartments.map((row) => [row.startMessage, row.endMessage])).toEqual([
+        [1, 4],
+        [5, 7],
+    ]);
+    expect(validateStoredCompartments(compartments)).toBeNull();
+    expect(readCoordinateRebaseNotice(db, "ses_a")).toMatchObject({
+        generation: "v2",
+        healedGaps: 1,
+        narrativeGaps: 0,
+    });
+});
+
+test("v2 notice compatibility tolerates an older synthetic-only stored gap", () => {
+    ensureSession("ses_a");
+    insertCompartment("ses_a", {
+        sequence: 1,
+        start: 1,
+        end: 3,
+        startMessageId: "msg_a_001_u1",
+        endMessageId: "msg_a_003_u2",
+    });
+    insertCompartment("ses_a", {
+        sequence: 2,
+        start: 5,
+        end: 7,
+        startMessageId: "msg_a_004_a2",
+        endMessageId: "msg_a_006_a3",
+    });
+    db.prepare("UPDATE session_meta SET coordinate_rebase_notice = ? WHERE session_id = ?").run(
+        JSON.stringify({ generation: "v2", previousGeneration: "v1", at: 1 }),
+        "ses_a",
+    );
+    const messages = v2Projection(syntheticSplit);
+
+    const error = withRawMessageProvider(
+        "ses_a",
+        { readMessages: () => messages, getMessageCount: () => messages.length },
+        () => {
+            const compartments = getCompartments(db, "ses_a");
+            const safeRanges = v2NonNarrativeStoredGapRanges(db, "ses_a", compartments);
+            expect(safeRanges).toEqual([{ start: 4, end: 4 }]);
+            return validateStoredCompartments(compartments, safeRanges);
+        },
+    );
+
+    expect(error).toBeNull();
+});
+
+test("a narrative row between rebased compartments remains a reported gap", () => {
+    ensureSession("ses_a");
+    insertCompartment("ses_a", {
+        sequence: 1,
+        start: 1,
+        end: 3,
+        startMessageId: "msg_a_001_u1",
+        endMessageId: "msg_a_003_u2",
+    });
+    insertCompartment("ses_a", {
+        sequence: 2,
+        start: 4,
+        end: 6,
+        startMessageId: "msg_a_004_a2",
+        endMessageId: "msg_a_006_a3",
+    });
+    db.prepare("UPDATE session_meta SET coordinate_generation = 'v1' WHERE session_id = ?").run(
+        "ses_a",
+    );
+    const narrativeSplit = syntheticSplit.map((row) =>
+        row.type === "synthetic"
+            ? ({ ...row, type: "user", data: { text: "narrative bridge" } } as StoreRow)
+            : row,
+    );
+
+    const outcome = runRebase("ses_a", "v2", v2Projection(narrativeSplit));
+    const compartments = getCompartments(db, "ses_a");
+
+    expect(outcome.healedGaps).toBe(0);
+    expect(outcome.narrativeGaps).toBe(1);
+    expect(compartments.map((row) => [row.startMessage, row.endMessage])).toEqual([
+        [1, 3],
+        [5, 7],
+    ]);
+    expect(validateStoredCompartments(compartments)).toBe("gap before message 5 (expected 4)");
+    expect(readCoordinateRebaseNotice(db, "ses_a")).toMatchObject({
+        generation: "v2",
+        healedGaps: 0,
+        narrativeGaps: 1,
+    });
+});
 
 test("a saved compartment end still selects its endpoint after a synthetic split", () => {
     // Saved against the 1.x projection: end=4, endpoint msg_a_004_a2 at ordinal 4.
@@ -415,11 +559,7 @@ test("chunk windows, depth records and the replay slot are rebuilt rather than r
     db.prepare(
         "INSERT INTO compression_depth (session_id, message_ordinal, depth, harness) VALUES (?, 4, 2, 'opencode')",
     ).run("ses_a");
-    db.prepare(
-        `INSERT INTO lkg_slots
-            (session_id, json_prefix, input_id_seq, input_content_digests, last_input_message_id, captured_at)
-         VALUES (?, '[]', '[]', '[]', 'msg_a_006_a3', 1)`,
-    ).run("ses_a");
+    seedLkgSlot("ses_a");
     ensureMessagesIndexed(db, "ses_a", () => v1Projection("ses_a"));
 
     const outcome = runRebase("ses_a", "v2", v2Projection(syntheticSplit));
@@ -442,6 +582,11 @@ test("chunk windows, depth records and the replay slot are rebuilt rather than r
     expect(
         db.prepare("SELECT COUNT(*) AS count FROM lkg_slots WHERE session_id = ?").get("ses_a"),
     ).toEqual({ count: 0 });
+    expect(
+        db
+            .prepare("SELECT COUNT(*) AS count FROM lkg_slot_chunks WHERE session_id = ?")
+            .get("ses_a"),
+    ).toEqual({ count: 0 });
     // The next pass must rebuild the prefix from the corrected rows rather than
     // replay bytes that embed the old ranges.
     expect(
@@ -453,10 +598,12 @@ test("chunk windows, depth records and the replay slot are rebuilt rather than r
     ).toEqual({ m0: null, m1: null });
 });
 
-test("an endpoint the running projection does not contain is marked unresolved, never guessed", () => {
+test("an endpoint the projection dropped is taken from the next compartment's start", () => {
     ensureSession("ses_b");
     // The compaction pair's user row is gone from the v2 projection entirely: the
-    // host folded it into a `compaction` record that MC does not count.
+    // host folded it into a `compaction` record that MC does not count. The next
+    // compartment's start anchor still resolves, and compartments tile the
+    // history, so the dropped end is the message before it.
     insertCompartment("ses_b", {
         sequence: 1,
         start: 1,
@@ -477,19 +624,45 @@ test("an endpoint the running projection does not contain is marked unresolved, 
 
     const outcome = runRebase("ses_b", "v2", v2Projection(compactionPair));
 
-    expect(outcome.compartmentsUnresolved).toBe(1);
-    expect(outcome.compartmentsRebased).toBe(1);
-    const dead = compartmentOf("ses_b", 1);
-    expect(dead.rebaseStatus).toBe("unresolved");
-    // Its saved ordinals are untouched, and its summary text is still readable.
-    expect(dead.endMessage).toBe(3);
-    expect(dead.content).toBe("summary text");
+    expect(outcome.compartmentsUnresolved).toBe(0);
+    expect(outcome.compartmentsRebased).toBe(2);
+    expect(outcome.compartmentsDerived).toBe(1);
+    const derived = compartmentOf("ses_b", 1);
+    expect(derived.rebaseStatus).toBe("ok");
+    expect([derived.startMessage, derived.endMessage]).toEqual([1, 2]);
+    expect(derived.content).toBe("summary text");
     const live = compartmentOf("ses_b", 2);
     expect(live.rebaseStatus).toBe("ok");
     expect([live.startMessage, live.endMessage]).toEqual([3, 4]);
-    // Range recovery and the protected-tail floor both read this boundary, and it
-    // now comes from the newest compartment that still resolves.
+    expect(validateStoredCompartments(getCompartments(db, "ses_b"))).toBeNull();
     expect(getLastCompartmentEndMessage(db, "ses_b")).toBe(4);
+});
+
+test("an endpoint no neighbour determines is marked unresolved, never guessed", () => {
+    ensureSession("ses_b");
+    // The only compartment lost its end, and nothing follows it to say where
+    // that end is now.
+    insertCompartment("ses_b", {
+        sequence: 1,
+        start: 1,
+        end: 3,
+        startMessageId: "msg_b_001_u1",
+        endMessageId: "msg_b_003_cu",
+    });
+    db.prepare("UPDATE session_meta SET coordinate_generation = 'v1' WHERE session_id = ?").run(
+        "ses_b",
+    );
+
+    const outcome = runRebase("ses_b", "v2", v2Projection(compactionPair));
+
+    expect(outcome.compartmentsUnresolved).toBe(1);
+    const dead = compartmentOf("ses_b", 1);
+    expect(dead.rebaseStatus).toBe("unresolved");
+    // Its stored end is kept rather than snapped to whichever message sits
+    // nearby, and its summary text is still readable.
+    expect(dead.endMessage).toBe(3);
+    expect(dead.content).toBe("summary text");
+    expect(getLastCompartmentEndMessage(db, "ses_b")).toBe(-1);
 });
 
 test("an endpoint that comes back on the way home returns its compartment to ok", () => {
@@ -635,7 +808,11 @@ test("a crash after the commit but before the reindex leaves an index later pass
     const projection = v2Projection(syntheticSplit);
     // Repopulating the index happens after the commit on purpose: it is catch-up
     // from the authoritative source, not part of the atomic state change. The
-    // second read stands in for a process that died right after committing.
+    // rebase reads the history once and writes the index from that read, so the
+    // process dying right after committing is stood in for by the first index
+    // write failing.
+    db.exec(`CREATE TEMP TRIGGER fail_reindex BEFORE INSERT ON message_history_source
+             BEGIN SELECT RAISE(ABORT, 'host store went away after the commit'); END`);
     let reads = 0;
     expect(() =>
         rebaseSessionCoordinates({
@@ -644,11 +821,12 @@ test("a crash after the commit but before the reindex leaves an index later pass
             generation: "v2",
             readMessages: () => {
                 reads += 1;
-                if (reads === 1) return projection;
-                throw new Error("host store went away after the commit");
+                return projection;
             },
         }),
     ).toThrow("host store went away after the commit");
+    db.exec("DROP TRIGGER fail_reindex");
+    expect(reads).toBe(1);
 
     // The rebase itself is durable, and the index is empty with a zero watermark
     // rather than holding documents filed under the old projection.
@@ -792,6 +970,102 @@ test("an unstamped session whose harness wrote the other projection is rebased f
     expect(formatRebaseLogLine(outcome, 1)).toContain("store-generation-rebase v1->v2");
 });
 
+for (const lane of [
+    { generation: "v2" as const, source: "v1" as const, systemPromptRunsFirst: true },
+    { generation: "v1" as const, source: "v2" as const, systemPromptRunsFirst: false },
+]) {
+    test(`${lane.source}->${lane.generation} rebase records the new host system hash without a second HARD`, async () => {
+        const sessionId = "ses_a";
+        ensureSession(sessionId);
+        insertCompartment(sessionId, {
+            sequence: 1,
+            start: 1,
+            end: lane.source === "v1" ? 4 : 5,
+            startMessageId: "msg_a_001_u1",
+            endMessageId: "msg_a_004_a2",
+        });
+        resolveCtxReduceAvailabilityFromMessages(sessionId, [
+            { info: { role: "user", tools: { "*": true } } },
+        ]);
+        const historyRefreshSessions = new Set<string>();
+        const systemPromptRefreshSessions = new Set<string>();
+        const pendingMaterializationSessions = new Set<string>();
+        const promptHash = createSystemPromptHashHandler({
+            db,
+            dreamerEnabled: false,
+            historyRefreshSessions,
+            systemPromptRefreshSessions,
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId: new Map(),
+        });
+        const model = { providerID: "provider", modelID: "model" };
+        const previousSystem = ["Host one prompt. Today's date: 2026-09-21"];
+        await promptHash.handler({ sessionID: sessionId, model }, { system: previousSystem });
+        const h1 = getOrCreateSessionMeta(db, sessionId).systemPromptHash;
+        expect(h1).not.toBe("");
+
+        db.prepare(
+            `UPDATE session_meta
+                SET coordinate_generation = ?, coordinate_rebase_notice = ?,
+                    cached_m0_bytes = X'6d30', cached_m1_bytes = X'6d31',
+                    cached_m0_system_hash = ?
+              WHERE session_id = ?`,
+        ).run(
+            lane.source,
+            JSON.stringify({ generation: lane.source, previousGeneration: lane.generation, at: 1 }),
+            h1,
+            sessionId,
+        );
+
+        const projection =
+            lane.generation === "v2" ? v2Projection(syntheticSplit) : v1Projection(sessionId);
+        expect(runRebase(sessionId, lane.generation, projection).status).toBe("rebased");
+
+        const hardReasons: string[] = [];
+        const foldPass = () => {
+            const state = getOrCreateSessionMeta(db, sessionId);
+            const result = injectM0M1({
+                db,
+                sessionId,
+                state,
+                historyBudgetTokens: 98_000,
+                isCacheBustingPass: pendingMaterializationSessions.has(sessionId),
+                hardSignals: {
+                    systemHash: state.systemPromptHash,
+                    modelKey: `${model.providerID}/${model.modelID}`,
+                    cacheExpired: false,
+                    lastResponseTime: 0,
+                },
+            });
+            if (result.m0RematerializedThisPass && result.decision.reason) {
+                hardReasons.push(result.decision.reason);
+            }
+            return result.decision.reason ?? "cache_hit";
+        };
+        const runNewHostSystemPrompt = async () => {
+            const system = ["Host two prompt. Today's date: 2026-09-22"];
+            await promptHash.handler({ sessionID: sessionId, model }, { system });
+            expect(system.join("\n")).toContain("Today's date: 2026-09-22");
+            expect(system.join("\n")).not.toContain("Today's date: 2026-09-21");
+        };
+
+        if (lane.systemPromptRunsFirst) await runNewHostSystemPrompt();
+        expect(foldPass()).toBe("first_render");
+        if (!lane.systemPromptRunsFirst) await runNewHostSystemPrompt();
+        if (lane.systemPromptRunsFirst) await runNewHostSystemPrompt();
+        expect(foldPass()).toBe("cache_hit");
+        if (!lane.systemPromptRunsFirst) await runNewHostSystemPrompt();
+
+        const h2 = getOrCreateSessionMeta(db, sessionId).systemPromptHash;
+        expect(h2).not.toBe("");
+        expect(h2).not.toBe(h1);
+        expect(historyRefreshSessions.has(sessionId)).toBe(false);
+        expect(systemPromptRefreshSessions.has(sessionId)).toBe(false);
+        expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
+        expect(hardReasons).toEqual(["first_render"]);
+    });
+}
+
 test("a session whose coordinates already match the projection pays only the stamp", () => {
     ensureSession("ses_a");
     insertCompartment("ses_a", {
@@ -828,11 +1102,7 @@ test("a session whose coordinates already match the projection pays only the sta
     db.prepare(
         "INSERT INTO compression_depth (session_id, message_ordinal, depth, harness) VALUES (?, 4, 2, 'opencode')",
     ).run("ses_a");
-    db.prepare(
-        `INSERT INTO lkg_slots
-            (session_id, json_prefix, input_id_seq, input_content_digests, last_input_message_id, captured_at)
-         VALUES (?, '[]', '[]', '[]', 'msg_a_006_a3', 1)`,
-    ).run("ses_a");
+    seedLkgSlot("ses_a");
     // coordinate_generation stays NULL: this is an existing session meeting the
     // rebase for the first time after the upgrade, on the same host it has
     // always run on.
@@ -943,8 +1213,8 @@ test("each rebased session produces one operator-readable log line with its coun
     // plus the protected-tail floor it carried. The compartment whose endpoint is
     // gone is reported separately as unresolved, never as a rewrite.
     expect(formatRebaseLogLine(outcome, 12.4)).toBe(
-        "INFO store-generation-rebase v1->v2 rows_rewritten=2 unresolved=1 " +
-            "index_rows_rebuilt=7 drops_discarded=0 ms=12 " +
+        "INFO store-generation-rebase v1->v2 rows_rewritten=2 unresolved=1 derived=0 " +
+            "index_rows_rebuilt=7 drops_discarded=0 healed_gaps=0 narrative_gaps=0 ms=12 " +
             "(chunk_windows_deleted=0 depth_rows_dropped=0 part_tags_folded=0 " +
             "lkg_slots_dropped=0 frozen_part_entries_dropped=0)",
     );
@@ -973,4 +1243,388 @@ test("the protected-tail floor follows the compartment boundary it was taken fro
             )
             .get("ses_a"),
     ).toEqual({ floor: 5 });
+});
+
+/**
+ * A 70-message session as the running host serves it: ids `m_001`..`m_070` at
+ * ordinals 1..70. Ids that are not in this list stand for messages the host's
+ * store conversion removed, such as the boundary row of a completed native
+ * compaction.
+ */
+function numberedProjection(count = 70): RawMessage[] {
+    return Array.from({ length: count }, (_, index) => ({
+        id: `m_${String(index + 1).padStart(3, "0")}`,
+        role: index % 2 === 0 ? "user" : "assistant",
+        ordinal: index + 1,
+        parts: [{ type: "text", text: `message ${index + 1}` }],
+    }));
+}
+
+function id(ordinal: number): string {
+    return `m_${String(ordinal).padStart(3, "0")}`;
+}
+
+function ranges(sessionId: string): Array<[number, number, string]> {
+    return getCompartments(db, sessionId).map((row) => [
+        row.startMessage,
+        row.endMessage,
+        row.rebaseStatus,
+    ]);
+}
+
+/**
+ * The stored shape from issue 531 before the fix ran: compartment 2's start
+ * anchor was a native-compaction boundary the conversion removed, its end
+ * anchor resolves to 53, and compartment 3 starts at 54. The v1 ordinals are
+ * one higher after message 25 because the v1 projection still counted the
+ * boundary row.
+ */
+function insertIssue531Compartments(sessionId: string): void {
+    insertCompartment(sessionId, {
+        sequence: 1,
+        start: 1,
+        end: 25,
+        startMessageId: id(1),
+        endMessageId: id(25),
+    });
+    insertCompartment(sessionId, {
+        sequence: 2,
+        start: 26,
+        end: 54,
+        startMessageId: "m_native_compaction_boundary",
+        endMessageId: id(53),
+    });
+    insertCompartment(sessionId, {
+        sequence: 3,
+        start: 55,
+        end: 66,
+        startMessageId: id(54),
+        endMessageId: id(65),
+    });
+}
+
+test("issue 531: a start anchor the conversion removed is taken from the previous compartment", () => {
+    ensureSession("ses_531");
+    insertIssue531Compartments("ses_531");
+    db.prepare("UPDATE session_meta SET coordinate_generation = 'v1' WHERE session_id = ?").run(
+        "ses_531",
+    );
+
+    const outcome = runRebase("ses_531", "v2", numberedProjection());
+
+    expect(ranges("ses_531")).toEqual([
+        [1, 25, "ok"],
+        [26, 53, "ok"],
+        [54, 65, "ok"],
+    ]);
+    expect(outcome.compartmentsUnresolved).toBe(0);
+    expect(outcome.compartmentsDerived).toBe(1);
+    expect(validateStoredCompartments(getCompartments(db, "ses_531"))).toBeNull();
+    const notice = readCoordinateRebaseNotice(db, "ses_531");
+    expect(notice).toMatchObject({
+        unresolvedCompartments: 0,
+        derivedCompartments: [{ sequence: 2, start: 26, end: 53 }],
+        unresolvedCompartmentRanges: [],
+    });
+    expect(notice?.neighbourRecoveryAt).toBeGreaterThan(0);
+    expect(formatCoordinateRebaseNotice(notice as NonNullable<typeof notice>)).toContain(
+        "1 compartment was re-anchored from the compartments around it (messages 26-53)",
+    );
+});
+
+test("a compartment that lost both anchors is placed between its resolved neighbours", () => {
+    ensureSession("ses_both");
+    insertCompartment("ses_both", {
+        sequence: 1,
+        start: 1,
+        end: 25,
+        startMessageId: id(1),
+        endMessageId: id(25),
+    });
+    insertCompartment("ses_both", {
+        sequence: 2,
+        start: 26,
+        end: 55,
+        startMessageId: "m_gone_start",
+        endMessageId: "m_gone_end",
+    });
+    insertCompartment("ses_both", {
+        sequence: 3,
+        start: 56,
+        end: 67,
+        startMessageId: id(54),
+        endMessageId: id(65),
+    });
+    db.prepare("UPDATE session_meta SET coordinate_generation = 'v1' WHERE session_id = ?").run(
+        "ses_both",
+    );
+
+    runRebase("ses_both", "v2", numberedProjection());
+
+    expect(ranges("ses_both")).toEqual([
+        [1, 25, "ok"],
+        [26, 53, "ok"],
+        [54, 65, "ok"],
+    ]);
+    expect(validateStoredCompartments(getCompartments(db, "ses_both"))).toBeNull();
+});
+
+test("two adjacent unresolved compartments stay unresolved and are clamped off their resolved neighbours", () => {
+    ensureSession("ses_adjacent");
+    insertCompartment("ses_adjacent", {
+        sequence: 1,
+        start: 1,
+        end: 25,
+        startMessageId: id(1),
+        endMessageId: id(25),
+    });
+    // The boundary between these two has no anchor on either side: the first
+    // lost its end and the second lost both ends.
+    insertCompartment("ses_adjacent", {
+        sequence: 2,
+        start: 26,
+        end: 40,
+        startMessageId: id(26),
+        endMessageId: "m_gone_a",
+    });
+    insertCompartment("ses_adjacent", {
+        sequence: 3,
+        start: 41,
+        end: 58,
+        startMessageId: "m_gone_b",
+        endMessageId: "m_gone_c",
+    });
+    insertCompartment("ses_adjacent", {
+        sequence: 4,
+        start: 55,
+        end: 66,
+        startMessageId: id(54),
+        endMessageId: id(65),
+    });
+    db.prepare("UPDATE session_meta SET coordinate_generation = 'v1' WHERE session_id = ?").run(
+        "ses_adjacent",
+    );
+
+    const outcome = runRebase("ses_adjacent", "v2", numberedProjection());
+
+    // Sequence 3's stale end (58) would overlap sequence 4, so it is clamped to
+    // 53. Where the boundary between 2 and 3 lies is still unknown, so neither
+    // row is marked ok.
+    expect(ranges("ses_adjacent")).toEqual([
+        [1, 25, "ok"],
+        [26, 40, "unresolved"],
+        [41, 53, "unresolved"],
+        [54, 65, "ok"],
+    ]);
+    expect(outcome.compartmentsUnresolved).toBe(2);
+    const notice = readCoordinateRebaseNotice(db, "ses_adjacent");
+    expect(notice?.unresolvedCompartmentRanges).toEqual([
+        { sequence: 2, start: 26, end: 40 },
+        { sequence: 3, start: 41, end: 53 },
+    ]);
+    expect(formatCoordinateRebaseNotice(notice as NonNullable<typeof notice>)).toContain(
+        "could not be re-anchored and are excluded from range recovery (messages 26-40, messages 41-53)",
+    );
+});
+
+test("a trailing compartment with no end anchor keeps the stored end and stays unresolved", () => {
+    ensureSession("ses_trailing");
+    // Saved against v1, where the removed boundary row sat inside the first
+    // compartment, so every later ordinal was one higher.
+    insertCompartment("ses_trailing", {
+        sequence: 1,
+        start: 1,
+        end: 26,
+        startMessageId: id(1),
+        endMessageId: id(25),
+    });
+    insertCompartment("ses_trailing", {
+        sequence: 2,
+        start: 27,
+        end: 54,
+        startMessageId: "m_gone_start",
+        endMessageId: "m_gone_end",
+    });
+    db.prepare("UPDATE session_meta SET coordinate_generation = 'v1' WHERE session_id = ?").run(
+        "ses_trailing",
+    );
+
+    runRebase("ses_trailing", "v2", numberedProjection());
+
+    // The start is determined by the previous compartment, but nothing follows
+    // to determine the end, so it is the end the store recorded and the row is
+    // not trusted for range recovery.
+    expect(ranges("ses_trailing")).toEqual([
+        [1, 25, "ok"],
+        [26, 54, "unresolved"],
+    ]);
+    expect(validateStoredCompartments(getCompartments(db, "ses_trailing"))).toBeNull();
+    expect(getLastCompartmentEndMessage(db, "ses_trailing")).toBe(25);
+});
+
+/** A session stamped v2 by a build without neighbour recovery, in the issue 531 shape. */
+function insertStuckStampedSession(sessionId: string): void {
+    ensureSession(sessionId, "opencode2");
+    insertCompartment(sessionId, {
+        sequence: 1,
+        start: 1,
+        end: 25,
+        startMessageId: id(1),
+        endMessageId: id(25),
+    });
+    insertCompartment(sessionId, {
+        sequence: 2,
+        start: 26,
+        end: 54,
+        startMessageId: "m_native_compaction_boundary",
+        endMessageId: id(53),
+    });
+    insertCompartment(sessionId, {
+        sequence: 3,
+        start: 54,
+        end: 65,
+        startMessageId: id(54),
+        endMessageId: id(65),
+    });
+    db.prepare(
+        "UPDATE compartments SET rebase_status = 'unresolved' WHERE session_id = ? AND sequence = 2",
+    ).run(sessionId);
+    db.prepare(
+        `UPDATE session_meta
+            SET coordinate_generation = 'v2', coordinate_rebase_notice = ?
+          WHERE session_id = ?`,
+    ).run(
+        JSON.stringify({
+            generation: "v2",
+            previousGeneration: "v1",
+            at: 1790317845430,
+            unresolvedCompartments: 1,
+            discardedReductions: 0,
+            droppedDepthRows: 0,
+            healedGaps: 0,
+            narrativeGaps: 0,
+        }),
+        sessionId,
+    );
+}
+
+test("a session already stamped with an overlapping unresolved row is repaired on the next pass, with no flip", () => {
+    insertStuckStampedSession("ses_stuck");
+    db.prepare(
+        "UPDATE session_meta SET cached_m0_bytes = X'6d30', cached_m1_bytes = X'6d31' WHERE session_id = ?",
+    ).run("ses_stuck");
+    expect(validateStoredCompartments(getCompartments(db, "ses_stuck"))).toBe(
+        "overlap before message 55 (saw 54-65)",
+    );
+
+    let reads = 0;
+    const outcome = rebaseSessionCoordinates({
+        db,
+        sessionId: "ses_stuck",
+        generation: "v2",
+        readMessages: () => {
+            reads += 1;
+            return numberedProjection();
+        },
+    });
+
+    expect(outcome.status).toBe("repaired");
+    expect(outcome.compartmentsDerived).toBe(1);
+    expect(reads).toBe(1);
+    expect(ranges("ses_stuck")).toEqual([
+        [1, 25, "ok"],
+        [26, 53, "ok"],
+        [54, 65, "ok"],
+    ]);
+    expect(validateStoredCompartments(getCompartments(db, "ses_stuck"))).toBeNull();
+    // The stamp is untouched and the earlier rebase's report is kept; only the
+    // recovery is added to it.
+    expect(readCoordinateGeneration(db, "ses_stuck")).toBe("v2");
+    const notice = readCoordinateRebaseNotice(db, "ses_stuck");
+    expect(notice).toMatchObject({
+        generation: "v2",
+        previousGeneration: "v1",
+        at: 1790317845430,
+        unresolvedCompartments: 0,
+        derivedCompartments: [{ sequence: 2, start: 26, end: 53 }],
+    });
+    expect(notice?.neighbourRecoveryAt).toBeGreaterThan(0);
+    // The cached render is left for a pass that is already rebuilding the prefix.
+    expect(
+        db
+            .prepare(
+                "SELECT hex(cached_m0_bytes) AS m0, hex(cached_m1_bytes) AS m1 FROM session_meta WHERE session_id = ?",
+            )
+            .get("ses_stuck"),
+    ).toEqual({ m0: "6D30", m1: "6D31" });
+
+    // Later passes find nothing to do and never read the host store again.
+    const settled = sessionDigest("ses_stuck");
+    expect(runRebase("ses_stuck", "v2", numberedProjection()).status).toBe("unchanged");
+    expect(reads).toBe(1);
+    expect(sessionDigest("ses_stuck")).toBe(settled);
+});
+
+test("the one-time repair is skipped once the notice records that recovery ran", () => {
+    insertStuckStampedSession("ses_recorded");
+    const notice = readCoordinateRebaseNotice(db, "ses_recorded");
+    db.prepare("UPDATE session_meta SET coordinate_rebase_notice = ? WHERE session_id = ?").run(
+        JSON.stringify({ ...notice, neighbourRecoveryAt: 5 }),
+        "ses_recorded",
+    );
+    const before = sessionDigest("ses_recorded");
+
+    let reads = 0;
+    const outcome = rebaseSessionCoordinates({
+        db,
+        sessionId: "ses_recorded",
+        generation: "v2",
+        readMessages: () => {
+            reads += 1;
+            return numberedProjection();
+        },
+    });
+
+    expect(outcome.status).toBe("unchanged");
+    expect(reads).toBe(0);
+    expect(sessionDigest("ses_recorded")).toBe(before);
+});
+
+test("a defer pass after the repair replays the cached render byte-identical", () => {
+    insertStuckStampedSession("ses_531_defer");
+    // A realistic render: the earlier pass materialized m0/m1 from the stuck rows.
+    const renderPass = (busting: boolean) => {
+        const state = getOrCreateSessionMeta(db, "ses_531_defer");
+        return injectM0M1({
+            db,
+            sessionId: "ses_531_defer",
+            state,
+            historyBudgetTokens: 98_000,
+            isCacheBustingPass: busting,
+            hardSignals: {
+                systemHash: state.systemPromptHash,
+                modelKey: "provider/model",
+                cacheExpired: false,
+                lastResponseTime: 0,
+            },
+        });
+    };
+    const first = renderPass(true);
+    expect(first.m0Bytes).not.toBeNull();
+    const before = { m0: first.m0Bytes?.toString("hex"), m1: first.m1Text };
+
+    expect(runRebase("ses_531_defer", "v2", numberedProjection()).status).toBe("repaired");
+
+    const deferred = renderPass(false);
+    expect(deferred.m0RematerializedThisPass).toBe(false);
+    expect({ m0: deferred.m0Bytes?.toString("hex"), m1: deferred.m1Text }).toEqual(before);
+
+    // The repaired rows do change the render, so the replay above is the cache
+    // holding rather than two renders that happen to agree.
+    clearInjectionCache("ses_531_defer");
+    db.prepare(
+        "UPDATE session_meta SET cached_m0_bytes = NULL, cached_m1_bytes = NULL WHERE session_id = ?",
+    ).run("ses_531_defer");
+    const rebuilt = renderPass(true);
+    expect({ m0: rebuilt.m0Bytes?.toString("hex"), m1: rebuilt.m1Text }).not.toEqual(before);
 });

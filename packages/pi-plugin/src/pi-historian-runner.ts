@@ -58,6 +58,7 @@ import {
 	clearHistorianDrainFailure,
 	clearHistorianFailureState,
 	describeProtectedTailDrainBudgetSkip,
+	getHistorianFailureState,
 	getOverflowState,
 	incrementHistorianFailure,
 	isWrapupInProgress,
@@ -87,17 +88,30 @@ import { queueDropsForCompartmentalizedMessages } from "@magic-context/core/hook
 import {
 	buildHistorianFailureNotice,
 	buildHistorianRepairPrompt,
+	buildHistorianWindowTooSmallNotice,
 	HISTORIAN_BOUNDARY_HEALING_SLACK,
 	shouldDiscardLastHistorianCompartment,
 	validateChunkCoverage,
 	validateHistorianOutput,
 	validateStoredCompartments,
 } from "@magic-context/core/hooks/magic-context/compartment-runner-validation";
-import { renderMemoryBlock } from "@magic-context/core/hooks/magic-context/inject-compartments";
+import {
+	producerSourceLocalBudget,
+	resolveHistorianProducerLimits,
+	resolveKnownHistorianContextLimit,
+} from "@magic-context/core/hooks/magic-context/derive-budgets";
+import {
+	describeHistorianPromptTrim,
+	fitHistorianPrompt,
+	PRODUCER_PROMPT_FIT_FAILURE_PATTERN,
+} from "@magic-context/core/hooks/magic-context/historian-prompt-fit";
 import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
 import { persistFilteredNoise } from "@magic-context/core/hooks/magic-context/persist-filtered-noise";
 import {
 	fitAtomicHistorianSourceToProducerWindow,
+	historianProducerReserve,
+	producerInputTokenLimit,
+	producerPromptFailureReason,
 	producerWindowFailureReason,
 } from "@magic-context/core/hooks/magic-context/producer-window-guard";
 import {
@@ -116,8 +130,9 @@ import {
 	withRawMessageProvider,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
-import { buildReferenceBlocks } from "@magic-context/core/hooks/magic-context/reference-retrieval";
 import { describeError } from "@magic-context/core/shared/error-message";
+import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
+import { isTransientHistorianPromptError } from "@magic-context/core/shared/historian-transient-error";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type {
 	ModelInput,
@@ -204,34 +219,6 @@ function getHistorianRetryBackoffMs(retryIndex: number): number {
 	return 6_000 + Math.floor(Math.random() * 2_001);
 }
 
-function isTransientHistorianPromptError(message: string): boolean {
-	const normalized = message.toLowerCase();
-	if (
-		normalized.includes("invalid request") ||
-		normalized.includes("bad request") ||
-		normalized.includes("unauthorized") ||
-		normalized.includes("forbidden") ||
-		normalized.includes("authentication") ||
-		normalized.includes("auth") ||
-		normalized.includes(" 400") ||
-		normalized.startsWith("400")
-	) {
-		return false;
-	}
-
-	return [
-		"429",
-		"rate limit",
-		"timeout",
-		"econnreset",
-		"etimedout",
-		"503",
-		"502",
-		"500",
-		"overloaded",
-	].some((token) => normalized.includes(token));
-}
-
 function isTransientHistorianRunFailure(
 	result: Extract<SubagentRunResult, { ok: false }>,
 ): boolean {
@@ -272,7 +259,13 @@ async function sleepWithAbort(
 	});
 }
 
-async function runHistorianSubagentWithTransientRetries(args: {
+const loggedProducerWindows = new Set<string>();
+const loggedInconsistentWindows = new Set<string>();
+
+async function runHistorianSubagentWithTransientRetriesGuarded(args: {
+	resolveContextLimit?: (model: string) => number | undefined;
+	resolveOutputLimit?: (model: string) => number | undefined;
+	onDispatch?: () => void;
 	runner: SubagentRunner;
 	options: SubagentRunOptions;
 	sessionId: string;
@@ -290,6 +283,42 @@ async function runHistorianSubagentWithTransientRetries(args: {
 		const attemptStart = Date.now();
 		let result: SubagentRunResult;
 		try {
+			const key = piModelRefToCanonical(args.options.model ?? "");
+			const window =
+				args.resolveContextLimit?.(key) ??
+				resolveKnownHistorianContextLimit(key);
+			const limits = args.resolveContextLimit
+				? { context: window, input: undefined }
+				: resolveHistorianProducerLimits(key);
+			const context =
+				limits.context ?? (limits.input === undefined ? window : undefined);
+			const reserve = historianProducerReserve(
+				context,
+				args.options.maxOutputTokens,
+				args.resolveOutputLimit?.(key),
+			);
+			if (
+				window !== undefined &&
+				producerInputTokenLimit(context, reserve, limits.input) === undefined &&
+				!loggedInconsistentWindows.has(key)
+			) {
+				loggedInconsistentWindows.add(key);
+				sessionLog(
+					args.sessionId,
+					`producer window inconsistent for ${key}: window=${window} reserve=${reserve}; sending unguarded`,
+				);
+			}
+			const failure = producerPromptFailureReason({
+				sourceLocal: estimateTokens(args.options.userMessage),
+				systemLocal: estimateTokens(args.options.systemPrompt),
+				toolsLocal: 0,
+				modelKey: key,
+				contextLimitTokens: context,
+				inputLimitTokens: limits.input,
+				maxOutputTokens: reserve,
+			});
+			if (failure) throw new Error(failure);
+			args.onDispatch?.();
 			result = await args.runner.run({
 				...args.options,
 				// The historian runner owns fallback iteration because every candidate's
@@ -424,6 +453,10 @@ export interface PiHistorianDeps {
 	historianChunkTokens: number;
 	/** Known context limit for the same resolved historian model. Unknown means no producer guard. */
 	historianContextLimit?: number;
+	producerContextLimits?: ReadonlyMap<string, number>;
+	/** Live Pi/OMP registry lookup; its models include host snapshot and custom overrides. */
+	resolveHostContextLimit?: (model: string) => number | undefined;
+	resolveHostOutputLimit?: (model: string) => number | undefined;
 	/** Boundary resolved by the Pi trigger/recovery decision with the real model context. */
 	boundarySnapshot?: ProtectedTailBoundarySnapshot;
 	/**
@@ -522,14 +555,14 @@ async function runPiHistorianTraced(
 		historianModel,
 		fallbackModels,
 		fallbackModelId,
-		historianChunkTokens,
+		historianChunkTokens: providerHistorianChunkTokens,
 		historianContextLimit,
 		boundarySnapshot: providedBoundarySnapshot,
 		refreshBoundarySnapshot,
 		currentContextLimit,
 		historianTimeoutMs = DEFAULT_HISTORIAN_TIMEOUT_MS,
 		temperature,
-		maxOutputTokens = 32_000,
+		maxOutputTokens: configuredMaxOutputTokens,
 		signal,
 		retryBackoffMs,
 		twoPass,
@@ -547,6 +580,61 @@ async function runPiHistorianTraced(
 		forceKeepLastCompartment,
 		onDrainBudgetSpent,
 	} = deps;
+	const primaryModelKey = piModelRefToCanonical(
+		historianModel ?? fallbackModelId ?? "",
+	);
+	const primaryWindow =
+		deps.resolveHostContextLimit?.(primaryModelKey) ?? historianContextLimit;
+	const maxOutputTokens =
+		configuredMaxOutputTokens ??
+		(primaryWindow === undefined
+			? 32_000
+			: historianProducerReserve(
+					primaryWindow,
+					undefined,
+					deps.resolveHostOutputLimit?.(primaryModelKey) ?? 32_000,
+				));
+	const historianSystemPrompt = withContentLanguageDirective(
+		COMPARTMENT_AGENT_SYSTEM_PROMPT,
+		deps.language,
+		{ preserveUserQuotes: true },
+	);
+	const historianChunkTokens = producerSourceLocalBudget(
+		providerHistorianChunkTokens,
+		piModelRefToCanonical(historianModel ?? fallbackModelId ?? ""),
+	);
+	const resolveProducerContextLimit = (model: string): number | undefined => {
+		const hostWindow = deps.resolveHostContextLimit?.(model);
+		const primaryWindow =
+			model === piModelRefToCanonical(historianModel)
+				? historianContextLimit
+				: undefined;
+		const suppliedWindow = deps.producerContextLimits?.get(model);
+		const cachedWindow = resolveKnownHistorianContextLimit(model);
+		const window =
+			hostWindow ?? primaryWindow ?? suppliedWindow ?? cachedWindow;
+		if (!loggedProducerWindows.has(model)) {
+			loggedProducerWindows.add(model);
+			sessionLog(
+				sessionId,
+				window === undefined
+					? `producer window unknown for ${model}: sending unguarded`
+					: `historian producer window for ${model}: ${window} (${hostWindow !== undefined ? "host registry" : primaryWindow !== undefined ? "configured" : suppliedWindow !== undefined ? "supplied" : "persisted cache"})`,
+			);
+		}
+		return window;
+	};
+	const runHistorianSubagentWithTransientRetries = (
+		args: Parameters<typeof runHistorianSubagentWithTransientRetriesGuarded>[0],
+	) =>
+		runHistorianSubagentWithTransientRetriesGuarded({
+			...args,
+			onDispatch: () => {
+				producerDispatched = true;
+			},
+			resolveOutputLimit: deps.resolveHostOutputLimit,
+			resolveContextLimit: resolveProducerContextLimit,
+		});
 
 	let issueNotified = false;
 	const notify = async (message: string): Promise<void> => {
@@ -575,6 +663,7 @@ async function runPiHistorianTraced(
 	};
 	let completedSuccessfully = false;
 	let retainDrainReservationForRetryThrottle = false;
+	let producerDispatched = false;
 	let drainReservation: ReturnType<
 		typeof reserveProtectedTailDrainTokens
 	>["reservation"] = null;
@@ -697,6 +786,72 @@ async function runPiHistorianTraced(
 				return;
 			}
 
+			// Size the prompt to the producer model before reserving drain budget or
+			// reading the chunk: the fixed prompt parts and the output reserve come
+			// off the window first, and the chunk gets what is left. The window is
+			// resolved the way the dispatch guard resolves it for the primary model.
+			const projectPath = resolveProjectIdentityForSession(
+				directory,
+				allowHomeProject,
+			);
+			const memories = projectPath
+				? getMemoriesByProject(db, projectPath, ["active", "permanent"])
+				: [];
+			const fitModelKey = piModelRefToCanonical(historianModel ?? "");
+			const fitContext = fitModelKey
+				? resolveProducerContextLimit(fitModelKey)
+				: undefined;
+			const promptFit = fitHistorianPrompt({
+				window: {
+					modelKey: fitModelKey || undefined,
+					contextLimitTokens: fitContext,
+					maxOutputTokens: historianProducerReserve(
+						fitContext,
+						maxOutputTokens,
+						deps.resolveHostOutputLimit?.(fitModelKey),
+					),
+				},
+				systemPrompt: historianSystemPrompt,
+				requestedChunkTokens: historianChunkTokens,
+				sessionId,
+				chunkStart: Math.max(1, offset),
+				lastOrdinal: eligibleEndOrdinal - 1,
+				sessionCompartments: priorCompartments,
+				memories,
+				memoryEnabled: memoryEnabled !== false,
+			});
+			if (!promptFit.ok) {
+				telemetry.failureReason = promptFit.reason;
+				if (
+					getHistorianFailureState(db, sessionId).lastError === promptFit.reason
+				) {
+					// The same model and window already failed this way. Nothing but
+					// a model, window or instruction change alters the reason, so
+					// running again would only repeat the failure and its notice.
+					telemetry.status = "noop";
+					sessionLog(
+						sessionId,
+						`historian no-op: prompt still cannot fit the historian model (${promptFit.reason}); waiting for a model or window change`,
+					);
+					return;
+				}
+				sessionLog(
+					sessionId,
+					`historian failure: source=prompt-fit reason="${promptFit.reason}"`,
+				);
+				incrementHistorianFailure(db, sessionId, promptFit.reason);
+				retainDrainReservationForRetryThrottle = true;
+				await notify(buildHistorianWindowTooSmallNotice());
+				return;
+			}
+			const chunkTokens = promptFit.chunkTokens;
+			if (promptFit.trimmed || chunkTokens < historianChunkTokens) {
+				sessionLog(
+					sessionId,
+					`historian prompt fit: sized to ${fitModelKey || "unknown"} (${describeHistorianPromptTrim(promptFit)}; requestedChunkTokens=${historianChunkTokens})`,
+				);
+			}
+
 			const perRunCap = selectPerRunCap(boundarySnapshot);
 			const usable = Math.max(
 				1,
@@ -733,7 +888,7 @@ async function runPiHistorianTraced(
 
 			const chunk = readSessionChunk(
 				sessionId,
-				historianChunkTokens,
+				chunkTokens,
 				offset,
 				eligibleEndOrdinal,
 			);
@@ -792,54 +947,38 @@ async function runPiHistorianTraced(
 				return;
 			}
 
-			// Build prompt: include prior compartments, facts, AND read-only
-			// memory block so historian can dedup new facts against existing
-			// project memories. Cross-harness coherence comes free here —
-			// memories written by OpenCode show up in this Pi historian run.
-			const projectPath = resolveProjectIdentityForSession(
-				directory,
-				allowHomeProject,
-			);
 			if (!projectPath) {
 				rollbackDrainReservation();
 				return;
 			}
-			const memories = getMemoriesByProject(db, projectPath, [
-				"active",
-				"permanent",
-			]);
-			const memoryBlock = renderMemoryBlock(memories) ?? undefined;
 
 			// v2 (E6 parity): bounded reference blocks replace the unbounded
-			// existing-state dump. The historian no longer sees ALL prior
-			// compartments — it gets 4 rotating cross-project seed examples
+			// existing-state dump: 4 rotating cross-project seed examples
 			// (importance-band calibration) + the last 6 same-session
-			// compartments (continuity) + <project-memory> for fact dedup.
-			// Bounded forever regardless of session age, so no temp-file
-			// offload is needed. Mirrors the OpenCode incremental runner.
-			const projectMemory = memoryBlock ?? "";
-			const references = buildReferenceBlocks({
-				sessionId,
-				chunkStart: chunk.startIndex,
-				sessionCompartments: priorCompartments,
-			});
-
+			// compartments (continuity) + <project-memory> for fact dedup, so
+			// memories written by OpenCode show up in this Pi historian run. The
+			// memory block is id-free because the historian dedups by content;
+			// byte-parity with the Rust port is pinned by the historian prompt
+			// golden. The prompt fit above rendered these blocks, trimmed if the
+			// producer window needed room for the chunk. Mirrors the OpenCode
+			// incremental runner.
 			const fittedAtomicSource = chunk.oversizeAtomicUnit
 				? fitAtomicHistorianSourceToProducerWindow({
 						text: chunk.text,
 						resultBoundaries: chunk.toolResultBoundaries,
 						contextLimitTokens: historianContextLimit,
 						maxOutputTokens,
+						maxSourceTokens: promptFit.roomTokens,
 					})
 				: null;
 			const chunkText = chunk.oversizeAtomicUnit
 				? (fittedAtomicSource?.text ?? chunk.text)
-				: truncateHistorianInputIfNeeded(chunk.text, historianChunkTokens);
+				: truncateHistorianInputIfNeeded(chunk.text, chunkTokens);
 			const producerSourceTokens = estimateTokens(chunkText);
 			if (boundarySnapshot.oversizeAtomicUnit || chunk.oversizeAtomicUnit) {
 				sessionLog(
 					sessionId,
-					`historian oversize admission: range=${chunk.startIndex}-${chunk.endIndex} rawComponentTokens=${boundarySnapshot.diagnostics?.head.completedFence.tokenMass ?? "unknown"} perRunCap=${perRunCap} producerSourceTokens=${producerSourceTokens} historianChunkTokens=${historianChunkTokens}; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
+					`historian oversize admission: range=${chunk.startIndex}-${chunk.endIndex} rawComponentTokens=${boundarySnapshot.diagnostics?.head.completedFence.tokenMass ?? "unknown"} perRunCap=${perRunCap} producerSourceTokens=${producerSourceTokens} historianChunkTokens=${chunkTokens}; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
 				);
 			}
 			if (fittedAtomicSource && fittedAtomicSource.removedTokens > 0) {
@@ -855,8 +994,7 @@ async function runPiHistorianTraced(
 			});
 			if (producerWindowFailure) {
 				telemetry.failureReason = producerWindowFailure;
-				retainDrainReservationForRetryThrottle = true;
-				incrementHistorianFailure(db, sessionId, producerWindowFailure);
+				rollbackDrainReservation();
 				sessionLog(
 					sessionId,
 					`historian oversize admission refused before spawn: ${producerWindowFailure}`,
@@ -866,14 +1004,14 @@ async function runPiHistorianTraced(
 			if (chunkText !== chunk.text) {
 				sessionLog(
 					sessionId,
-					`historian pre-flight: truncated formatted input for ${chunk.startIndex}-${chunk.endIndex} to fit ${historianChunkTokens} tokens`,
+					`historian pre-flight: truncated formatted input for ${chunk.startIndex}-${chunk.endIndex} to fit ${chunkTokens} tokens`,
 				);
 			}
 
 			const prompt = buildCompartmentAgentPrompt({
-				seedExamples: references.seedExamples,
-				sessionReferences: references.sessionReferences,
-				projectMemory,
+				seedExamples: promptFit.seedExamples,
+				sessionReferences: promptFit.sessionReferences,
+				projectMemory: promptFit.projectMemory,
 				inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
 				memoryEnabled: memoryEnabled !== false,
 			});
@@ -994,11 +1132,6 @@ async function runPiHistorianTraced(
 				);
 
 			retainDrainReservationForRetryThrottle = true;
-			const historianSystemPrompt = withContentLanguageDirective(
-				COMPARTMENT_AGENT_SYSTEM_PROMPT,
-				deps.language,
-				{ preserveUserQuotes: true },
-			);
 			const historianEditorSystemPrompt = withContentLanguageDirective(
 				HISTORIAN_EDITOR_SYSTEM_PROMPT,
 				deps.language,
@@ -1146,6 +1279,15 @@ async function runPiHistorianTraced(
 						: validatedPass.kind === "spawn-failed"
 							? `subagent run failed (${validatedPass.reason}): ${validatedPass.error}`
 							: "historian returned no usable text";
+				// A window refusal here comes from a fallback model (the primary was
+				// fitted above). Treat it like any other failed pass: count it, notify,
+				// and keep the reserved drain budget spent even though nothing was
+				// dispatched, so the next trigger does not retry at once.
+				if (
+					!producerDispatched &&
+					!PRODUCER_PROMPT_FIT_FAILURE_PATTERN.test(errorMsg)
+				)
+					retainDrainReservationForRetryThrottle = false;
 				sessionLog(sessionId, `historian failure: ${errorMsg}`);
 				telemetry.failureReason = errorMsg;
 				{
@@ -1295,12 +1437,10 @@ async function runPiHistorianTraced(
 			const skipUnanchoredPromotion =
 				discardedLast || weakLookaheadFinalCompartment;
 
-			// Two distinct gates (parity with OpenCode): embeddingActive = memory
-			// feature on (drives registration + embedding, the ctx_search / dreamer
-			// linking substrate); promotionActive additionally requires auto_promote
-			// (drives writing facts as memories).
-			const embeddingActive = memoryEnabled !== false;
-			const promotionActive = embeddingActive && autoPromote !== false;
+			// Writing facts as memories requires the memory feature AND auto_promote
+			// (parity with OpenCode). History embedding below is NOT gated here: it
+			// depends only on the embedding provider, which the embed call checks.
+			const promotionActive = memoryEnabled !== false && autoPromote !== false;
 
 			// Events: stored, NOT rendered. Best-effort. discard-last: drop events
 			// anchored to the discarded provisional compartment.
@@ -1358,8 +1498,8 @@ async function runPiHistorianTraced(
 					"historian.events": publishableEvents.length,
 				},
 				async (publishSpan): Promise<"published" | "lease-lost"> => {
-					const transactionStartedAt = performance.now();
 					db.exec("BEGIN IMMEDIATE");
+					const transactionStartedAt = performance.now();
 					try {
 						if (
 							!isCompartmentLeaseHeld(db, sessionId, compartmentLeaseHolderId)
@@ -1596,8 +1736,9 @@ async function runPiHistorianTraced(
 			}
 
 			// Raw chunk embeddings: the ctx_search semantic substrate over session
-			// history. Fire-and-forget, best-effort, memory-gated.
-			if (embeddingActive) {
+			// history. Fire-and-forget, best-effort, gated only by the embedding
+			// provider (`memory.enabled` does not affect it).
+			if (newCompartments.length > 0) {
 				const chunksToEmbed = newCompartments
 					.map((c, i) => ({
 						id: persistedIds[i],

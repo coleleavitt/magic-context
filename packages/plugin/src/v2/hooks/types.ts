@@ -9,7 +9,12 @@ export interface V2Message {
 }
 export interface SessionContext {
     sessionID: string;
-    model: { providerID: string; id: string; variant?: string };
+    model: {
+        providerID: string;
+        id: string;
+        variant?: string;
+        limit?: { context: number; input?: number; output?: number };
+    };
     agent: string;
     messages: V2Message[];
     system: Array<Record<string, unknown>>;
@@ -25,6 +30,7 @@ export interface V2AgentEditor {
             description?: string;
             mode: "subagent" | "primary" | "all";
             hidden: boolean;
+            steps?: number;
             request: {
                 settings: Record<string, unknown>;
                 headers: Record<string, string>;
@@ -149,9 +155,14 @@ export interface V2Context {
             model: { providerID: string; id: string; variant?: string };
             location: { directory: string };
             metadata: { magic_context: "hidden-run"; role: "historian" | "dreamer" };
+            /** Kept only by hosts that also have the optional `session.remove` declared below. */
+            parentID?: string;
         }): Promise<{ id: string }>;
         get(input: { sessionID: string }): Promise<{
             model?: { providerID: string; id: string; variant?: string };
+            parentID?: string;
+            /** The directory the host bound the session to when it was created. */
+            location?: { directory?: string };
         }>;
         switchModel(input: {
             sessionID: string;
@@ -180,5 +191,10 @@ export interface V2Context {
             callback: (draft: SessionContext) => Promise<void>,
         ): Promise<unknown>;
         interrupt(input: { sessionID: string }): Promise<{ interrupted: boolean }>;
+        /**
+         * Present only on OpenCode 2 builds newer than 2.0.21, so it is optional and must be
+         * feature-checked (`typeof remove === "function"`), never inferred from a version.
+         */
+        remove?(input: { sessionID: string }): Promise<void>;
     };
 }

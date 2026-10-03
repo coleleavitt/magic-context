@@ -71,7 +71,7 @@ export interface RetrospectiveRawProvider {
     readOldestMessageTimesSince?(
         sessionIds: readonly string[],
         sinceMs: number,
-    ): Map<string, number> | Promise<Map<string, number>>;
+    ): Map<string, number> | null | Promise<Map<string, number> | null>;
     /** The ~`count` most recent typed USER messages at or before `beforeMs` — the
      *  run-boundary overlap so friction spanning two runs isn't missed. */
     readUserMessagesBefore(
@@ -130,12 +130,14 @@ export class OpenCodeRetrospectiveRawProvider implements RetrospectiveRawProvide
         // is_subagent lives in session_meta (same DB); missing meta → treat as root.
         const rows = this.deps.contextDb
             .prepare<[string], SessionProjectRow>(
-                `SELECT sp.session_id, sp.updated_at
+                `SELECT sp.session_id, CAST(activity.value AS INTEGER) AS updated_at
                    FROM session_projects sp
+                   JOIN schema_migrations_meta activity
+                     ON activity.key = 'retrospective_activity:' || sp.session_id
                    LEFT JOIN session_meta m ON m.session_id = sp.session_id
                   WHERE sp.project_path = ? AND sp.harness = 'opencode'
                     AND COALESCE(m.is_subagent, 0) = 0
-                  ORDER BY sp.updated_at ASC, sp.session_id ASC`,
+                  ORDER BY updated_at ASC, sp.session_id ASC`,
             )
             .all(projectIdentity);
         return rows.map((row) => ({
@@ -160,19 +162,16 @@ export class OpenCodeRetrospectiveRawProvider implements RetrospectiveRawProvide
     ): RetrospectiveSinceRead {
         const db = this.resolveDb();
         if (!db) return { messages: [], truncated: false };
-        try {
-            return readOpenCodeMessagesSince(db, sessionId, sinceMs, capPerSession);
-        } catch {
-            return { messages: [], truncated: false };
-        }
+        return readOpenCodeMessagesSince(db, sessionId, sinceMs, capPerSession);
     }
 
     readOldestMessageTimesSince(
         sessionIds: readonly string[],
         sinceMs: number,
-    ): Map<string, number> {
+    ): Map<string, number> | null {
         const db = this.resolveDb();
-        if (!db || sessionIds.length === 0) return new Map();
+        if (!db) return null;
+        if (sessionIds.length === 0) return new Map();
         return readOpenCodeOldestMessageTimesSince(db, sessionIds, sinceMs);
     }
 
@@ -360,10 +359,17 @@ export async function readRetrospectiveScanWindow(
         }
         const droppedSince = [...budgetDropped, ...countDropped];
 
-        // Watermark = newest ADMITTED ts, clamped below any incompletely-scanned
-        // source. Starting at scanSinceMs makes the configured recency cutoff a
-        // durable jump even when every historical session is already expired.
+        // The watermark records the newest processed timestamp; the configured
+        // recency cutoff also expires older messages even when none are selected.
+        // If every selected session has no pending user messages, advance past
+        // observed assistant/tool activity so idle sessions do not keep reopening
+        // the gate. The frontier below still protects sessions not yet scanned.
         let maxScannedTs = scanSinceMs;
+        if (oldestBySession && sinceReads.every((read) => read.messages.length === 0)) {
+            for (const { session } of eligibleSessions) {
+                maxScannedTs = Math.max(maxScannedTs, session.updatedAt ?? scanSinceMs);
+            }
+        }
         for (const row of keptSince) {
             if (row.ts > maxScannedTs) maxScannedTs = row.ts;
         }
@@ -536,15 +542,62 @@ function normalizeOpenCodeRows(
     // bounded message-id predicate drive the stock OpenCode part index.
     const messageIds = rows.map((row) => row.id);
     const placeholders = messageIds.map(() => "?").join(", ");
+    const userIds = rows
+        .filter((row) => parseJsonRecord(row.data)?.role === "user")
+        .map((row) => row.id);
+    const userPlaceholders = userIds.map(() => "?").join(", ") || "NULL";
+    // Evaluate output/error evidence inside SQLite: returning full tool payloads
+    // only to discard them after privacy filtering can exhaust the JS heap.
+    const output = `CASE json_type(data, '$.state.output')
+        WHEN 'text' THEN json_extract(data, '$.state.output')
+        WHEN 'null' THEN '' ELSE COALESCE(data -> '$.state.output', '') END`;
+    const error = `CASE json_type(data, '$.state.error')
+        WHEN 'text' THEN json_extract(data, '$.state.error')
+        WHEN 'null' THEN '' ELSE COALESCE(data -> '$.state.error', '') END`;
+    const containsError = (value: string) =>
+        ["error", "failed", "exception", "traceback"]
+            .map((word) => `(' ' || lower(${value}) || ' ') GLOB '*[^a-z0-9_]${word}[^a-z0-9_]*'`)
+            .join(" OR ");
+    // JSON.stringify decodes escaped characters and re-escapes string leaves.
+    // Inspect leaves/keys in SQL so object output has the same word boundaries.
+    const errorWords = `CASE WHEN json_type(data, '$.state.output') IN ('object', 'array')
+        THEN EXISTS (SELECT 1 FROM json_tree(data, '$.state.output') AS leaf
+            WHERE (leaf.type = 'text' AND (${containsError("json_quote(leaf.atom)")}))
+               OR (typeof(leaf.key) = 'text' AND (${containsError("json_quote(leaf.key)")})))
+        WHEN instr(CAST(${output} AS BLOB), x'00') > 0 THEN EXISTS (
+            WITH RECURSIVE segments(rest, piece) AS (
+                SELECT CAST(${output} AS BLOB), x''
+                UNION ALL
+                SELECT CASE WHEN instr(rest, x'00') > 0
+                           THEN substr(rest, instr(rest, x'00') + 1) ELSE NULL END,
+                       CASE WHEN instr(rest, x'00') > 0
+                           THEN substr(rest, 1, instr(rest, x'00') - 1) ELSE rest END
+                  FROM segments WHERE rest IS NOT NULL
+            ) SELECT 1 FROM segments WHERE (${containsError("CAST(piece AS TEXT)")}))
+        ELSE (${containsError(output)}) END`;
+    // JavaScript trim's whitespace set, not SQLite's space-only default.
+    const whitespace =
+        "\u0009\u000a\u000b\u000c\u000d \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
     const partRows = db
         .prepare<string[], OpenCodePartRow>(
-            `SELECT message_id, data
+            `SELECT message_id, CASE json_extract(data, '$.type')
+                WHEN 'text' THEN CASE WHEN message_id IN (${userPlaceholders}) THEN json_object(
+                    'type', 'text', 'text', data -> '$.text',
+                    'synthetic', data -> '$.synthetic', 'ignored', data -> '$.ignored') ELSE '{}' END
+                WHEN 'tool' THEN json_object(
+                    'type', 'tool', 'tool', data -> '$.tool',
+                    'state', json_object('isError', json(CASE WHEN
+                        json_type(data, '$.state.isError') = 'true'
+                        OR lower(json_extract(data, '$.state.status')) = 'error'
+                        OR length(CAST(trim(${error}, ?) AS BLOB)) > 0 OR ${errorWords}
+                        THEN 'true' ELSE 'false' END)))
+                ELSE '{}' END AS data
                FROM part
-              WHERE +session_id = ?
+              WHERE +session_id = ? AND json_valid(data)
                 AND likelihood(message_id IN (${placeholders}), 0.000001)
               ORDER BY time_created ASC, id ASC`,
         )
-        .all(sessionId, ...messageIds);
+        .all(...userIds, whitespace, sessionId, ...messageIds);
     const partsByMessageId = new Map<string, unknown[]>();
     for (const row of partRows) {
         const parts = partsByMessageId.get(row.message_id) ?? [];

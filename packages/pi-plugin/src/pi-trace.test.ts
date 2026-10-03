@@ -47,6 +47,18 @@ describe("pi-trace bridge", () => {
 		]);
 	});
 
+	test("does not wait for an unresolved trace api before running the pass", async () => {
+		configureTraceApiForTests(undefined);
+		let ran = false;
+		const pass = tracedContextPass("context.transform", {}, async () => {
+			ran = true;
+			return 1;
+		});
+		// The pass body starts synchronously instead of after the pi-ai import.
+		expect(ran).toBe(true);
+		expect(await pass).toBe(1);
+	});
+
 	test("runs the pass directly when the host has no tracing", async () => {
 		configureTraceApiForTests(null);
 		expect(

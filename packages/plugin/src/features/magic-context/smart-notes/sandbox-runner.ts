@@ -21,7 +21,7 @@ import type {
 } from "quickjs-emscripten";
 
 import type { SmartNoteCapabilityApi, SmartNoteCapabilityFactory } from "./capabilities";
-import { isSmartNoteNetworkError, type SmartNoteCheckResult } from "./types";
+import { isSmartNoteNetworkError, type SmartNoteCheckResult, SmartNoteNetworkError } from "./types";
 
 /**
  * The WASM module is expensive to instantiate (~1MB compile) but reusable across
@@ -175,6 +175,8 @@ export interface RunCompiledSmartNoteCheckFailure {
     cancelled: false;
     error: string;
     network: boolean;
+    persistent: boolean;
+    retryAt?: number;
 }
 
 export interface RunCompiledSmartNoteCheckCancelled {
@@ -256,6 +258,10 @@ async function runCompiledSmartNoteCheckLocked(
     const controller = new AbortController();
     let externallyCancelled = false;
     let executionTimedOut = false;
+    let persistentNetworkFailure = false;
+    let missingResource = false;
+    let httpFailure: SmartNoteNetworkError | undefined;
+    let httpRetryAt: number | undefined;
     const externalAbort = () => {
         externallyCancelled = true;
         controller.abort(options.signal?.reason);
@@ -276,9 +282,34 @@ async function runCompiledSmartNoteCheckLocked(
             context.runtime.setInterruptHandler(
                 () => controller.signal.aborted || Date.now() > deadline,
             );
-            installCapabilityObject(context, capabilities);
+            installCapabilityObject(context, {
+                ...capabilities,
+                httpGet: async (url) => {
+                    try {
+                        const response = await capabilities.httpGet(url);
+                        if (response.status === 404 || response.status === 410)
+                            missingResource = true;
+                        return response;
+                    } catch (error) {
+                        // QuickJS turns host exceptions into guest errors, losing
+                        // the typed failure metadata before the outer catch.
+                        if (error instanceof SmartNoteNetworkError) {
+                            if (!httpFailure?.persistent) httpFailure = error;
+                            persistentNetworkFailure ||= error.persistent;
+                            if (error.retryAt !== undefined) {
+                                httpRetryAt = Math.max(httpRetryAt ?? 0, error.retryAt);
+                            }
+                        }
+                        throw error;
+                    }
+                },
+            });
             disableAmbientDynamicCode(context);
             const result = await evalCheck(context, options.compiledCheck);
+            // Accept a returned {met} verdict: HTTP 404/410 can prove deletion.
+            // Fetch failures (access, rate limit, size or timeout) still fail the
+            // check, even if its JavaScript caught the error and returned a verdict.
+            if (httpFailure) throw httpFailure;
             const checkResult = result as { met?: unknown } | null;
             if (!checkResult || typeof checkResult.met !== "boolean") {
                 return failureResult("check() must return { met: boolean }", false);
@@ -291,15 +322,33 @@ async function runCompiledSmartNoteCheckLocked(
         // Queue deadlines and lease loss are control flow, not evidence that a
         // healthy compiled check is failing. Only this run's own timeout counts.
         if (externallyCancelled && !executionTimedOut) return cancelledResult(error);
-        return failureResult(formatSandboxError(error), isSmartNoteNetworkError(error));
+        if (!httpFailure && missingResource) return { ok: true, result: { met: false } };
+        return failureResult(
+            formatSandboxError(httpFailure ?? error),
+            isSmartNoteNetworkError(httpFailure ?? error),
+            persistentNetworkFailure,
+            httpRetryAt,
+        );
     } finally {
         clearTimeout(timer);
         options.signal?.removeEventListener("abort", externalAbort);
     }
 }
 
-function failureResult(error: string, network: boolean): RunCompiledSmartNoteCheckFailure {
-    return { ok: false, cancelled: false, error: truncate(error), network };
+function failureResult(
+    error: string,
+    network: boolean,
+    persistent = false,
+    retryAt?: number,
+): RunCompiledSmartNoteCheckFailure {
+    return {
+        ok: false,
+        cancelled: false,
+        error: truncate(error),
+        network,
+        persistent,
+        ...(retryAt === undefined ? {} : { retryAt }),
+    };
 }
 
 function cancelledResult(reason: unknown): RunCompiledSmartNoteCheckCancelled {

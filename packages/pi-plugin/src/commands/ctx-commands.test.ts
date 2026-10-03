@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { replaceAllCompartmentState } from "@magic-context/core/features/magic-context/compartment-storage";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import {
@@ -7,6 +7,10 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { queuePendingOp } from "@magic-context/core/features/magic-context/storage-ops";
+import {
+	clearProducerModelObservations,
+	observeProducerModelsForTest,
+} from "@magic-context/core/hooks/magic-context/producer-window-test-support";
 import { Database } from "@magic-context/core/shared/sqlite";
 
 import {
@@ -221,6 +225,21 @@ describe("Pi Magic Context commands", () => {
 		expect(customCalls[0]?.options).toMatchObject({ overlay: true });
 	});
 
+	it("reports an empty Pi model chain loudly in /ctx-status", async () => {
+		const db = createDb();
+		const { pi, handlers, sent } = createMockPi();
+		registerCtxStatusCommand(pi as never, {
+			db,
+			projectIdentity: "/tmp/project",
+			modelChainWarning:
+				"Pi model chain empty (no model found): classify-memories, historian",
+		});
+		await handlers.get("ctx-status")?.("", createCtx());
+		expect(sent[0]?.data.text).toContain(
+			"WARNING: Pi model chain empty (no model found): classify-memories, historian",
+		);
+	});
+
 	it("appends a model-invisible status entry without UI", async () => {
 		const db = createDb();
 		const { pi, handlers, sent } = createMockPi();
@@ -417,6 +436,46 @@ describe("Pi Magic Context commands", () => {
 		expect(registrationCwds).toEqual(["/tmp/project"]);
 		expect(sent[0]?.customType).toBe("ctx-status");
 		expect(sent[0]?.data.text).toContain("/ctx-dream");
+	});
+
+	it("/ctx-dream returns to an interactive Pi while the run continues", async () => {
+		const db = createDb();
+		const { pi, handlers, sent } = createMockPi();
+		let finishRegistration: () => void = () => {};
+		const registration = new Promise<void>((resolve) => {
+			finishRegistration = resolve;
+		});
+
+		registerCtxDreamCommand(pi as never, {
+			db,
+			projectDir: "/tmp/project",
+			projectIdentity: "/tmp/project",
+			registrationOwner: {},
+			// Stands in for a dream run that takes minutes.
+			ensureRegistered: () => registration,
+		});
+
+		// In interactive Pi the command handler is the user's turn: awaiting
+		// the run would freeze the REPL until every dream task finished.
+		const handled = await Promise.race([
+			Promise.resolve(
+				handlers.get("ctx-dream")?.("", { ...createCtx(), hasUI: true }),
+			).then(() => "returned"),
+			new Promise((resolve) => setTimeout(() => resolve("blocked"), 500)),
+		]);
+
+		expect(handled).toBe("returned");
+		expect(sent).toHaveLength(1);
+		expect(sent[0]?.data.text).toContain("Starting dream run");
+
+		// The detached run still reports its outcome when it ends (here the
+		// project is not registered with the dreamer, so it reports a failure).
+		finishRegistration();
+		for (let i = 0; i < 50 && sent.length < 2; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		expect(sent).toHaveLength(2);
+		expect(sent[1]?.data.title).toBe("/ctx-dream");
 	});
 
 	it("/ctx-dream accepts split memory tasks and rejects retired task names", async () => {
@@ -790,3 +849,12 @@ describe("Pi Magic Context commands", () => {
 		expect(consumeDeferredMaterialization(sessionId)).toBe(false);
 	});
 });
+
+beforeEach(async () => {
+	await observeProducerModelsForTest([
+		"test/model",
+		"anthropic/claude",
+		"anthropic/claude-from-project-b",
+	]);
+});
+afterEach(clearProducerModelObservations);

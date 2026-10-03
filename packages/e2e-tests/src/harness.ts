@@ -34,10 +34,14 @@ export interface TestHarnessOptions {
     omitConfigDirCompaction?: boolean;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
+    /** Register a separate mock historian model with this window and pin the historian to it. */
+    historianMockModel?: { id: string; contextLimit: number };
     /** Set false only when the test intentionally verifies conflict-based self-disable behavior. */
     expectMagicContext?: boolean;
     /** Debug harnesses may boot the plugin with hooks configured off while retaining diagnostics. */
     expectedMagicContextState?: "enabled" | "configured-disabled" | "conflict-disabled";
+    /** Leave schema initialization to an older released plugin during compatibility probes. */
+    prepareContextDatabase?: boolean;
     /**
      * Default response used when the mock queue is empty. Lets tests send extra
      * prompts without worrying about scripting every one.
@@ -146,7 +150,8 @@ export class TestHarness implements HostHarness {
             openCodeGlobalConfigExtra: options.openCodeGlobalConfigExtra,
             omitConfigDirCompaction: options.omitConfigDirCompaction,
             modelContextLimit: options.modelContextLimit,
-            prepareContextDatabase: expectMagicContext,
+            historianMockModel: options.historianMockModel,
+            prepareContextDatabase: options.prepareContextDatabase ?? expectMagicContext,
             expectedMagicContextState,
         };
         let opencode: SpawnedOpencode | undefined;
@@ -172,7 +177,7 @@ export class TestHarness implements HostHarness {
             this.contextDbCached = null;
         }
         const env = this.opencodeInstance.env;
-        await this.opencodeInstance.kill();
+        await this.opencodeInstance.kill({ root: "keep" });
         this.opencodeInstance = await spawnOpencode({
             ...this.spawnOptions,
             existingEnv: env,
@@ -193,6 +198,32 @@ export class TestHarness implements HostHarness {
             () => this.client.session.create({ query: { directory: this.opencode.env.workdir } }),
             "session.create",
         );
+    }
+
+    /**
+     * Run OpenCode's own compaction on a session, the request `/compact` sends.
+     * Resolves once the host has written its summary.
+     */
+    async compactSession(
+        sessionId: string,
+        model: { providerID: string; modelID: string } = {
+            providerID: "mock-anthropic",
+            modelID: "mock-sonnet",
+        },
+    ): Promise<void> {
+        const response = await fetch(
+            `${this.opencode.url}/session/${encodeURIComponent(sessionId)}/summarize`,
+            {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ ...model, auto: false }),
+            },
+        );
+        if (!response.ok) {
+            throw new Error(
+                `session compaction failed with HTTP ${response.status}: ${await response.text()}`,
+            );
+        }
     }
 
     async removeSession(sessionId: string): Promise<void> {
@@ -517,7 +548,13 @@ export class TestHarness implements HostHarness {
 
     assertHistorianRequestsUseMock(): void {
         if (this.expectMagicContext && this.hasContextDb()) {
-            assertHistorianMockRouting(this.contextDb(), "opencode", "mock-anthropic/mock-sonnet");
+            // A test that pins the historian to its own mock model routes there.
+            const historianModel = this.spawnOptions.historianMockModel;
+            assertHistorianMockRouting(
+                this.contextDb(),
+                "opencode",
+                `mock-anthropic/${historianModel?.id ?? "mock-sonnet"}`,
+            );
         }
     }
 
@@ -533,7 +570,7 @@ export class TestHarness implements HostHarness {
                 }
                 this.contextDbCached = null;
             }
-            await this.opencode.kill();
+            await this.opencode.kill({ root: "remove" });
             await this.mock.stop();
         }
     }

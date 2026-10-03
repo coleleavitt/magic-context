@@ -111,7 +111,7 @@ export interface SessionSummary {
   is_subagent: boolean;
 }
 
-export type Harness = "opencode" | "opencode2" | "pi" | "omp" | "claude_code" | "codex";
+export type Harness = "opencode" | "opencode2" | "pi" | "omp" | "broca" | "claude_code" | "codex";
 
 export interface SessionFilter {
   harness?: Harness;
@@ -476,9 +476,18 @@ export interface DbCacheEvent {
   input_tokens: number;
   cache_read: number;
   cache_write: number;
+  cache_reported: boolean;
   total_tokens: number;
   hit_ratio: number;
-  severity: "stable" | "info" | "warning" | "bust" | "full_bust" | "warming" | "unknown";
+  severity:
+    | "stable"
+    | "info"
+    | "warning"
+    | "bust"
+    | "full_bust"
+    | "warming"
+    | "unknown"
+    | "aggregate";
   cause: string | null;
   agent: string | null;
   finish?: string;
@@ -491,6 +500,20 @@ export interface DbCacheEvent {
    *  segmenting/scaling the timeline (see normalizeEstimatedContextLimits). */
   context_limit_estimated: boolean;
   is_drop: boolean;
+  /** True when the row sums several provider requests (a whole Broca run)
+   *  rather than describing one. `hit_ratio` is then the run's total cached
+   *  share and `severity` is "aggregate"; it is never a STABLE/BUST verdict. */
+  aggregate: boolean;
+  /** True for a session's first row: its opening request could not read the
+   *  cache, so a low share there is a cold start, not a miss. */
+  cold_start: boolean;
+  /** False when the source omitted the cache-write count, so `cache_write`
+   *  is an absent value rather than a reported zero. */
+  cache_write_reported: boolean;
+  /** Provider and model that served the request (for a Broca run total, the
+   *  run's last segment). Null when the source does not record them. */
+  provider: string | null;
+  model: string | null;
 }
 
 export interface SessionCacheStats {
@@ -507,6 +530,8 @@ export interface SessionCacheStats {
   managed: boolean;
   is_subagent: boolean;
   title: string | null;
+  /** Set when this session's activity time cannot follow a running turn. */
+  activity_note?: string | null;
 }
 
 export interface ConfigFile {
@@ -524,6 +549,7 @@ export interface ModelCatalogs {
   opencode: string[];
   pi: string[];
   omp: string[];
+  opencodeError?: string | null;
 }
 
 export interface ProjectConfigEntry {

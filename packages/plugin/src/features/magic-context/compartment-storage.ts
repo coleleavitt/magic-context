@@ -1,9 +1,12 @@
+import { invalidateAutoEmbedSession } from "../../hooks/magic-context/embed-session-state";
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import { deleteChunkEmbedBackoffForSession } from "./compartment-chunk-embedding";
 import { isCompartmentLeaseHeld } from "./compartment-lease";
 import { getIncrementDepthStatement } from "./compression-depth-storage";
 import { isNoContentCompartment } from "./no-content-compartment";
+import { queueM0Mutation } from "./storage-m0-mutation-log";
 import { clearCachedM0M1 } from "./storage-meta-shared";
 
 const insertCompartmentStatements = new WeakMap<Database, PreparedStatement>();
@@ -13,7 +16,7 @@ function getInsertCompartmentStatement(db: Database): PreparedStatement {
     let stmt = insertCompartmentStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at, harness, start_block_index, end_block_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         );
         insertCompartmentStatements.set(db, stmt);
     }
@@ -39,6 +42,9 @@ export interface Compartment {
     endMessage: number;
     startMessageId: string;
     endMessageId: string;
+    /** NULL/absent covers a whole message; an indexed end keeps that message raw to preserve later blocks. */
+    startBlockIndex?: number | null;
+    endBlockIndex?: number | null;
     title: string;
     /** v2: P1 tier text (fullest). Legacy rows: flat v1 content. Always present (NOT NULL). */
     content: string;
@@ -83,6 +89,8 @@ interface CompartmentRow {
     end_message: number;
     start_message_id: string;
     end_message_id: string;
+    start_block_index?: number | null;
+    end_block_index?: number | null;
     title: string;
     content: string;
     p1: string | null;
@@ -158,6 +166,9 @@ export interface CompartmentInput {
     endMessage: number;
     startMessageId: string;
     endMessageId: string;
+    /** NULL/absent covers a whole message; an indexed end keeps that message raw to preserve later blocks. */
+    startBlockIndex?: number | null;
+    endBlockIndex?: number | null;
     title: string;
     /** v2: P1 tier text. Legacy/compressor inserts: flat content. */
     content: string;
@@ -201,8 +212,11 @@ function insertCompartmentRows(
             hasTiers || isNoContentCompartment(compartment) ? 0 : 1,
             now,
             getHarness(),
+            compartment.startBlockIndex ?? null,
+            compartment.endBlockIndex ?? null,
         );
     }
+    if (compartments.length > 0) invalidateAutoEmbedSession(sessionId);
 }
 
 function insertFactRows(
@@ -226,6 +240,8 @@ function toCompartment(row: CompartmentRow): Compartment {
         endMessage: row.end_message,
         startMessageId: row.start_message_id,
         endMessageId: row.end_message_id,
+        ...(row.start_block_index != null ? { startBlockIndex: row.start_block_index } : {}),
+        ...(row.end_block_index != null ? { endBlockIndex: row.end_block_index } : {}),
         title: row.title,
         content: row.content,
         p1: row.p1 ?? null,
@@ -283,16 +299,18 @@ export function getLastCompartmentEndMessage(db: Database, sessionId: string): n
 
 /**
  * The OpenCode message id at the boundary of the highest-sequence compartment —
- * i.e. the last raw message the compartment history (m[0]+m[1]) covers. Returns
- * null when there are no compartments or the latest one has no stored boundary
- * (legacy rows). Used to persist the m[1]-coverage boundary so a cold post-
+ * i.e. the last raw message the compartment history (m[0]+m[1]) covers. A newer
+ * compartment with no stored end id (a legacy row, or one carried into a forked
+ * session) cannot be placed, so the boundary is the newest compartment that has
+ * one: everything up to it is covered, and the rows after it stay raw. Returns
+ * null when no compartment has an end id. Used to persist the m[1]-coverage boundary so a cold post-
  * restart pass trims the live tail to what the cached summary actually covers,
  * not to the latest compartment (which may be newer than the cached m[1]).
  */
 export function getLastCompartmentEndMessageId(db: Database, sessionId: string): string | null {
     const row = db
         .prepare(
-            "SELECT end_message_id FROM compartments WHERE session_id = ? AND rebase_status != 'unresolved' ORDER BY sequence DESC LIMIT 1",
+            "SELECT end_message_id FROM compartments WHERE session_id = ? AND rebase_status != 'unresolved' AND end_message_id IS NOT NULL AND end_message_id != '' ORDER BY sequence DESC LIMIT 1",
         )
         .get(sessionId) as { end_message_id: string | null } | undefined;
     const id = row?.end_message_id;
@@ -330,9 +348,18 @@ export function replaceAllCompartments(
 ): void {
     const now = Date.now();
     db.transaction(() => {
-        db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        deleteChunkEmbedBackoffForSession(db, sessionId);
+        const deleted = db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        if (deleted.changes > 0) {
+            queueM0Mutation(db, {
+                sessionId,
+                mutationType: "recomp_boundary_change",
+                queuedAt: now,
+            });
+        }
+        invalidateAutoEmbedSession(sessionId);
         insertCompartmentRows(db, sessionId, compartments, now);
-    })();
+    }).immediate();
 }
 
 /**
@@ -349,7 +376,7 @@ export function appendCompartments(
     const now = Date.now();
     db.transaction(() => {
         insertCompartmentRows(db, sessionId, compartments, now);
-    })();
+    }).immediate();
 }
 
 /**
@@ -367,7 +394,7 @@ export function replaceSessionFacts(
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
         insertFactRows(db, sessionId, facts, now);
         clearCachedM0M1(db, sessionId);
-    })();
+    }).immediate();
 }
 
 export function getSessionFacts(db: Database, sessionId: string): SessionFact[] {
@@ -386,14 +413,23 @@ export function replaceAllCompartmentState(
 ): void {
     const now = Date.now();
     db.transaction(() => {
-        db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        deleteChunkEmbedBackoffForSession(db, sessionId);
+        const deleted = db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        if (deleted.changes > 0) {
+            queueM0Mutation(db, {
+                sessionId,
+                mutationType: "recomp_boundary_change",
+                queuedAt: now,
+            });
+        }
+        invalidateAutoEmbedSession(sessionId);
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
 
         insertCompartmentRows(db, sessionId, compartments, now);
         insertFactRows(db, sessionId, facts, now);
 
         clearCachedM0M1(db, sessionId);
-    })();
+    }).immediate();
 }
 
 export function replaceAllCompartmentStateAndBumpDepth(
@@ -406,8 +442,8 @@ export function replaceAllCompartmentStateAndBumpDepth(
     depthEndOrdinal: number,
 ): boolean {
     const now = Date.now();
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     let finished = false;
     try {
         if (!isCompartmentLeaseHeld(db, sessionId, holderId)) {
@@ -416,7 +452,16 @@ export function replaceAllCompartmentStateAndBumpDepth(
             return false;
         }
 
-        db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        deleteChunkEmbedBackoffForSession(db, sessionId);
+        const deleted = db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        if (deleted.changes > 0) {
+            queueM0Mutation(db, {
+                sessionId,
+                mutationType: "recomp_boundary_change",
+                queuedAt: now,
+            });
+        }
+        invalidateAutoEmbedSession(sessionId);
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
 
         insertCompartmentRows(db, sessionId, compartments, now);
@@ -517,7 +562,7 @@ export function saveRecompStagingPass(
         db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
 
         const compartmentStmt = db.prepare(
-            "INSERT OR REPLACE INTO recomp_compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, p1, p2, p3, p4, importance, episode_type, pass_number, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO recomp_compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, p1, p2, p3, p4, importance, episode_type, pass_number, created_at, harness, start_block_index, end_block_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         );
         for (const c of compartments) {
             compartmentStmt.run(
@@ -538,6 +583,8 @@ export function saveRecompStagingPass(
                 passNumber,
                 now,
                 getHarness(),
+                c.startBlockIndex ?? null,
+                c.endBlockIndex ?? null,
             );
         }
 
@@ -547,7 +594,7 @@ export function saveRecompStagingPass(
         for (const f of facts) {
             factStmt.run(sessionId, f.category, f.content, passNumber, now, getHarness());
         }
-    })();
+    }).immediate();
 }
 
 /** Read existing staging data for resume. Returns null if no staging exists. */
@@ -565,6 +612,8 @@ export function getRecompStaging(db: Database, sessionId: string): RecompStaging
         endMessage: row.end_message,
         startMessageId: row.start_message_id,
         endMessageId: row.end_message_id,
+        ...(row.start_block_index != null ? { startBlockIndex: row.start_block_index } : {}),
+        ...(row.end_block_index != null ? { endBlockIndex: row.end_block_index } : {}),
         title: row.title,
         content: row.content,
         p1: row.p1 ?? null,
@@ -602,23 +651,36 @@ export function promoteRecompStaging(
 } | null {
     const now = Date.now();
     if (!holderId) {
-        return db.transaction(() => {
-            const staging = getRecompStaging(db, sessionId);
-            if (!staging || staging.compartments.length === 0) return null;
+        return db
+            .transaction(() => {
+                const staging = getRecompStaging(db, sessionId);
+                if (!staging || staging.compartments.length === 0) return null;
 
-            db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
-            db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
-            insertCompartmentRows(db, sessionId, staging.compartments, now);
-            insertFactRows(db, sessionId, staging.facts, now);
-            db.prepare("DELETE FROM recomp_compartments WHERE session_id = ?").run(sessionId);
-            db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
-            clearCachedM0M1(db, sessionId);
-            return { compartments: staging.compartments, facts: staging.facts };
-        })();
+                deleteChunkEmbedBackoffForSession(db, sessionId);
+                const deleted = db
+                    .prepare("DELETE FROM compartments WHERE session_id = ?")
+                    .run(sessionId);
+                if (deleted.changes > 0) {
+                    queueM0Mutation(db, {
+                        sessionId,
+                        mutationType: "recomp_boundary_change",
+                        queuedAt: now,
+                    });
+                }
+                invalidateAutoEmbedSession(sessionId);
+                db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
+                insertCompartmentRows(db, sessionId, staging.compartments, now);
+                insertFactRows(db, sessionId, staging.facts, now);
+                db.prepare("DELETE FROM recomp_compartments WHERE session_id = ?").run(sessionId);
+                db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
+                clearCachedM0M1(db, sessionId);
+                return { compartments: staging.compartments, facts: staging.facts };
+            })
+            .immediate();
     }
 
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     let finished = false;
     try {
         if (!isCompartmentLeaseHeld(db, sessionId, holderId)) {
@@ -634,7 +696,16 @@ export function promoteRecompStaging(
             return null;
         }
         // Replace real tables
-        db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        deleteChunkEmbedBackoffForSession(db, sessionId);
+        const deleted = db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        if (deleted.changes > 0) {
+            queueM0Mutation(db, {
+                sessionId,
+                mutationType: "recomp_boundary_change",
+                queuedAt: now,
+            });
+        }
+        invalidateAutoEmbedSession(sessionId);
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
 
         insertCompartmentRows(db, sessionId, staging.compartments, now);
@@ -676,7 +747,7 @@ export function clearRecompStaging(db: Database, sessionId: string): void {
         } catch {
             // column missing in very old schemas — ignore
         }
-    })();
+    }).immediate();
 }
 
 // ── Partial recomp range marker ─────────────────────────────────────────────
@@ -734,6 +805,8 @@ interface RecompCompartmentRow {
     end_message: number;
     start_message_id: string;
     end_message_id: string;
+    start_block_index?: number | null;
+    end_block_index?: number | null;
     title: string;
     content: string;
     p1: string | null;
@@ -787,4 +860,33 @@ export function escapeXmlAttr(s: string): string {
 
 export function escapeXmlContent(s: string): string {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** An indexed end may leave later blocks uncovered, so the host must retain the whole message. */
+export function hasPartialCompartmentEndThrough(
+    db: Database,
+    sessionId: string,
+    endOrdinal: number,
+): boolean {
+    return Boolean(
+        db
+            .prepare(
+                "SELECT 1 FROM compartments WHERE session_id=? AND end_message<=? AND end_block_index IS NOT NULL LIMIT 1",
+            )
+            .get(sessionId, endOrdinal),
+    );
+}
+
+export function isPartialCompartmentEnd(
+    db: Database,
+    sessionId: string,
+    messageId: string,
+): boolean {
+    return Boolean(
+        db
+            .prepare(
+                "SELECT 1 FROM compartments WHERE session_id=? AND end_message_id=? AND end_block_index IS NOT NULL LIMIT 1",
+            )
+            .get(sessionId, messageId),
+    );
 }

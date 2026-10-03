@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
 import { formatEmbedStatusText } from "../../hooks/magic-context/format-embed-status";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     buildCanonicalChunkTextFromFts,
     chunkCanonicalText,
@@ -21,7 +21,7 @@ import { upsertCommits } from "./git-commits/storage-git-commits";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import { insertMemory } from "./memory/storage-memory";
 import { loadAllEmbeddings, saveEmbedding } from "./memory/storage-memory-embeddings";
-import { recordMessageFtsRowid } from "./message-fts-rowid-map";
+import { backfillMessageFtsRowidMapBatch, recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setShadowBackfillNowForTests,
@@ -143,10 +143,13 @@ describe("shadow embedding historical backfill", () => {
     const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
     function useTempDb() {
-        const dir = mkdtempSync(join(tmpdir(), "shadow-backfill-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "shadow-backfill-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
-        return openDatabase();
+        const db = openDatabase();
+        // These fixtures model upgraded stores; do not depend on startup completing synchronously.
+        if (db) backfillMessageFtsRowidMapBatch(db);
+        return db;
     }
 
     afterEach(() => {
