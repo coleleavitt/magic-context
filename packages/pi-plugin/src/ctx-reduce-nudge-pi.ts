@@ -35,6 +35,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import {
 	buildChannel1Reminder,
+	buildChannel1UserMessage,
 	buildChannel2Reminder,
 	CHANNEL1_SENTINEL,
 	decideChannel1,
@@ -114,19 +115,56 @@ function toolResultText(content: readonly unknown[]): string {
 }
 
 /**
- * Channel 1 decision for a just-finished tool result. Returns the reminder
- * TextContent block to append (so the caller's `tool_result` handler can return
- * `{ content: [...event.content, block] }`), or null when no nudge should fire.
+ * How Channel 1 reaches the model.
+ *
+ * - `in_band`: a `<system-reminder>` block appended to the tool result. Claude is
+ *   trained on this harness convention and acts on it.
+ * - `user_message`: a hidden custom steer the model sees as a user turn before its
+ *   next call. Other models (measured on Qwen 3.6: 0/6 in-band, 7/8 as a plain user
+ *   instruction) treat tool output and reminder tags as data, not instructions.
+ */
+export type Channel1Delivery = "in_band" | "user_message";
+
+const ANTHROPIC_APIS = new Set([
+	"anthropic-messages",
+	"cortexkit-anthropic-messages",
+]);
+
+export function channel1DeliveryForModel(
+	model: { provider?: unknown; api?: unknown; id?: unknown } | undefined,
+): Channel1Delivery {
+	if (!model) return "in_band";
+	if (typeof model.api === "string" && ANTHROPIC_APIS.has(model.api)) {
+		return "in_band";
+	}
+	if (model.provider === "anthropic") return "in_band";
+	// Claude served through another provider (e.g. Bedrock via an OpenAI-compatible proxy)
+	if (typeof model.id === "string" && /claude/i.test(model.id))
+		return "in_band";
+	return "user_message";
+}
+
+export type Channel1Nudge =
+	| { delivery: "in_band"; block: PiTextContent }
+	| { delivery: "user_message"; text: string };
+
+/**
+ * Channel 1 decision for a just-finished tool result. Returns the nudge to
+ * deliver, or null when no nudge should fire. An `in_band` nudge is a TextContent
+ * block the caller's `tool_result` handler appends (`{ content: [...event.content,
+ * block] }`); a `user_message` nudge is text the caller sends as a hidden steer.
  * `toolName` of `ctx_reduce` short-circuits to suppression (the agent is
  * actively managing context) — mirrors OpenCode's `tool.execute.after` branch.
  */
-export function maybeChannel1ReminderForToolResult(args: {
+export function maybeChannel1NudgeForToolResult(args: {
 	db: Database;
 	sessionId: string;
 	toolName: string;
 	content: readonly unknown[];
-}): PiTextContent | null {
+	delivery?: Channel1Delivery;
+}): Channel1Nudge | null {
 	const { db, sessionId, toolName } = args;
+	const delivery = args.delivery ?? "in_band";
 	const state = channel1StateBySession.get(sessionId);
 	if (!state) return null; // primary-only: no baseline ⇒ subagent ⇒ off
 
@@ -180,21 +218,79 @@ export function maybeChannel1ReminderForToolResult(args: {
 		setChannel1NudgeState(db, sessionId, nextNudgeState);
 		return null;
 	}
-	const block = {
-		type: "text" as const,
-		text: buildChannel1Reminder(
-			decision.level,
-			decision.undroppedTokens,
-			reclaimableToolOutputCount(state.baselineParts),
-			currentReclaimHints(db, sessionId, state.oldestReclaimableToolTags),
-			decision.sticky,
-		),
-	};
+	const reclaimable = reclaimableToolOutputCount(state.baselineParts);
+	const hints = currentReclaimHints(
+		db,
+		sessionId,
+		state.oldestReclaimableToolTags,
+	);
+	const nudge: Channel1Nudge =
+		delivery === "user_message"
+			? {
+					delivery,
+					text: buildChannel1UserMessage(
+						decision.undroppedTokens,
+						reclaimable,
+						hints,
+					),
+				}
+			: {
+					delivery,
+					block: {
+						type: "text" as const,
+						text: buildChannel1Reminder(
+							decision.level,
+							decision.undroppedTokens,
+							reclaimable,
+							hints,
+							decision.sticky,
+						),
+					},
+				};
 	setChannel1NudgeState(db, sessionId, {
 		...nextNudgeState,
 		ordinal: state.realUserTurnCount,
 	});
-	return block;
+	return nudge;
+}
+
+/** In-band Channel 1: the reminder block to append to the tool result, or null. */
+export function maybeChannel1ReminderForToolResult(args: {
+	db: Database;
+	sessionId: string;
+	toolName: string;
+	content: readonly unknown[];
+}): PiTextContent | null {
+	const nudge = maybeChannel1NudgeForToolResult({
+		...args,
+		delivery: "in_band",
+	});
+	return nudge?.delivery === "in_band" ? nudge.block : null;
+}
+
+const CHANNEL1_NUDGE_CUSTOM_TYPE = "magic-context:reduce-nudge";
+
+/**
+ * Send a `user_message` Channel 1 nudge as a hidden steer. Like Channel 2 it is a
+ * `custom` entry (`display: false`): the model sees a user turn before its next
+ * call, while turn counting and the tail walk treat it as synthetic. It is
+ * persisted with the session, so it replays byte-identically on later passes.
+ */
+export function deliverChannel1UserMessagePi(
+	pi: PiSendMessage,
+	sessionId: string,
+	text: string,
+): void {
+	pi.sendMessage(
+		{
+			customType: CHANNEL1_NUDGE_CUSTOM_TYPE,
+			content: text,
+			display: false,
+			details: { kind: "channel-1-reduce-nudge" },
+		},
+		{ deliverAs: "steer", triggerTurn: false },
+	);
+	sessionLog(sessionId, "channel1 reduce nudge sent as a user message");
 }
 
 /**

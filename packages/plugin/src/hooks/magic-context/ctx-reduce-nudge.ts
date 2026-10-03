@@ -497,3 +497,23 @@ export function buildChannel1Reminder(
     }
     return `\n\n<system-reminder>\n${body}${hintText}\n</system-reminder>`;
 }
+
+/**
+ * Channel 1 copy for delivery as a hidden user-role message instead of a reminder on a tool output.
+ * Models without Claude's harness convention (e.g. Qwen) read tool output and `<system-reminder>`
+ * blocks as data and ignore them; a plain, direct instruction in a user turn is what they act on.
+ * The wording is the one that measured 7/8 compliance on Qwen 3.6, against 0/6 for the in-band reminder.
+ */
+export function buildChannel1UserMessage(
+    undroppedTokens: number,
+    reclaimableToolOutputs: number,
+    hint?: readonly ToolReclaimHint[],
+): string {
+    const summary = formatReclaimableOutputSummary(reclaimableToolOutputs, undroppedTokens);
+    const tags = (hint ?? [])
+        .slice(0, 4)
+        .map((tag) => `§${tag.tagNumber}§`)
+        .join(", ");
+    const oldest = tags.length > 0 ? `, oldest first: ${tags}` : "";
+    return `Before you continue: ${summary} are taking up context${oldest}. Call ctx_reduce now to drop the ones you no longer need, then carry on with the task.`;
+}

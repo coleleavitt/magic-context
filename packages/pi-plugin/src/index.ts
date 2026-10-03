@@ -160,8 +160,10 @@ import {
 	trackSessionForProject,
 } from "./context-handler";
 import {
+	channel1DeliveryForModel,
+	deliverChannel1UserMessagePi,
 	markPiChannel1Reduced,
-	maybeChannel1ReminderForToolResult,
+	maybeChannel1NudgeForToolResult,
 	maybeDeliverChannel2Pi,
 } from "./ctx-reduce-nudge-pi";
 import { stopStatusDialogRefresh } from "./dialogs/status-dialog";
@@ -2682,15 +2684,20 @@ async function startPiMagicContextRuntime(
 			// synthetic result. No-ops unless pending and revalidated; agent_end stays
 			// as the fallback delivery site.
 			if (compactionOff) return;
-			const block = maybeChannel1ReminderForToolResult({
+			const nudge = maybeChannel1NudgeForToolResult({
 				db,
 				sessionId,
 				toolName: event.toolName,
 				content: event.content,
+				delivery: channel1DeliveryForModel(ctx.model),
 			});
 			if (db) maybeDeliverChannel2Pi(pi, db, sessionId);
-			if (!block) return;
-			return { content: [...event.content, block] };
+			if (!nudge) return;
+			if (nudge.delivery === "user_message") {
+				deliverChannel1UserMessagePi(pi, sessionId, nudge.text);
+				return;
+			}
+			return { content: [...event.content, nudge.block] };
 		} catch (err) {
 			log(
 				`tool_result hook failed (continuing): ${err instanceof Error ? err.message : String(err)}`,

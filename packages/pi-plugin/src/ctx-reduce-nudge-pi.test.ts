@@ -14,8 +14,11 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import {
+	channel1DeliveryForModel,
 	clearPiChannel1State,
+	deliverChannel1UserMessagePi,
 	getPiChannel1Baseline,
+	maybeChannel1NudgeForToolResult,
 	maybeChannel1ReminderForToolResult,
 	maybeDeliverChannel2Pi,
 	setPiChannel1Baseline,
@@ -1132,3 +1135,107 @@ for (const channel of [1, 2]) {
 		}
 	});
 }
+
+describe("Channel 1 user-message delivery", () => {
+	it("keeps in-band reminders for Claude and routes other models to a user message", () => {
+		expect(channel1DeliveryForModel(undefined)).toBe("in_band");
+		expect(
+			channel1DeliveryForModel({
+				provider: "anthropic",
+				api: "cortexkit-anthropic-messages",
+				id: "claude-opus-4-6",
+			}),
+		).toBe("in_band");
+		expect(
+			channel1DeliveryForModel({
+				provider: "anthropic",
+				api: "anthropic-messages",
+				id: "claude-sonnet-5",
+			}),
+		).toBe("in_band");
+		expect(
+			channel1DeliveryForModel({
+				provider: "openwebui",
+				api: "openai-completions",
+				id: "bedrock-claude-5-opus",
+			}),
+		).toBe("in_band");
+		expect(
+			channel1DeliveryForModel({
+				provider: "llamacpp",
+				api: "openai-completions",
+				id: "qwen3.6-35b-a3b-abl",
+			}),
+		).toBe("user_message");
+		expect(
+			channel1DeliveryForModel({
+				provider: "openwebui",
+				api: "openai-completions",
+				id: "openai.gpt-5.6-sol",
+			}),
+		).toBe("user_message");
+	});
+
+	it("renders a plain user instruction without the reminder wrapper and records the fire", () => {
+		const db = createTestDb();
+		const sessionId = "ses-ch1-user";
+		const hints = [
+			{ tagNumber: 3, toolName: "ipython" },
+			{ tagNumber: 5, toolName: "ipython" },
+		];
+		for (const hint of hints) {
+			insertTag(
+				db,
+				sessionId,
+				`hint-${hint.tagNumber}`,
+				"tool",
+				9000,
+				hint.tagNumber,
+				0,
+				hint.toolName,
+			);
+		}
+		setPiChannel1Baseline(sessionId, {
+			...channel2BaselineFields(120_000, 400_000),
+			reducedSinceRefresh: false,
+			baselineParts: reclaimableToolOutputParts(9),
+			oldestReclaimableToolTags: hints,
+		});
+
+		const nudge = maybeChannel1NudgeForToolResult({
+			db,
+			sessionId,
+			toolName: "ipython",
+			content: [{ type: "text", text: "tool output" }],
+			delivery: "user_message",
+		});
+
+		expect(nudge?.delivery).toBe("user_message");
+		const text = nudge?.delivery === "user_message" ? nudge.text : "";
+		expect(text).toBe(
+			"Before you continue: 9 spent tool outputs (~120k tokens) are taking up context, oldest first: §3§, §5§. Call ctx_reduce now to drop the ones you no longer need, then carry on with the task.",
+		);
+		expect(text).not.toContain("<system-reminder>");
+		expect(getChannel1NudgeState(db, sessionId).level).toBe("gentle");
+		clearPiChannel1State(sessionId);
+	});
+
+	it("sends the user message as a hidden steer", () => {
+		const sendMessage = mock(() => {});
+		deliverChannel1UserMessagePi(
+			{ sendMessage },
+			"ses-ch1-send",
+			"Before you continue: ...",
+		);
+		expect(sendMessage).toHaveBeenCalledTimes(1);
+		expect(sendMessage.mock.calls[0]).toEqual([
+			{
+				customType: "magic-context:reduce-nudge",
+				content: "Before you continue: ...",
+				display: false,
+				details: { kind: "channel-1-reduce-nudge" },
+			},
+			{ deliverAs: "steer", triggerTurn: false },
+		]);
+	});
+});
