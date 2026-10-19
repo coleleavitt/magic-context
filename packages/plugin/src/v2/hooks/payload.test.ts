@@ -13,7 +13,10 @@ import {
 } from "../../hooks/magic-context/tool-drop-target";
 import * as logger from "../../shared/logger";
 import { rememberHostMedia, resetHostMediaForTests } from "../fold/host-media";
+import { restoreRow } from "../fold/restore";
+import type { StoreRow } from "../store-reader";
 import { adaptPayload } from "./payload";
+import { rawMessages } from "./store";
 import type { SessionContext, V2Message } from "./types";
 
 // Content part types the OpenCode 2 request schema accepts (LLM.Content.*).
@@ -87,6 +90,186 @@ function callsAndResults(messages: V2Message[]) {
 }
 
 describe("adaptPayload", () => {
+    it("render review: 400 timestamp observations preserve exact provider-visible bytes", () => {
+        let seed = 4910;
+        const next = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0);
+        for (let pass = 0; pass < 400; pass++) {
+            const messages: V2Message[] = [
+                {
+                    id: `u${pass}`,
+                    role: "user",
+                    content: [
+                        { type: "text", text: `Question ${next()}`, cache: { type: "ephemeral" } },
+                    ],
+                },
+                ...toolTurn(`a${pass}`, `call${pass}`, "read", `Contents ${next()}`),
+                {
+                    id: `tail${pass}`,
+                    role: "user",
+                    content: [{ type: "text", text: `Follow-up ${next()}` }],
+                },
+            ];
+            const untimed = draft(structuredClone(messages));
+            const timed = draft(structuredClone(messages));
+            const times = new Map(
+                messages
+                    .filter((m) => m.id)
+                    .map((m) => [m.id!, { created: next(), completed: next() }]),
+            );
+            const plain = adaptPayload(untimed);
+            const observed = adaptPayload(timed, new Set(), times);
+            expect(observed.messages[0].info.time).toEqual(times.get(`u${pass}`));
+            if (next() % 2) {
+                plain.messages[0].parts[0].text += " Edited by the pipeline.";
+                observed.messages[0].parts[0].text += " Edited by the pipeline.";
+            }
+            for (const message of observed.messages)
+                message.info.time = { created: next(), completed: next() };
+            plain.commit();
+            observed.commit();
+            expect(JSON.stringify(timed), `timestamp pass ${pass}`).toBe(JSON.stringify(untimed));
+            expect(timed.messages.some((m) => "info" in m)).toBe(false);
+        }
+    });
+
+    it("observes store timestamps internally without serializing info to the host draft", () => {
+        const context = draft([
+            { id: "timed", role: "user", content: [{ type: "text", text: "hello" }] },
+            { role: "assistant", content: [{ type: "text", text: "world" }] },
+        ]);
+        const before = JSON.stringify(context);
+        const time = { created: 1700000000000, completed: 1700000001000 };
+        const payload = adaptPayload(context, new Set(), new Map([["timed", time]]));
+        expect(payload.messages[0].info.time).toEqual(time);
+        expect(payload.messages[1].info.time).toBeUndefined();
+        payload.messages[0].info.time = { created: 42, completed: 43 };
+        payload.commit();
+        expect(JSON.stringify(context)).toBe(before);
+        expect(context.messages.every((message) => !("info" in message))).toBe(true);
+    });
+
+    it("preserves restored and normalized tool errors as errors with identical tagged text", () => {
+        const failure = {
+            error: { type: "tool.execution", message: "File not found: missing.txt" },
+            content: [],
+        };
+        for (const result of [
+            { result: failure, resultType: "error" },
+            { result: { type: "error", value: failure } },
+        ]) {
+            const context = draft(toolTurn("msg-error", "call-error", "read", ""));
+            Object.assign(context.messages[1].content[0], result);
+            const payload = adaptPayload(context);
+            const state = payload.messages[0].parts[1].state as Record<string, unknown>;
+            expect(state.status).toBe("error");
+            expect(state.output).toBe(JSON.stringify(failure));
+            state.output = `§2§ ${state.output}`;
+            payload.commit();
+            expect(callsAndResults(context.messages).results[0].result).toEqual({
+                type: "error",
+                value: `§2§ ${JSON.stringify(failure)}`,
+            });
+            expect(() => Message.make(context.messages[1])).not.toThrow();
+        }
+    });
+
+    it("preserves converted store errors and unbridged replay errors", () => {
+        const failure = { error: { type: "tool.execution", message: "missing" }, content: [] };
+        const context = draft([
+            {
+                id: "converted",
+                role: "assistant",
+                content: [
+                    {
+                        type: "tool",
+                        id: "call-error",
+                        name: "read",
+                        state: { status: "error", input: { path: "missing" }, ...failure },
+                    },
+                ],
+            },
+        ]);
+        const payload = adaptPayload(context);
+        const state = payload.messages[0].parts[0].state as Record<string, unknown>;
+        expect(state.status).toBe("error");
+        expect(state.output).toBe(JSON.stringify(failure));
+        state.output = `§2§ ${state.output}`;
+        payload.messages.push({
+            info: { role: "assistant", id: "replay" },
+            parts: [
+                {
+                    type: "tool",
+                    tool: "read",
+                    callID: "replay-call",
+                    state: { status: "error", input: {}, output: "§3§ replay error" },
+                },
+            ],
+        });
+        payload.commit();
+        expect(callsAndResults(context.messages).results.map((part) => part.result)).toEqual([
+            { type: "error", value: `§2§ ${JSON.stringify(failure)}` },
+            { type: "error", value: "§3§ replay error" },
+        ]);
+    });
+
+    it("store-reader projection and checkpoint replay retain error text and status", () => {
+        const failure = {
+            error: { type: "tool.execution", message: "missing" },
+            content: [{ type: "text", text: "details" }],
+        };
+        const row: StoreRow = {
+            id: "error-owner",
+            session_id: "ses-1",
+            type: "assistant",
+            seq: 2,
+            data: {
+                model: { providerID: "provider", id: "model" },
+                content: [
+                    {
+                        type: "tool",
+                        id: "call-error",
+                        name: "read",
+                        state: { status: "error", input: { path: "missing" }, ...failure },
+                    },
+                ],
+            },
+        };
+        expect(rawMessages([row])[0].parts[0]).toMatchObject({
+            state: { status: "error", output: JSON.stringify(failure) },
+        });
+        const context = draft(restoreRow(row, { providerID: "provider", id: "model" }));
+        const payload = adaptPayload(context);
+        expect(payload.messages[0].parts[0]).toMatchObject({
+            state: { status: "error", output: JSON.stringify(failure) },
+        });
+        payload.commit();
+        expect(callsAndResults(context.messages).results[0]).toMatchObject({
+            resultType: "error",
+            result: failure,
+        });
+    });
+
+    it("keeps error drop marker bytes and call pairing", () => {
+        const context = draft(toolTurn("msg-error", "call-error", "read", ""));
+        Object.assign(context.messages[1].content[0], {
+            resultType: "error",
+            result: { error: "missing", content: [] },
+        });
+        const payload = adaptPayload(context);
+        const owner = payload.messages[0];
+        const target = createToolDropTarget(
+            "call-error",
+            [],
+            indexMessage(owner),
+            new ToolMutationBatch(payload.messages),
+            7,
+        );
+        expect(target.truncate()).toBe("truncated");
+        payload.commit();
+        const { calls, results } = callsAndResults(context.messages);
+        expect(calls[0].input).toEqual({ dropped: "[dropped §7§]" });
+        expect(results[0].result).toEqual({ type: "error", value: "[dropped §7§]" });
+    });
     describe("#given a tool arc that the drop pipeline truncates", () => {
         it("#then commit() maps the cloned tool part back to a V2 tool-call/tool-result pair", () => {
             const context = draft(toolTurn("msg-1", "call-1", "shell", "a very long output"));
@@ -667,4 +850,128 @@ it("OpenCode 2 question fallback vetoes automatic drops but preserves explicit r
     expect(target.skeletonReal()).toBe("truncated");
     mapped.commit();
     expect(JSON.stringify(payload.messages)).toContain("[dropped §1§]");
+});
+
+describe("adaptPayload commit on canonical Anthropic", () => {
+    // Anthropic answers an empty text block with HTTP 400, and OpenCode 2 sends a
+    // `system` row to it as an in-conversation system message with its text
+    // blocks as they are. The whole-message lanes leave such a row with no parts;
+    // commit omits it, and a final guard takes out any empty text part left.
+    const HINT = { type: "ephemeral" };
+
+    function anthropicDraft(sessionID: string, messages: V2Message[]): SessionContext {
+        return {
+            ...draft(messages),
+            sessionID,
+            model: { providerID: "anthropic", id: "claude-opus-5-5" },
+        };
+    }
+
+    function rows(): V2Message[] {
+        // The host stores assistant replies without tag notation; adaptPayload strips
+        // any it finds there (a model-copied tag), so the assistant row starts plain.
+        return [
+            { id: "u1", role: "user", content: [{ type: "text", text: "§1§ start" }] },
+            { id: "s1", role: "system", content: [{ type: "text", text: "[dropped §2§]" }] },
+            { id: "a1", role: "assistant", content: [{ type: "text", text: "reply" }] },
+            { id: "u2", role: "user", content: [{ type: "text", text: "§4§ next" }] },
+        ];
+    }
+
+    function commitWith(
+        context: SessionContext,
+        edit: (byId: Map<unknown, MessageLike>) => void,
+    ): string[] {
+        const mapped = adaptPayload(context);
+        edit(new Map(mapped.messages.map((message) => [message.info.id, message])));
+        const logged: string[] = [];
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation((_session, message) => {
+            logged.push(message);
+        });
+        try {
+            mapped.commit();
+        } finally {
+            logSpy.mockRestore();
+        }
+        return logged.filter((line) => line.includes("v2 payload: left out"));
+    }
+
+    it("omits a system row left with no parts and records it once per session", () => {
+        const first = anthropicDraft("ses-662-omit", rows());
+        const logged = commitWith(first, (byId) => {
+            byId.get("s1")!.parts.length = 0;
+        });
+        expect(first.messages.map((message) => message.id)).toEqual(["u1", "a1", "u2"]);
+        expect(logged).toHaveLength(1);
+        expect(logged[0]).toContain("left out 1 emptied messages and 0 empty text parts");
+
+        // The next ordinary pass serves the same bytes and does not log again.
+        const second = anthropicDraft("ses-662-omit", rows());
+        expect(
+            commitWith(second, (byId) => {
+                byId.get("s1")!.parts.length = 0;
+            }),
+        ).toEqual([]);
+        expect(JSON.stringify(second.messages)).toBe(JSON.stringify(first.messages));
+    });
+
+    it("takes out empty text parts and puts a removed cache hint where OpenCode 2 would", () => {
+        const context = anthropicDraft("ses-662-guard", rows());
+        const logged = commitWith(context, (byId) => {
+            // An empty system row whose sentinel carries the host's cache hint.
+            byId.get("s1")!.parts.splice(0, 1, { type: "text", text: "", cache: HINT });
+            // An assistant row with empty parts around its text, the last one hinted.
+            byId.get("a1")!.parts.unshift({ type: "text", text: "" });
+            byId.get("a1")!.parts.push({ type: "text", text: "§5§ more" });
+            byId.get("a1")!.parts.push({ type: "text", text: "", cache: HINT });
+        });
+        expect(context.messages).toEqual([
+            // OpenCode 2's cache policy (packages/ai cache-policy.ts, markMessageAt)
+            // marks a message's last text part, else its last part.
+            { id: "u1", role: "user", content: [{ type: "text", text: "§1§ start", cache: HINT }] },
+            {
+                id: "a1",
+                role: "assistant",
+                content: [
+                    { type: "text", text: "reply" },
+                    { type: "text", text: "§5§ more", cache: HINT },
+                ],
+            },
+            { id: "u2", role: "user", content: [{ type: "text", text: "§4§ next" }] },
+        ]);
+        expect(logged).toHaveLength(1);
+        expect(logged[0]).toContain("left out 1 emptied messages and 3 empty text parts");
+    });
+
+    it("never adds a second breakpoint to a message that already has one", () => {
+        const context = anthropicDraft("ses-662-existing", rows());
+        commitWith(context, (byId) => {
+            const assistant = byId.get("a1")!;
+            assistant.parts.unshift({ type: "text", text: "kept", cache: HINT });
+            assistant.parts.push({ type: "text", text: "", cache: { type: "other" } });
+        });
+        expect(context.messages.find((message) => message.id === "a1")?.content).toEqual([
+            { type: "text", text: "kept", cache: HINT },
+            { type: "text", text: "reply" },
+        ]);
+    });
+
+    it("leaves other providers' rows and empty parts exactly as the pipeline produced them", () => {
+        const context = {
+            ...anthropicDraft("ses-662-openai", rows()),
+            model: { providerID: "openai", id: "gpt" },
+        };
+        const logged = commitWith(context, (byId) => {
+            byId.get("s1")!.parts.splice(0, 1, { type: "text", text: "[dropped]" });
+            byId.get("a1")!.parts.push({ type: "text", text: "" });
+        });
+        expect(logged).toEqual([]);
+        expect(context.messages.find((message) => message.id === "s1")?.content).toEqual([
+            { type: "text", text: "[dropped]" },
+        ]);
+        expect(context.messages.find((message) => message.id === "a1")?.content).toEqual([
+            { type: "text", text: "reply" },
+            { type: "text", text: "" },
+        ]);
+    });
 });

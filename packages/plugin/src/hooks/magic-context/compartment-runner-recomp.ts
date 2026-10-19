@@ -49,6 +49,7 @@ import {
 import {
     getRawSessionMessageCount,
     getRawSessionTagKeysThrough,
+    prepareRawSessionOrdinals,
     readSessionChunk,
 } from "./read-session-chunk";
 import { sendStatusNotification } from "./send-session-notification";
@@ -168,6 +169,8 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         return "## Magic Recomp — Skipped\n\nCould not acquire the compartment-state lease for this session.";
     }
     const leaseHolderId = holderId;
+    if (!(await prepareRawSessionOrdinals(sessionId)))
+        return "## Magic Recomp — Deferred\n\nSession ordinals are warming in the background. Retry shortly; no history was rebuilt.";
     // Once promotion commits, the rebuilt compartments are the session's history. The
     // steps after it (depth reset, drop queue, publication signal, embedding, compaction
     // marker) can each be repaired later. One failing must not report the committed
@@ -365,12 +368,10 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
             // behind — recomp now owns the boundary.
             if (lastCompartmentEnd > 0) {
                 afterPublish("compaction-marker", () => {
-                    const markerUpdated = updateCompactionMarkerAfterPublication(
-                        db,
-                        sessionId,
-                        lastCompartmentEnd,
-                        deps.directory,
-                    );
+                    const markerUpdated = (
+                        deps.compactionMarkerStrategy?.publish ??
+                        updateCompactionMarkerAfterPublication
+                    )(db, sessionId, lastCompartmentEnd, deps.directory);
                     // Only CAS-clear a stale pending marker blob when the direct
                     // update actually advanced the boundary. If the update failed
                     // (transient OpenCode DB write error on removal/injection), keep
@@ -443,6 +444,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 promptFit.chunkTokens,
                 offset,
                 protectedTailStart,
+                { expandTools: deps.historianExpandTools },
             );
             if (!chunk.text || chunk.messageCount === 0 || chunk.endIndex < offset) {
                 // Remaining messages before the protected tail are too few or all noise.
@@ -471,7 +473,8 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("recomp_unavailable")}`;
             }
 
-            // v2 bounded reference model: 4 rotating seeds + last-6 recency
+            // Bounded calibration: 3 seeds + 3 diverse older + 4 recent examples.
+            // Recent scores are hidden to prevent anchoring in one-compartment runs
             // (the compartments built so far in THIS recomp run provide
             // continuity). Recomp is a structural rebuild and emits no durable
             // facts (see below), so <project-memory> is omitted — there's
@@ -511,6 +514,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 sequenceOffset: candidateCompartments.length,
                 dumpLabelBase: `recomp-${sessionId}-${chunk.startIndex}-${chunk.endIndex}-pass-${passCount + 1}`,
                 timeoutMs: historianTimeoutMs,
+                maxOutputTokens: deps.historianMaxOutputTokens,
                 model: deps.model,
                 fallbackModelId: deps.fallbackModelId,
                 fallbackModels: deps.fallbackModels,
@@ -547,6 +551,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                         reducedBudget,
                         offset,
                         protectedTailStart,
+                        { expandTools: deps.historianExpandTools },
                     );
                     if (smallerChunk.messageCount > 0 && smallerChunk.endIndex < chunk.endIndex) {
                         await sendStatusNotification(
@@ -575,7 +580,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                     subagentInvocationId: validatedPass.invocationId ?? null,
                     runKind: "recomp",
                     status: "failed",
-                    failureReason: validatedPass.error,
+                    failureReason: validatedPass.failureReason ?? validatedPass.error,
                     chunkStartOrdinal: chunk.startIndex,
                     chunkEndOrdinal: chunk.endIndex,
                     compartmentsProduced: 0,
@@ -738,12 +743,9 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         // next incremental run may reprocess already-compartmentalized messages.
         if (lastCompartmentEnd > 0) {
             afterPublish("compaction-marker", () => {
-                const markerUpdated = updateCompactionMarkerAfterPublication(
-                    db,
-                    sessionId,
-                    lastCompartmentEnd,
-                    deps.directory,
-                );
+                const markerUpdated = (
+                    deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication
+                )(db, sessionId, lastCompartmentEnd, deps.directory);
                 // Only clear the stale pending blob when the boundary actually
                 // advanced — preserve it for the deferred-drain retry on failure.
                 if (markerUpdated) {

@@ -66,6 +66,22 @@ export function findIdentitySplits(
     if (!tableExists(db, "session_projects")) return [];
     const directories = new Map<string, Set<string>>();
     const directorySpellings = new Map<string, Set<string>>();
+    // A host store repeats the same directory on many session rows. Resolve
+    // each spelling once per inspection, without retaining filesystem state
+    // between doctor invocations.
+    const canonicalDirectories = new Map<string, string>();
+    const canonicalDirectory = (directory: string): string => {
+        const cached = canonicalDirectories.get(directory);
+        if (cached !== undefined) return cached;
+        let canonical = directory;
+        try {
+            canonical = realpathSync.native(directory);
+        } catch {
+            /* Historical paths need not still exist. */
+        }
+        canonicalDirectories.set(directory, canonical);
+        return canonical;
+    };
     for (const table of ["session", "session_v2"]) {
         if (!tableExists(host, table)) continue;
         const rows = host
@@ -73,12 +89,7 @@ export function findIdentitySplits(
             .all() as Array<{ id: string; directory: string }>;
         for (const row of rows) {
             if (!row.directory) continue;
-            let canonical = row.directory;
-            try {
-                canonical = realpathSync.native(canonical);
-            } catch {
-                /* Historical paths need not still exist. */
-            }
+            const canonical = canonicalDirectory(row.directory);
             const key = `${table === "session" ? "opencode" : "opencode2"}\0${row.id}`;
             const roots = directories.get(key) ?? new Set<string>();
             const directoryKey = projectDirectoryKey(canonical);
@@ -105,14 +116,26 @@ export function findIdentitySplits(
             byDirectory.set(directory, identities);
         }
     }
-    const count = (table: string, identity: string): number =>
-        tableExists(db, table)
-            ? (
-                  db
-                      .prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE project_path = ?`)
-                      .get(identity) as { n: number }
-              ).n
-            : 0;
+    const countStatements = new Map<string, ReturnType<Database["prepare"]> | null>();
+    const counts = new Map<string, number>();
+    const count = (table: string, identity: string): number => {
+        const key = `${table}\0${identity}`;
+        const cached = counts.get(key);
+        if (cached !== undefined) return cached;
+        if (!countStatements.has(table)) {
+            countStatements.set(
+                table,
+                tableExists(db, table)
+                    ? db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE project_path = ?`)
+                    : null,
+            );
+        }
+        const statement = countStatements.get(table);
+        const value = statement ? (statement.get(identity) as { n: number }).n : 0;
+        counts.set(key, value);
+        return value;
+    };
+    const gitIdentities = new Map<string, string | undefined>();
     // A first commit can strand directory-scoped data before any git-bound session is recorded.
     for (const [directoryKey, spellings] of directorySpellings) {
         for (const directory of spellings) {
@@ -126,26 +149,32 @@ export function findIdentitySplits(
                 "retrospective_processed_windows",
             ].some((table) => count(table, dirIdentity) > 0);
             if (!hasData) continue;
+            const canonical = canonicalDirectory(directory);
             try {
                 // Probe git directly: doctor must not write the identity sidecar or migrate a store.
-                const roots = execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], {
-                    cwd: directory,
-                    encoding: "utf8",
-                    timeout: 5_000,
-                    stdio: ["ignore", "pipe", "pipe"],
-                    windowsHide: true,
-                })
-                    .trim()
-                    .split(/\r?\n/)
-                    .filter((root) => /^[0-9a-f]{7,64}$/.test(root))
-                    .sort();
-                if (!roots[0]) continue;
+                if (!gitIdentities.has(canonical)) {
+                    const roots = execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], {
+                        cwd: directory,
+                        encoding: "utf8",
+                        timeout: 5_000,
+                        stdio: ["ignore", "pipe", "pipe"],
+                        windowsHide: true,
+                    })
+                        .trim()
+                        .split(/\r?\n/)
+                        .filter((root) => /^[0-9a-f]{7,64}$/.test(root))
+                        .sort();
+                    gitIdentities.set(canonical, roots[0]);
+                }
+                const root = gitIdentities.get(canonical);
+                if (!root) continue;
                 const identities = byDirectory.get(directoryKey) ?? new Set<string>();
                 identities.add(dirIdentity);
-                identities.add(`git:${roots[0]}`);
+                identities.add(`git:${root}`);
                 byDirectory.set(directoryKey, identities);
             } catch {
                 // Missing paths, unborn repositories, and transient git failures are not split evidence.
+                gitIdentities.set(canonical, undefined);
             }
         }
     }

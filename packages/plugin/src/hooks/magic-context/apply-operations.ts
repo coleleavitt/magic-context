@@ -1,12 +1,14 @@
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     getDroppedTagsByNumbers,
+    getNewestToolTagNumbers,
     getPendingOps,
-    getTagsBySession,
+    getTagsByNumbers,
     removePendingOp,
     updateTagDropMode,
     updateTagStatus,
 } from "../../features/magic-context/storage";
+import { markTagDropped } from "../../features/magic-context/storage-tags";
 import type { PendingOp, TagEntry } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
@@ -83,20 +85,37 @@ export interface NewToolDropOutcome {
  */
 export function applyNewToolDrop(
     target: TagTarget | undefined,
-    options: { inWindow: boolean; keepSkeleton?: boolean },
+    options: {
+        inWindow: boolean;
+        keepSkeleton?: boolean;
+        /** Commit the complete durable decision before any transcript mutation. */
+        persist?: (mode: NewToolDropOutcome["mode"]) => void;
+    },
 ): NewToolDropOutcome {
-    if (!target) return { result: "absent", mode: "full" };
+    // Automatic cleanup protects user answers, but an explicit ctx_reduce can
+    // still drop them. Check for a completed result before persisting the drop,
+    // not whether automatic cleanup is allowed to select it.
+    if (options.persist && (target?.prepareDrop?.() ?? target?.canDrop?.()) === false) {
+        return { result: "incomplete", mode: "full" };
+    }
+    if (!target) {
+        options.persist?.("full");
+        return { result: "absent", mode: "full" };
+    }
     if (
         (options.inWindow && hasSmallToolInput(target)) ||
         options.keepSkeleton === true ||
-        target.cannotRemove?.() === true
+        target.cannotRemove?.() === true ||
+        target.wouldStrandConversationEnd?.() === true
     ) {
         const strip = target.hasAttachments?.() === true;
+        options.persist?.(strip ? "skeleton_stripped" : "skeleton_real");
         return {
             result: (strip ? target.skeletonStripped?.() : target.skeletonReal?.()) ?? "absent",
             mode: strip ? "skeleton_stripped" : "skeleton_real",
         };
     }
+    options.persist?.("full");
     const result = target.drop?.() ?? "absent";
     // A result at the end of the request cannot be removed without leaving a
     // dangling call. When drop() keeps that call as a skeleton, strip its media
@@ -105,6 +124,27 @@ export function applyNewToolDrop(
         return { result: target.skeletonStripped?.() ?? "absent", mode: "skeleton_stripped" };
     }
     return { result, mode: result === "truncated" ? "skeleton_real" : "full" };
+}
+
+/** Persist one drop atomically before applying it; earlier drops survive a later write failure. */
+export function applyPersistedToolDrop(
+    db: ContextDatabase,
+    sessionId: string,
+    tagNumber: number,
+    target: TagTarget | undefined,
+    options: { inWindow: boolean; keepSkeleton?: boolean },
+    afterWrite?: () => void,
+): NewToolDropOutcome {
+    return applyNewToolDrop(target, {
+        ...options,
+        persist: (mode) => {
+            db.transaction(() => {
+                updateTagDropMode(db, sessionId, tagNumber, mode);
+                updateTagStatus(db, sessionId, tagNumber, "dropped");
+                afterWrite?.();
+            }).immediate();
+        },
+    });
 }
 
 /** True when a drop of this call inside the newest-call window keeps real arguments. */
@@ -215,15 +255,41 @@ export function convertLegacyToolSkeletons(
     targets: ReadonlyMap<number, TagTarget>,
     options: { keepFullDrop?: (callId: string | null) => boolean } = {},
 ): Map<number, ConvertedToolDropMode> {
-    const rows = db
-        .prepare(
+    const prepared = prepareLegacyToolSkeletonConversions(db, sessionId, targets, options);
+    prepared.persist(db);
+    return prepared.converted;
+}
+
+/** Traverse the wire before writer admission; commit only if the tag rows still match. */
+export function prepareLegacyToolSkeletonConversions(
+    db: ContextDatabase,
+    sessionId: string,
+    targets: ReadonlyMap<number, TagTarget>,
+    options: { keepFullDrop?: (callId: string | null) => boolean } = {},
+) {
+    // Only calls on the wire can change. Point lookups use the session/tag
+    // unique index instead of reading every historical dropped tool twice.
+    const candidates = [...targets.keys()].sort((a, b) => a - b);
+    const readRows = (connection: ContextDatabase) => {
+        if (candidates.length === 0) return [];
+        const statement = connection.prepare(
             `SELECT tag_number AS tagNumber, drop_mode AS dropMode, message_id AS callId
-               FROM tags
-              WHERE session_id = ? AND type = 'tool' AND status = 'dropped'
-                AND drop_mode IN ('truncated', 'full')
-              ORDER BY tag_number`,
-        )
-        .all(sessionId) as Array<{ tagNumber: number; dropMode: string; callId: string | null }>;
+             FROM tags WHERE session_id = ? AND tag_number = ?
+               AND type = 'tool' AND status = 'dropped'
+               AND drop_mode IN ('truncated', 'full')`,
+        );
+        return candidates.flatMap((tagNumber) => {
+            const row = statement.get(sessionId, tagNumber) as
+                | {
+                      tagNumber: number;
+                      dropMode: string;
+                      callId: string | null;
+                  }
+                | undefined;
+            return row ? [row] : [];
+        });
+    };
+    const rows = readRows(db);
     const converted = new Map<number, ConvertedToolDropMode>();
     for (const row of rows) {
         const target = targets.get(row.tagNumber);
@@ -241,10 +307,27 @@ export function convertLegacyToolSkeletons(
         } else {
             mode = hasSmallToolInput(target) || cannotRemove ? "skeleton_real" : "full";
         }
-        updateTagDropMode(db, sessionId, row.tagNumber, mode);
         converted.set(row.tagNumber, mode);
     }
-    return converted;
+    return {
+        converted,
+        isCurrent: (connection: ContextDatabase) => {
+            const current = readRows(connection);
+            return (
+                current.length === rows.length &&
+                current.every(
+                    (row, index) =>
+                        row.tagNumber === rows[index].tagNumber &&
+                        row.dropMode === rows[index].dropMode &&
+                        row.callId === rows[index].callId,
+                )
+            );
+        },
+        persist: (connection: ContextDatabase) => {
+            for (const [tagNumber, mode] of converted)
+                updateTagDropMode(connection, sessionId, tagNumber, mode);
+        },
+    };
 }
 
 /** Render conversions from convertLegacyToolSkeletons on this pass's wire. */
@@ -306,16 +389,27 @@ export function applyPendingOperations(
         diagnostics.reasons[reason] = (diagnostics.reasons[reason] ?? 0) + 1;
     };
     let admitted = false;
-    let startedAt = 0;
     try {
         db.transaction(() => {
             admitted = true;
-            startedAt = performance.now();
-            const tags = preloadedTags ?? getTagsBySession(db, sessionId);
+        }).immediate();
+        {
+            const pendingOps = preloadedPendingOps ?? getPendingOps(db, sessionId);
+            // Load only the rows this batch reads: the operations' own tags. A
+            // full getTagsBySession load (every tag the session ever had, about
+            // 100k rows on a long session) ran here while this transaction held
+            // the writer lock and cost over a second per call.
+            const tags =
+                preloadedTags ??
+                getTagsByNumbers(db, sessionId, [
+                    ...new Set([
+                        ...pendingOps.map((op) => op.tagId),
+                        ...syntheticPendingOps.map((op) => op.tagId),
+                    ]),
+                ]);
             const tagById = new Map(tags.map((tag) => [tag.tagNumber, tag] as const));
             const tagStatusById = new Map(tags.map((tag) => [tag.tagNumber, tag.status] as const));
             const tagTypeById = new Map(tags.map((tag) => [tag.tagNumber, tag.type] as const));
-            const pendingOps = preloadedPendingOps ?? getPendingOps(db, sessionId);
             const opsToApply: Array<{ op: PendingOp; synthetic: boolean }> = [
                 ...pendingOps.map((op) => ({ op, synthetic: false })),
                 ...syntheticPendingOps.map((op) => ({ op, synthetic: true })),
@@ -335,13 +429,17 @@ export function applyPendingOperations(
 
             // Newest-K tool calls at THIS moment — the skeleton window. Computed
             // once per apply pass over all tool tags (any status: the window
-            // reflects conversation recency, not droppability).
+            // reflects conversation recency, not droppability). Preloaded tags
+            // carry the window rows (getTagsForPendingOperations); otherwise an
+            // index walk reads just those K tag numbers.
             const skeletonWindow = new Set(
-                tags
-                    .filter((tag) => tag.type === "tool")
-                    .map((tag) => tag.tagNumber)
-                    .sort((left, right) => right - left)
-                    .slice(0, RECENT_TOOL_SKELETON_WINDOW),
+                preloadedTags
+                    ? tags
+                          .filter((tag) => tag.type === "tool")
+                          .map((tag) => tag.tagNumber)
+                          .sort((left, right) => right - left)
+                          .slice(0, RECENT_TOOL_SKELETON_WINDOW)
+                    : getNewestToolTagNumbers(db, sessionId, RECENT_TOOL_SKELETON_WINDOW),
             );
 
             for (const { op: pendingOp, synthetic } of opsToApply) {
@@ -359,6 +457,10 @@ export function applyPendingOperations(
                 }
 
                 const target = targets.get(pendingOp.tagId);
+                if (target?.thinkingDropProtected) {
+                    reject("active_thinking");
+                    continue;
+                }
                 const isToolTag = tagTypeById.get(pendingOp.tagId) === "tool";
 
                 if (synthetic) {
@@ -377,6 +479,19 @@ export function applyPendingOperations(
                     }
                 }
 
+                const persistDrop = (mode?: TagEntry["dropMode"]): void => {
+                    let startedAt = 0;
+                    try {
+                        db.transaction(() => {
+                            startedAt = performance.now();
+                            markTagDropped(db, sessionId, pendingOp.tagId, mode);
+                            if (!synthetic) removePendingOp(db, sessionId, pendingOp.tagId);
+                        }).immediate();
+                    } finally {
+                        if (startedAt)
+                            logSlowWriteTransaction("apply_pending_operation", startedAt);
+                    }
+                };
                 let shouldPersistDrop = false;
                 if (isToolTag) {
                     if (editMarkerTagIds.has(pendingOp.tagId)) {
@@ -384,6 +499,15 @@ export function applyPendingOperations(
                         // marker even when the tag is inside the recent skeleton
                         // window. Freeze the chosen render mode for later replay.
                         const strip = target?.hasAttachments?.() === true;
+                        if (
+                            target?.canDrop?.() === false ||
+                            target?.prepareDrop?.() === false ||
+                            !target
+                        ) {
+                            reject("edit_marker_incomplete");
+                            continue;
+                        }
+                        persistDrop(strip ? "edit_marker_stripped" : "edit_marker");
                         const markResult =
                             (strip ? target?.editMarkerStripped?.() : target?.editMarker?.()) ??
                             "absent";
@@ -394,12 +518,6 @@ export function applyPendingOperations(
                         didMutateMessage = true;
                         operationMutated = true;
                         onTagReduced?.({ tagNumber: pendingOp.tagId, mode: "edit_marker" });
-                        updateTagDropMode(
-                            db,
-                            sessionId,
-                            pendingOp.tagId,
-                            strip ? "edit_marker_stripped" : "edit_marker",
-                        );
                         shouldPersistDrop = true;
                     } else {
                         // Real-or-absent: a small input inside the newest-call
@@ -409,6 +527,7 @@ export function applyPendingOperations(
                         // applied so replays match this pass.
                         const { result: dropResult, mode: appliedMode } = applyNewToolDrop(target, {
                             inWindow: skeletonWindow.has(pendingOp.tagId),
+                            persist: persistDrop,
                         });
                         if (
                             dropResult === "incomplete" ||
@@ -427,12 +546,12 @@ export function applyPendingOperations(
                         } else {
                             reject(`drop_${dropResult}`);
                         }
-                        updateTagDropMode(db, sessionId, pendingOp.tagId, appliedMode);
                         shouldPersistDrop = true;
                     }
                 } else if (target) {
                     const replacement = buildReplacementContent(pendingOp.tagId);
                     const priorContent = target.getContent?.();
+                    persistDrop();
                     const changed = target.setContent(replacement);
                     if (changed) {
                         didMutateMessage = true;
@@ -452,6 +571,7 @@ export function applyPendingOperations(
                     shouldPersistDrop = true;
                 } else if (!synthetic) {
                     reject("target_absent");
+                    persistDrop();
                     shouldPersistDrop = true;
                 }
 
@@ -459,12 +579,10 @@ export function applyPendingOperations(
                     reject("not_persisted");
                     continue;
                 }
-                updateTagStatus(db, sessionId, pendingOp.tagId, "dropped");
-                if (!synthetic) removePendingOp(db, sessionId, pendingOp.tagId);
                 if (operationMutated) diagnostics.mutated += 1;
                 else diagnostics.persistedWithoutMutation += 1;
             }
-        }).immediate();
+        }
     } catch (error) {
         // Acquire the writer before reading tags or changing wire bytes. A WAL
         // read-to-write upgrade cannot wait under busy_timeout. Failed admission
@@ -479,10 +597,9 @@ export function applyPendingOperations(
             );
             return false;
         }
-        // Once mutation starts, rollback of SQLite alone cannot restore the wire.
+        // Earlier operations are already durable; stop before applying the failed
+        // operation or inspecting later operations. The next admitted pass retries.
         throw error;
-    } finally {
-        if (admitted) logSlowWriteTransaction("apply_pending_operations", startedAt);
     }
     if (diagnostics) {
         onBatchComplete?.(diagnostics);

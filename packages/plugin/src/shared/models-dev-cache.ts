@@ -25,20 +25,15 @@
  * for Pi and Pi's own path is used.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ContextLimitProvenance } from "./context-limit-provenance";
 import { getMagicContextStorageDir } from "./data-path";
 import { getHarness } from "./harness";
 import { modelRefLookupOrder } from "./harness-provider-map";
 import { sessionLog } from "./logger";
-import { shouldEnforcePrivateStoragePermissions } from "./storage-permissions";
-import {
-    deriveWindowGeometry,
-    getWindowOverlay,
-    resolveWindowOverlayFacts,
-    type WindowGeometryResult,
-} from "./window-geometry";
+import { writeStorageFileAtomicSync } from "./storage-permissions";
+import { deriveWindowGeometry, type WindowGeometryResult } from "./window-geometry";
 
 interface OpencodeClientLike {
     config: {
@@ -182,16 +177,8 @@ function persistApiCache(): void {
         }
     }
     try {
-        const dir = getMagicContextStorageDir();
-        mkdirSync(dir, { recursive: true });
         const target = persistFilePath();
-        const tmp = `${target}.${process.pid}.tmp`;
-        if (shouldEnforcePrivateStoragePermissions()) {
-            writeFileSync(tmp, JSON.stringify(obj), { encoding: "utf-8", mode: 0o600 });
-        } else {
-            writeFileSync(tmp, JSON.stringify(obj), { encoding: "utf-8" });
-        }
-        renameSync(tmp, target);
+        writeStorageFileAtomicSync(target, JSON.stringify(obj));
     } catch {
         // best-effort — a failed persist only loses cold-start warmth, not correctness
     }
@@ -523,7 +510,6 @@ export function getSdkWindowGeometry(
             output: metadata.outputLimit,
         },
         {
-            overlay: resolveWindowOverlayFacts(providerID, modelID, getWindowOverlay()),
             outputReserveOverride: resolveOutputReserve(providerID, modelID),
             harness: options?.harness ?? "opencode",
             contextCap:
@@ -533,7 +519,11 @@ export function getSdkWindowGeometry(
         },
     );
     if (!result || promptOnlyDetected === undefined) return result;
-    const usableSoft = promptOnlyDetected;
+    // A declared input cap bounds the prompt wall; without one the wall is
+    // already pre-carved and may exceed the catalog-derived window.
+    const usableSoft = isFinitePositive(metadata.inputLimit)
+        ? Math.min(promptOnlyDetected, result.usableSoft)
+        : promptOnlyDetected;
     return {
         ...result,
         usableSoft,

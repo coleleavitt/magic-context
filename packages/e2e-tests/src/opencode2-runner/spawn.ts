@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { hostExtractCache } from '../host-extract-cache';
 import { pinMockAgents } from "../mock-routing";
+import { seedModelsCatalog } from "../models-catalog";
 import { prepareContextDatabase } from "../prepare-context-db";
 import { pinnedOpenCode2Version, resolveOpenCode2CLI, sharedOpenCode2Root } from "./cli-resolution";
 import { isolateStoreDirectories } from "./store-directories";
@@ -111,6 +112,8 @@ export function isolation(): OpenCode2Isolation {
 		mkdirSync(env[key]);
 	}
 	const cwd = join(root, "work");
+	// Foundation's HTTP cache uses this home instead of HOME/XDG on macOS.
+	env.CFFIXED_USER_HOME = env.HOME;
 	mkdirSync(cwd);
 	env.MAGIC_CONTEXT_STORAGE_DIR = join(env.XDG_DATA_HOME!, "cortexkit", "magic-context");
 	// Magic Context writes its diagnostics to this file and never to the host's
@@ -261,6 +264,10 @@ export interface OpenCode2SpawnOptions {
     /** Built plugin snapshot used before a same-store upgrade. */
     magicContextPlugin?: string;
 	probePlugin?: string;
+	/** Absolute path to a plugin loaded before Magic Context, so its session hooks
+	 * shape the draft Magic Context receives, the way another user plugin listed
+	 * ahead of it would. */
+	prePlugin?: string;
 	providerID?: string;
 	probeStandalone?: boolean;
 	defaultModelID?: string;
@@ -279,6 +286,13 @@ export interface OpenCode2SpawnOptions {
 	 * follows `modelOutputLimit`. Default: the historian uses the session model.
 	 */
 	historianModel?: { id: string; contextLimit: number };
+	/**
+	 * A second provider on the mock, pinned as the historian's model while the session
+	 * keeps `providerID`. `package` selects its wire format.
+	 */
+	historianProvider?: { providerID: string; modelID: string; package: string };
+	/** models.dev catalogue copied into the throwaway host cache before boot. */
+	modelsCatalog?: string;
 	compactionAuto?: boolean;
 	existingIsolation?: OpenCode2Isolation;
 	existingMock?: { mock: MockProvider; baseURL: string };
@@ -331,12 +345,17 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 			defaultModelID,
 			...(options.additionalModelIDs ?? []),
 			...(options.historianModel ? [options.historianModel.id] : []),
+			// A historian on the session's own provider is one more model on that provider.
+			...(options.historianProvider?.providerID === providerID
+				? [options.historianProvider.modelID]
+				: []),
 		]);
 		writeFileSync(
 			join(fixture.cwd, "opencode.json"),
 			JSON.stringify({
 				...options.extraConfig,
 				plugins: [
+					...(options.prePlugin ? [options.prePlugin] : []),
 					...(options.includeMagicContext === false ? [] : [options.magicContextPlugin ?? PLUGIN]),
 					...(options.probePlugin ? [options.probePlugin] : []),
 					SCHEMA_GUARD,
@@ -366,6 +385,23 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 							]),
 						),
 					},
+					...(options.historianProvider && options.historianProvider.providerID !== providerID
+						? {
+								[options.historianProvider.providerID]: {
+									package: options.historianProvider.package,
+									settings: { baseURL: provider.baseURL, apiKey: "mock-key" },
+									models: {
+										[options.historianProvider.modelID]: {
+											name: options.historianProvider.modelID,
+											limit: {
+												context: options.modelContextLimit ?? 200_000,
+												output: options.modelOutputLimit ?? 32768,
+											},
+										},
+									},
+								},
+							}
+						: {}),
 				},
 			}),
 		);
@@ -385,15 +421,23 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 							`${providerID}/${defaultModelID}`,
 							// Both OpenCode host generations use the `agents.*.opencode` config block.
 							"opencode",
-							options.historianModel
-								? { historian: `${providerID}/${options.historianModel.id}` }
-								: {},
+							options.historianProvider
+								? {
+										historian: `${options.historianProvider.providerID}/${options.historianProvider.modelID}`,
+									}
+								: options.historianModel
+									? { historian: `${providerID}/${options.historianModel.id}` }
+									: {},
 						),
 					},
 					null,
 					2,
 				),
 			);
+		}
+		if (options.modelsCatalog) {
+			seedModelsCatalog(fixture.env.XDG_CACHE_HOME!, options.modelsCatalog);
+			fixture.env.OPENCODE_DISABLE_MODELS_FETCH = "1";
 		}
 		// serve owns its server directly; --standalone is a TUI/run flag, not a serve option.
 		const child = spawn(
@@ -525,6 +569,16 @@ export function assertOpenPaths(
 	const under = (path: string, base: string) =>
 		path === base || path.startsWith(`${base}/`);
 	const home = homedir();
+	// Opt-in only after lsof identifies Foundation's per-user HTTP cache on
+	// macOS. Exempt this exact SQLite file and its handles, never a directory,
+	// an application store, or a similarly named database elsewhere.
+	const httpCacheDb = process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB;
+	const verifiedHttpCacheDb = process.platform === "darwin" && httpCacheDb &&
+		(/^\/private\/var\/folders\/[^/]+\/[^/]+\/C\/opencode\/Cache\.db$/.test(httpCacheDb) ||
+			/^\/Users\/[^/]+\/Library\/Caches\/opencode\/Cache\.db$/.test(httpCacheDb))
+		? httpCacheDb : undefined;
+	const isHttpCacheHandle = (path: string) => verifiedHttpCacheDb !== undefined &&
+		(path === verifiedHttpCacheDb || path === `${verifiedHttpCacheDb}-wal` || path === `${verifiedHttpCacheDb}-shm`);
 	const protectedRoots = [
 		join(home, ".local/share/opencode"),
 		join(home, ".local/share/cortexkit/magic-context"),
@@ -535,7 +589,7 @@ export function assertOpenPaths(
 	for (const path of paths) {
 		if (!path.startsWith("/")) continue; // lsof socket/pipe labels are not filesystem paths.
 		if (protectedRoots.some((base) => under(path, base)) ||
-			(/\.(?:db|sqlite)(?:-(?:wal|shm))?$/.test(path) && !under(path, root)) ||
+			(/\.(?:db|sqlite)(?:-(?:wal|shm))?$/.test(path) && !under(path, root) && !isHttpCacheHandle(path)) ||
 			// Config and state live under the home XDG roots; a source file that merely sits
 			// in a directory named `config` (the plugin's own src/config/index.ts, which the
 			// TUI loads) is not operator configuration.
@@ -546,7 +600,7 @@ export function assertOpenPaths(
 	}
 	for (const path of writable) {
 		if (!path.startsWith("/")) continue;
-		if (![root, ...allowed].some((base) => under(path, base)))
+		if (![root, ...allowed].some((base) => under(path, base)) && !isHttpCacheHandle(path))
 			throw new Error(`v2 process holds a forbidden writable path: ${path}`);
 	}
 }

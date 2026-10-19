@@ -74,6 +74,8 @@ describe("CLI context database access", () => {
 
         const db = openExistingContextDatabase(path, { readonly: false });
         expect(db).not.toBeNull();
+        expect(db?.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
+        expect(db?.prepare("PRAGMA synchronous").get()).toEqual({ synchronous: 1 });
         db?.exec("CREATE TABLE migration_probe (id INTEGER PRIMARY KEY)");
         db?.close();
 

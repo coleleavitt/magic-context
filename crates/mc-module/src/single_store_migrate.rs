@@ -27,6 +27,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use mc_store::private_permissions::{create_directory, ensure_directory, tighten_tree, write_file};
 use mc_store::single_store_schema::{self as schema, DomainTables, CONTEXT_TABLES, LEGACY_TABLES};
 use mc_store::{McStoreError, MemoryRenderSnapshot, StoredCompartment, WorkspaceMembership};
 use rusqlite::types::Value as SqlValue;
@@ -280,6 +281,17 @@ pub struct StoreBytes {
     pub after: Option<u64>,
 }
 
+/// A provenance reference whose target was already absent before migration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DroppedProvenance {
+    pub project: String,
+    pub id_space: Winner,
+    pub memory_id: i64,
+    pub context_memory_id: i64,
+    pub field: String,
+    pub dropped_reference: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct Report {
     pub status: String,
@@ -292,6 +304,8 @@ pub struct Report {
     pub history: Vec<HistoryDecision>,
     pub sessions_reset: usize,
     pub normalized_context_compartments: usize,
+    pub dropped_provenance_count: usize,
+    pub dropped_provenance: Vec<DroppedProvenance>,
     pub store_db_bytes: StoreBytes,
     /// Wall time of the one transaction and of the `VACUUM` after it.
     pub transaction_ms: Option<u64>,
@@ -948,13 +962,13 @@ impl Twin {
 /// A memory whose reference columns the second pass writes.
 struct PendingReferences {
     project: String,
+    store_id: i64,
     context_id: i64,
     superseded_store: SqlValue,
     merged_from_store: SqlValue,
-    /// The store row was seeded from a `context.db` row and paired with a twin. Seeding
-    /// copied `merged_from` verbatim, so such a row's list already holds `context.db` ids
-    /// when it still equals its twin's.
-    seeded_twin: bool,
+    /// Seeding copied `merged_from` verbatim; equality with the original twin proves
+    /// this list still holds context ids, even if the copy overwrites the twin.
+    merged_in_context: bool,
 }
 
 struct Copier<'a> {
@@ -976,6 +990,13 @@ struct Copier<'a> {
     dangling: Vec<String>,
     /// Every memory id `store.db` holds, in any project.
     store_memory_ids: HashSet<i64>,
+    /// Snapshot before inserts or deletions: a newly allocated id cannot resurrect a
+    /// reference to a source that was already deleted.
+    context_memory_ids: HashSet<i64>,
+    /// Context ids named by the original seed/identity metadata of extant store rows.
+    context_links: HashMap<i64, BTreeSet<i64>>,
+    dropped_provenance: Vec<DroppedProvenance>,
+    expected_references: BTreeMap<i64, (SqlValue, SqlValue)>,
     /// Mappings whose memory no longer exists in `store.db`; not copied.
     orphan_mappings: usize,
     authority: &'a Authority,
@@ -986,6 +1007,7 @@ struct Copier<'a> {
     /// The compartments of each session whose `context.db` history was kept, as they
     /// were before the copy; verification checks they are still exactly that.
     context_kept: BTreeMap<String, Vec<Vec<SqlValue>>>,
+    merged_history: BTreeMap<String, Vec<Vec<SqlValue>>>,
 }
 
 impl<'a> Copier<'a> {
@@ -1117,6 +1139,18 @@ impl<'a> Copier<'a> {
                 .collect();
             self.counts(project, "memories").source += 1;
             let twin = self.resolve_memory(project, row)?;
+            let merged_in_context = if let Some(id) = twin.id() {
+                let original: SqlValue = self.conn.query_row(
+                    "SELECT merged_from FROM ctx.memories WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                as_text(&get(row, "context_store_uuid")) == Some(self.file_uuid.as_str())
+                    && as_i64(&get(row, "context_row_id")).is_some()
+                    && original == get(row, "merged_from")
+            } else {
+                false
+            };
             let context_id = match twin.id() {
                 Some(id) => {
                     twins.insert(id);
@@ -1159,11 +1193,11 @@ impl<'a> Copier<'a> {
                 self.written_memories.insert(context_id);
                 self.pending_references.push(PendingReferences {
                     project: project.to_string(),
+                    store_id,
                     context_id,
                     superseded_store: get(row, "superseded_by_memory_id"),
                     merged_from_store: get(row, "merged_from"),
-                    seeded_twin: twin != Twin::Missing
-                        && as_i64(&get(row, "context_row_id")).is_some(),
+                    merged_in_context,
                 });
             }
         }
@@ -1263,7 +1297,7 @@ impl<'a> Copier<'a> {
             }
         }
         self.dangling.push(format!(
-            "{what} of {project} names store memory {store_id}, which exists in neither file"
+            "{what} of {project} names store memory {store_id}, which cannot be resolved to a migrated context memory"
         ));
         Ok(None)
     }
@@ -1274,7 +1308,12 @@ impl<'a> Copier<'a> {
         for pending in std::mem::take(&mut self.pending_references) {
             let superseded = match as_i64(&pending.superseded_store) {
                 Some(store_id) => self
-                    .remap(&pending.project, store_id, "superseded_by_memory_id")?
+                    .provenance_target(
+                        &pending,
+                        Winner::Store,
+                        store_id,
+                        "superseded_by_memory_id",
+                    )?
                     .map_or(SqlValue::Null, SqlValue::Integer),
                 None => SqlValue::Null,
             };
@@ -1283,20 +1322,19 @@ impl<'a> Copier<'a> {
                 params![pending.context_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            let merged_from = if pending.seeded_twin && current.1 == pending.merged_from_store {
-                pending.merged_from_store.clone()
-            } else {
-                match as_text(&pending.merged_from_store) {
-                    Some(raw) => SqlValue::Text(self.remap_merged_from(&pending.project, raw)?),
-                    None => pending.merged_from_store.clone(),
-                }
+            let merged_from = match as_text(&pending.merged_from_store) {
+                Some(raw) => SqlValue::Text(self.clean_merged_from(&pending, raw)?),
+                None => pending.merged_from_store.clone(),
             };
             if current != (superseded.clone(), merged_from.clone()) {
                 self.conn.execute(
                     "UPDATE ctx.memories SET superseded_by_memory_id = ?1, merged_from = ?2 WHERE id = ?3",
                     params![superseded, merged_from, pending.context_id],
                 )?;
+                self.changed_projects.insert(pending.project.clone());
             }
+            self.expected_references
+                .insert(pending.context_id, (superseded, merged_from));
         }
         if !self.dangling.is_empty() {
             return Err(Refusal::new(
@@ -1313,26 +1351,155 @@ impl<'a> Copier<'a> {
         Ok(())
     }
 
-    /// `merged_from` holds a JSON array of the memory ids merged into this one.
-    fn remap_merged_from(&mut self, project: &str, raw: &str) -> rusqlite::Result<String> {
+    /// An integer present in either original file must not be discarded. A numeric
+    /// collision in the other id space is not evidence for remapping it: that refuses
+    /// unless an identity mapping resolves it.
+    fn provenance_target(
+        &mut self,
+        pending: &PendingReferences,
+        space: Winner,
+        target: i64,
+        field: &str,
+    ) -> rusqlite::Result<Option<i64>> {
+        let identity = if space == Winner::Store {
+            self.identity_row("memories", &pending.project, target)?
+        } else {
+            None
+        };
+        let exists = self.store_memory_ids.contains(&target)
+            || self.context_memory_ids.contains(&target)
+            || (space == Winner::Context && self.context_links.contains_key(&target))
+            || identity.is_some_and(|id| self.context_memory_ids.contains(&id));
+        if !exists {
+            self.dropped_provenance.push(DroppedProvenance {
+                project: pending.project.clone(),
+                id_space: space,
+                memory_id: if space == Winner::Store {
+                    pending.store_id
+                } else {
+                    pending.context_id
+                },
+                context_memory_id: pending.context_id,
+                field: field.to_string(),
+                dropped_reference: target,
+            });
+            return Ok(None);
+        }
+        if space == Winner::Context {
+            // Existing context ids are never interpreted as same-numbered store ids.
+            if !self.context_memory_ids.contains(&target) {
+                if let Some(linked) = self.context_links.get(&target) {
+                    if linked.len() == 1 {
+                        if let Some(id) = linked
+                            .iter()
+                            .next()
+                            .and_then(|store_id| self.memory_ids.get(store_id))
+                        {
+                            return Ok(Some(*id));
+                        }
+                    }
+                }
+                self.dangling.push(format!("{field} of context memory {} names absent context memory {target}; an extant store row prevents dropping it, but no unique identity resolves it to a migrated row", pending.context_id));
+                return Ok(None);
+            }
+            return Ok(Some(target));
+        }
+        self.remap(&pending.project, target, field)
+    }
+
+    /// Translate provenance in its original id space, recording every deleted target.
+    fn clean_merged_from(
+        &mut self,
+        pending: &PendingReferences,
+        raw: &str,
+    ) -> rusqlite::Result<String> {
         let Ok(Value::Array(ids)) = serde_json::from_str::<Value>(raw) else {
             // Not an id list, so there is nothing to translate; it is copied as written.
             return Ok(raw.to_string());
         };
         let mut out = Vec::with_capacity(ids.len());
+        let space = if pending.merged_in_context {
+            Winner::Context
+        } else {
+            Winner::Store
+        };
         for entry in ids {
             let store_id = entry
                 .as_i64()
                 .or_else(|| entry.as_str().and_then(|value| value.parse().ok()));
             match store_id {
-                Some(store_id) => match self.remap(project, store_id, "merged_from")? {
-                    Some(id) => out.push(Value::from(id)),
-                    None => out.push(entry),
-                },
+                Some(store_id) => {
+                    match self.provenance_target(pending, space, store_id, "merged_from")? {
+                        Some(id) if space == Winner::Context && id == store_id => out.push(entry),
+                        Some(id) => out.push(Value::from(id)),
+                        None => {}
+                    }
+                }
                 None => out.push(entry),
             }
         }
-        Ok(Value::Array(out).to_string())
+        // Preserve the original spelling when no remap or drop changed the list.
+        let original: Value = serde_json::from_str(raw).unwrap();
+        let cleaned = Value::Array(out);
+        Ok(if cleaned == original {
+            raw.to_string()
+        } else {
+            cleaned.to_string()
+        })
+    }
+
+    /// Context-winning rows retain context-space provenance, but references to already
+    /// deleted sources are reported and removed just as they are for copied rows.
+    fn clean_context_references(
+        &mut self,
+        decided: &BTreeMap<String, Classification>,
+    ) -> Result<(), EngineError> {
+        for (project, decision) in decided {
+            if *decision != Classification::Wins(Winner::Context) {
+                continue;
+            }
+            for id in self.scoped_ids(project, "memories")? {
+                if self.expected_references.contains_key(&id) {
+                    continue;
+                }
+                let (superseded, merged): (SqlValue, SqlValue) = self.conn.query_row(
+                    "SELECT superseded_by_memory_id, merged_from FROM ctx.memories WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let pending = PendingReferences {
+                    project: project.clone(),
+                    store_id: id,
+                    context_id: id,
+                    superseded_store: superseded.clone(),
+                    merged_from_store: merged.clone(),
+                    merged_in_context: true,
+                };
+                let superseded = match as_i64(&superseded) {
+                    Some(target) => self
+                        .provenance_target(
+                            &pending,
+                            Winner::Context,
+                            target,
+                            "superseded_by_memory_id",
+                        )?
+                        .map_or(SqlValue::Null, SqlValue::Integer),
+                    None => superseded,
+                };
+                let merged = match as_text(&merged) {
+                    Some(raw) => text(&self.clean_merged_from(&pending, raw)?),
+                    None => merged,
+                };
+                if (superseded.clone(), merged.clone())
+                    != (pending.superseded_store, pending.merged_from_store)
+                {
+                    self.conn.execute("UPDATE ctx.memories SET superseded_by_memory_id = ?1, merged_from = ?2 WHERE id = ?3", params![superseded, merged, id])?;
+                    self.changed_projects.insert(project.clone());
+                }
+                self.expected_references.insert(id, (superseded, merged));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1638,6 +1805,12 @@ struct SessionSrc {
 }
 
 impl SessionSrc {
+    fn min_sequence(&self) -> Option<i64> {
+        self.compartments
+            .iter()
+            .filter_map(|row| as_i64(&row[1]))
+            .min()
+    }
     fn compartment(&self, sequence: i64) -> Option<&Vec<SqlValue>> {
         self.compartments
             .iter()
@@ -1831,6 +2004,63 @@ pub struct HistoryDecision {
     pub context_compartments: usize,
     pub store_end_message: Option<i64>,
     pub context_end_message: Option<i64>,
+    /// Older context compartments retained before the store's first sequence.
+    pub context_prefix_compartments: usize,
+}
+
+/// The old flat `msg#0` and the bare `msg` identify the same boundary. After splitting
+/// flat ids into message id + block index, only NULL and zero are equivalent; nonzero
+/// blocks, ordinals, content, timestamps and all other columns remain exact.
+fn same_prefix_overlap(left: &[SqlValue], right: &[SqlValue]) -> bool {
+    let block_indices = ["start_block_index", "end_block_index"].map(|name| {
+        COMPARTMENT_COLUMNS
+            .iter()
+            .position(|column| *column == name)
+            .unwrap_or_else(|| panic!("COMPARTMENT_COLUMNS must include {name}"))
+    });
+    let canonical = |row: &[SqlValue]| {
+        let mut row = row.to_vec();
+        for index in block_indices {
+            if as_i64(&row[index]) == Some(0) {
+                row[index] = SqlValue::Null;
+            }
+        }
+        row
+    };
+    canonical(left) == canonical(right)
+}
+
+fn with_context_prefix(
+    session_id: &str,
+    store: &SessionSrc,
+    context: &[Vec<SqlValue>],
+) -> Result<Vec<Vec<SqlValue>>, EngineError> {
+    let Some(min) = store.min_sequence() else {
+        return Ok(Vec::new());
+    };
+    let prefix: Vec<_> = context
+        .iter()
+        .filter(|row| as_i64(&row[1]).is_some_and(|seq| seq < min))
+        .cloned()
+        .collect();
+    if prefix.is_empty() {
+        return Ok(prefix);
+    }
+    for row in context {
+        if let Some(other) = as_i64(&row[1]).and_then(|seq| store.compartment(seq)) {
+            if !same_prefix_overlap(other, row) {
+                return refuse(HISTORY_DIVERGED, format!("session {session_id} cannot join the context prefix to store history: overlapping sequence {:?} differs beyond the exact #0 boundary spelling", as_i64(&row[1])));
+            }
+        }
+    }
+    let combined: Vec<_> = prefix.iter().chain(&store.compartments).collect();
+    if combined
+        .windows(2)
+        .any(|rows| as_i64(&rows[0][1]).and_then(|seq| seq.checked_add(1)) != as_i64(&rows[1][1]))
+    {
+        return refuse(HISTORY_DIVERGED, format!("session {session_id} cannot join the context prefix to store history: sequence gap or duplicate"));
+    }
+    Ok(prefix)
 }
 
 /// One side's view of a session's history, for deciding which copy was being written.
@@ -1893,6 +2123,7 @@ fn decide_history(
         context_compartments: context_side.rows,
         store_end_message: store_side.end_message,
         context_end_message: context_side.end_message,
+        context_prefix_compartments: 0,
     };
     if context_side.changed == 0 && store_side.changed == 0 {
         return Ok(None);
@@ -2073,7 +2304,7 @@ impl<'a> Copier<'a> {
             .get(session_id)
             .cloned()
             .unwrap_or_else(|| UNATTRIBUTED.to_string());
-        let session = self.session_src(session_id, source)?;
+        let mut session = self.session_src(session_id, source)?;
         let context_history = self.context_compartments(session_id)?;
         let owner = self.prefer.get(&project).copied().or_else(|| {
             match self.authority.ownership(&project, &self.file_uuid) {
@@ -2081,7 +2312,7 @@ impl<'a> Copier<'a> {
                 _ => None,
             }
         });
-        let decision = decide_history(
+        let mut decision = decide_history(
             session_id,
             &project,
             &session.compartments,
@@ -2089,6 +2320,18 @@ impl<'a> Copier<'a> {
             owner,
             self.prefer_history.get(session_id).copied(),
         )?;
+        if self.prefer_history.get(session_id) == Some(&Winner::Store) {
+            let prefix = with_context_prefix(session_id, &session, &context_history)?;
+            if !prefix.is_empty() {
+                if let Some(decision) = &mut decision {
+                    decision.context_prefix_compartments = prefix.len();
+                }
+                self.counts(&project, "compartments").kept += prefix.len();
+                session.compartments.splice(0..0, prefix);
+                self.merged_history
+                    .insert(session_id.to_string(), session.compartments.clone());
+            }
+        }
         let kept = decision.as_ref().map(|decision| decision.kept);
         self.history.extend(decision);
         if kept == Some(Winner::Context) {
@@ -2175,8 +2418,18 @@ impl<'a> Copier<'a> {
             )?;
             self.counts(&project, "compartments").deleted += trimmed;
         }
+        let original_min = source.compartments.get(session_id).and_then(|rows| {
+            rows.iter()
+                .filter_map(|row| as_i64(&get(row, "sequence")))
+                .min()
+        });
         for desired in &session.compartments {
             let sequence = as_i64(&desired[1]).unwrap_or_default();
+            if self.merged_history.contains_key(session_id)
+                && original_min.is_some_and(|min| sequence < min)
+            {
+                continue;
+            }
             self.counts(&project, "compartments").source += 1;
             match context_compartment(self.conn, session_id, sequence)? {
                 Some((_, values)) if &values == desired => {
@@ -2394,8 +2647,12 @@ impl<'a> Copier<'a> {
 
 // ── Render check ────────────────────────────────────────────────────────────
 
-/// m0's inputs read from the old `store.db` tables of the engine's connection.
-struct LegacySource<'a>(&'a Connection);
+/// The own-project baseline comes from store.db; foreign workspace rows come from the
+/// same context snapshot used after migration, not the module's stale seeded copies.
+struct LegacySource<'a> {
+    conn: &'a Connection,
+    prefix_sessions: &'a BTreeSet<String>,
+}
 
 /// m0's inputs read from `context.db` and the compartment-date cache, exactly as the
 /// module reads them after the migration.
@@ -2418,13 +2675,24 @@ fn source_reads(
 
 impl M0Source for LegacySource<'_> {
     fn load_compartments(&self, session_id: &str) -> Result<Vec<StoredCompartment>, McStoreError> {
-        schema::read_legacy_compartments(self.0, session_id).map_err(store_error)
+        let mut rows =
+            schema::read_legacy_compartments(self.conn, session_id).map_err(store_error)?;
+        if self.prefix_sessions.contains(session_id) {
+            if let Some(min) = rows.iter().map(|row| row.sequence).min() {
+                let mut prefix = schema::read_context_compartments(self.conn, session_id)
+                    .map_err(store_error)?;
+                prefix.retain(|row| row.sequence < min);
+                prefix.extend(rows);
+                rows = prefix;
+            }
+        }
+        Ok(rows)
     }
     fn resolve_workspace_membership(
         &self,
         project: &str,
     ) -> Result<Option<WorkspaceMembership>, McStoreError> {
-        schema::read_workspace_membership(self.0, &LEGACY_TABLES, project).map_err(store_error)
+        schema::read_workspace_membership(self.conn, &LEGACY_TABLES, project).map_err(store_error)
     }
     fn load_memory_render_snapshot(
         &self,
@@ -2432,10 +2700,26 @@ impl M0Source for LegacySource<'_> {
         membership: Option<&WorkspaceMembership>,
         now_ms: i64,
     ) -> Result<MemoryRenderSnapshot, McStoreError> {
-        source_reads(self.0, &LEGACY_TABLES, project, membership, now_ms)
+        let mut own = source_reads(self.conn, &LEGACY_TABLES, project, None, now_ms)?;
+        if membership.is_some() {
+            let foreign = source_reads(self.conn, &CONTEXT_TABLES, project, membership, now_ms)?;
+            own.memories.extend(
+                foreign
+                    .memories
+                    .into_iter()
+                    .filter(|row| row.project_path != project),
+            );
+        }
+        // Store and context ids are different namespaces. The compose selector and
+        // attribution map key by id, so give every baseline row a unique temporary id.
+        // The comparison masks these tokens; real remaps are verified separately.
+        for (index, row) in own.memories.iter_mut().enumerate() {
+            row.id = (index + 1) as i64;
+        }
+        Ok(own)
     }
     fn load_active_user_memories(&self) -> Result<Vec<String>, McStoreError> {
-        schema::read_active_user_memories(self.0, &LEGACY_TABLES).map_err(store_error)
+        schema::read_active_user_memories(self.conn, &LEGACY_TABLES).map_err(store_error)
     }
 }
 
@@ -2590,6 +2874,7 @@ fn render_check(
     sessions: &Sessions,
     skipped_sessions: &BTreeSet<String>,
     store_wins: &BTreeSet<String>,
+    prefix_sessions: &BTreeSet<String>,
     options: &EngineOptions,
 ) -> Result<RenderCheck, EngineError> {
     let mut recent = Vec::new();
@@ -2635,7 +2920,10 @@ fn render_check(
         let index = (next_random(&mut state) % others.len() as u64) as usize;
         picked.push(others.swap_remove(index));
     }
-    let legacy = LegacySource(conn);
+    let legacy = LegacySource {
+        conn,
+        prefix_sessions,
+    };
     let context = ContextSource(conn);
     let mut check = RenderCheck {
         seed: options.render_seed,
@@ -2757,6 +3045,12 @@ fn verify(
                     "session {session}'s context history was to be kept but changed during the copy"
                 )));
             }
+        } else if let Some(expected) = copier.merged_history.get(session) {
+            if &context != expected {
+                return Err(mismatch(format!(
+                    "session {session}'s joined history changed during the copy"
+                )));
+            }
         } else if !src.compartments.is_empty() && context != src.compartments {
             return Err(mismatch(format!(
                 "session {session}'s context compartments differ from the store's after the copy"
@@ -2778,12 +3072,23 @@ fn verify(
         }
     }
     // References of every memory the run wrote name existing memories.
-    for id in &copier.written_memories {
+    for id in copier.expected_references.keys() {
         let (superseded, merged_from): (Option<i64>, Option<String>) = conn.query_row(
             "SELECT superseded_by_memory_id, merged_from FROM ctx.memories WHERE id = ?1",
             params![id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        if let Some(expected) = copier.expected_references.get(id) {
+            let actual = (
+                superseded.map_or(SqlValue::Null, SqlValue::Integer),
+                merged_from.as_ref().map_or(SqlValue::Null, |raw| text(raw)),
+            );
+            if &actual != expected {
+                return Err(mismatch(format!(
+                    "memory {id}'s provenance does not hold the verified id remap"
+                )));
+            }
+        }
         let mut targets: Vec<i64> = superseded.into_iter().collect();
         if let Some(Value::Array(ids)) = merged_from.and_then(|raw| serde_json::from_str(&raw).ok())
         {
@@ -2889,7 +3194,8 @@ fn backup(options: &EngineOptions) -> Result<(), EngineError> {
 
 /// The copy-and-check half of [`backup`], without the migration's undo instructions.
 pub(crate) fn backup_files(options: &EngineOptions) -> Result<(), EngineError> {
-    std::fs::create_dir_all(&options.backup_dir)?;
+    let private = crate::config::private_storage_permissions_enabled();
+    ensure_directory(&options.backup_dir, private)?;
     let mut manifest = String::from("name\tsource\tschema_version\tsha256\n");
     for (name, source) in [
         ("context.db", &options.context_db),
@@ -2901,6 +3207,7 @@ pub(crate) fn backup_files(options: &EngineOptions) -> Result<(), EngineError> {
             file_len(source) as f64 / 1e9
         );
         let conn = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        mc_store::single_store_domain::set_synchronous_normal_if_wal(&conn)?;
         conn.busy_timeout(std::time::Duration::from_millis(u64::from(
             CONTEXT_BUSY_TIMEOUT_MS,
         )))?;
@@ -2913,6 +3220,7 @@ pub(crate) fn backup_files(options: &EngineOptions) -> Result<(), EngineError> {
             let digest = scope.spawn(|| sha256_file(&target));
             let check = (|| -> rusqlite::Result<(String, i64)> {
                 let copy = Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                mc_store::single_store_domain::set_synchronous_normal_if_wal(&copy)?;
                 let check: String = copy.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
                 let version = if name == "context.db" {
                     context_version(&copy)?
@@ -2940,7 +3248,17 @@ pub(crate) fn backup_files(options: &EngineOptions) -> Result<(), EngineError> {
             source.display(),
         ));
     }
-    std::fs::write(options.backup_dir.join("MANIFEST.tsv"), manifest)?;
+    write_file(
+        &options.backup_dir.join("MANIFEST.tsv"),
+        manifest.as_bytes(),
+        private,
+    )?;
+    let report = tighten_tree(&options.backup_dir, private);
+    tracing::info!(
+        tightened = report.tightened,
+        failures = report.failures,
+        "mc-module: migration backup permission tightening"
+    );
     Ok(())
 }
 
@@ -3022,6 +3340,7 @@ pub(crate) fn open_existing(path: &Path) -> Result<Connection, EngineError> {
         )));
     }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    mc_store::single_store_domain::set_synchronous_normal_if_wal(&conn)?;
     conn.busy_timeout(std::time::Duration::from_millis(u64::from(
         CONTEXT_BUSY_TIMEOUT_MS,
     )))?;
@@ -3030,11 +3349,22 @@ pub(crate) fn open_existing(path: &Path) -> Result<Connection, EngineError> {
 
 fn restore_wal(conn: &Connection) {
     for schema in ["main", "ctx"] {
-        if let Err(error) =
-            conn.query_row(&format!("PRAGMA {schema}.journal_mode = WAL"), [], |row| {
-                row.get::<_, String>(0)
-            })
-        {
+        let restore = (|| -> rusqlite::Result<()> {
+            let journal =
+                conn.query_row(&format!("PRAGMA {schema}.journal_mode = WAL"), [], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            if journal != "wal" {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let database = if schema == "main" {
+                rusqlite::DatabaseName::Main
+            } else {
+                rusqlite::DatabaseName::Attached("ctx")
+            };
+            conn.pragma_update(Some(database), "synchronous", "NORMAL")
+        })();
+        if let Err(error) = restore {
             eprintln!("could not restore WAL mode on {schema}: {error}");
         }
     }
@@ -3136,7 +3466,13 @@ pub fn run(options: &EngineOptions, hooks: &mut dyn EngineHooks) -> Result<Repor
         if !context_migrated && marker.2.ends_with(schema::FRESH_INSTALL_MARKER_SUFFIX) {
             // A fresh store that McStore::open migrated, whose context.db flag the module
             // had not written yet. There is nothing to move; write the flag.
-            write_fresh_context_flag(&context_conn, marker.1.unwrap_or(options.now_ms), &marker.2)?;
+            if !options.dry_run {
+                write_fresh_context_flag(
+                    &context_conn,
+                    marker.1.unwrap_or(options.now_ms),
+                    &marker.2,
+                )?;
+            }
             return Ok(Report {
                 status: "already_migrated".into(),
                 migrated_at: marker.1,
@@ -3173,13 +3509,87 @@ pub fn run(options: &EngineOptions, hooks: &mut dyn EngineHooks) -> Result<Repor
     drop(context_conn);
     drop(store_conn);
 
+    if options.dry_run {
+        return dry_run_on_copies(options, hooks, store_version);
+    }
     backup(options)?;
+    migrate_files(options, hooks, store_version)
+}
+
+/// Run the whole migration against copies of both files and report what it would do.
+///
+/// The migration cannot run read-only: it upgrades an older `store.db` to the version it
+/// starts from, switches both files out of WAL mode, and runs its work in a write
+/// transaction it then rolls back. Done on the live files, a dry run would change
+/// `store.db` and create the backup directory, after which the real run with the same
+/// `--backup-dir` refuses with `BACKUP_DIR_EXISTS`. The copies are taken the same way the
+/// backup is (a checked `VACUUM INTO`), into a scratch directory beside the requested
+/// backup directory so they land on the same volume the real backup would use, and the
+/// directory is removed afterwards whatever the outcome.
+fn dry_run_on_copies(
+    options: &EngineOptions,
+    hooks: &mut dyn EngineHooks,
+    store_version: u32,
+) -> Result<Report, EngineError> {
+    let scratch = DryRunScratch::new(&options.backup_dir)?;
+    let mut copy = options.clone();
+    copy.backup_dir = scratch.path.clone();
+    backup_files(&copy)?;
+    copy.context_db = scratch.path.join("context.db");
+    copy.store_db = scratch.path.join("store.db");
+    let mut report = migrate_files(&copy, hooks, store_version)?;
+    // Nothing was backed up for the caller, and the sizes are those of the live file.
+    report.backup_dir = None;
+    report.store_db_bytes.before = file_len(&options.store_db);
+    Ok(report)
+}
+
+/// The scratch directory a dry run copies both files into, removed when dropped.
+struct DryRunScratch {
+    path: PathBuf,
+}
+
+impl DryRunScratch {
+    fn new(backup_dir: &Path) -> Result<Self, EngineError> {
+        let name = backup_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "single-store-backup".to_string());
+        let path = backup_dir.with_file_name(format!(
+            "{name}.dry-run-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        // `create_dir` (not `create_dir_all`) so an existing directory is never adopted
+        // and then deleted by the drop below.
+        create_directory(&path, crate::config::private_storage_permissions_enabled())?;
+        Ok(DryRunScratch { path })
+    }
+}
+
+impl Drop for DryRunScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Everything after the backup: bring an older `store.db` up to the starting version,
+/// switch both files to rollback-journal mode, run the transaction, restore WAL, and on a
+/// real run compact `store.db`.
+fn migrate_files(
+    options: &EngineOptions,
+    hooks: &mut dyn EngineHooks,
+    store_version: u32,
+) -> Result<Report, EngineError> {
     if store_version < schema::PRE_SINGLE_STORE_VERSION {
         mc_store::migrate_store_to_pre_single_store(&options.store_db)?;
     }
     let store_bytes_before = file_len(&options.store_db);
 
     let conn = open_existing(&options.store_db)?;
+    // The attached two-file migration intentionally uses rollback journals so SQLite's
+    // super-journal can commit both files atomically. It must not inherit WAL's NORMAL.
+    conn.pragma_update(None, "synchronous", "FULL")?;
     conn.query_row("PRAGMA main.journal_mode = DELETE", [], |row| {
         row.get::<_, String>(0)
     })?;
@@ -3190,6 +3600,11 @@ pub fn run(options: &EngineOptions, hooks: &mut dyn EngineHooks) -> Result<Repor
     conn.query_row("PRAGMA ctx.journal_mode = DELETE", [], |row| {
         row.get::<_, String>(0)
     })?;
+    conn.pragma_update(
+        Some(rusqlite::DatabaseName::Attached("ctx")),
+        "synchronous",
+        "FULL",
+    )?;
     let started = Instant::now();
     let outcome = migrate_in_transaction(&conn, options, hooks);
     let transaction_ms = started.elapsed().as_millis() as u64;
@@ -3221,6 +3636,7 @@ fn restore_both_wal(options: &EngineOptions) {
             let _ = conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
                 row.get::<_, String>(0)
             });
+            let _ = mc_store::single_store_domain::set_wal_synchronous_normal(&conn);
         }
     }
 }
@@ -3372,6 +3788,13 @@ fn migrate_in_transaction(
     }
     let normalized_context_compartments =
         normalize_context_compartment_boundaries(conn, options.now_ms)?;
+    // The old workspace seed used project_path as its label. Preserve the host's real
+    // names in the legacy data before composing the baseline; do not mask attribution.
+    conn.execute("UPDATE main.mc_workspace_members SET display_name = (SELECT display_name FROM ctx.workspace_members WHERE project_path = main.mc_workspace_members.project_path) WHERE EXISTS (SELECT 1 FROM ctx.workspace_members WHERE project_path = main.mc_workspace_members.project_path)", [])?;
+    let context_memory_ids = conn
+        .prepare("SELECT id FROM ctx.memories")?
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<Result<HashSet<_>, _>>()?;
     let mut copier = Copier {
         conn,
         file_uuid,
@@ -3390,13 +3813,34 @@ fn migrate_in_transaction(
             .iter()
             .filter_map(|row| as_i64(&get(row, "id")))
             .collect(),
+        context_memory_ids,
+        context_links: HashMap::new(),
+        dropped_provenance: Vec::new(),
+        expected_references: BTreeMap::new(),
         orphan_mappings: 0,
         authority: &authority,
         prefer: &options.prefer,
         prefer_history: &options.prefer_history,
         history: Vec::new(),
         context_kept: BTreeMap::new(),
+        merged_history: BTreeMap::new(),
     };
+    for row in &source.memories {
+        let store_id = as_i64(&get(row, "id")).unwrap_or_default();
+        let project = get(row, "project_path");
+        let identity =
+            copier.identity_row("memories", as_text(&project).unwrap_or_default(), store_id)?;
+        let seeded = (as_text(&get(row, "context_store_uuid")) == Some(copier.file_uuid.as_str()))
+            .then(|| as_i64(&get(row, "context_row_id")))
+            .flatten();
+        for context_id in identity.into_iter().chain(seeded) {
+            copier
+                .context_links
+                .entry(context_id)
+                .or_default()
+                .insert(store_id);
+        }
+    }
     for (project, decision) in &decided {
         let Classification::Wins(winner) = *decision else {
             continue;
@@ -3404,6 +3848,7 @@ fn migrate_in_transaction(
         copier.copy_memories(project, winner, &by_project(&source.memories, project))?;
     }
     copier.write_references()?;
+    copier.clean_context_references(&decided)?;
     for (project, decision) in &decided {
         let Classification::Wins(winner) = *decision else {
             continue;
@@ -3487,7 +3932,15 @@ fn migrate_in_transaction(
         .cloned()
         .chain(copier.context_kept.keys().cloned())
         .collect();
-    let render_check = render_check(conn, &sessions, &unmoved_sessions, &store_wins, options)?;
+    let prefix_sessions = copier.merged_history.keys().cloned().collect();
+    let render_check = render_check(
+        conn,
+        &sessions,
+        &unmoved_sessions,
+        &store_wins,
+        &prefix_sessions,
+        options,
+    )?;
     log_step("render check", step);
 
     let mut projects_report: Vec<ProjectReport> = Vec::new();
@@ -3506,6 +3959,13 @@ fn migrate_in_transaction(
         projects_report.push(entry);
     }
     let history = std::mem::take(&mut copier.history);
+    let dropped_provenance = std::mem::take(&mut copier.dropped_provenance);
+    for entry in &dropped_provenance {
+        eprintln!(
+            "dropped absent provenance: {:?} memory {} ({}) {} -> {}",
+            entry.id_space, entry.memory_id, entry.project, entry.field, entry.dropped_reference
+        );
+    }
     projects_report.extend(copier.reports.into_values());
     let mut report = Report {
         status: "migrated".into(),
@@ -3517,6 +3977,8 @@ fn migrate_in_transaction(
         history,
         sessions_reset,
         normalized_context_compartments,
+        dropped_provenance_count: dropped_provenance.len(),
+        dropped_provenance,
         ..Report::default()
     };
     report.store_db_bytes.before = file_len(&options.store_db);

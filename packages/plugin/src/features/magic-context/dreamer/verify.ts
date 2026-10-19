@@ -19,6 +19,7 @@ import type { Database } from "../../../shared/sqlite";
 import {
     archiveMemory,
     clearMemoryVerifications,
+    getMemoryByHash,
     getMemoryById,
     hasMemoryClassifiedAtColumn,
     hasMemoryShareableColumn,
@@ -45,6 +46,7 @@ import {
 import {
     DreamerProviderOutputFailureError,
     providerOutputFailureFromInvalidManifest,
+    withDreamerModelCooldown,
 } from "./provider-output-failure";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
 import { DreamTokenBudgetExceeded } from "./token-budget";
@@ -79,7 +81,7 @@ import {
 // Broad verification fits ~2.00M at 20, below 70% of its 3M default budget.
 // Both leave room to finalize without repeatedly paying overhead for tiny batches.
 // Observed costs vary widely around these means; heavy batches can still finalize
-// early (docs/reports/verify-token-budget-2026-09-30.md).
+// early.
 const VERIFY_BATCH_SIZE = 20;
 // One batch already exhausts the configured model fallback chain. A second
 // identical provider-shaped completion means continuing this run only hammers
@@ -178,6 +180,10 @@ function closeBroadCycle(args: VerifyArgs, cycleStartAt: number | undefined): vo
 }
 
 export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
+    return withDreamerModelCooldown(() => runVerifyWithCooldown(args));
+}
+
+async function runVerifyWithCooldown(args: VerifyArgs): Promise<VerifyResult> {
     const runStartedAt = Date.now();
     const result: VerifyResult = {
         verified: 0,
@@ -354,8 +360,11 @@ async function verifyOneBatch(
                 language: args.language,
                 timeoutMs: sliceMs,
                 signal,
-                parse: (text) => {
-                    const providerFailure = providerOutputFailureFromInvalidManifest([], text);
+                parse: (text, completion) => {
+                    const providerFailure = providerOutputFailureFromInvalidManifest(
+                        completion.messages ?? [],
+                        text,
+                    );
                     if (providerFailure) throw providerFailure;
                     return validateVerifyManifest(text, new Set(batch.map((memory) => memory.id)));
                 },
@@ -378,7 +387,9 @@ async function verifyOneBatch(
             client,
             db: args.db,
             parentSessionId: args.parentSessionId,
-            title: "magic-context-dream-verify",
+            title: args.forceBroad
+                ? "magic-context-dream-verify-broad"
+                : "magic-context-dream-verify",
             directory: args.sessionDirectory,
         });
         const created = shared.normalizeSDKResponse(
@@ -733,6 +744,24 @@ async function applyParsedVerifyManifest(
                 if (verifiedHead) recordVerifiedCommit(args.db, memory, now, verifiedHead);
                 verified += 1;
             } else if (w.kind === "update") {
+                // memories has UNIQUE(project_path, category, normalized_hash).
+                // A rewrite that lands on another memory's exact content would
+                // throw and roll back the whole batch, so skip it instead. Two
+                // memories saying the same thing is a merge, which verify does
+                // not decide; curate or an agent can merge them.
+                const duplicate = getMemoryByHash(
+                    args.db,
+                    memory.projectPath,
+                    memory.category,
+                    w.hash,
+                );
+                if (duplicate && duplicate.id !== memory.id) {
+                    log(
+                        `[dreamer] verify safety refusal: memory_id=${w.id} verdict=update reason=duplicate-of duplicate_id=${duplicate.id}`,
+                    );
+                    refused += 1;
+                    continue;
+                }
                 rewriteMemoryContent(args.db, memory, w.content, w.hash);
                 queueMemoryMutation(args.db, {
                     projectPath: args.projectIdentity,

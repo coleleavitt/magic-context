@@ -1,10 +1,11 @@
-import { createHash } from "node:crypto";
 import { buildMagicContextSection } from "../../agents/magic-context-prompt";
+import { computeHardCacheExpired } from "../../features/magic-context/scheduler";
 import {
     type ContextDatabase,
     getOrCreateSessionMeta,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import { noteSystemPromptHashChange } from "../../features/magic-context/transform-decision-log";
 import type { PluginContext } from "../../plugin/types";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { log, sessionLog } from "../../shared/logger";
@@ -13,7 +14,7 @@ import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import {
     createPromptSurfaceGuidanceEpochCache,
     createPromptSurfaceRuntime,
-    promptSurfaceHashMaterial,
+    systemPromptFingerprint,
 } from "../../shared/prompt-surface-runtime";
 import {
     ctxReduceSpawnPermissionReadNeeded,
@@ -21,8 +22,11 @@ import {
     resolveCtxReduceAvailability,
     spawnAgentFromOpenCodeDb,
 } from "./ctx-reduce-availability";
-
+import { currentLkgRequestIdentity } from "./lkg-measured-request";
+import { requestPendingMaterialization } from "./pending-materialization";
 import { estimateTokens } from "./read-session-formatting";
+import { systemPromptDates } from "./system-prompt-dates";
+import { isHeldHeadForRequest, recordSystemPromptForRequest } from "./system-prompt-delivery";
 
 const MAGIC_CONTEXT_MARKER = "## Magic Context";
 const SYSTEM_PROMPT_GUIDANCE_SEPARATOR = "\n\n";
@@ -133,6 +137,7 @@ export function isMagicContextInternalAgent(systemPromptContent: string): boolea
 export function createSystemPromptHashHandler(deps: {
     db: ContextDatabase;
     dreamerEnabled: boolean;
+    smartNotesEnabled?: boolean;
     /** When false (`memory.enabled: false`), the `<project-memory>` block is
      *  never injected, so ctx_memory guidance is dropped from the prompt and the
      *  ctx_memory tool is not registered. ctx_search guidance stays (it still
@@ -205,10 +210,20 @@ export function createSystemPromptHashHandler(deps: {
     /** When true, inject a "BEWARE: history compression is on" warning so the
      *  agent doesn't mimic its own caveman-compressed past output. */
     experimentalCavemanTextCompression?: boolean;
+    /**
+     * True when the messages transform for this same request already ran (the
+     * host calls the system hook after it). Consumes that per-request signal.
+     * Absent (tests, hosts without the signal): a system change is assumed to be
+     * seen before the messages transform, as on a system-first host.
+     */
+    consumeMessagesPrepared?: (sessionId: string) => boolean;
+    /** Without a request token, pair hooks using the ID of the last real user whose turn contains the thinking. */
+    resolveDateTurnId?: (sessionId: string) => string | undefined;
 }): {
     handler: (
         input: {
             sessionID?: string;
+            dateRefreshRequest?: SystemDateRequestIdentity;
             model?: { providerID?: string; modelID?: string };
         },
         output: { system: string[] },
@@ -228,9 +243,10 @@ export function createSystemPromptHashHandler(deps: {
     // flip from causing an unnecessary flush + cache rebuild.
     const stickyDateBySession = new Map<string, string>();
 
-    const handler = async (
+    const processSystemPrompt = async (
         input: {
             sessionID?: string;
+            dateRefreshRequest?: SystemDateRequestIdentity;
             model?: { providerID?: string; modelID?: string };
         },
         output: { system: string[] },
@@ -320,6 +336,24 @@ export function createSystemPromptHashHandler(deps: {
             return;
         }
 
+        // Read after the skip checks above: a skipped title/summary call for this
+        // session must not consume the marker left by the main request's messages pass.
+        const messagesPrepared = deps.consumeMessagesPrepared?.(sessionId) ?? false;
+        const dateRequest = beginSystemDateRequest(
+            deps.historyRefreshSessions,
+            sessionId,
+            messagesPrepared ? "system-after-messages" : "system",
+            input.dateRefreshRequest === undefined &&
+                hasSystemDateRefresh(deps.historyRefreshSessions)
+                ? (deps.resolveDateTurnId ?? latestRealUserTurnIdFromOpenCodeDb)(sessionId)
+                : undefined,
+            input.dateRefreshRequest,
+        );
+        bindSystemDateRequest(output, dateRequest);
+        const requestMessagesFinal =
+            messagesPrepared ||
+            systemDateRefreshPermission(deps.historyRefreshSessions, dateRequest) !== undefined;
+
         // ── Step 1: Inject magic-context guidance ──
         // Subagents with callable ctx_reduce get only the minimal drop mechanics
         // guidance. Subagents without the tool get no Magic Context guidance,
@@ -385,6 +419,7 @@ export function createSystemPromptHashHandler(deps: {
                 deps.memoryEnabled !== false,
                 promptSurface.preset,
                 promptSurface.primaryOverride,
+                deps.smartNotesEnabled,
             );
             // OpenAI-compatible serializers emit one wire message per array entry,
             // and strict chat templates reject a second system message. Keep the host
@@ -407,10 +442,35 @@ export function createSystemPromptHashHandler(deps: {
         // are the volatile resident at m[1]. Keep only guidance + sticky
         // date in system so BP1 remains stable.
         const isCacheBusting = deps.systemPromptRefreshSessions.has(sessionId);
+        // Some OpenCode 1 routes run messages.transform before this hook. An idle-expired
+        // request is already a full provider-cache rebuild, even if an aborted
+        // attempt prepared its frozen head. Adopt this request's system identity
+        // with that head instead of scheduling another rewrite on its next step.
+        // A scheduler execute alone is not proof: pressure passes can replay an
+        // unchanged, still-warm prefix, so those retain the hash-change fold.
+        const idleCacheExpired =
+            sessionMetaEarly !== undefined &&
+            computeHardCacheExpired(
+                sessionMetaEarly.cacheTtl,
+                sessionMetaEarly.lastResponseTime,
+                Date.now(),
+            );
+        // When this request's messages are already final (OpenCode 1 runs the
+        // messages transform before this hook), a changed system prompt is already
+        // a full provider-cache rewrite on this request, and Magic Context can no
+        // longer fold into it. Queuing a rebuild for the next request would make the
+        // provider rewrite its cache a second time. Adopt the new identity here, as
+        // on an idle-expired request; queued work rides the next natural bust.
+        // This must not release the sticky date: OpenCode 1 reports
+        // `requestMessagesFinal` on every request, warm or not.
+        // A completed messages hook that kept m[0]/m[1] frozen for signed
+        // thinking must instead wait for the matching successful provider reply.
+        const adoptSystemChange =
+            idleCacheExpired ||
+            (requestMessagesFinal &&
+                !isHeldHeadForRequest(sessionId, currentLkgRequestIdentity(sessionId)));
 
         // ── Step 2: Coalesce content/preset and date changes into one bust ──
-        const DATE_PATTERN = /Today's date: .+/;
-        const DATE_PATTERN_ALL = /Today's date: .+/g;
         const liveSystemContent = output.system.join("\n");
         if (liveSystemContent.length === 0) return;
         const previousHash = sessionMetaEarly?.systemPromptHash ?? "";
@@ -419,27 +479,72 @@ export function createSystemPromptHashHandler(deps: {
         // establish a new baseline. Discard the session's sticky date instead of
         // reusing the date line frozen for the earlier host projection.
         if (!hasPersistedHash) stickyDateBySession.delete(sessionId);
-        // Every element carrying a date line participates in freezing. Only MC
-        // injects the line today, but a host prompt carrying the same format
-        // must not leave a second live date that busts the hash at midnight.
-        const dateElementIndexes: number[] = [];
-        let currentDate: string | undefined;
-        for (let i = 0; i < output.system.length; i++) {
-            const match = output.system[i].match(DATE_PATTERN);
-            if (!match) continue;
-            dateElementIndexes.push(i);
-            currentDate ??= match[0];
-        }
         const stickyDate = stickyDateBySession.get(sessionId);
-        const stableCandidate =
-            currentDate && stickyDate && currentDate !== stickyDate
-                ? liveSystemContent.replace(DATE_PATTERN_ALL, stickyDate)
-                : liveSystemContent;
-        const stableCandidateHash = createHash("md5")
-            .update(promptSurfaceHashMaterial(stableCandidate, promptSurface.preset))
-            .digest("hex");
+        const dates = systemPromptDates(liveSystemContent, stickyDate);
+        const currentDate = dates.live;
+        const stableCandidate = dates.stable;
+        const stableCandidateHash = systemPromptFingerprint(stableCandidate, promptSurface.preset);
         const contentOrPresetChanged = hasPersistedHash && stableCandidateHash !== previousHash;
-        const dateMayAdvance = isCacheBusting || contentOrPresetChanged;
+        const rewritePermission = systemDateRefreshPermission(
+            deps.historyRefreshSessions,
+            dateRequest,
+        );
+        // A queued refresh alone cannot change the prompt before an assistant's
+        // encrypted thinking that still requires its original earlier messages.
+        // If the system hook runs first, wait for a permitted messages rebuild;
+        // if the messages hook ran first, use its completed rebuild decision.
+        let deferredDateRefresh = false;
+        if (
+            currentDate &&
+            stickyDate &&
+            currentDate !== stickyDate &&
+            isCacheBusting &&
+            !idleCacheExpired &&
+            !contentOrPresetChanged &&
+            !requestMessagesFinal
+        ) {
+            const liveElements = [...output.system];
+            deferredDateRefresh = waitForSystemDateRefresh(
+                deps.historyRefreshSessions,
+                dateRequest,
+                (permitted) => {
+                    if (!permitted) {
+                        deps.systemPromptRefreshSessions.add(sessionId);
+                        return;
+                    }
+                    try {
+                        const content = liveElements.join("\n");
+                        const hash = systemPromptFingerprint(content, promptSurface.preset);
+                        updateSessionMeta(deps.db, sessionId, {
+                            systemPromptHash: hash,
+                            cachedM0SystemHash: hash,
+                            systemPromptTokens: estimateTokens(content),
+                        });
+                        stickyDateBySession.set(sessionId, currentDate);
+                        output.system.splice(0, output.system.length, ...liveElements);
+                        publishSystemDateOutput(output.system);
+                        deps.systemPromptRefreshSessions.delete(sessionId);
+                        sessionLog(
+                            sessionId,
+                            `system prompt date updated after prefix rewrite: ${stickyDate} → ${currentDate}`,
+                        );
+                    } catch (error) {
+                        deps.systemPromptRefreshSessions.add(sessionId);
+                        sessionLog(
+                            sessionId,
+                            "system prompt date refresh failed (keeping frozen date):",
+                            error,
+                        );
+                    }
+                },
+            );
+        }
+        const dateMayAdvance =
+            idleCacheExpired ||
+            contentOrPresetChanged ||
+            (isCacheBusting &&
+                !deferredDateRefresh &&
+                (dateRequest ? rewritePermission === true : rewritePermission !== false));
 
         if (currentDate && !stickyDate) {
             stickyDateBySession.set(sessionId, currentDate);
@@ -450,12 +555,19 @@ export function createSystemPromptHashHandler(deps: {
                     sessionId,
                     `system prompt date updated: ${stickyDate} → ${currentDate} (cache-busting pass)`,
                 );
-            } else if (dateElementIndexes.length > 0) {
-                for (const index of dateElementIndexes) {
-                    output.system[index] = output.system[index].replace(
-                        DATE_PATTERN_ALL,
-                        stickyDate,
-                    );
+            } else {
+                // Apply the saved host dates to each system prompt element
+                // without combining the original array entries.
+                let offset = 0;
+                const prior: string[] = JSON.parse(stickyDate);
+                for (let index = 0; index < output.system.length; index++) {
+                    const element = systemPromptDates(output.system[index]);
+                    const count = element.live ? JSON.parse(element.live).length : 0;
+                    output.system[index] = systemPromptDates(
+                        output.system[index],
+                        JSON.stringify(prior.slice(offset, offset + count)),
+                    ).stable;
+                    offset += count;
                 }
                 sessionLog(
                     sessionId,
@@ -475,9 +587,17 @@ export function createSystemPromptHashHandler(deps: {
         // causing precision loss on read-back and infinite hash-change flushes.
         // node:crypto MD5 produces identical digests to Bun.CryptoHasher("md5"),
         // so persisted hashes remain stable across the Bun→Node runtime swap.
-        const currentHash = createHash("md5")
-            .update(promptSurfaceHashMaterial(systemContent, promptSurface.preset))
-            .digest("hex");
+        const currentHash = systemPromptFingerprint(systemContent, promptSurface.preset);
+
+        recordSystemPromptForRequest(
+            sessionId,
+            currentLkgRequestIdentity(sessionId),
+            currentHash,
+            deps.db,
+            previousHash !== currentHash ? !deps.historyRefreshSessions.has(sessionId) : undefined,
+            deps.historyRefreshSessions,
+            deps.pendingMaterializationSessions,
+        );
 
         // Reuse sessionMetaEarly from Step 1 — no code path between that read
         // and here mutates session_meta for this session, so a second DB read
@@ -492,16 +612,28 @@ export function createSystemPromptHashHandler(deps: {
         if (previousHash !== "" && previousHash !== "0" && previousHash !== currentHash) {
             sessionLog(
                 sessionId,
-                `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), triggering flush`,
+                `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), ${idleCacheExpired ? "adopting on idle-expired request" : requestMessagesFinal ? "adopting on the request whose messages are already final" : "triggering flush"}`,
             );
-            // Real prompt-content or preset change: signal all three independent
-            // refresh lifetimes. The semantic prompt epoch changed on this turn,
-            // so history rebuild, adjunct refresh, and materialization should ride
-            // the same cycle.
-            deps.historyRefreshSessions.add(sessionId);
-            deps.systemPromptRefreshSessions.add(sessionId);
-            deps.pendingMaterializationSessions.add(sessionId);
-            deps.lastHeuristicsTurnId.delete(sessionId);
+            // This request carries the new prompt, so the provider rewrites its
+            // cache from the system block onward whatever the messages pass did.
+            // Its transform decision names the change, in every branch below.
+            noteSystemPromptHashChange(sessionId);
+            // When the following messages transform can still fold into this
+            // request, signal all three independent refresh lifetimes. The semantic
+            // prompt epoch changed on this turn, so history rebuild, adjunct refresh,
+            // and materialization should ride the same cycle.
+            if (!adoptSystemChange) {
+                deps.historyRefreshSessions.add(sessionId);
+                deps.systemPromptRefreshSessions.add(sessionId);
+                if (!deps.pendingMaterializationSessions.has(sessionId)) {
+                    requestPendingMaterialization(
+                        deps.pendingMaterializationSessions,
+                        sessionId,
+                        "system_hash",
+                    );
+                }
+                deps.lastHeuristicsTurnId.delete(sessionId);
+            }
         } else if (previousHash === "" || previousHash === "0") {
             sessionLog(
                 sessionId,
@@ -534,12 +666,13 @@ export function createSystemPromptHashHandler(deps: {
                 updateSessionMeta(deps.db, sessionId, {
                     systemPromptHash: currentHash,
                     systemPromptTokens,
-                    // On OpenCode 1, messages.transform runs before system.transform.
+                    // When messages.transform has already run before this hook,
                     // After a rebase clears the previous host baseline, the first
                     // m[0] render records no system-prompt hash. Store this request's
                     // hash with that cached render so the following pass recognizes
                     // the unchanged system prompt and reuses the cache.
-                    cachedM0SystemHash: hasPersistedHash ? undefined : currentHash,
+                    cachedM0SystemHash:
+                        !hasPersistedHash || adoptSystemChange ? currentHash : undefined,
                 });
             } catch (error) {
                 sessionLog(sessionId, "system prompt meta persist failed (fail-open):", error);
@@ -574,14 +707,33 @@ export function createSystemPromptHashHandler(deps: {
         // the next valid pass can consume it.
         //
         // See Oracle review 2026-04-26 Finding A1 for the bug this fixes.
-        if (isCacheBusting) {
+        if (
+            isCacheBusting &&
+            !deferredDateRefresh &&
+            (contentOrPresetChanged ||
+                !currentDate ||
+                currentDate === stickyDate ||
+                !dateRequest ||
+                rewritePermission === true)
+        ) {
             deps.systemPromptRefreshSessions.delete(sessionId);
         }
     };
 
+    const handler: typeof processSystemPrompt = async (input, output) => {
+        try {
+            await processSystemPrompt(input, output);
+        } finally {
+            finishSystemDateHook(
+                deps.historyRefreshSessions,
+                systemDateRequestForOutput(deps.historyRefreshSessions, output),
+            );
+        }
+    };
     return {
         handler,
         clearSession: (sessionId: string) => {
+            clearSystemDateRefresh(deps.historyRefreshSessions, sessionId);
             guidanceEpochs.clear(sessionId);
             clearSystemPromptHashSession(sessionId, {
                 stickyDateBySession,
@@ -590,3 +742,17 @@ export function createSystemPromptHashHandler(deps: {
         },
     };
 }
+
+import { latestRealUserTurnIdFromOpenCodeDb } from "./read-session-db";
+import {
+    beginSystemDateRequest,
+    bindSystemDateRequest,
+    clearSystemDateRefresh,
+    finishSystemDateHook,
+    hasSystemDateRefresh,
+    publishSystemDateOutput,
+    type SystemDateRequestIdentity,
+    systemDateRefreshPermission,
+    systemDateRequestForOutput,
+    waitForSystemDateRefresh,
+} from "./system-date-refresh";

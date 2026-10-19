@@ -153,14 +153,13 @@ export async function partitionVerifyScope(args: {
                 const verifiedAtB = verById.get(b.id)?.verifiedAt ?? 0;
                 return verifiedAtA - verifiedAtB || a.id - b.id;
             });
+        const broadIds = new Set(broadCandidates.map((m) => m.id));
         return {
             runStartedAt,
             mode: "broad",
             inScope: broadCandidates.map(toPrompt),
             inScopeIds: broadCandidates.map((m) => m.id),
-            skippedIds: candidates
-                .filter((m) => !broadCandidates.some((candidate) => candidate.id === m.id))
-                .map((m) => m.id),
+            skippedIds: candidates.filter((m) => !broadIds.has(m.id)).map((m) => m.id),
             broadCycleStartAt,
             reason: `broad cycle (${broadCandidates.length} remain; started ${broadCycleStartAt})`,
         };
@@ -186,8 +185,8 @@ export async function partitionVerifyScope(args: {
         reason,
     });
 
-    const gitRoot =
-        (await resolveGitTopLevel(args.projectDirectory)) ?? path.resolve(args.projectDirectory);
+    const resolvedGitRoot = await resolveGitTopLevel(args.projectDirectory);
+    const gitRoot = resolvedGitRoot ?? path.resolve(args.projectDirectory);
 
     // Oldest verified time among already-verified candidates bounds the git-log
     // window. Never-verified candidates (verified_at = 0) are always in scope.
@@ -196,7 +195,11 @@ export async function partitionVerifyScope(args: {
         .filter((t) => t > 0);
     const sinceMs = verifiedTimes.length > 0 ? minOf(verifiedTimes) : runStartedAt;
 
-    const changeTimes = await readGitFileChangeTimesSince(args.projectDirectory, sinceMs);
+    const changeTimes = await readGitFileChangeTimesSince(
+        args.projectDirectory,
+        sinceMs,
+        resolvedGitRoot ?? undefined,
+    );
     if (changeTimes === null) {
         // git unavailable → verify everything (safe direction: re-check vs skip).
         return allInScope("full", "git change-times unavailable; full verification");
@@ -205,7 +208,11 @@ export async function partitionVerifyScope(args: {
     // a mapped file with a pending edit is "changed now" → re-verify.
     const head = await readGitHead(args.projectDirectory);
     const uncommitted = head
-        ? ((await readGitChangedFilesSince(args.projectDirectory, head)) ?? new Set<string>())
+        ? ((await readGitChangedFilesSince(
+              args.projectDirectory,
+              head,
+              resolvedGitRoot ?? undefined,
+          )) ?? new Set<string>())
         : new Set<string>();
 
     const inScope: VerifyPromptMemory[] = [];

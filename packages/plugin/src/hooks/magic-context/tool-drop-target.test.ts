@@ -56,6 +56,30 @@ function buildIndex(messages: MessageLike[]): ToolCallIndex {
 }
 
 describe("tool-drop-target", () => {
+    it("compacts many removed wrappers in place while preserving survivor references and order", () => {
+        const messages: MessageLike[] = Array.from({ length: 6000 }, (_, index) => ({
+            info: { id: `compact-${index}`, role: "user" },
+            parts: [{ type: "text", text: `content-${index}` }],
+        }));
+        const survivors = messages.filter((_, index) => index % 2 === 1);
+        const original = messages;
+        const batch = new ToolMutationBatch(messages, true);
+        for (let index = 0; index < messages.length; index += 2) {
+            batch.markForRemoval({
+                message: messages[index],
+                part: messages[index].parts[0],
+                kind: "result",
+            });
+        }
+        batch.finalize();
+        expect(messages).toBe(original);
+        expect(messages).toEqual(survivors);
+        expect(messages[0]).toBe(survivors[0]);
+        expect(messages[messages.length - 1]).toBe(survivors[survivors.length - 1]);
+        batch.finalize();
+        expect(messages).toEqual(survivors);
+    });
+
     it("strips attachments on a newly selected skeleton but preserves legacy replay", () => {
         const attachment = { type: "file", mime: "image/png", url: "data:image/png;base64,abcd" };
         const original = {

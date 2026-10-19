@@ -52,70 +52,80 @@ function schedulerLines(logPath: string, sessionID: string): string[] {
 		);
 }
 
-test("OpenCode 2 executes a pass over execute_threshold_tokens below the percentage threshold", async () => {
-	const fixture = isolation();
-	const logPath = join(fixture.root, "magic-context-threshold.log");
-	fixture.env.MAGIC_CONTEXT_LOG_PATH = logPath;
-	const host = await spawnOpencode2({
-		existingIsolation: fixture,
-		modelContextLimit: CONTEXT_LIMIT,
-		modelOutputLimit: 1024,
-		compactionAuto: false,
-		magicContextConfig: {
-			execute_threshold_percentage: 80,
-			execute_threshold_tokens: { default: 20_000 },
-			historian: { disable: true },
-			dreamer: { disable: true },
-			memory: { enabled: false },
-		},
-	});
-	try {
-		const client = OpenCode.make({
-			baseUrl: host.url,
-			headers: { authorization: `Basic ${btoa(`opencode:${host.password}`)}` },
+for (const perModel of [false, true]) {
+	const providerID = perModel ? "opencode" : "openai";
+	const modelID = perModel ? "muse-spark-1.3-contributor-free" : "mock-model";
+	test(`OpenCode 2 executes a pass over ${perModel ? "per-model " : ""}execute_threshold_tokens below the percentage threshold`, async () => {
+		const fixture = isolation();
+		const logPath = join(fixture.root, "magic-context-threshold.log");
+		fixture.env.MAGIC_CONTEXT_LOG_PATH = logPath;
+		const host = await spawnOpencode2({
+			existingIsolation: fixture,
+			providerID,
+			defaultModelID: modelID,
+			modelContextLimit: CONTEXT_LIMIT,
+			modelOutputLimit: 1024,
+			compactionAuto: false,
+			magicContextConfig: {
+				execute_threshold_percentage: 80,
+				execute_threshold_tokens: perModel
+					? { default: 70_000, [`${providerID}/${modelID}`]: 20_000 }
+					: { default: 20_000 },
+				historian: { disable: true },
+				dreamer: { disable: true },
+				memory: { enabled: false },
+			},
 		});
-		const session = await client.session.create({
-			title: "execute threshold tokens",
-			location: { directory: host.cwd },
-			model: { providerID: "openai", id: "mock-model" },
-		});
-		await waitForPluginActive(client, host.cwd);
-
-		const prompt = async (text: string, inputTokens: number) => {
-			host.mock.setDefault({
-				text: `reply to ${text}`,
-				usage: { input_tokens: inputTokens, output_tokens: 20 },
+		try {
+			const client = OpenCode.make({
+				baseUrl: host.url,
+				headers: {
+					authorization: `Basic ${btoa(`opencode:${host.password}`)}`,
+				},
 			});
-			await client.session.prompt({ sessionID: session.id, text });
-			await client.session.wait(
-				{ sessionID: session.id },
-				{ signal: AbortSignal.timeout(30_000) },
-			);
-		};
-		const decisionFor = (inputTokens: number) =>
-			eventually(
-				() =>
-					schedulerLines(logPath, session.id).find((line) =>
-						line.includes(`inputTokens=${inputTokens} `),
-					),
-				`a scheduler decision at inputTokens=${inputTokens}`,
-			);
+			const session = await client.session.create({
+				title: "execute threshold tokens",
+				location: { directory: host.cwd },
+				model: { providerID, id: modelID },
+			});
+			await waitForPluginActive(client, host.cwd);
 
-		await prompt("first turn", 10_000);
-		await prompt("second turn", 30_000);
-		await prompt("third turn", 30_000);
+			const prompt = async (text: string, inputTokens: number) => {
+				host.mock.setDefault({
+					text: `reply to ${text}`,
+					usage: { input_tokens: inputTokens, output_tokens: 20 },
+				});
+				await client.session.prompt({ sessionID: session.id, text });
+				await client.session.wait(
+					{ sessionID: session.id },
+					{ signal: AbortSignal.timeout(30_000) },
+				);
+			};
+			const decisionFor = (inputTokens: number) =>
+				eventually(
+					() =>
+						schedulerLines(logPath, session.id).find((line) =>
+							line.includes(`inputTokens=${inputTokens} `),
+						),
+					`a scheduler decision at inputTokens=${inputTokens}`,
+				);
 
-		const under = await decisionFor(10_000);
-		expect(under).toContain("decision=defer");
-		const over = await decisionFor(30_000);
-		expect(over).toContain("decision=execute");
-		expect(
-			readFileSync(join(fixture.root, "llm-schema-guard.jsonl"), "utf8"),
-		).toContain(`PASS ${session.id} `);
-	} catch (error) {
-		console.error(host.stdout(), host.stderr());
-		throw error;
-	} finally {
-		await host.stop();
-	}
-}, 120_000);
+			await prompt("first turn", 10_000);
+			await prompt("second turn", 30_000);
+			await prompt("third turn", 30_000);
+
+			const under = await decisionFor(10_000);
+			expect(under).toContain("decision=defer");
+			const over = await decisionFor(30_000);
+			expect(over).toContain("decision=execute");
+			expect(
+				readFileSync(join(fixture.root, "llm-schema-guard.jsonl"), "utf8"),
+			).toContain(`PASS ${session.id} `);
+		} catch (error) {
+			console.error(host.stdout(), host.stderr());
+			throw error;
+		} finally {
+			await host.stop();
+		}
+	}, 120_000);
+}

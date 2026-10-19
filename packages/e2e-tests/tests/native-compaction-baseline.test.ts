@@ -3,10 +3,13 @@
 import { afterAll, beforeAll, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { createTestTempDir } from "../../plugin/src/shared/test-temp-dir";
 import { TestHarness } from "../src/harness";
+import { markerWorkerBundleFixture } from "../src/marker-worker-bundle-fixture";
 import { buildMockHistorianPayload, findHistorianOrdinalRange } from "../src/mock-historian";
+import { assertOpenPaths } from "../src/opencode2-runner/spawn";
 
 /**
  * A native OpenCode compaction (`/compact`) on a Magic Context session.
@@ -62,19 +65,29 @@ function bigUsage(text: string) {
 }
 
 let h: TestHarness;
+let bundle: ReturnType<typeof markerWorkerBundleFixture>;
 
 beforeAll(async () => {
-    h = await TestHarness.create({
-        magicContextConfig: { execute_threshold_percentage: 40 },
-        // Keep only the newest turn after the summary, so the stored boundary sits
-        // before the host window (a large session's usual shape). A retained tail
-        // that reaches back past the boundary lets the trim cut the summary rows.
-        openCodeConfigExtra: { compaction: { auto: false, prune: false, tail_turns: 1 } },
-    });
+    bundle = markerWorkerBundleFixture();
+    const previousEntry = process.env.MC_E2E_PLUGIN_ENTRY;
+    process.env.MC_E2E_PLUGIN_ENTRY = bundle.entry;
+    try {
+        h = await TestHarness.create({
+            magicContextConfig: { execute_threshold_percentage: 40 },
+            // Keep only the newest turn after the summary, so the stored boundary sits
+            // before the host window (a large session's usual shape). A retained tail
+            // that reaches back past the boundary lets the trim cut the summary rows.
+            openCodeConfigExtra: { compaction: { auto: false, prune: false, tail_turns: 1 } },
+        });
+    } finally {
+        if (previousEntry === undefined) delete process.env.MC_E2E_PLUGIN_ENTRY;
+        else process.env.MC_E2E_PLUGIN_ENTRY = previousEntry;
+    }
 });
 
 afterAll(async () => {
-    await h.dispose();
+    await h?.dispose();
+    bundle?.dispose();
 });
 
 function readBaseline(sessionId: string): {
@@ -147,26 +160,44 @@ function mainRequestBodies(): string[] {
         .map((request) => JSON.stringify(request.body));
 }
 
-/**
- * Every OpenCode or Magic Context store the OpenCode process holds open must live
- * under the harness data dir. (The embedding runtime also opens its own telemetry
- * database under the user's Library; that is neither store and is not checked.)
- */
+function assertThrowawayDatabasePaths(databases: string[], dataDir: string): void {
+    const canonicalData = realpathSync(dataDir);
+    const paths = databases.map((path) => realpathSync(path));
+    expect(paths.some((path) => path.endsWith("opencode.db") && path.startsWith(`${canonicalData}/`))).toBe(true);
+    expect(paths.some((path) => path.endsWith("context.db") && path.startsWith(`${canonicalData}/`))).toBe(true);
+    // CFFIXED_USER_HOME puts ONNX telemetry under private HOME, still inside the fixture root.
+    const root = realpathSync(dirname(dataDir));
+    assertOpenPaths(paths, root);
+}
+
 function assertOpenDatabasesAreThrowaway(): void {
     const result = spawnSync("lsof", ["-p", String(h.opencode.pid), "-Fn"], {
         encoding: "utf8",
+        windowsHide: true,
     });
     const dataDir = realpathSync(h.dataDir);
     const databases = result.stdout
         .split("\n")
         .filter((line) => line.startsWith("n") && /\.db(-wal|-shm)?$/.test(line))
-        .map((line) => line.slice(1))
-        .filter((path) => /opencode|cortexkit|magic-context|context\.db/.test(path));
-    expect(databases.some((path) => path.endsWith("opencode.db"))).toBe(true);
-    expect(databases.some((path) => path.endsWith("context.db"))).toBe(true);
-    const outside = databases.filter((path) => !realpathSync(path).startsWith(dataDir));
-    expect(outside).toEqual([]);
+        .map((line) => line.slice(1));
+    assertThrowawayDatabasePaths(databases, dataDir);
 }
+
+it("native compaction database fence rejects a database outside the complete throwaway root", () => {
+    const fixture = createTestTempDir("native-compaction-fence-");
+    try {
+        const root = join(fixture.dir, "host");
+        const data = join(root, "data");
+        mkdirSync(data, { recursive: true });
+        const paths = [join(data, "opencode.db"), join(data, "context.db"), join(root, "onnxruntime.db")];
+        const outside = join(fixture.dir, "outside.db");
+        for (const path of [...paths, outside]) writeFileSync(path, "path-fence fixture");
+        expect(() => assertThrowawayDatabasePaths(paths, data)).not.toThrow();
+        expect(() => assertThrowawayDatabasePaths([...paths, outside], data)).toThrow("forbidden");
+    } finally {
+        fixture.cleanup();
+    }
+});
 
 it(
     "re-anchors the baseline once on the first pass after /compact",
@@ -242,7 +273,33 @@ it(
         const beforeCompaction = readBaseline(sessionId);
         expect(beforeCompaction.hasM0).toBe(true);
         expect(beforeCompaction.boundary).not.toBeNull();
-        expect(mainRequestBodies().at(-1)).toContain(HISTORY_SENTINEL);
+        expect(mainRequestBodies().at(-1), pluginLog().slice(-40000)).toContain(HISTORY_SENTINEL);
+
+        // Missing marker-candidate discovery must not replace new history with an old request.
+        await h.waitFor(() => pluginLog().includes("candidate worker unavailable"), {
+            timeoutMs: 5_000, label: "missing marker worker diagnostic",
+        });
+        expect(pluginLog().match(/\[ERROR\] compaction-marker: candidate worker unavailable/g)).toHaveLength(1);
+        expect(pluginLog()).not.toContain("transform refused degraded pass");
+        expect(pluginLog()).not.toContain("compaction-marker-drain-failure");
+        const markerState = () => h.contextDb().prepare(
+            "SELECT NULLIF(compaction_marker_state,'') AS marker, NULLIF(pending_compaction_marker_state,'') AS pending FROM session_meta WHERE session_id=?",
+        ).get(sessionId) as { marker: string | null; pending: string | null };
+        expect(markerState().marker).toBeNull();
+        expect(markerState().pending).not.toBeNull();
+
+        // Put the candidate worker back and require the pending compaction marker to advance
+        // while ordinary new prompts continue to write messages to the host store.
+        bundle.restoreWorker();
+        let rebuildingPasses = 0;
+        for (; rebuildingPasses < 4 && markerState().marker === null; rebuildingPasses++) {
+            const prompt = `marker recovery rebuilding pass ${rebuildingPasses + 1}`;
+            await h.sendPrompt(sessionId, prompt);
+            expect(mainRequestBodies().at(-1)).toContain(prompt);
+            expect(mainRequestBodies().at(-1)).toContain(HISTORY_SENTINEL);
+        }
+        expect(markerState().marker, pluginLog().slice(-40000)).not.toBeNull();
+        console.log(`marker worker recovery: advanced after ${rebuildingPasses} rebuilding passes with new messages`);
 
         // Native compaction. The mock answers the summary request.
         h.mock.setDefault(smallUsage(HOST_SUMMARY_SENTINEL));

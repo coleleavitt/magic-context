@@ -1,62 +1,22 @@
-import { createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { createMemo, createSignal, For, Show } from "solid-js";
+import FloatingLayer from "./FloatingLayer";
+import { commitTypedModelValue, getTypedModelSelection } from "./model-selection";
+
+export { commitTypedModelValue, getTypedModelSelection } from "./model-selection";
 
 interface ModelSelectProps {
   models: string[];
   value: string | undefined;
   onChange: (value: string) => void;
   placeholder?: string;
-}
-
-const INVALID_MODEL_ID_HINT = "Enter a model id in provider/model form";
-
-export function getTypedModelSelection(
-  input: string,
-  availableModels: readonly string[],
-): { model: string | null; hint: string | null; isListed: boolean } {
-  const model = input.trim();
-  if (!model) return { model: null, hint: null, isListed: false };
-
-  const slash = model.indexOf("/");
-  if (slash <= 0 || slash === model.length - 1) {
-    return { model: null, hint: INVALID_MODEL_ID_HINT, isListed: false };
-  }
-
-  // Discovery lists are never exhaustive, so a valid provider/model ID must
-  // remain selectable even when it is not one of the discovered models.
-  return {
-    model,
-    hint: null,
-    isListed: availableModels.includes(model),
-  };
-}
-
-export function commitTypedModelValue(
-  input: string,
-  availableModels: readonly string[],
-  onChange: (model: string) => void,
-): { model: string | null; hint: string | null; isListed: boolean } {
-  const selection = getTypedModelSelection(input, availableModels);
-  if (selection.model) onChange(selection.model);
-  return selection;
+  label?: string;
 }
 
 export default function ModelSelect(props: ModelSelectProps) {
   const [open, setOpen] = createSignal(false);
   const [search, setSearch] = createSignal("");
-  let containerRef: HTMLDivElement | undefined;
+  let triggerRef!: HTMLButtonElement;
   let inputRef: HTMLInputElement | undefined;
-
-  // Close on outside click
-  const handleClickOutside = (e: MouseEvent) => {
-    if (containerRef && !containerRef.contains(e.target as Node)) {
-      setOpen(false);
-    }
-  };
-
-  // Register/cleanup listener
-  const startListening = () => document.addEventListener("mousedown", handleClickOutside);
-  const stopListening = () => document.removeEventListener("mousedown", handleClickOutside);
-  onCleanup(stopListening);
 
   // Group models by provider
   const grouped = createMemo(() => {
@@ -83,21 +43,19 @@ export default function ModelSelect(props: ModelSelectProps) {
   const openDropdown = () => {
     setOpen(true);
     setSearch("");
-    startListening();
     requestAnimationFrame(() => inputRef?.focus());
   };
 
   const selectModel = (model: string) => {
     props.onChange(model);
     setOpen(false);
-    stopListening();
+    triggerRef.focus();
   };
 
   const clearSelection = (e: MouseEvent) => {
     e.stopPropagation();
     props.onChange("");
     setOpen(false);
-    stopListening();
   };
 
   const commitTypedModel = () => commitTypedModelValue(search(), props.models, selectModel);
@@ -123,9 +81,18 @@ export default function ModelSelect(props: ModelSelectProps) {
   };
 
   return (
-    <div class="model-select" ref={containerRef}>
+    <div class="model-select">
       {/* Trigger button */}
-      <button class="model-select-trigger" onClick={openDropdown} type="button">
+      <button
+        ref={triggerRef}
+        class="model-select-trigger"
+        onClick={openDropdown}
+        type="button"
+        aria-label={props.label}
+        aria-expanded={open()}
+        aria-haspopup="dialog"
+        title={displayValue()}
+      >
         <span class={`model-select-value ${!valueStr() ? "placeholder" : ""}`}>
           {valueStr() ? (
             <>
@@ -139,82 +106,90 @@ export default function ModelSelect(props: ModelSelectProps) {
           )}
         </span>
         <span class="model-select-actions">
-          <Show when={props.value}>
-            <button
-              type="button"
-              class="model-select-clear"
-              onClick={clearSelection}
-              title="Clear selection"
-              style={{ background: "none", border: "none", padding: 0, cursor: "pointer" }}
-            >
-              ✕
-            </button>
-          </Show>
           <span class="model-select-chevron">▾</span>
         </span>
       </button>
+      <Show when={props.value}>
+        <button
+          type="button"
+          class="model-select-clear"
+          onClick={clearSelection}
+          aria-label={`Clear ${props.label ?? "model selection"}`}
+        >
+          ✕
+        </button>
+      </Show>
 
       {/* Dropdown */}
       <Show when={open()}>
-        <div class="model-select-dropdown">
-          <div class="model-select-search-wrap">
-            <input
-              ref={inputRef}
-              class="model-select-search"
-              type="text"
-              placeholder="Search or type provider/model..."
-              value={search()}
-              onInput={(e) => setSearch(e.currentTarget.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") {
-                  setOpen(false);
-                  stopListening();
-                } else if (e.key === "Enter") {
-                  e.preventDefault();
-                  commitTypedModel();
-                }
-              }}
-            />
-          </div>
-          <div class="model-select-options">
-            <For each={grouped()}>
-              {([provider, models]) => (
-                <div class="model-select-group">
-                  <div class="model-select-group-label">{provider}</div>
-                  <For each={models}>
-                    {(model) => (
-                      <button
-                        class={`model-select-option ${props.value === model ? "active" : ""}`}
-                        onClick={() => selectModel(model)}
-                        type="button"
-                      >
-                        {modelName(model)}
-                      </button>
-                    )}
-                  </For>
-                </div>
-              )}
-            </For>
-            <Show when={showTypedModelOption()}>
-              <button
-                class="model-select-option"
-                onClick={() => {
-                  const model = typedModel();
-                  if (model) selectModel(model);
+        <FloatingLayer anchor={triggerRef} onClose={() => setOpen(false)}>
+          <div role="dialog" aria-label={props.label ?? "Select model"}>
+            <div class="model-select-search-wrap">
+              <input
+                ref={inputRef}
+                class="model-select-search"
+                type="text"
+                placeholder="Search or type provider/model..."
+                value={search()}
+                onInput={(e) => setSearch(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    setOpen(false);
+                    triggerRef.focus();
+                  } else if (e.key === "Enter") {
+                    e.preventDefault();
+                    commitTypedModel();
+                  } else if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    e.currentTarget
+                      .closest('[role="dialog"]')
+                      ?.querySelector<HTMLButtonElement>("button")
+                      ?.focus();
+                  }
                 }}
-                type="button"
-              >
-                Use "{typedModel()}"
-              </button>
-            </Show>
-            <Show when={typedSelection().hint}>
-              {(hint) => <div class="model-select-empty">{hint()}</div>}
-            </Show>
-            <Show when={grouped().length === 0 && !typedModel() && !typedSelection().hint}>
-              <div class="model-select-empty">Search models or type a model id</div>
-            </Show>
+              />
+            </div>
+            <div class="model-select-options">
+              <For each={grouped()}>
+                {([provider, models]) => (
+                  <div class="model-select-group">
+                    <div class="model-select-group-label">{provider}</div>
+                    <For each={models}>
+                      {(model) => (
+                        <button
+                          class={`model-select-option ${props.value === model ? "active" : ""}`}
+                          onClick={() => selectModel(model)}
+                          type="button"
+                          title={model}
+                        >
+                          {modelName(model)}
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                )}
+              </For>
+              <Show when={showTypedModelOption()}>
+                <button
+                  class="model-select-option"
+                  onClick={() => {
+                    const model = typedModel();
+                    if (model) selectModel(model);
+                  }}
+                  type="button"
+                >
+                  Use "{typedModel()}"
+                </button>
+              </Show>
+              <Show when={typedSelection().hint}>
+                {(hint) => <div class="model-select-empty">{hint()}</div>}
+              </Show>
+              <Show when={grouped().length === 0 && !typedModel() && !typedSelection().hint}>
+                <div class="model-select-empty">Search models or type a model id</div>
+              </Show>
+            </div>
           </div>
-        </div>
+        </FloatingLayer>
       </Show>
     </div>
   );

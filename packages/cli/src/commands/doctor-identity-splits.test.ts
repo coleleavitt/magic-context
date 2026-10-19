@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync, rmSync } from "node:fs";
@@ -7,6 +7,51 @@ import { join } from "node:path";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { findIdentitySplits, formatIdentitySplits } from "./doctor-identity-splits";
+
+test("identity inspections reuse path and count probes only within one request", () => {
+    const directory = realpathSync(
+        createTestTempDirFromPath(join(tmpdir(), "doctor-probe-reuse-")),
+    );
+    const db = new Database(":memory:");
+    const host = new Database(":memory:");
+    const canonicalProbe = spyOn(realpathSync, "native");
+    const prepare = spyOn(db, "prepare");
+    try {
+        db.exec(
+            "CREATE TABLE session_projects(session_id TEXT, harness TEXT, project_path TEXT); CREATE TABLE memories(project_path TEXT); CREATE TABLE notes(project_path TEXT)",
+        );
+        host.exec("CREATE TABLE session(id TEXT, directory TEXT)");
+        for (let i = 0; i < 3; i++) {
+            host.prepare("INSERT INTO session VALUES (?1, ?2)").run(`s${i}`, directory);
+            db.prepare("INSERT INTO session_projects VALUES (?1, 'opencode', ?2)").run(
+                `s${i}`,
+                i % 2 ? "git:aaa" : "dir:bbb",
+            );
+        }
+        prepare.mockClear();
+        const first = findIdentitySplits(db, host);
+        expect(canonicalProbe).toHaveBeenCalledTimes(1);
+        const countPreparations = prepare.mock.calls.filter(([sql]) =>
+            String(sql).startsWith("SELECT COUNT(*) AS n"),
+        );
+        expect(countPreparations).toHaveLength(3);
+        expect(first[0]?.identities.find((entry) => entry.identity === "git:aaa")?.memories).toBe(
+            0,
+        );
+        db.prepare("INSERT INTO memories VALUES ('git:aaa')").run();
+        const second = findIdentitySplits(db, host);
+        expect(canonicalProbe).toHaveBeenCalledTimes(2);
+        expect(second[0]?.identities.find((entry) => entry.identity === "git:aaa")?.memories).toBe(
+            1,
+        );
+    } finally {
+        canonicalProbe.mockRestore();
+        prepare.mockRestore();
+        host.close();
+        db.close();
+        rmSync(directory, { recursive: true, force: true });
+    }
+});
 
 test("reports dir/git and two-git splits from both host generations without changing rows", () => {
     const db = new Database(":memory:");

@@ -1,14 +1,22 @@
-import { newestCtxReduceTagNumbers } from "../../features/magic-context/reclaim-protection";
+import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import type { TagEntry } from "../../features/magic-context/types";
 import { isRecord } from "../../shared/record-type-guard";
-import { stableStringify } from "../../shared/stable-json";
+import { stableStringify, stableStringifyHash } from "../../shared/stable-json";
 import { contentTagOwnerMessageId } from "../../shared/tag-owner-id";
+import { TailHygieneJsonMemo } from "../../shared/tail-hygiene-json";
 import {
     estimateImageTokensFromDataUrl,
     estimateToolAttachmentImageTokens,
 } from "./image-token-estimate";
+import {
+    providerVisibleMessageForTailHygiene as providerVisibleMessage,
+    providerVisibleMessageForOpenCode2,
+    providerVisiblePartForTailHygiene as providerVisiblePart,
+    providerVisiblePartForOpenCode2,
+} from "./provider-visible-parts";
 import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
+import { rememberCurrentToolOutputCount } from "./tail-hygiene-output-count";
 import { isSyntheticTodoPart } from "./todo-view";
 
 export interface TailHygieneDeltas {
@@ -91,6 +99,8 @@ export interface TailHygienePostReduceGrace {
 }
 
 export interface TailHygieneBaseline {
+    /** Keep counts adopted on the last rebuilding pass; absent on legacy baselines. */
+    protectedToolsPolicy?: Readonly<Record<string, number>>;
     baselineU: number;
     baselineT: number;
     turnDeltaU: number;
@@ -127,11 +137,19 @@ interface ContentMemoEntry {
     hash: string;
     tokens: number | undefined;
     keyBytes: number;
+    kind: TailHygienePartKind;
+    content: string;
 }
 
 const MAX_CONTENT_MEMO_ENTRIES = 100_000;
-const MAX_CONTENT_MEMO_BYTES = 64 * 1024 * 1024;
-const contentMemo = new Map<string, ContentMemoEntry>();
+// Every pass measures the whole rendered tail, and a miss tokenizes the text
+// again, which costs about a second per 50 MB. The memo holds each session's
+// tail across passes, so it must fit the tails of the sessions a process serves
+// in turn: at 64 MiB, two sessions with about 30 MB of tool output each evicted
+// each other's entries and every pass tokenized everything again.
+const MAX_CONTENT_MEMO_BYTES = 256 * 1024 * 1024;
+const contentMemo = new Map<TailHygienePartKind, Map<string, ContentMemoEntry>>();
+const contentMemoOrder = new Set<ContentMemoEntry>();
 let contentMemoBytes = 0;
 const FNV1A_32_OFFSET = 0x811c9dc5;
 const FNV1A_32_PRIME = 0x01000193;
@@ -151,25 +169,41 @@ function fnv1a32(value: string): string {
 }
 
 function memoizedContent(kind: TailHygienePartKind, content: string): ContentMemoEntry {
-    const key = `${kind}\0${content}`;
-    const cached = contentMemo.get(key);
+    let byContent = contentMemo.get(kind);
+    if (!byContent) {
+        byContent = new Map();
+        contentMemo.set(kind, byContent);
+    }
+    const cached = byContent.get(content);
     if (cached) return cached;
+    // Stream the original kind/NUL/content sequence so signatures stay identical
+    // without allocating a second copy of every tool output as a composite key.
+    let hash = FNV1A_32_OFFSET;
+    for (const segment of [kind, "\0", content]) {
+        for (let index = 0; index < segment.length; index += 1) {
+            hash ^= segment.charCodeAt(index);
+            hash = Math.imul(hash, FNV1A_32_PRIME) >>> 0;
+        }
+    }
     const measured = {
-        hash: fnv1a32(key),
+        hash: hash.toString(16).padStart(8, "0"),
         tokens: kind === "excluded" ? 0 : undefined,
-        keyBytes: key.length * 2 + 32,
+        keyBytes: (kind.length + 1 + content.length) * 2 + 32,
+        kind,
+        content,
     };
-    contentMemo.set(key, measured);
+    byContent.set(content, measured);
+    contentMemoOrder.add(measured);
     contentMemoBytes += measured.keyBytes;
     while (
-        contentMemo.size > MAX_CONTENT_MEMO_ENTRIES ||
+        contentMemoOrder.size > MAX_CONTENT_MEMO_ENTRIES ||
         contentMemoBytes > MAX_CONTENT_MEMO_BYTES
     ) {
-        const oldest = contentMemo.keys().next().value;
-        if (typeof oldest !== "string") break;
-        const removed = contentMemo.get(oldest);
-        if (removed) contentMemoBytes -= removed.keyBytes;
-        contentMemo.delete(oldest);
+        const oldest = contentMemoOrder.values().next().value;
+        if (!oldest) break;
+        contentMemoBytes -= oldest.keyBytes;
+        contentMemo.get(oldest.kind)?.delete(oldest.content);
+        contentMemoOrder.delete(oldest);
     }
     return measured;
 }
@@ -324,38 +358,49 @@ export function stripChannel1ReminderSpans(output: string): string {
 }
 
 function isDropSentinel(content: string): boolean {
-    const stripped = content.trimStart().replace(TAG_PREFIX, "").trimStart().toLowerCase();
-    return DROP_PREFIXES.some((prefix) => stripped.startsWith(prefix));
+    // Only the head can match. Lowercasing the whole text copied every tool
+    // output on every pass; the prefixes are ASCII, so lowercasing their
+    // length of the head gives the same answer.
+    let stripped = content.trimStart();
+    const tag = TAG_PREFIX.exec(stripped);
+    if (tag) stripped = stripped.slice(tag[0].length).trimStart();
+    return DROP_PREFIXES.some(
+        (prefix) => stripped.slice(0, prefix.length).toLowerCase() === prefix,
+    );
 }
 
-function toolOutputText(part: Record<string, unknown>): string | null {
+function toolOutputText(part: Record<string, unknown>, key: string): string | null {
+    const serialize = (value: unknown): string =>
+        partJsonMemo.get(key, value, () => safeStableStringify(value));
     if (part.type === "tool") {
         const state = isRecord(part.state) ? part.state : null;
         if (!state) return null;
-        if (state.output !== undefined) return safeStableStringify(state.output);
-        if (state.error !== undefined) return safeStableStringify(state.error);
-        if (state.result !== undefined) return safeStableStringify(state.result);
+        if (state.output !== undefined) return serialize(state.output);
+        if (state.error !== undefined) return serialize(state.error);
+        if (state.result !== undefined) return serialize(state.result);
         return null;
     }
     if (part.type === "tool_result") {
         const value = part.content ?? part.output ?? part.result;
-        return value === undefined ? null : safeStableStringify(value);
+        return value === undefined ? null : serialize(value);
     }
     return null;
 }
 
-function toolInputText(part: Record<string, unknown>): string | null {
+function toolInputText(part: Record<string, unknown>, key: string): string | null {
+    const serialize = (value: unknown): string =>
+        partJsonMemo.get(key, value, () => safeStableStringify(value));
     if (part.type === "tool") {
         const state = isRecord(part.state) ? part.state : null;
         if (!state || state.input === undefined) return null;
-        return safeStableStringify(state.input);
+        return serialize(state.input);
     }
     if (part.type === "tool-invocation") {
         const value = part.args ?? part.input;
-        return value === undefined ? null : safeStableStringify(value);
+        return value === undefined ? null : serialize(value);
     }
     if (part.type === "tool_use") {
-        return part.input === undefined ? null : safeStableStringify(part.input);
+        return part.input === undefined ? null : serialize(part.input);
     }
     return null;
 }
@@ -374,11 +419,10 @@ function messageIdForTag(tag: TagEntry): string | null {
 function resolveProtectedTagNumbers(
     tags: readonly TagEntry[],
     protectedTagNumbersInput: ReadonlySet<number>,
+    protectedToolTags?: ReadonlySet<number>,
 ): Set<number> {
     const protectedNumbers = new Set(protectedTagNumbersInput);
-    const protectedCtxReduceTags = newestCtxReduceTagNumbers(
-        tags.filter((tag) => tag.status === "active" && tag.type === "tool"),
-    );
+    const protectedCtxReduceTags = protectedToolTags ?? protectedToolTagNumbers(tags);
     for (const tagNumber of protectedCtxReduceTags) protectedNumbers.add(tagNumber);
     return protectedNumbers;
 }
@@ -409,12 +453,17 @@ function buildTagAttribution(args: {
     tags: readonly TagEntry[];
     toolIdentities: ReadonlyMap<unknown, ToolPartIdentity>;
     protectedTagNumbers: ReadonlySet<number>;
+    protectedToolTags?: ReadonlySet<number>;
 }): {
     protectedNumbers: ReadonlySet<number>;
     messageTags: ReadonlyMap<string, TagEntry>;
     toolTagsByPart: ReadonlyMap<unknown, TagEntry>;
 } {
-    const protectedNumbers = resolveProtectedTagNumbers(args.tags, args.protectedTagNumbers);
+    const protectedNumbers = resolveProtectedTagNumbers(
+        args.tags,
+        args.protectedTagNumbers,
+        args.protectedToolTags,
+    );
     const messageTags = new Map<string, TagEntry>();
     const exactToolTags = new Map<string, TagEntry>();
     const orphanTagsByCall = new Map<string, TagEntry[]>();
@@ -517,17 +566,35 @@ function snapshot(args: {
     };
 }
 
+const partJsonMemo = new TailHygieneJsonMemo();
+
 function excludedSnapshot(key: string, part: unknown): TailHygienePartMeasurement {
-    const content = safeStableStringify(part);
-    return snapshot({
+    const contentHash = partJsonMemo.get(
         key,
+        part,
+        () => {
+            if (part === null || part === undefined || typeof part === "string")
+                return memoizedContent("excluded", safeStableStringify(part)).hash;
+            try {
+                // measureWithReplay keeps only provider-visible fields before hashing or memo comparison.
+                return stableStringifyHash(part, "excluded\0");
+            } catch {
+                return memoizedContent("excluded", String(part)).hash;
+            }
+        },
+        true,
+    );
+    return {
+        key,
+        contentHash,
         kind: "excluded",
-        content,
         tokens: 0,
-        tag: undefined,
-        protectedNumbers: new Set(),
-        pendingDropTagNumbers: new Set(),
-    });
+        uTokens: 0,
+        tagNumber: null,
+        tagStatus: null,
+        protected: false,
+        queuedForDrop: false,
+    };
 }
 
 function fileContentAndTokens(part: Record<string, unknown>): { content: string; tokens: number } {
@@ -576,17 +643,25 @@ function structuralSize(value: unknown): number {
  * allocation-free tree walk, instead of materializing JSON and UTF-8 buffers.
  * Like the old byte-length signature, it can miss same-length substitutions;
  * the size proxy does not promise the same collision set or exact byte counts.
- * The full content-hash assertion remains a separate dev-only check. Only the
+ * The full content-hash assertion remains a separate opt-in debug check. Only the
  * returned signature and per-message part-count array need to be allocated.
  */
 export function tailHygieneStructuralSignature(
     messages: readonly MessageLike[],
+    opencode2 = false,
 ): TailHygieneStructuralSignature {
     const partCounts: number[] = [];
     let totalBytes = 0;
     for (const message of messages) {
         partCounts.push(message.parts.length);
-        totalBytes += structuralSize(message);
+        // Fields the provider never receives (tool metadata such as LSP
+        // diagnostics) are left out: they do not change what is measured, and
+        // walking them cost seconds per pass on diagnostics-heavy sessions.
+        totalBytes += structuralSize(
+            opencode2
+                ? providerVisibleMessageForOpenCode2(message)
+                : providerVisibleMessage(message),
+        );
     }
     return { messageCount: messages.length, partCounts, totalBytes };
 }
@@ -605,7 +680,7 @@ export function sameTailHygieneStructuralSignature(
     return expected.partCounts.every((count, index) => count === actual.partCounts[index]);
 }
 
-export function measureTailHygiene(input: {
+type MeasurementInput = {
     messages: readonly MessageLike[];
     tags: readonly TagEntry[];
     /**
@@ -615,19 +690,69 @@ export function measureTailHygiene(input: {
     protectedTagNumbers: ReadonlySet<number>;
     /** Active tags whose drop is queued but not yet materialized into the rendered tail. */
     pendingDropTagNumbers?: ReadonlySet<number>;
-}): TailHygieneMeasurement {
+    protectedToolTags?: ReadonlySet<number>;
+    /** OpenCode 2 does not forward OpenCode 1's interrupted-error metadata. */
+    opencode2?: boolean;
+};
+
+interface ReplayMeasurement extends TailHygieneMeasurement {
+    messagePartStarts: number[];
+    toolOutputs: Array<Array<string | null>>;
+    toolOwners: Map<unknown, ToolPartIdentity>;
+    droppedToolOwners: Set<string>;
+}
+
+export function measureTailHygiene(input: MeasurementInput): TailHygieneMeasurement {
+    return measureWithReplay(input);
+}
+
+function measureWithReplay(
+    input: MeasurementInput,
+    replay?: BaselineMeasurementMemo,
+): ReplayMeasurement {
+    partJsonMemo.beginPass();
+    const projectPart = input.opencode2 ? providerVisiblePartForOpenCode2 : providerVisiblePart;
+    const views = new WeakMap<object, unknown>();
+    const excluded = (key: string, part: unknown): TailHygienePartMeasurement => {
+        let view = part !== null && typeof part === "object" ? views.get(part) : undefined;
+        if (view === undefined) {
+            view = projectPart(part);
+            if (part !== null && typeof part === "object") views.set(part, view);
+        }
+        return excludedSnapshot(key, view);
+    };
     const pendingDropTagNumbers = input.pendingDropTagNumbers ?? new Set<number>();
+    const unchanged = input.messages.map((message, index) => {
+        const previous = replay?.messages[index];
+        return previous !== undefined && sameReplayMessage(previous, message, projectPart);
+    });
     const toolIdentities = collectToolPartIdentities(input.messages);
     const attribution = buildTagAttribution({
         messages: input.messages,
         tags: input.tags,
         toolIdentities,
         protectedTagNumbers: input.protectedTagNumbers,
+        protectedToolTags: input.protectedToolTags,
+    });
+    const toolOutputs = input.messages.map((message, index) =>
+        message.parts.map((part, partIndex) =>
+            unchanged[index]
+                ? (replay?.measured.toolOutputs[index][partIndex] ?? null)
+                : isRecord(part)
+                  ? toolOutputText(part, `${messageIdentity(message, index)}\0${partIndex}\0output`)
+                  : null,
+        ),
+    );
+    const outputByPart = new Map<unknown, string | null>();
+    input.messages.forEach((message, index) => {
+        message.parts.forEach((part, partIndex) => {
+            outputByPart.set(part, toolOutputs[index][partIndex]);
+        });
     });
     const droppedToolOwners = new Set<string>();
     for (const [part, identity] of toolIdentities) {
         if (!isRecord(part)) continue;
-        const output = toolOutputText(part);
+        const output = outputByPart.get(part) ?? null;
         if (output !== null && isDropSentinel(output)) {
             droppedToolOwners.add(`${identity.ownerMessageId}\0${identity.callId}`);
         }
@@ -637,16 +762,82 @@ export function measureTailHygiene(input: {
     let t = 0;
     let u = 0;
     let newestMessagePartStart = 0;
+    const messagePartStarts: number[] = [];
     for (let messageIndex = 0; messageIndex < input.messages.length; messageIndex += 1) {
         const message = input.messages[messageIndex];
+        messagePartStarts.push(parts.length);
         if (messageIndex === input.messages.length - 1) newestMessagePartStart = parts.length;
         const messageKey = messageIdentity(message, messageIndex);
+        const priorMessage = replay?.messages[messageIndex];
+        // Content equality is exact, including historical edits through reused host
+        // objects. Tool ownership and paired sentinels are contextual, so validate
+        // them separately before borrowing this message's hashes and token counts.
+        const reusable =
+            unchanged[messageIndex] &&
+            priorMessage &&
+            message.parts.every((part, index) => {
+                const current = toolIdentities.get(part);
+                const prior = replay?.measured.toolOwners.get(priorMessage.parts[index]);
+                if (!current || !prior) return current === prior;
+                const currentKey = `${current.ownerMessageId}\0${current.callId}`;
+                const priorKey = `${prior.ownerMessageId}\0${prior.callId}`;
+                return (
+                    currentKey === priorKey &&
+                    droppedToolOwners.has(currentKey) ===
+                        replay?.measured.droppedToolOwners.has(priorKey)
+                );
+            });
+        if (reusable && replay) {
+            const start = replay.measured.messagePartStarts[messageIndex];
+            const end =
+                replay.measured.messagePartStarts[messageIndex + 1] ?? replay.measured.parts.length;
+            for (let index = start; index < end; index += 1) {
+                const prior = replay.measured.parts[index];
+                const partIndex = Number(prior.key.slice(messageKey.length + 1).split("\0")[0]);
+                const tag =
+                    prior.kind === "text"
+                        ? attribution.messageTags.get(`${message.info.id}:p${partIndex}`)
+                        : prior.kind === "file"
+                          ? attribution.messageTags.get(`${message.info.id}:file${partIndex}`)
+                          : prior.kind === "toolInput" || prior.kind === "toolOutput"
+                            ? attribution.toolTagsByPart.get(message.parts[partIndex])
+                            : undefined;
+                const protectedPart = tag ? attribution.protectedNumbers.has(tag.tagNumber) : false;
+                const queuedForDrop = tag ? pendingDropTagNumbers.has(tag.tagNumber) : false;
+                const uTokens =
+                    tag?.status === "active" &&
+                    !protectedPart &&
+                    !queuedForDrop &&
+                    prior.kind !== "excluded"
+                        ? prior.tokens
+                        : 0;
+                const measured =
+                    prior.tagNumber === (tag?.tagNumber ?? null) &&
+                    prior.tagStatus === (tag?.status ?? null) &&
+                    prior.protected === protectedPart &&
+                    prior.queuedForDrop === queuedForDrop &&
+                    prior.uTokens === uTokens
+                        ? prior
+                        : {
+                              ...prior,
+                              tagNumber: tag?.tagNumber ?? null,
+                              tagStatus: tag?.status ?? null,
+                              protected: protectedPart,
+                              queuedForDrop,
+                              uTokens,
+                          };
+                parts.push(measured);
+                t += measured.tokens;
+                u += measured.uTokens;
+            }
+            continue;
+        }
         const messageSynthetic = isSyntheticMessage(message);
         for (let partIndex = 0; partIndex < message.parts.length; partIndex += 1) {
             const part = message.parts[partIndex];
             const key = `${messageKey}\0${partIndex}`;
             if (messageSynthetic || isSyntheticPart(part) || !isRecord(part)) {
-                parts.push(excludedSnapshot(`${key}\0excluded`, part));
+                parts.push(excluded(`${key}\0excluded`, part));
                 continue;
             }
             const type = typeof part.type === "string" ? part.type : "";
@@ -656,14 +847,14 @@ export function measureTailHygiene(input: {
                 type === "redacted_thinking" ||
                 type === "signature"
             ) {
-                parts.push(excludedSnapshot(`${key}\0excluded`, part));
+                parts.push(excluded(`${key}\0excluded`, part));
                 continue;
             }
             if (type === "text") {
                 const rawContent = firstString(part, ["text", "content"]);
                 const content = rawContent === null ? null : stripChannel1ReminderSpans(rawContent);
                 if (!content || isDropSentinel(content)) {
-                    parts.push(excludedSnapshot(`${key}\0excluded`, part));
+                    parts.push(excluded(`${key}\0excluded`, part));
                     continue;
                 }
                 const tokens = memoizedTokens("text", content);
@@ -685,7 +876,7 @@ export function measureTailHygiene(input: {
             if (type === "file" || type.includes("image") || type === "source") {
                 const file = fileContentAndTokens(part);
                 if (!file.content || isDropSentinel(file.content)) {
-                    parts.push(excludedSnapshot(`${key}\0excluded`, part));
+                    parts.push(excluded(`${key}\0excluded`, part));
                     continue;
                 }
                 const tag = attribution.messageTags.get(`${message.info.id}:file${partIndex}`);
@@ -707,11 +898,11 @@ export function measureTailHygiene(input: {
             if (toolIdentity) {
                 const ownerKey = `${toolIdentity.ownerMessageId}\0${toolIdentity.callId}`;
                 if (droppedToolOwners.has(ownerKey)) {
-                    parts.push(excludedSnapshot(`${key}\0excluded`, part));
+                    parts.push(excluded(`${key}\0excluded`, part));
                     continue;
                 }
                 const tag = attribution.toolTagsByPart.get(part);
-                const inputText = toolInputText(part);
+                const inputText = toolInputText(part, `${key}\0input`);
                 if (inputText !== null) {
                     const tokens = memoizedTokens("toolInput", inputText);
                     const measured = snapshot({
@@ -727,11 +918,11 @@ export function measureTailHygiene(input: {
                     t += measured.tokens;
                     u += measured.uTokens;
                 }
-                const rawOutput = toolOutputText(part);
+                const rawOutput = outputByPart.get(part) ?? null;
                 if (rawOutput !== null) {
                     const output = stripChannel1ReminderSpans(rawOutput);
                     if (isDropSentinel(output)) {
-                        parts.push(excludedSnapshot(`${key}\0excludedOutput`, output));
+                        parts.push(excluded(`${key}\0excludedOutput`, output));
                     } else {
                         // Images the tool returned beside its text are billed as images.
                         const tokens =
@@ -754,11 +945,11 @@ export function measureTailHygiene(input: {
                     }
                 }
                 if (inputText === null && rawOutput === null) {
-                    parts.push(excludedSnapshot(`${key}\0excluded`, part));
+                    parts.push(excluded(`${key}\0excluded`, part));
                 }
                 continue;
             }
-            parts.push(excludedSnapshot(`${key}\0excluded`, part));
+            parts.push(excluded(`${key}\0excluded`, part));
         }
     }
 
@@ -768,6 +959,10 @@ export function measureTailHygiene(input: {
         contentSignature: contentSignature(parts),
         parts,
         newestMessagePartStart,
+        messagePartStarts,
+        toolOutputs,
+        toolOwners: toolIdentities,
+        droppedToolOwners,
     };
 }
 
@@ -906,47 +1101,87 @@ function sameReplayValue(before: unknown, after: unknown): boolean {
     return true;
 }
 
+// Strings are immutable: retain their values instead of copying large text/tool
+// bodies. Copy every mutable container so an in-place edit cannot poison replay.
+function copyReplayValue(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(copyReplayValue);
+    if (value !== null && typeof value === "object") {
+        const prototype = Object.getPrototypeOf(value);
+        if (prototype !== Object.prototype && prototype !== null) return structuredClone(value);
+        const copy: Record<string, unknown> = Object.create(prototype);
+        for (const key of Object.keys(value))
+            copy[key] = copyReplayValue((value as Record<string, unknown>)[key]);
+        return copy;
+    }
+    return value;
+}
+
 function sameNumbers(before: ReadonlySet<number>, after: ReadonlySet<number>): boolean {
     if (before.size !== after.size) return false;
     for (const number of before) if (!after.has(number)) return false;
     return true;
 }
 
+/**
+ * `left` is a snapshot made by {@link replaySnapshotParts}; `right` is a live
+ * message, compared through the same provider-visible view.
+ */
+function sameReplayMessage(
+    left: MessageLike,
+    right: MessageLike,
+    projectPart = providerVisiblePart,
+): boolean {
+    return (
+        left.info.id === right.info.id &&
+        left.info.role === right.info.role &&
+        left.info.summary === right.info.summary &&
+        sameReplayValue(left.parts, right.parts.map(projectPart))
+    );
+}
+
+/**
+ * The parts a replay snapshot keeps: what the provider sees of each part (see
+ * provider-visible-parts.ts), copied so a later in-place edit cannot change the
+ * snapshot. Nothing the measurement reads is left out.
+ */
+function replaySnapshotParts(
+    parts: readonly unknown[],
+    projectPart = providerVisiblePart,
+): unknown[] {
+    return copyReplayValue(parts.map(projectPart)) as unknown[];
+}
+
 function sameReplayMessages(
     before: readonly MessageLike[],
     after: readonly MessageLike[],
+    projectPart = providerVisiblePart,
 ): boolean {
     if (before.length !== after.length) return false;
     for (let index = 0; index < before.length; index += 1) {
         const left = before[index];
         const right = after[index];
-        if (
-            left.info.id !== right.info.id ||
-            left.info.role !== right.info.role ||
-            left.info.summary !== right.info.summary ||
-            !sameReplayValue(left.parts, right.parts)
-        )
-            return false;
+        if (!sameReplayMessage(left, right, projectPart)) return false;
     }
     return true;
 }
 
 interface BaselineMeasurementMemo {
+    opencode2: boolean;
     messages: readonly MessageLike[];
     tags: readonly TagEntry[];
     protectedTagNumbers: ReadonlySet<number>;
     pendingDropTagNumbers: ReadonlySet<number>;
-    measured: TailHygieneMeasurement;
+    measured: ReplayMeasurement;
     size: number;
 }
 
-// Keep at most eight copied message/tag inputs, bounded by an estimated 32 MiB.
+// Keep at most eight immutable message/tag snapshots, bounded by an estimated 128 MiB.
 // Recompute the measurement when message parts, tag ownership/status, protected
 // tag numbers, or queued drops change. Comparing copied values catches historical
 // edits through reused host objects. Only id/role/summary and parts affect token
 // accounting; unrelated host metadata is not part of this cache key.
 const baselineMeasurementMemo = new Map<TailHygienePartMeasurement[], BaselineMeasurementMemo>();
-const MAX_BASELINE_MEMO_SIZE = 32 * 1024 * 1024;
+const MAX_BASELINE_MEMO_SIZE = 128 * 1024 * 1024;
 let baselineMemoSize = 0;
 
 function retainBaselineMeasurement(
@@ -1013,26 +1248,43 @@ export function refreshTailHygieneBaseline(input: {
     tags: readonly TagEntry[];
     /** Canonical tag-number membership from persisted row mass and the floor snapshot. */
     protectedTagNumbers: ReadonlySet<number>;
+    protectedToolTags?: ReadonlySet<number>;
     pendingDropTagNumbers?: ReadonlySet<number>;
     cacheBusting: boolean;
+    protectedTools?: Readonly<Record<string, number>>;
     previous?: TailHygieneBaseline;
     /** Frozen decision ratios. They change only on an authorized bust. */
     calibration?: { toolsRatio: number; proseRatio: number };
     hygieneUnitsVersion?: number;
     now?: number;
+    opencode2?: boolean;
 }): TailHygieneBaseline {
+    const protectedToolsPolicy = adoptedProtectedToolsPolicy(
+        input.protectedTools,
+        input.previous?.protectedToolsPolicy,
+        input.cacheBusting,
+        !!input.previous,
+    );
+    const protectedToolTags = protectedToolTagNumbers(input.tags, protectedToolsPolicy);
+    input = {
+        ...input,
+        protectedToolTags,
+        protectedTagNumbers: new Set([...input.protectedTagNumbers, ...protectedToolTags]),
+    };
     const pendingDropTagNumbers = input.pendingDropTagNumbers ?? new Set<number>();
-    const cached = input.previous
+    const priorMemo = input.previous
         ? baselineMeasurementMemo.get(input.previous.baselineParts)
         : undefined;
+    const cached = priorMemo?.opencode2 === !!input.opencode2 ? priorMemo : undefined;
+    const projectPart = input.opencode2 ? providerVisiblePartForOpenCode2 : providerVisiblePart;
     const hit =
         !input.cacheBusting &&
         cached &&
-        sameReplayMessages(cached.messages, input.messages) &&
+        sameReplayMessages(cached.messages, input.messages, projectPart) &&
         sameReplayValue(cached.tags, input.tags) &&
         sameNumbers(cached.protectedTagNumbers, input.protectedTagNumbers) &&
         sameNumbers(cached.pendingDropTagNumbers, pendingDropTagNumbers);
-    const rawMeasured = hit ? cached.measured : measureTailHygiene(input);
+    const rawMeasured = hit ? cached.measured : measureWithReplay(input, cached);
     const frozenCalibration =
         !input.cacheBusting && input.previous
             ? {
@@ -1062,39 +1314,68 @@ export function refreshTailHygieneBaseline(input: {
     const memo = hit
         ? cached
         : {
-              messages: structuredClone(
-                  input.messages.map((message) => ({
-                      info: {
-                          id: message.info.id,
-                          role: message.info.role,
-                          summary: message.info.summary,
-                      },
-                      parts: message.parts,
-                  })),
+              opencode2: !!input.opencode2,
+              messages: input.messages.map((message, index) =>
+                  cached?.messages[index] &&
+                  sameReplayMessage(cached.messages[index], message, projectPart)
+                      ? cached.messages[index]
+                      : {
+                            info: {
+                                id: message.info.id,
+                                role: message.info.role,
+                                summary: message.info.summary,
+                            },
+                            parts: replaySnapshotParts(message.parts, projectPart),
+                        },
               ),
               tags: structuredClone(input.tags),
               protectedTagNumbers: new Set(input.protectedTagNumbers),
               pendingDropTagNumbers: new Set(pendingDropTagNumbers),
               measured: rawMeasured,
-              size: 2 * structuralSize(input.messages) + 512 * input.tags.length,
+              size:
+                  2 *
+                      structuralSize(
+                          input.messages.map(
+                              input.opencode2
+                                  ? providerVisibleMessageForOpenCode2
+                                  : providerVisibleMessage,
+                          ),
+                      ) +
+                  512 * input.tags.length,
           };
+    // The replay snapshot owns separate wrappers; associate contextual identities
+    // with those wrappers, not mutable host parts from the pass just served.
+    if (!hit) {
+        const owners = new Map<unknown, ToolPartIdentity>();
+        input.messages.forEach((message, index) => {
+            message.parts.forEach((part, partIndex) => {
+                const identity = rawMeasured.toolOwners.get(part);
+                if (identity) owners.set(memo.messages[index].parts[partIndex], identity);
+            });
+        });
+        rawMeasured.toolOwners = owners;
+    }
     const now = input.now ?? Date.now();
     const refrozen = (mismatch?: TailHygienePrefixMismatch): TailHygieneBaseline => {
         const frozen = freezeTailHygieneMeasurement(measured);
         retainBaselineMeasurement(frozen.baselineParts, memo);
-        return {
-            ...frozen,
-            hygieneUnitsVersion: frozenCalibration.hygieneUnitsVersion,
-            toolsRatio: frozenCalibration.toolsRatio,
-            proseRatio: frozenCalibration.proseRatio,
-            baselineGeneration: (input.previous?.baselineGeneration ?? 0) + 1,
-            computedAt: now,
-            evaluable: true,
-            generationInvalidated: false,
-            contentSignature: measured.contentSignature,
-            channel1PostReduceGrace: input.previous?.channel1PostReduceGrace,
-            lastPrefixMismatch: mismatch,
-        };
+        return rememberCurrentToolOutputCount(
+            {
+                ...frozen,
+                protectedToolsPolicy,
+                hygieneUnitsVersion: frozenCalibration.hygieneUnitsVersion,
+                toolsRatio: frozenCalibration.toolsRatio,
+                proseRatio: frozenCalibration.proseRatio,
+                baselineGeneration: (input.previous?.baselineGeneration ?? 0) + 1,
+                computedAt: now,
+                evaluable: true,
+                generationInvalidated: false,
+                contentSignature: measured.contentSignature,
+                channel1PostReduceGrace: input.previous?.channel1PostReduceGrace,
+                lastPrefixMismatch: mismatch,
+            },
+            measured,
+        );
     };
     if (input.cacheBusting || !input.previous) return refrozen();
 
@@ -1120,15 +1401,19 @@ export function refreshTailHygieneBaseline(input: {
         // outputs extend the measured tail, include outputs that have aged out of protection.
         if (part.kind !== "toolOutput" || !part.protected) turnDeltaU += part.uTokens;
     }
-    return {
-        ...input.previous,
-        turnDeltaU,
-        turnDeltaT,
-        evaluable: true,
-        generationInvalidated: false,
-        contentSignature: measured.contentSignature,
-        lastPrefixMismatch: undefined,
-    };
+    return rememberCurrentToolOutputCount(
+        {
+            ...input.previous,
+            protectedToolsPolicy,
+            turnDeltaU,
+            turnDeltaT,
+            evaluable: true,
+            generationInvalidated: false,
+            contentSignature: measured.contentSignature,
+            lastPrefixMismatch: undefined,
+        },
+        measured,
+    );
 }
 
 export function effectiveTailHygiene(
@@ -1144,6 +1429,7 @@ export function assertTailHygieneContentUnchanged(input: {
     tags: readonly TagEntry[];
     protectedTagNumbers: ReadonlySet<number>;
     expectedSignature: string;
+    opencode2?: boolean;
 }): void {
     const actual = measureTailHygiene(input).contentSignature;
     if (actual !== input.expectedSignature) {
@@ -1152,3 +1438,14 @@ export function assertTailHygieneContentUnchanged(input: {
         );
     }
 }
+
+/** Opt-in diagnostics must not add a second hashing/token walk to shipped passes. */
+export function assertTailHygieneContentUnchangedIfEnabled(
+    input: Parameters<typeof assertTailHygieneContentUnchanged>[0],
+): void {
+    if (process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS === "1") {
+        assertTailHygieneContentUnchanged(input);
+    }
+}
+
+import { adoptedProtectedToolsPolicy } from "../../features/magic-context/reclaim-protection";

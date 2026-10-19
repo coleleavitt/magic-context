@@ -65,14 +65,15 @@ export interface ResolvedBoundaryContext {
     cacheNamespace: string;
     createdAt?: number;
     /**
-     * Durable per-message token totals (sum of the message's active tag
+     * Durable per-message token totals (sum of the message's all-status tag
      * token_counts), keyed by real message id. When present, the boundary's
      * token index reads these instead of re-tokenizing the raw session — the
      * restart-durable fast path. A message missing here (or with a NULL-count
-     * tag) falls back to live tokenization. Built once in resolveBoundaryContext
-     * from the tag store; omitted (→ all-live) when the caller has no tag store.
+     * tag) falls back to live tokenization. Explicit maps support callers with
+     * their own token source; store-backed callers load only the requested owners.
      */
     storedTokenTotals?: Map<string, number>;
+    storedTokenTotalsForMessages?: (messageIds: string[]) => Map<string, number> | undefined;
     calibration?: ReturnType<typeof sessionDecisionCalibration>;
 }
 
@@ -503,12 +504,16 @@ export function applyHeadCap(args: {
         },
     );
     diagnostics.completedRefence.to = end;
-    diagnostics.eligibleEnd = end <= offset ? offset : Math.min(end, protectedTailStart);
+    // A component beginning before offset may fence forward past the protected
+    // tail. Clamping it back would split the same arc again. There is no valid
+    // head in that interval, so wait for a later pass instead.
+    if (end > protectedTailStart) end = offset;
+    diagnostics.eligibleEnd = end <= offset ? offset : end;
     args.observeDiagnostics?.(diagnostics);
     if (end <= offset && offset < protectedTailStart) {
         return { eligibleEndOrdinal: offset, oversizeAtomicUnit };
     }
-    return { eligibleEndOrdinal: Math.min(end, protectedTailStart), oversizeAtomicUnit };
+    return { eligibleEndOrdinal: end, oversizeAtomicUnit };
 }
 
 export function resolveProtectedTailBoundary(
@@ -524,7 +529,8 @@ export function resolveProtectedTailBoundary(
         Math.max(1, offset - 1),
         absoluteMessageCount,
     );
-    const storedTotals = ctx.storedTokenTotals;
+    const storedTotals =
+        ctx.storedTokenTotalsForMessages?.(messages.map((m) => m.id)) ?? ctx.storedTokenTotals;
     const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
         providerShapeVersion: ctx.providerShapeVersion,
         cacheNamespace: ctx.cacheNamespace,
@@ -733,6 +739,13 @@ export function resolveProtectedTailBoundary(
     // message. On OpenCode 2 that is often an instruction-update row, which the
     // host never serves by id; keep such rows in the protected tail.
     protectedTailStart = retreatPastHostUnservedRows(messages, protectedTailStart, offset);
+    // The live-user floor and host-row retreat run after the initial tool fence.
+    // Either can land inside a parallel tool batch. Re-fence toward older history
+    // so neither the live prompt nor any result is pulled into the eligible head.
+    protectedTailStart = Math.max(
+        offset,
+        fenceBoundaryForCompletedToolArcs(protectedTailStart, arcs, 1),
+    );
     const perRunCap = selectPerRunCap({
         usagePercentage,
         N: scaledN,
@@ -752,10 +765,10 @@ export function resolveProtectedTailBoundary(
         capTokens: perRunCap,
         recentOpenArcCutoff,
     });
-    const eligibleEndOrdinal = retreatPastHostUnservedRows(
-        messages,
-        head.eligibleEndOrdinal,
+    const servedEndOrdinal = retreatPastHostUnservedRows(messages, head.eligibleEndOrdinal, offset);
+    const eligibleEndOrdinal = Math.max(
         offset,
+        fenceBoundaryForCompletedToolArcs(servedEndOrdinal, arcs, 1),
     );
     const rawRangeFingerprint = computeRawRangeFingerprint(messages, offset, eligibleEndOrdinal);
     return {
@@ -784,7 +797,7 @@ export function resolveProtectedTailBoundary(
         cacheNamespace: ctx.cacheNamespace,
         createdAt,
         rawRangeFingerprint,
-        trueRawEligibleTokens: index.rangeTokens(offset, protectedTailStart),
+        trueRawEligibleTokens: index.rangeTokens(offset, eligibleEndOrdinal),
         oversizeAtomicUnit: head.oversizeAtomicUnit,
         boundaryReason,
         diagnostics: boundaryDiagnostics({
@@ -880,21 +893,26 @@ export function resolveBoundaryContext(args: {
     // a cold pass (the 16s→ms win). Best-effort: a store failure just falls back
     // to all-live tokenization.
     const calibration = sessionDecisionCalibration(args.db, args.sessionId);
-    let storedTokenTotals: Map<string, number> | undefined;
-    try {
-        storedTokenTotals = getAllStatusTagTokenTotalsFlat(
-            args.db,
-            args.sessionId,
-            args.taggerFloor ?? 0,
-            calibration,
-        ).totals;
-    } catch (error) {
-        sessionLog(
-            args.sessionId,
-            "protected-tail stored-token map unavailable (live fallback):",
-            error,
-        );
-    }
+    // Only messages above the compartment boundary enter the token index. Load
+    // their owners by index, rather than materializing compacted tag history.
+    const storedTokenTotalsForMessages = (messageIds: string[]) => {
+        try {
+            return getAllStatusTagTokenTotalsFlat(
+                args.db,
+                args.sessionId,
+                args.taggerFloor ?? 0,
+                calibration,
+                messageIds,
+            ).totals;
+        } catch (error) {
+            sessionLog(
+                args.sessionId,
+                "protected-tail stored-token map unavailable (live fallback):",
+                error,
+            );
+            return undefined;
+        }
+    };
     return {
         sessionId: args.sessionId,
         mode: args.mode,
@@ -911,7 +929,7 @@ export function resolveBoundaryContext(args: {
         emergencyTailScale: args.emergencyTailScale,
         providerShapeVersion: args.providerShapeVersion ?? "opencode-v1",
         cacheNamespace: args.cacheNamespace ?? `opencode:${args.sessionId}`,
-        storedTokenTotals,
+        storedTokenTotalsForMessages,
         calibration,
     };
 }
@@ -939,14 +957,16 @@ export function resolveWrapupProtectedTailBoundary(
         Math.max(1, offset - 1),
         absoluteMessageCount,
     );
+    const storedTotals =
+        ctx.storedTokenTotalsForMessages?.(messages.map((m) => m.id)) ?? ctx.storedTokenTotals;
     const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
         providerShapeVersion: ctx.providerShapeVersion,
         cacheNamespace: ctx.cacheNamespace,
         calibration: ctx.calibration,
         absoluteMessageCount,
-        storedTotalForMessage: ctx.storedTokenTotals
+        storedTotalForMessage: storedTotals
             ? (m) => {
-                  const value = ctx.storedTokenTotals?.get(m.id);
+                  const value = storedTotals?.get(m.id);
                   return value === undefined ? null : value;
               }
             : undefined,
@@ -1125,6 +1145,7 @@ export function hasProtectedEligibleHead(snapshot: ProtectedTailBoundarySnapshot
 
 export function hasRunnableCompartmentWindow(snapshot: ProtectedTailBoundarySnapshot): boolean {
     if (snapshot.offset >= snapshot.protectedTailStart) return false;
+    if (snapshot.eligibleEndOrdinal <= snapshot.offset) return false;
     const forceMaterializationPercentage = escalationBands(
         snapshot.executeThresholdPercentage,
     ).forceMaterializationPercentage;
@@ -1137,26 +1158,13 @@ export function hasRunnableCompartmentWindow(snapshot: ProtectedTailBoundarySnap
     return snapshot.eligibleEndOrdinal > snapshot.offset;
 }
 
-export function validateBoundarySnapshot(args: {
-    db: Database;
-    snapshot: ProtectedTailBoundarySnapshot;
-    currentContextLimit?: number;
-}): BoundarySnapshotValidationResult {
-    const { snapshot } = args;
-    if (args.currentContextLimit && args.currentContextLimit !== snapshot.contextLimit) {
-        return {
-            ok: false,
-            reason: "model_or_limit_changed",
-            detail: `context limit changed from ${snapshot.contextLimit} to ${args.currentContextLimit}`,
-        };
-    }
-    const currentRawMessageCount = getRawSessionMessageOrdinalCount(snapshot.sessionId);
-    if (snapshot.rawMessageCountAtTrigger > currentRawMessageCount) {
-        return { ok: false, reason: "stale_snapshot", detail: "raw message count shrank" };
-    }
-    const idAt = (ordinal: number): string | null =>
-        readRawSessionMessageIdOrdinalsForRange(snapshot.sessionId, ordinal, ordinal).keys().next()
-            .value ?? null;
+/**
+ * The ordinals whose message ids {@link validateBoundarySnapshot} compares with
+ * the snapshot, with the snapshot's expected id and a label for the log.
+ */
+export function boundarySnapshotIdChecks(
+    snapshot: ProtectedTailBoundarySnapshot,
+): Array<[number, string | null, string]> {
     const checks: Array<[number, string | null, string]> = [
         [snapshot.offset, snapshot.offsetMessageId, "offset"],
         [snapshot.rawMessageCountAtTrigger, snapshot.rawLastMessageIdAtTrigger, "last"],
@@ -1175,7 +1183,46 @@ export function validateBoundarySnapshot(args: {
             "eligibleEnd",
         ]);
     }
-    for (const [ordinal, expected, label] of checks) {
+    return checks;
+}
+
+export function validateBoundarySnapshot(args: {
+    db: Database;
+    snapshot: ProtectedTailBoundarySnapshot;
+    currentContextLimit?: number;
+    /**
+     * The current message id at every ordinal {@link boundarySnapshotIdChecks}
+     * lists, read exactly for this validation on a worker thread so the thread
+     * that serves requests does not scan the session. Without it the ids are
+     * read here, synchronously.
+     */
+    exactIds?: ReadonlyMap<number, string | null>;
+}): BoundarySnapshotValidationResult {
+    const { snapshot, exactIds } = args;
+    if (args.currentContextLimit && args.currentContextLimit !== snapshot.contextLimit) {
+        return {
+            ok: false,
+            reason: "model_or_limit_changed",
+            detail: `context limit changed from ${snapshot.contextLimit} to ${args.currentContextLimit}`,
+        };
+    }
+    const currentRawMessageCount = getRawSessionMessageOrdinalCount(snapshot.sessionId);
+    if (snapshot.rawMessageCountAtTrigger > currentRawMessageCount) {
+        return { ok: false, reason: "stale_snapshot", detail: "raw message count shrank" };
+    }
+    const idAt = (ordinal: number): string | null => {
+        if (!exactIds)
+            return (
+                readRawSessionMessageIdOrdinalsForRange(snapshot.sessionId, ordinal, ordinal)
+                    .keys()
+                    .next().value ?? null
+            );
+        const id = exactIds.get(ordinal);
+        if (id === undefined)
+            throw new Error(`boundary validation was given no exact id for ordinal ${ordinal}`);
+        return id;
+    };
+    for (const [ordinal, expected, label] of boundarySnapshotIdChecks(snapshot)) {
         if (expected !== idAt(ordinal)) {
             return {
                 ok: false,

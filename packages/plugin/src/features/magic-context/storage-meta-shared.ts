@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { getHarness } from "../../shared/harness";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
-import type { Database } from "../../shared/sqlite";
+import { type Database, prepareCachedStatement, type Statement } from "../../shared/sqlite";
 import type { SessionMeta } from "./types";
 
 export interface SessionMetaRow {
@@ -363,7 +363,22 @@ export function getDefaultSessionMeta(sessionId: string): SessionMeta {
     };
 }
 
-export function ensureSessionMetaRow(db: Database, sessionId: string): void {
+const sessionMetaExistsStatements = new WeakMap<Database, Statement>();
+
+export function ensureSessionMetaRow(
+    db: Database,
+    sessionId: string,
+    initialIsSubagent = false,
+): void {
+    let exists = sessionMetaExistsStatements.get(db);
+    if (!exists) {
+        exists = prepareCachedStatement(db, "SELECT 1 FROM session_meta WHERE session_id = ?");
+        sessionMetaExistsStatements.set(db, exists);
+    }
+    // Most callers already have a row. Even INSERT OR IGNORE takes the writer
+    // lock, so a read must not wait on sibling hosts merely to ensure it exists.
+    // Keep INSERT OR IGNORE for the race where another host creates it first.
+    if (exists.get(sessionId)) return;
     const defaults = getDefaultSessionMeta(sessionId);
     // Note-nudge persistence columns rely on session_meta defaults and are updated
     // through storage-meta-persisted helpers, not SessionMeta writes.
@@ -378,7 +393,7 @@ export function ensureSessionMetaRow(db: Database, sessionId: string): void {
         defaults.lastNudgeTokens,
         defaults.lastNudgeBand ?? "",
         defaults.lastTransformError ?? "",
-        defaults.isSubagent ? 1 : 0,
+        initialIsSubagent ? 1 : 0,
         defaults.lastContextPercentage,
         defaults.lastInputTokens,
         defaults.observedSafeInputTokens,

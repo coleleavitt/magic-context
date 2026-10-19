@@ -1,5 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { CTX_REDUCE_DESCRIPTION } from "./constants";
+import { readFileSync } from "node:fs";
+import { CTX_REDUCE_DESCRIPTION, formatCtxReduceReply } from "./constants";
+
+interface ReplyCase {
+    label: string;
+    stamped: number;
+    self_stamps: number;
+    expected: string;
+}
 
 describe("ctx-reduce constants", () => {
     //#given
@@ -19,5 +27,17 @@ describe("ctx-reduce constants", () => {
             expect(CTX_REDUCE_DESCRIPTION).not.toContain("gone forever");
             expect(CTX_REDUCE_DESCRIPTION).not.toContain("Remove entirely");
         });
+    });
+
+    it("matches the shared cross-runtime ctx_reduce reply cases", () => {
+        const cases = JSON.parse(
+            readFileSync(new URL("./reply-cases.json", import.meta.url), "utf8"),
+        ) as ReplyCase[];
+        for (const replyCase of cases) {
+            expect(
+                formatCtxReduceReply(replyCase.stamped, replyCase.self_stamps),
+                replyCase.label,
+            ).toBe(replyCase.expected);
+        }
     });
 });

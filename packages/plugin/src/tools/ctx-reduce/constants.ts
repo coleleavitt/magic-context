@@ -4,3 +4,18 @@ Stamp: file reads, search results and tool outputs the work ahead no longer need
 Keep: user messages (never stamp one for its directive), your own conversation text, unresolved errors, raw evidence you haven't extracted yet, and outputs whose exact wording may still matter.
 
 Look at each tag before stamping it; never blanket-stamp a range like "1-50". Many small targeted stamps beat one sweep. \`drop\` accepts "3-5", "1,2,9", "1-5,8,12-15".`;
+
+export function formatCtxReduceReply(stampedCount: number, selfStampCount = 0): string {
+    const parts: string[] = [];
+    if (stampedCount > 0) {
+        parts.push(`${stampedCount} tag${stampedCount === 1 ? "" : "s"} stamped.`);
+    }
+    if (selfStampCount > 0) {
+        parts.push(
+            selfStampCount === 1
+                ? "1 was a ctx_reduce call; leave those alone, they are cleaned up automatically."
+                : `${selfStampCount} were ctx_reduce calls; leave those alone, they are cleaned up automatically.`,
+        );
+    }
+    return parts.join(" ");
+}

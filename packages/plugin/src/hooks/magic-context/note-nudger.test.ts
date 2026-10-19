@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, setSystemTime } from "bun:test";
 import {
     appendNoteNudgeAnchor,
     getNoteNudgeAnchors,
@@ -12,11 +12,13 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     clearNoteNudgeState,
     clearNoteNudgeTriggerOnly,
+    getNoteNudgeCooldownCountForTest,
     getNoteNudgeText,
     getStickyNoteNudge,
     markNoteNudgeDelivered,
     onNoteTrigger,
     peekNoteNudgeText,
+    recordNoteNudgeDeliveryTime,
     resetNoteNudgeCooldownOnly,
 } from "./note-nudger";
 
@@ -100,6 +102,46 @@ function getPersistedRow(db: Database, sessionId: string) {
 }
 
 describe("note-nudger", () => {
+    it("acknowledges a wrapped unavailable notice once across turns and restarts", () => {
+        const db = makeDb();
+        const sessionId = "ses-unavailable-once";
+        const notice = addNote(db, "session", {
+            sessionId,
+            content:
+                "Smart note #42 cannot be checked.\nCondition: CI fails\nReason: dry-run failed: Error: HTTP request failed with status 403\nRepair the condition.",
+        });
+        onNoteTrigger(db, sessionId, "historian_complete");
+        expect(peekNoteNudgeText(db, sessionId, "u-1")).toBeNull();
+        const text = peekNoteNudgeText(db, sessionId, "u-2")!;
+        expect(text).toContain("Smart note check unavailable");
+        const wrapped = `\n\n<instruction name="deferred_notes">${text}</instruction>`;
+        // A failed placement must not consume the notice.
+        appendNoteNudgeAnchor(db, sessionId, "u-conflict", "another reminder");
+        expect(markNoteNudgeDelivered(db, sessionId, wrapped, "u-conflict").ok).toBe(false);
+        expect(db.prepare("SELECT status FROM notes WHERE id=?").get(notice.id)).toEqual({
+            status: "active",
+        });
+        expect(markNoteNudgeDelivered(db, sessionId, wrapped, "u-2").ok).toBe(true);
+        expect(db.prepare("SELECT status FROM notes WHERE id=?").get(notice.id)).toEqual({
+            status: "dismissed",
+        });
+        clearNoteNudgeState(db, sessionId);
+        for (let turn = 3; turn < 9; turn++) {
+            onNoteTrigger(db, sessionId, "todos_complete");
+            expect(peekNoteNudgeText(db, sessionId, `u-${turn}`)).toBeNull();
+            expect(peekNoteNudgeText(db, sessionId, `u-${turn}-next`)).toBeNull();
+        }
+        // A new condition failure is a new state and can notify again.
+        addNote(db, "session", {
+            sessionId,
+            content:
+                "Smart note #42 cannot be checked.\nCondition: release appears\nReason: inaccessible source",
+        });
+        onNoteTrigger(db, sessionId, "historian_complete");
+        expect(peekNoteNudgeText(db, sessionId, "u-new")).toBeNull();
+        expect(peekNoteNudgeText(db, sessionId, "u-new-next")).toContain("inaccessible source");
+    });
+
     it("persists trigger deferral and sticky delivery state in session_meta", () => {
         const db = makeDb();
         addNote(db, "session", { sessionId: "ses-trigger", content: "Follow up later." });
@@ -337,5 +379,26 @@ describe("note-nudger", () => {
             { messageId: "m1", text: "one" },
             { messageId: "m2", text: "two" },
         ]);
+    });
+
+    it("drops cooldown entries once their window has passed instead of keeping one per session forever", () => {
+        // Far ahead of the real clock, so entries other tests left behind count as expired.
+        const start = new Date("2100-01-01T00:00:00Z").getTime();
+        try {
+            setSystemTime(start);
+            for (let index = 0; index < 50; index += 1) {
+                recordNoteNudgeDeliveryTime(`ses-cooldown-prune-${index}`);
+            }
+            expect(getNoteNudgeCooldownCountForTest()).toBeGreaterThanOrEqual(50);
+
+            // Sixteen minutes later every earlier window has closed, so the next
+            // delivery leaves only its own entry behind.
+            setSystemTime(start + 16 * 60 * 1000);
+            recordNoteNudgeDeliveryTime("ses-cooldown-prune-late");
+            expect(getNoteNudgeCooldownCountForTest()).toBe(1);
+        } finally {
+            setSystemTime();
+            resetNoteNudgeCooldownOnly("ses-cooldown-prune-late");
+        }
     });
 });

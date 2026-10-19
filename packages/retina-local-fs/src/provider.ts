@@ -170,8 +170,13 @@ async function evaluatePredicate(
                 "--verify",
                 `${predicate.sha}^{commit}`,
             ]);
+            // Revalidate both refs even on a quiet poll: the base may have been
+            // deleted or moved. An unchanged tip cannot emit an event, so only
+            // pay for ancestry when a new tip could actually be reported.
             const isAfter =
-                currentSha !== baseSha && (await gitIsAncestor(pathAtUse, baseSha, currentSha));
+                previous?.state !== currentSha &&
+                currentSha !== baseSha &&
+                (await gitIsAncestor(pathAtUse, baseSha, currentSha));
             return {
                 state: currentSha,
                 occurrence: previous?.occurrence ?? 0,

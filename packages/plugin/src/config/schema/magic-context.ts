@@ -6,7 +6,9 @@ import type {
     AGENTIC_DREAM_TASKS,
     DreamTaskName,
 } from "../../features/magic-context/dreamer/task-registry";
+import { toolTemplateError } from "../../shared/historian-tool-template";
 import { isValidPromptSurfaceModelKey } from "../../shared/prompt-surface";
+import { DEFAULT_PROTECTED_TOOLS, mergeProtectedTools } from "../../shared/protected-tools-policy";
 import { AgentOverrideConfigSchema } from "./agent-overrides";
 
 export const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE = 65;
@@ -617,6 +619,8 @@ export const DreamTasksSchema = z
         ),
         "review-user-memories": ReviewUserMemoriesTaskConfigSchema.default(() =>
             ReviewUserMemoriesTaskConfigSchema.parse(defaultTaskConfig("review-user-memories")),
+        ).describe(
+            "Promote recurring user observations into the <user-profile> block. A non-empty schedule also makes the historian collect user observations, but only while the dreamer is runnable (dreamer.disable not true); collection and review follow that one gate and do not depend on memory.enabled.",
         ),
         "promote-primers": PromotePrimersTaskConfigSchema.default(() =>
             PromotePrimersTaskConfigSchema.parse(defaultTaskConfig("promote-primers")),
@@ -645,6 +649,15 @@ const AgentMetadataSchema = AgentOverrideConfigSchema.pick({
 
 /** Combined dreamer metadata plus independent strict execution blocks. */
 export const DreamerConfigSchema = AgentMetadataSchema.extend({
+    // Its own node rather than the one shared with the historian through
+    // AgentMetadataSchema: `dreamer.disable` is a live-reload key and the
+    // historian's is not, and the live marker is set on the schema node.
+    disable: z
+        .boolean()
+        .optional()
+        .describe(
+            "Disable the dreamer: no scheduled or manual dream task runs. Also turns off smart notes (ctx_note drops surface_condition even with smart_notes.enabled true) and the historian's collection of user observations for review-user-memories. dreamer.inject_docs still applies.",
+        ),
     runner: z
         .enum(["broca", "host"])
         .optional()
@@ -659,7 +672,7 @@ export const DreamerConfigSchema = AgentMetadataSchema.extend({
         .boolean()
         .default(true)
         .describe(
-            "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)",
+            "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true). Not a dreamer setting despite its place under dreamer: it applies on every host, also with dreamer.disable true.",
         ),
 });
 export type DreamerConfig = z.infer<typeof DreamerConfigSchema>;
@@ -669,6 +682,21 @@ export type DreamerConfig = z.infer<typeof DreamerConfigSchema>;
  * the strict opencode, pi, and omp blocks; two_pass and disallowed_tools stay here.
  */
 export const HistorianConfigSchema = AgentMetadataSchema.extend({
+    expand_tools: z
+        .record(
+            z.string(),
+            z.union([
+                z.string().superRefine((value, ctx) => {
+                    const error = toolTemplateError(value);
+                    if (error) ctx.addIssue({ code: "custom", message: error });
+                }),
+                z.literal(false),
+            ]),
+        )
+        .optional()
+        .describe(
+            'Readable historian tool expansions, keyed by exact host tool name. Templates override built-in defaults; false disables an expansion. Supports ${input.path}, ${output.path}, bare ${output}, array [N], [*].field, .each("${field}"), .join("separator"), .count and final .truncate(N). Missing fields are empty. Historian text and lists have no implicit caps; explicit .truncate(N) keeps complete sentences and marks omitted characters, or emits only the marker if no sentence fits. When the ctx_expand history-recovery tool is called in verbose mode, its tool-call previews retain their original built-in templates and limits (300 characters per placeholder, 10 list elements, 1000 characters per expansion). Valid in user and project config; never changes the wire or default ctx_expand transcript.',
+        ),
     opencode: OpenCodeHarnessBlockSchema.optional(),
     pi: PiHarnessBlockSchema.optional(),
     omp: OmpHarnessBlockSchema.optional(),
@@ -777,7 +805,7 @@ const BaseEmbeddingConfigSchema = z
             .enum(["auto", "native", "wasm"])
             .default("auto")
             .describe(
-                "Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Inference runs in a dedicated worker. On Bun before 1.4.0, even explicit 'native' uses WASM because native worker teardown can crash the process. Set 'wasm' to avoid loading the native addon on newer hosts too.",
+                "Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Inference runs in a dedicated worker after disabling POSIX telemetry in the native process environment. Compiled Bun hosts and hosts without a verified in-process opt-out use a subprocess instead. Windows native ONNX emits OS-controlled ETW diagnostics, not direct uploads. On Bun before 1.4.0, even explicit 'native' uses WASM because native worker teardown can crash the process. Set 'wasm' to avoid loading the native addon on newer hosts too.",
             ),
         local_dtype: z
             .enum([
@@ -902,12 +930,14 @@ export interface ShadowEmbeddingConfig {
 
 export interface MuralConfig {
     enabled: boolean;
-    /** The CUE COMPRESSOR model for the compress-cues dreamer task (the mural is
-     *  now rendered deterministically, so this no longer names an author model). */
-    model?: string;
+    /** Deprecated and ignored: compress-cues takes its model from each
+     *  harness's dreamer settings, like every other dreamer task. */
+    model?: unknown;
 }
 
 export interface MagicContextConfig {
+    /** The loader sets this to distinguish an explicit `5m` from the built-in default; users do not configure it. */
+    cacheTtlConfigured?: boolean;
     enabled: boolean;
     /** User-level setting that lets a session in the canonical home directory use project memory. */
     allow_home_project: boolean;
@@ -926,6 +956,8 @@ export interface MagicContextConfig {
     historian?: HistorianConfig;
     dreamer?: DreamerConfig;
     smart_notes: {
+        /** Enable smart-note authoring and checks for the user; read at process startup. */
+        enabled: boolean;
         /** Flip ownership of authoring-compiled conditions from dreamer to retina. */
         retina_handoff: boolean;
     };
@@ -934,8 +966,8 @@ export interface MagicContextConfig {
     prompt_surface: PromptSurfaceConfig;
     /** User-only output-token reservation override. Zero disables reservation. */
     output_reserve?: number | { default: number; [modelKey: string]: number };
-    /** User-only model metadata inputs. */
-    models?: { window_overlay_path?: string };
+    /** Deprecated user-only window metadata path; parsed only so loaders can warn and ignore it. */
+    models?: { window_overlay_path?: unknown };
     /** TUI toast lifetime in milliseconds for Magic Context notifications. Default: 5000. */
     toast_duration_ms?: number;
     execute_threshold_percentage: number | { default: number; [modelKey: string]: number };
@@ -945,7 +977,9 @@ export interface MagicContextConfig {
     execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
     protected_tokens?: number;
     protected_tags?: number;
-    clear_reasoning_age: number;
+    protected_tools: Record<string, number>;
+    clear_reasoning_age?: unknown;
+    keep_reasoning_tokens?: number | Record<string, number>;
     history_budget_percentage: number;
     historian_timeout_ms: number;
     commit_cluster_trigger: {
@@ -1028,7 +1062,8 @@ export interface MagicContextConfig {
      *  on its own; when off, the messages sent to the model are byte-identical to
      *  the age-based-only behavior. Experimental, opt-in, default off until cache
      *  stability is proven. */
-    smart_drops: boolean;
+    /** Deprecated and ignored: supersession reclaim is always on. */
+    smart_drops?: unknown;
     /**
      * Age-tier caveman compression for long user/assistant text parts.
      * Graduated from `experimental.caveman_text_compression`; opt-in, default off.
@@ -1101,13 +1136,12 @@ export const MagicContextConfigSchema = z
             .object({
                 enabled: z.boolean().default(false),
                 model: z
-                    .string()
-                    .trim()
-                    .min(1)
+                    .unknown()
                     .optional()
                     .describe(
-                        "Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model).",
-                    ),
+                        "Deprecated: ignored. compress-cues now uses the dreamer model for each harness, like every other dreamer task; override it with dreamer.opencode.tasks.compress-cues.model (or the pi/omp equivalent). Remove this key; it no longer does anything.",
+                    )
+                    .meta({ deprecated: true }),
             })
             .default({ enabled: false })
             .describe(
@@ -1160,10 +1194,16 @@ export const MagicContextConfigSchema = z
             "Historian metadata plus independent strict OpenCode, Pi, and OMP execution blocks. Retained metadata stays at historian; model, fallback_models, variant, and thinking_level belong only in historian.opencode, historian.pi, or historian.omp.",
         ),
         dreamer: DreamerConfigSchema.optional().describe(
-            "Dreamer metadata and scheduling plus independent strict OpenCode, Pi, and OMP execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block.",
+            "Dreamer metadata and scheduling plus independent strict OpenCode, Pi, and OMP execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block. Each task follows the setting it serves: memory tasks need memory.enabled, evaluate-smart-notes needs smart_notes.enabled, review-user-memories needs its schedule, maintain-docs only a runnable dreamer.",
         ),
         smart_notes: z
             .object({
+                enabled: z
+                    .boolean()
+                    .default(true)
+                    .describe(
+                        "Enable smart-note authoring and condition evaluation. Needs a runnable dreamer, which evaluates the conditions: with dreamer.disable true (or no dreamer block) ctx_note offers no surface_condition whatever this says. User-level only: tool definitions are process-wide. Changes require a host restart and rebuild each session's cached prompt once. Pending notes remain stored and unchecked; already-ready notes still surface.",
+                    ),
                 retina_handoff: z
                     .boolean()
                     .default(false)
@@ -1171,13 +1211,13 @@ export const MagicContextConfigSchema = z
                         "When true, dreamer skips smart notes whose surface conditions compiled to retina provider configs at authoring time. Default false keeps both paths active until the retina consumer is deployed.",
                     ),
             })
-            .default({ retina_handoff: false })
+            .default({ enabled: true, retina_handoff: false })
             .describe("Smart-note ownership transition controls."),
         cache_ttl: z
             .union([z.string(), z.object({ default: z.string() }).catchall(z.string())])
             .default("5m")
             .describe(
-                'How long Magic Context assumes the provider\'s cached prefix stays valid. This is MC\'s own deferral gate — it does not change the provider\'s actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard). Explicit per-model entries win; otherwise GPT-5.6 and later (including gpt-6*, through any provider prefix) use a built-in 30m lifetime before the object default or 5m fallback. An unset or global "5m" opts into built-in defaults; any other global string is an explicit policy and wins. Policy is frozen per session, including across restarts; a model switch resolves against that frozen policy. /ctx-status shows the effective value and source. OpenAI documents at least 30 minutes since the latest write or reuse: https://developers.openai.com/api/docs/guides/prompt-caching (Cache lifetime and Summary of model differences). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
+                'How long Magic Context assumes the provider\'s cached prefix stays valid. This is MC\'s own deferral gate — it does not change the provider\'s actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard, then default). User and project settings, including an explicit "5m" or object default, apply on the next pass. Only built-in defaults are frozen per session, including across restarts: when unset, GPT-5.6 and later (including gpt-6*, through any provider prefix) use 30m, other models use 5m. /ctx-status shows the effective TTL and whether it comes from your config or a frozen built-in default. Editing the TTL does not itself rewrite prompt bytes; a lowered TTL rebuilds only after normal idle expiry. OpenAI documents at least 30 minutes since the latest write or reuse: https://developers.openai.com/api/docs/guides/prompt-caching (Cache lifetime and Summary of model differences). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
             ),
         prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe(
             "Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. OpenCode 1.x, Pi, and OMP register tool descriptions once per process (they follow the default preset). OpenCode 2 rewrites the five ctx_* descriptions per request from the draft model.",
@@ -1193,12 +1233,16 @@ export const MagicContextConfigSchema = z
             ),
         models: z
             .object({
-                window_overlay_path: z.string().trim().min(1).optional(),
+                window_overlay_path: z
+                    .unknown()
+                    .optional()
+                    .describe(
+                        "Deprecated: ignored. Fusiform no longer publishes window-overlay data, so this setting no longer changes model window geometry. Remove this key.",
+                    )
+                    .meta({ deprecated: true }),
             })
             .optional()
-            .describe(
-                "User-only Fusiform window-overlay settings. The path defaults to <dataDir>/fusiform/window-overlay.json.",
-            ),
+            .describe("Deprecated user-only Fusiform window-overlay settings; ignored."),
         toast_duration_ms: z
             .number()
             .min(0)
@@ -1244,10 +1288,21 @@ export const MagicContextConfigSchema = z
             )
             .meta({ deprecated: true }),
         clear_reasoning_age: z
-            .number()
-            .min(10)
-            .default(50)
-            .describe("Clear reasoning/thinking blocks older than N tags (default: 50)"),
+            .unknown()
+            .optional()
+            .describe("Deprecated and ignored. Use keep_reasoning_tokens instead.")
+            .meta({ deprecated: true }),
+        keep_reasoning_tokens: z
+            .union([
+                z.number().int().min(0).max(1_000_000),
+                z
+                    .object({ default: z.number().int().min(0).max(1_000_000).optional() })
+                    .catchall(z.number().int().min(0).max(1_000_000)),
+            ])
+            .optional()
+            .describe(
+                "Reasoning tokens to keep on rebuilding passes. Number or per-model object; exact, shorter model keys, provider/*, then default. Omitted: fixed 10,000. 0 removes all eligible historical reasoning; newest and exempt steps always stay.",
+            ),
         history_budget_percentage: z
             .number()
             .min(0.05)
@@ -1261,7 +1316,7 @@ export const MagicContextConfigSchema = z
             .min(60_000)
             .default(DEFAULT_HISTORIAN_TIMEOUT_MS)
             .describe(
-                "Timeout for each historian prompt call in both TypeScript and Rust transform modes, in milliseconds (default: 600000)",
+                "Timeout for each historian prompt call in both TypeScript and Rust transform modes, in milliseconds (default: 600000). A historian setting kept at the top level for compatibility; no effect while historian.disable is true or compaction.enabled is false.",
             ),
         commit_cluster_trigger: z
             .object({
@@ -1279,7 +1334,7 @@ export const MagicContextConfigSchema = z
             })
             .default({ enabled: true, min_clusters: 3 })
             .describe(
-                "Commit-cluster trigger: fire historian when enough commit clusters accumulate in the unsummarized tail",
+                "Commit-cluster trigger: fire historian when enough commit clusters accumulate in the unsummarized tail. A historian setting kept at the top level for compatibility; no effect while historian.disable is true or compaction.enabled is false.",
             ),
         system_prompt_injection: z
             .object({
@@ -1336,12 +1391,12 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(true)
                     .describe(
-                        "When true (default), Magic Context creates and re-tightens its storage directories to owner-only 0700 and storage files to owner-only 0600. Set false only for a deliberate trusted-group deployment whose operator manages directory, database, WAL/SHM, cache, and RPC file permissions externally; Magic Context then never chmods or supplies restrictive creation modes. USER-LEVEL ONLY — ignored in project config for security. On Windows, POSIX chmod modes are already meaningless, so this setting is a no-op.",
+                        "When true (default), Magic Context creates and re-tightens its TypeScript-mode storage directories to owner-only 0700 and storage files to owner-only 0600. Set false only for a deliberate trusted-group deployment whose operator manages those files externally; in TypeScript mode Magic Context then skips its own creation modes and recursive tightening. In Rust transform mode, ck-mc's store library always keeps the shared data directory owner-only 0700, regardless of this setting. USER-LEVEL ONLY — ignored in project config for security. On Windows, POSIX chmod modes are already meaningless, so this setting is a no-op.",
                     ),
             })
             .default({ enforce_private_permissions: true })
             .describe(
-                "Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; every group member able to read the storage can read all stored session content and memories.",
+                "Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; TypeScript mode follows that policy, but Rust transform mode always keeps its shared data directory owner-only because ck-mc's store library enforces it.",
             ),
         embedding: EmbeddingConfigSchema.default({
             provider: "local",
@@ -1428,10 +1483,18 @@ export const MagicContextConfigSchema = z
             "Pi-only child-process extension controls. This setting is user-level only; project configuration cannot choose which extensions a user's subagent children load.",
         ),
         smart_drops: z
-            .boolean()
-            .default(false)
+            .unknown()
+            .optional()
             .describe(
-                "Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 3), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart.",
+                "Deprecated: ignored. Content-aware supersession reclaim is always on, only on passes already rebuilding the cache. Remove this key; it no longer does anything.",
+            )
+            .meta({ deprecated: true }),
+        protected_tools: z
+            .record(z.string(), z.number().int().nonnegative())
+            .default({ ...DEFAULT_PROTECTED_TOOLS })
+            .transform((map) => mergeProtectedTools(map))
+            .describe(
+                "Keep each tool's newest N still-active results in every automatic drop lane (issue 621). User and project maps merge over defaults {todowrite: 1, ctx_reduce: 3}; 0 turns protection off. Names are case-insensitive and ignore leading mcp_. Holds even at 95% pressure, with no byte cap: large protected outputs can reach refusal sooner. Queued drops, from the agent or historian publication, are held until newer calls displace the result and a later cache-rebuilding pass applies them. The historian's summary is unaffected; the raw result leaves at the next fold. Frozen strips are unaffected. Changes and rotation never originate a bust; dropped results are never restored.",
             ),
         caveman_text_compression: z
             .object({
@@ -1460,7 +1523,7 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(true)
                     .describe(
-                        "Enable cross-session memory (default: true). Does not affect history embedding or semantic ctx_search over session history; set embedding.provider to 'off' to stop all embedding.",
+                        "Enable cross-session project memory (default: true). Also gates the dreamer's project-memory tasks: while false, map-memories, verify, verify-broad, curate, compress-cues, classify-memories, retrospective, promote-primers and refresh-primers neither run on schedule nor through /ctx-dream; maintain-docs, evaluate-smart-notes and review-user-memories still run. memory.auto_search and memory.git_commit_indexing do not depend on it. Does not affect history embedding or semantic ctx_search over session history; set embedding.provider to 'off' to stop all embedding.",
                     ),
                 injection_budget_tokens: z
                     .number()
@@ -1474,14 +1537,14 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(true)
                     .describe(
-                        "Automatically promote eligible session facts into memory (default: true)",
+                        "Automatically promote eligible session facts into memory (default: true). No effect while memory.enabled is false.",
                     ),
                 retrieval_count_promotion_threshold: z
                     .number()
                     .min(1)
                     .default(3)
                     .describe(
-                        "retrieval_count threshold for promoting memory to permanent status (min: 1, default: 3)",
+                        "Currently has no effect: no code reads this value, and memories are not promoted to permanent by retrieval count. Kept so existing configs stay valid (min: 1, default: 3).",
                     ),
                 auto_search: z
                     .object({
@@ -1489,7 +1552,7 @@ export const MagicContextConfigSchema = z
                             .boolean()
                             .default(true)
                             .describe(
-                                "Automatically append a compact <ctx-search-hint> to eligible user messages when relevant memories, conversation, or commits are found. Graduated from experimental.auto_search; on by default (set false to opt out). Independent of memory.enabled.",
+                                "Automatically append a compact <ctx-search-hint> to eligible user messages when relevant memories, conversation, or commits are found. Graduated from experimental.auto_search; on by default (set false to opt out). Independent of memory.enabled despite its place under memory: with memory off it still searches past conversation and commits, only the memory source is skipped.",
                             ),
                         score_threshold: z
                             .number()
@@ -1510,7 +1573,7 @@ export const MagicContextConfigSchema = z
                     })
                     .default({ enabled: true, score_threshold: 0.6, min_prompt_chars: 20 })
                     .describe(
-                        "Auto-search hint: transform-time ctx_search on each new user message; when the top hit clears the threshold, append a compact <ctx-search-hint> block of vague fragments to that user message. Does NOT inject full content. Graduated from experimental.auto_search; enabled by default (set enabled: false to opt out). Independent of memory.enabled.",
+                        "Auto-search hint: transform-time ctx_search on each new user message; when the top hit clears the threshold, append a compact <ctx-search-hint> block of vague fragments to that user message. Does NOT inject full content. Graduated from experimental.auto_search; enabled by default (set enabled: false to opt out). Independent of memory.enabled despite its place under memory: with memory off it still searches past conversation and commits.",
                     ),
                 git_commit_indexing: z
                     .object({
@@ -1518,7 +1581,7 @@ export const MagicContextConfigSchema = z
                             .boolean()
                             .default(false)
                             .describe(
-                                "Index HEAD git commits for ctx_search (git_commit source). Graduated from experimental.git_commit_indexing; opt-in, default off. Independent of memory.enabled.",
+                                "Index HEAD git commits for ctx_search (git_commit source). Graduated from experimental.git_commit_indexing; opt-in, default off. Independent of memory.enabled despite its place under memory.",
                             ),
                         since_days: z
                             .number()
@@ -1539,7 +1602,7 @@ export const MagicContextConfigSchema = z
                     })
                     .default({ enabled: false, since_days: 365, max_commits: 2000 })
                     .describe(
-                        "Index git commit messages from HEAD into ctx_search. Commits become a 4th searchable source alongside memories and session history. Graduated from experimental.git_commit_indexing; opt-in, default off (per-project embedding cost). Independent of memory.enabled.",
+                        "Index git commit messages from HEAD into ctx_search. Commits become a 4th searchable source alongside memories and session history. Graduated from experimental.git_commit_indexing; opt-in, default off (per-project embedding cost). Independent of memory.enabled despite its place under memory.",
                     ),
             })
             .default({
@@ -1550,7 +1613,9 @@ export const MagicContextConfigSchema = z
                 auto_search: { enabled: true, score_threshold: 0.6, min_prompt_chars: 20 },
                 git_commit_indexing: { enabled: false, since_days: 365, max_commits: 2000 },
             })
-            .describe("Cross-session memory configuration"),
+            .describe(
+                "Cross-session memory configuration. auto_search and git_commit_indexing sit here for history but work with memory.enabled false.",
+            ),
     })
     .transform((data): MagicContextConfig => {
         return {
@@ -1561,7 +1626,7 @@ export const MagicContextConfigSchema = z
 
 /** Settings whose fresh values can be used by later agent runs without changing rendered prompt bytes. */
 export const LIVE_RELOAD_CONFIG_PATHS = [
-    "mural.model",
+    "cache_ttl",
     "toast_duration_ms",
     "historian.opencode.model",
     "historian.opencode.fallback_models",
@@ -1573,11 +1638,13 @@ export const LIVE_RELOAD_CONFIG_PATHS = [
     "historian.omp.fallback_models",
     "historian.omp.thinking_level",
     "historian.two_pass",
+    "historian.expand_tools",
     "historian.maxTokens",
     "historian_timeout_ms",
     "commit_cluster_trigger.enabled",
     "commit_cluster_trigger.min_clusters",
     "memory.auto_promote",
+    "dreamer.disable",
     "dreamer.maxTokens",
     "dreamer.opencode.model",
     "dreamer.opencode.fallback_models",

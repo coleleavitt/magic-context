@@ -2,7 +2,7 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { SingleStoreMigrationRequiredError } from "./single-store-refusal";
 /// <reference types="bun-types" />
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmodSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
@@ -124,6 +124,97 @@ function deferred<T = void>(): {
 }
 
 describe("SubcModuleTransport", () => {
+    it("serializes management dispatch from the call method over the real socket and preserves facade envelopes", async () => {
+        const tempDir = createTestTempDirFromPath(join(tmpdir(), "module-dispatch-wire-"));
+        const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
+        const daemonId = Uint8Array.from({ length: 16 }, (_, index) => 100 + index);
+        const serverNonce = Uint8Array.from({ length: 32 }, (_, index) => 200 - index);
+        const requests: unknown[] = [];
+        const finished = deferred();
+        let acceptedSocket: Socket | undefined;
+        const server = createServer((socket) => {
+            acceptedSocket = socket;
+            void (async () => {
+                const reader = new FakeServerReader(socket);
+                const hello = await readAuthMessage(reader);
+                const clientNonce = Uint8Array.from(hello.client_nonce as number[]);
+                writeAuthMessage(socket, {
+                    server_nonce: [...serverNonce],
+                    daemon_id: [...daemonId],
+                    server_proof: [
+                        ...computeProof(
+                            key,
+                            SERVER_PROOF_DOMAIN,
+                            clientNonce,
+                            serverNonce,
+                            daemonId,
+                        ),
+                    ],
+                });
+                await readAuthMessage(reader);
+                const route = await readFrame(reader);
+                writeJsonResponse(socket, route.header, { route_channel: 7, route_epoch: 77 });
+                for (let index = 0; index < 3; index++) {
+                    const request = await readFrame(reader);
+                    requests.push(JSON.parse(Buffer.from(request.body).toString("utf8")));
+                    writeJsonResponse(socket, request.header, { ok: true });
+                }
+                finished.resolve();
+            })().catch(finished.reject);
+        });
+        finished.promise.catch(() => {});
+        let transport: SubcModuleTransport | undefined;
+        try {
+            const port = await listen(server);
+            const connectionFile = join(tempDir, "subc-connection.json");
+            writeFileSync(
+                connectionFile,
+                JSON.stringify({
+                    schema: 1,
+                    endpoints: [{ host: "127.0.0.1", port }],
+                    key: [...key],
+                    daemon_id: [...daemonId],
+                    pid: process.pid,
+                    daemon_ver: "fake-v2",
+                }),
+            );
+            chmodSync(connectionFile, 0o600);
+            transport = new SubcModuleTransport(connectionFile, "magic-context", 1_000);
+            const route = { sessionId: "session-1", projectRoot: "/workspace/project" };
+            await transport.call({
+                ...route,
+                method: "session.flush",
+                body: { v: 1, session_id: "session-1" },
+            });
+            await transport.call({
+                ...route,
+                method: "session.status",
+                body: { method: "session.flush", v: 1 },
+            });
+            await transport.call({
+                ...route,
+                method: "ctx_memory",
+                body: { name: "ctx_memory", arguments: { action: "list" } },
+            });
+            await finished.promise;
+            expect(requests).toEqual([
+                {
+                    method: "session.flush",
+                    v: 1,
+                    session_id: "session-1",
+                    accept_reply_pages: true,
+                },
+                { method: "session.status", v: 1, accept_reply_pages: true },
+                { name: "ctx_memory", arguments: { action: "list" }, accept_reply_pages: true },
+            ]);
+        } finally {
+            transport?.closeSession("session-1");
+            acceptedSocket?.destroy();
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+            rmSync(tempDir, { recursive: true, force: true });
+        }
+    });
+
     it("omits an ambient supervised identity while preserving route identity and flat request bytes", async () => {
         const tempDir = createTestTempDirFromPath(join(tmpdir(), "module-subc-v2-"));
         const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
@@ -368,6 +459,90 @@ describe("SubcModuleTransport", () => {
             { method: "transform", accept_reply_pages: true },
             { method: "reply.page", reply_page_id: id, reply_page_index: 1 },
         ]);
+        expect(connects).toBe(1);
+    });
+
+    it("does not rebind a stale reply page after the transform already answered", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 100);
+        const original = JSON.stringify({ messages: ["x".repeat(100_000)] });
+        const id = createHash("sha256").update(original).digest("hex");
+        const requests: unknown[] = [];
+        let connects = 0;
+        const client = {
+            routeOpen: async () => ({ channel: 7, epoch: 77 }),
+            request: async (_route: RouteHandle, body: unknown) => {
+                requests.push(decodedBody(body));
+                if (requests.length === 1)
+                    return {
+                        reply_page: {
+                            id,
+                            index: 0,
+                            total: 2,
+                            bytes: Buffer.byteLength(original),
+                            data: original.slice(0, 65_536),
+                        },
+                    };
+                throw Object.assign(new Error("route handle is stale"), {
+                    name: "StaleRouteHandleError",
+                    code: "stale_route_handle",
+                });
+            },
+            close: () => undefined,
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureConnected(): Promise<SubcClient>;
+        };
+        internals.ensureConnected = async () => {
+            connects += 1;
+            internals.client = client;
+            return client;
+        };
+        await expect(
+            transport.call({
+                sessionId: "stale-page",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform" },
+            }),
+        ).rejects.toMatchObject({ code: "transform_transport_interrupted" });
+        expect(requests).toEqual([
+            { method: "transform", accept_reply_pages: true },
+            { method: "reply.page", reply_page_id: id, reply_page_index: 1 },
+        ]);
+        expect(connects).toBe(1);
+    });
+
+    it("does not treat a remote stale-route code as proof the transform was unsent", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 100);
+        let requests = 0;
+        let connects = 0;
+        const client = {
+            routeOpen: async () => ({ channel: 7, epoch: 77 }),
+            request: async () => {
+                requests += 1;
+                throw new SubcError("module returned stale-route code", "stale_route_handle");
+            },
+            close: () => undefined,
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureConnected(): Promise<SubcClient>;
+        };
+        internals.ensureConnected = async () => {
+            connects += 1;
+            internals.client = client;
+            return client;
+        };
+        await expect(
+            transport.call({
+                sessionId: "remote-stale",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform" },
+            }),
+        ).rejects.toMatchObject({ code: "transform_transport_interrupted" });
+        expect(requests).toBe(1);
         expect(connects).toBe(1);
     });
 
@@ -669,6 +844,24 @@ describe("SubcModuleTransport", () => {
     });
 
     it("fails a completed-series deadline without reconnecting or retrying", async () => {
+        let now = 1_000;
+        const clock = spyOn(Date, "now").mockImplementation(() => now);
+        const scheduled = Promise.withResolvers<void>();
+        let expire!: () => void;
+        const realTimeout = globalThis.setTimeout;
+        const schedule = ((
+            callback: (...args: unknown[]) => void,
+            ms?: number,
+            ...args: unknown[]
+        ) => {
+            if (ms !== 25) return realTimeout(callback, ms, ...args);
+            expire = () => callback(...args);
+            scheduled.resolve();
+            const handle = realTimeout(() => {}, 0);
+            clearTimeout(handle);
+            return handle;
+        }) as typeof setTimeout;
+        const timer = spyOn(globalThis, "setTimeout").mockImplementation(schedule);
         const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
         const route = { channel: 8, epoch: 88 } as RouteHandle;
         let requestCount = 0;
@@ -699,8 +892,8 @@ describe("SubcModuleTransport", () => {
             generation: 0,
         });
 
-        await expect(
-            transport.call({
+        try {
+            const pending = transport.call({
                 sessionId: "session-execute-timeout",
                 projectRoot: "/workspace/project",
                 method: "transform",
@@ -708,14 +901,26 @@ describe("SubcModuleTransport", () => {
                 generationSensitive: true,
                 attemptClass: "transform_series_execute",
                 timeoutMs: 25,
-            }),
-        ).rejects.toMatchObject({ code: "ETIMEDOUT" });
-        expect(requestCount).toBe(1);
-        expect(closeCount).toBe(0);
-        expect(internals.client).toBe(client);
+            });
+            void pending.catch(() => {});
+            await scheduled.promise;
+            expect(requestCount).toBe(1);
+            now += 25;
+            expire();
+            await expect(pending).rejects.toMatchObject({ code: "ETIMEDOUT" });
+            expect(requestCount).toBe(1);
+            expect(closeCount).toBe(0);
+            expect(internals.client).toBe(client);
+        } finally {
+            timer.mockRestore();
+            clock.mockRestore();
+        }
     });
 
-    it("reopens a route and retries when a restarted module leaves a stale route token", async () => {
+    it.each([
+        "session.status",
+        "transform",
+    ] as const)("rebinds an unsent %s when a restarted module leaves a stale route token", async (method) => {
         const tempDir = createTestTempDirFromPath(join(tmpdir(), "module-subc-restart-"));
         const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
         const daemonId = Uint8Array.from({ length: 16 }, (_, index) => 100 + index);
@@ -786,8 +991,8 @@ describe("SubcModuleTransport", () => {
             const args = {
                 sessionId: "session-restart",
                 projectRoot: "/workspace/project",
-                method: "session.status" as const,
-                body: { method: "session.status", v: 1 },
+                method,
+                body: { method, v: 1 },
             };
             await expect(transport.call(args)).resolves.toEqual({ result: { requestCount: 1 } });
 
@@ -800,6 +1005,8 @@ describe("SubcModuleTransport", () => {
 
             await expect(transport.call(args)).resolves.toEqual({ result: { requestCount: 2 } });
             expect(routeOpenCount).toBe(2);
+            // Only the two intended requests reached the peer; the stale handle
+            // rejection never emitted a frame or executed a transform.
             expect(requestCount).toBe(2);
             expect(serverError).toBeUndefined();
         } finally {
@@ -1609,8 +1816,18 @@ it("attributes encode, route, request issue, response wait and settlement on one
     const transport = new SubcModuleTransport("unused");
     const route = { channel: 7, epoch: 77 } as RouteHandle;
     const samples: import("./module-transport").ModuleCallTimings[] = [];
+    let now = 0;
+    let resolveResponse!: (response: { ok: boolean }) => void;
+    let signalRequestIssued!: () => void;
+    const requestIssued = new Promise<void>((resolve) => {
+        signalRequestIssued = resolve;
+    });
     const client = {
-        request: async (_route: RouteHandle, body: unknown, options: { binary?: boolean }) => {
+        request: (_route: RouteHandle, body: unknown, options: { binary?: boolean }) => {
+            const response = new Promise<{ ok: boolean }>((resolve) => {
+                resolveResponse = resolve;
+            });
+            signalRequestIssued();
             expect(body).toBeInstanceOf(Uint8Array);
             expect(options.binary).not.toBe(true);
             expect(decodedBody(body)).toEqual({
@@ -1618,8 +1835,7 @@ it("attributes encode, route, request issue, response wait and settlement on one
                 text: "🚀",
                 accept_reply_pages: true,
             });
-            await Bun.sleep(20);
-            return { ok: true };
+            return response;
         },
     } as unknown as SubcClient;
     const internals = transport as unknown as {
@@ -1633,32 +1849,37 @@ it("attributes encode, route, request issue, response wait and settlement on one
     };
     internals.client = client;
     internals.ensureRoute = async () => {
-        await Bun.sleep(10);
+        now += 10;
         return { client, route, routeKey: "timing", generation: 0 };
     };
-    const start = performance.now();
-    expect(
-        await transport.call({
+    __moduleTransportTest.setMonotonicClockForTests(() => now);
+    const startedAt = now;
+    try {
+        const pending = transport.call({
             sessionId: "timing",
             projectRoot: ".",
             method: "transform",
             body: { method: "transform", text: "🚀" },
             onTimings: (timings) => samples.push(timings),
-        }),
-    ).toEqual({ ok: true });
-    const elapsed = performance.now() - start;
-    expect(samples).toHaveLength(1);
-    expect(samples[0].route).toBeGreaterThanOrEqual(8);
-    expect(samples[0].responseWait).toBeGreaterThanOrEqual(18);
-    expect(Object.keys(samples[0]).sort()).toEqual([
-        "encode",
-        "issue",
-        "lane",
-        "responseWait",
-        "route",
-        "settle",
-    ]);
-    const sum = Object.values(samples[0]).reduce((a, b) => a + b, 0);
-    expect(sum).toBeLessThanOrEqual(elapsed);
-    expect(elapsed - sum).toBeLessThan(10);
+        });
+        await requestIssued;
+        now += 20;
+        resolveResponse({ ok: true });
+        expect(await pending).toEqual({ ok: true });
+
+        const elapsed = now - startedAt;
+        expect(samples).toHaveLength(1);
+        expect(samples[0]).toEqual({
+            lane: 0,
+            route: 10,
+            encode: 0,
+            issue: 0,
+            responseWait: 20,
+            settle: 0,
+        });
+        const sum = Object.values(samples[0]).reduce((a, b) => a + b, 0);
+        expect(sum).toBe(elapsed);
+    } finally {
+        __moduleTransportTest.setMonotonicClockForTests(null);
+    }
 });

@@ -1,9 +1,17 @@
 {
   "format": "magic-context/tool-catalog-definition/1",
+  "preset_aliases": {"primary": "head", "subagent": "worker", "tools-only": "head"},
   "preset_tools": {
-    "primary": ["ctx_reduce", "ctx_expand", "ctx_note", "ctx_memory", "ctx_search"],
-    "subagent": ["ctx_reduce", "ctx_expand", "ctx_note", "ctx_memory", "ctx_search"],
-    "tools-only": ["ctx_search", "ctx_memory", "ctx_note"]
+    "compacting": {
+      "head": ["ctx_reduce", "ctx_expand", "ctx_note", "ctx_memory", "ctx_search"],
+      "worker": ["ctx_reduce", "ctx_expand", "ctx_search"],
+      "reader": ["ctx_reduce", "ctx_expand", "ctx_search"]
+    },
+    "not_compacting": {
+      "head": ["ctx_search", "ctx_memory", "ctx_note"],
+      "worker": [],
+      "reader": []
+    }
   },
   "tools": [
     {
@@ -333,6 +341,12 @@
     }
   },
   "texts": {
+    "head/reduce/full": "{{primary/reduce/full}}",
+    "head/reduce/light": "{{primary/reduce/light}}",
+    "head/no_reduce/full": "{{primary/no_reduce/full}}",
+    "head/no_reduce/light": "{{primary/no_reduce/light}}",
+    "worker/full": "{{subagent/full}}",
+    "worker/light": "{{subagent/light}}",
     "primary/reduce/full": "## Magic Context\n\n{{partner_frame}}\n{{partner_closer_reduce}}\n\n{{desk_reduce}}{{#caveman}}{{caveman_warning}}{{/caveman}}\n\n{{self_tag}}{{#language}}\n\n{{$language_directive}}{{/language}}",
     "primary/reduce/light": "## Magic Context\n\n{{partner_frame}}\n{{partner_closer_reduce_light}}\n\n{{desk_reduce_light}}{{#caveman}}{{caveman_warning}}{{/caveman}}\n\n{{self_tag}}{{#language}}\n\n{{$language_directive}}{{/language}}",
     "primary/no_reduce/full": "## Magic Context\n\n{{partner_frame}}\n{{partner_closer_no_reduce}}\n\n{{desk_no_reduce}}{{#caveman}}{{caveman_warning}}{{/caveman}}{{#language}}\n\n{{$language_directive}}{{/language}}",

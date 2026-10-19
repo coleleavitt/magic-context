@@ -10,6 +10,33 @@
  * Both shapes are normalized to role + part type/length/text-prefix messages so
  * attribution and --show-diff have the same output on either lane.
  *
+ * Usage fields and the meter, per provider:
+ *   Anthropic  `input_tokens` are the uncached tokens after the last cache
+ *              breakpoint; `cache_read_input_tokens` were served from cache and
+ *              `cache_creation_input_tokens` were written to it
+ *              (https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching#tracking-cache-performance).
+ *              A request is cache-healthy when its read covers what the previous
+ *              request read or wrote: read >= previous read + previous write - 64.
+ *              Uncached input never counts as reuse. Counting it ("read + input")
+ *              let a request with no breakpoint after the head, which read 47k and
+ *              billed ~475k as input, pass as a warm hit. A short read that wrote
+ *              nothing while >= 1,024 tokens went uncached is
+ *              `missing_breakpoint_after_read` and always a BUST: the request's own
+ *              shape caused it, whatever its bytes. A short read with a large write
+ *              is a rewrite and goes through the shared classifier.
+ *   OpenAI     `prompt_tokens`/`input_tokens` include `cached_tokens`; there are no
+ *              breakpoints or write meter, because every prompt prefix is cached
+ *              implicitly (https://platform.openai.com/docs/guides/prompt-caching).
+ *              The read is `cached_tokens` alone; the uncached part never counts.
+ *   Gemini     `promptTokenCount` includes `cachedContentTokenCount`; implicit
+ *              caching has no write meter either
+ *              (https://ai.google.dev/gemini-api/docs/caching, "Implicit caching").
+ *   For OpenAI and Gemini the previous request's uncached tail may not be cached
+ *   yet when the next request arrives, so the floor is the previous read, not the
+ *   previous prompt.
+ * Any provider: a short read more than --cache-ttl (default 5m) after the prefix
+ * was last read in full or written is `idle_cache_expiry`.
+ *
  * Usage:
  *   bun scripts/analyze-cache-busts.ts <sessionIdPrefix> [options]
  *   bun scripts/analyze-cache-busts.ts --session <sessionIdPrefix> [options]
@@ -21,6 +48,7 @@
  *   --since <time>   created at/after ISO time or duration ago (for example 30m)
  *   --until <time>   created at/before ISO time or duration ago
  *   --limit <N>      only the last N requests in range
+ *   --cache-ttl <d>  idle time after which the provider prefix is expired (default 5m)
  *   --show-diff      print before/after snippet of the first-diverging segment
  *   --all-busts      list every diverging segment, not just the first
  *   --all-rows       also print STABLE and UNMETERED rows
@@ -33,8 +61,15 @@ import {
     type CacheBustDecisionAttribution,
     type CacheBustDivergenceClass,
     type CacheBustSessionAnalysis,
+    CACHE_READ_EPSILON_TOKENS,
+    cachedPrefixFloor,
     classifyCacheBust,
+    DEFAULT_CACHE_TTL_MS,
+    isIdleCacheExpiry,
+    isMissingBreakpointAfterRead,
     nearestCacheBustDecision,
+    parseCacheTtl,
+    refreshesCachedPrefix,
 } from "./cache-bust-attribution";
 import {
     type BodyProvider,
@@ -63,9 +98,12 @@ interface DumpSource {
 interface Args {
     sessionPrefix: string;
     sources: DumpSource[];
+    /** Read every request with this meter, overriding the dump's wire family. */
+    meter?: BodyProvider;
     since?: string;
     until?: string;
     limit?: number;
+    cacheTtl?: string;
     showDiff: boolean;
     allBusts: boolean;
     allRows: boolean;
@@ -78,6 +116,8 @@ interface MeterUsage {
     cacheCreation?: number;
     input: number;
     total: number;
+    /** Generated tokens; only the Gemini meter records it (candidates + thoughts). */
+    output?: number;
     source: string;
     provider: BodyProvider;
     rule: string;
@@ -98,6 +138,47 @@ interface Snapshot {
     usage?: MeterUsage;
     orderCreatedAt: string;
     sequence: number;
+    /** `wire_family` from the dump's meta.json (Broca cache-dump exports write it). */
+    wireFamily?: string;
+    /** Meter the usage was read with; undefined when the wire family has no meter here. */
+    meter?: BodyProvider;
+    meterForced?: boolean;
+}
+
+/**
+ * Broca's cache-dump exporter names the wire grammar of every request in
+ * meta.json. That name decides both the body shape and the usage meter, because
+ * the directory a dump sits in says nothing about which provider produced it.
+ * Families absent here (openai_chat, bedrock_converse) get no meter: the
+ * analyzer refuses them instead of reading a meter they do not carry.
+ */
+const WIRE_FAMILY_PROVIDERS: Readonly<Record<string, BodyProvider>> = {
+    anthropic_messages: "anthropic",
+    openai_responses: "openai",
+    openai_responses_chatgpt: "openai",
+    gemini: "gemini",
+    google_codeassist: "gemini",
+};
+
+const METER_RULES: Readonly<Record<BodyProvider, string>> = {
+    anthropic: "Anthropic explicit cache: cache_read_input_tokens/cache_creation_input_tokens",
+    openai: "OpenAI implicit-prefix cache: prompt_tokens_details.cached_tokens; no write premium",
+    gemini: "Gemini implicit-prefix cache: usageMetadata.cachedContentTokenCount inside promptTokenCount; no write premium",
+};
+
+const METER_FIELDS: Readonly<Record<BodyProvider, string>> = {
+    anthropic: "input_tokens/cache_read_input_tokens",
+    openai: "prompt_tokens|input_tokens + cached_tokens",
+    gemini: "promptTokenCount/cachedContentTokenCount",
+};
+
+/** OpenAI and Gemini cache any byte-identical prompt prefix; there are no breakpoints. */
+function isImplicitPrefixCache(provider: BodyProvider): boolean {
+    return provider === "openai" || provider === "gemini";
+}
+
+function finiteNumber(value: unknown): value is number {
+    return typeof value === "number" && Number.isFinite(value);
 }
 
 export interface AnalysisRow {
@@ -108,10 +189,14 @@ export interface AnalysisRow {
     verdict: MeterVerdict | "BASE";
     meterVsBytes?: MeterVsBytes;
     prevTotal?: number;
+    /** Set when the meter floor came from an earlier request than `previous`. */
+    meterReference?: Snapshot;
     epsilon?: number;
     meterFloor?: number;
     comparableRead?: number;
     shortRead?: boolean;
+    /** Time since the cached prefix was last read in full or written. */
+    idleGapMs?: number;
     rewrittenTokens?: number;
     divergenceClass?: CacheBustDivergenceClass;
     decision?: CacheBustDecisionAttribution;
@@ -129,6 +214,8 @@ export interface OpenCodeCacheBustAnalysisOptions {
     scanCursor?: string;
     scanDeadlineMs?: number;
     scanNow?: () => number;
+    /** Idle time after which the provider prefix counts as expired; default 5 min. */
+    cacheTtlMs?: number;
 }
 
 interface DumpCandidate {
@@ -160,6 +247,8 @@ function parseArgs(argv: string[]): Args {
         "--since",
         "--until",
         "--limit",
+        "--meter",
+        "--cache-ttl",
     ]);
     let positionalSession = "";
     for (let index = 0; index < args.length; index += 1) {
@@ -195,13 +284,19 @@ function parseArgs(argv: string[]): Args {
                   label: "openai-auth",
               },
           ];
+    const meterRaw = getOpt("--meter");
+    if (meterRaw !== undefined && !(meterRaw in METER_RULES)) {
+        throw new Error(`Invalid --meter ${meterRaw}; expected anthropic, openai, or gemini`);
+    }
     return {
         sessionPrefix: getOpt("--session") ?? positionalSession,
         mcLogPath: getOpt("--mc-log"),
         sources,
+        meter: meterRaw as BodyProvider | undefined,
         since: getOpt("--since"),
         until: getOpt("--until"),
         limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
+        cacheTtl: getOpt("--cache-ttl"),
         showDiff: args.includes("--show-diff"),
         allBusts: args.includes("--all-busts"),
         allRows: args.includes("--all-rows"),
@@ -276,6 +371,34 @@ function meterUsage(
 ): MeterUsage | undefined {
     const usage = asJson(value);
     if (!usage) return undefined;
+    if (provider === "gemini") {
+        // Broca's exporter documents promptTokenCount as fresh input PLUS cached
+        // content (the Gemini wire semantics), so the cached tokens are already
+        // inside the total and are subtracted, never added, for the direct input.
+        // Google omits zero-valued counts, so an absent cachedContentTokenCount next
+        // to a prompt count is a zero read. Without a prompt count there is no total
+        // to compare against, so the request is unmetered.
+        const promptTokens = usage.promptTokenCount;
+        const cachedTokens = usage.cachedContentTokenCount ?? 0;
+        if (!finiteNumber(promptTokens) || !finiteNumber(cachedTokens)) return undefined;
+        const candidates = usage.candidatesTokenCount;
+        const thoughts = usage.thoughtsTokenCount;
+        const output =
+            finiteNumber(candidates) || finiteNumber(thoughts)
+                ? (finiteNumber(candidates) ? candidates : 0) +
+                  (finiteNumber(thoughts) ? thoughts : 0)
+                : undefined;
+        return {
+            cacheRead: cachedTokens,
+            cacheCreation: undefined,
+            input: Math.max(0, promptTokens - cachedTokens),
+            total: promptTokens,
+            output,
+            source,
+            provider,
+            rule: METER_RULES.gemini,
+        };
+    }
     if (provider === "openai") {
         const promptTokens = usage.prompt_tokens ?? usage.input_tokens;
         const details = asJson(usage.prompt_tokens_details) ?? asJson(usage.input_tokens_details);
@@ -318,7 +441,7 @@ function meterUsage(
         total: (cacheRead ?? 0) + (cacheCreation ?? 0) + usage.input_tokens,
         source,
         provider,
-        rule: "Anthropic explicit cache: cache_read_input_tokens + direct input versus prior read/write/input total",
+        rule: "Anthropic explicit cache: cache_read_input_tokens versus prior read + write; uncached input_tokens never count as reuse",
     };
 }
 
@@ -341,12 +464,19 @@ function collectUsageCandidates(
     const eventType = typeof object.type === "string" ? object.type : source;
     const direct = meterUsage(object.usage, `${eventType}.usage`, provider);
     if (direct) candidates.push(direct);
+    // Raw Gemini and Code Assist responses name the meter `usageMetadata`
+    // (Code Assist nests it under `response`, which the recursion below reaches).
+    if (provider === "gemini") {
+        const metadata = meterUsage(object.usageMetadata, `${eventType}.usageMetadata`, provider);
+        if (metadata) candidates.push(metadata);
+    }
     const message = asJson(object.message);
     const messageUsage = meterUsage(message?.usage, `${eventType}.message.usage`, provider);
     if (messageUsage) candidates.push(messageUsage);
 
     for (const [key, child] of Object.entries(object)) {
         if (key === "usage" || key === "message") continue;
+        if (provider === "gemini" && key === "usageMetadata") continue;
         if (typeof child === "string" && key === "data") {
             try {
                 collectUsageCandidates(JSON.parse(child), `${source}.data`, provider, candidates);
@@ -498,13 +628,25 @@ function loadCandidateSnapshots(candidate: DumpCandidate, opts: Args, selectedFi
         if (until && createdAt > until) continue;
         const { bodyPath, responsePath } = artifactPaths(candidate.source, metaFile, meta);
         if (!bodyPath) continue;
+        // A recorded wire family decides the body shape and the meter; the
+        // directory or filename only decides them when the dump does not say.
+        const wireFamily =
+            typeof meta.wire_family === "string" && meta.wire_family.length > 0
+                ? meta.wire_family
+                : undefined;
+        const familyProvider = wireFamily ? WIRE_FAMILY_PROVIDERS[wireFamily] : undefined;
         try {
             const rawBody = readFileSync(bodyPath);
             const body = JSON.parse(rawBody.toString("utf8")) as Json;
             const normalized = buildSegments(
                 body,
-                candidate.source.label === "explicit --dir" ? undefined : candidate.source.provider,
+                familyProvider ??
+                    (candidate.source.label === "explicit --dir"
+                        ? undefined
+                        : candidate.source.provider),
             );
+            // An unsupported family has no meter unless --meter forces one.
+            const meter = opts.meter ?? (wireFamily ? familyProvider : normalized.provider);
             snapshots.push({
                 file: metaFile,
                 bodyPath,
@@ -517,9 +659,14 @@ function loadCandidateSnapshots(candidate: DumpCandidate, opts: Args, selectedFi
                 wireModel: wireModel(body),
                 sourceDir: candidate.source.dir,
                 segments: normalized.segments,
-                usage: loadMeterUsage(responsePath, normalized.provider),
+                usage: meter ? loadMeterUsage(responsePath, meter) : undefined,
                 orderCreatedAt: dumpName?.createdAt ?? createdAt,
-                sequence: dumpName?.sequence ?? 0,
+                // Broca exports name files by run and step, not by time and
+                // sequence; meta.step keeps same-millisecond steps in order.
+                sequence: dumpName?.sequence ?? (finiteNumber(meta.step) ? meta.step : 0),
+                ...(wireFamily ? { wireFamily } : {}),
+                meter,
+                ...(opts.meter ? { meterForced: true } : {}),
             });
         } catch {
             // Ignore malformed or partially written request bodies.
@@ -676,7 +823,11 @@ export function analyzeOpenCodeCacheBustSession(
             : boundedSnapshots.slice(
                   options.sinceExclusiveMs === undefined ? 0 : Math.max(0, firstNewIndex - 2),
               );
-    const rows = analyzeSnapshots(analysisSnapshots, withSchedulerLogFallback(options.decisions ?? [], options.sessionId, options.mcLogPath));
+    const rows = analyzeSnapshots(
+        analysisSnapshots,
+        withSchedulerLogFallback(options.decisions ?? [], options.sessionId, options.mcLogPath),
+        { cacheTtlMs: options.cacheTtlMs },
+    );
     const requests: AnalyzedCacheRequest[] = rows.flatMap((row) => {
         const timestampMs = Date.parse(row.current.createdAt);
             if (!Number.isFinite(timestampMs) || !inWindow(row.current)) return [];
@@ -732,6 +883,43 @@ function firstDivergence(prev: Segment[], cur: Segment[]): number {
     return prev.length === cur.length ? -1 : n;
 }
 
+function isTailShrink(previous: Snapshot, current: Snapshot, divergenceIndex: number): boolean {
+    if (divergenceIndex < 0) return false;
+    const previousTail = previous.segments[divergenceIndex];
+    const currentTail = current.segments[divergenceIndex];
+    if (!previousTail) return false;
+    if (!currentTail) return divergenceIndex === current.segments.length;
+    if (
+        divergenceIndex !== current.segments.length - 1 ||
+        divergenceIndex < Math.max(0, previous.segments.length - 2)
+    ) {
+        return false;
+    }
+    if (
+        currentTail.role !== previousTail.role ||
+        currentTail.bytes >= previousTail.bytes ||
+        currentTail.parts.length !== previousTail.parts.length
+    ) {
+        return false;
+    }
+    let shortenedPart = false;
+    for (let index = 0; index < currentTail.parts.length; index += 1) {
+        const currentPart = currentTail.parts[index];
+        const previousPart = previousTail.parts[index];
+        if (
+            !currentPart ||
+            !previousPart ||
+            currentPart.type !== previousPart.type ||
+            currentPart.length > previousPart.length ||
+            !previousPart.textPrefix.startsWith(currentPart.textPrefix)
+        ) {
+            return false;
+        }
+        shortenedPart ||= currentPart.length < previousPart.length;
+    }
+    return shortenedPart;
+}
+
 /** Effective cached prefix = bytes up to the last breakpoint strictly before divergence. */
 function cachedPrefixBytes(segs: Segment[], divergeIdx: number): { bytes: number; at: string } {
     let bytes = 0;
@@ -774,7 +962,7 @@ function bustsReusablePrefix(
     divergenceIndex: number,
 ): boolean {
     if (divergenceIndex < 0) return false;
-    return current.provider === "openai"
+    return isImplicitPrefixCache(current.provider)
         ? divergenceIndex < previous.segments.length
         : divergenceIndex <= lastBreakpointIndex(previous.segments);
 }
@@ -782,7 +970,12 @@ function bustsReusablePrefix(
 export function analyzeSnapshots(
     snaps: readonly Snapshot[],
     decisionsAndMarkers: readonly CacheBustDecisionAttribution[] = [],
+    options: { cacheTtlMs?: number } = {},
 ): AnalysisRow[] {
+    const cacheTtlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+    // When the reusable prefix was last read in full or written; see
+    // refreshesCachedPrefix for which requests move it.
+    let prefixRefreshedAtMs: number | undefined;
     // Disruption markers explain a following epoch HARD but never serve a request, so
     // they stay out of every request join.
     const decisions = decisionsAndMarkers.filter((record) => record.disruption === undefined);
@@ -813,6 +1006,8 @@ export function analyzeSnapshots(
     let previousShortRead = false;
     let previousBustDivergenceIndex: number | undefined;
     let previousMetered: Snapshot | undefined;
+    // Last metered request before the current run of LATENCY rows (Gemini only).
+    let latencyReference: Snapshot | undefined;
     const rows: AnalysisRow[] = [];
     for (let index = 0; index < snaps.length; index += 1) {
         const current = snaps[index];
@@ -840,6 +1035,7 @@ export function analyzeSnapshots(
         if (!previousMetered) {
             rows.push({ current, divergenceIndex: -1, verdict: "BASE" });
             previousMetered = current;
+            prefixRefreshedAtMs = current.requestTimestampMs;
             continue;
         }
         const previous = previousMetered;
@@ -848,27 +1044,80 @@ export function analyzeSnapshots(
         const byteVerdict: ByteVerdict = bustsReusablePrefix(previous, current, divergenceIndex)
             ? "BUST"
             : "STABLE";
-        const prevTotal = previous.usage!.total;
-        const epsilon = Math.max(64, previous.usage.input);
-        const meterFloor = prevTotal - epsilon;
-        // Anthropic separates direct input from cache writes, so it belongs in the
-        // comparable read. OpenAI's uncached prompt tokens include rewritten prefix
-        // tokens; adding them back would make every prompt look fully cached.
-        const comparableRead =
-            current.provider === "openai"
-                ? current.usage.cacheRead
-                : current.usage.cacheRead + current.usage.input;
+        // Implicit-prefix forgiveness is the previous request's uncached input: its
+        // tail may not be cached yet. After a provider-side miss that input is the
+        // whole prompt, which would forgive any read at all, so a Gemini request
+        // that follows a run of LATENCY rows is measured against the last request
+        // before the run. The run kept the prefix byte-identical (that is what
+        // makes it LATENCY), so that earlier read is still owed. A BUST resets the
+        // reference because it really did rewrite the prefix.
+        const reference =
+            previous.usage.provider === "gemini" && latencyReference?.usage
+                ? latencyReference
+                : previous;
+        const referenceUsage = reference.usage ?? previous.usage;
+        const prevTotal = referenceUsage.total;
+        // Anthropic-style breakpoints: the read alone must cover what the previous
+        // request read or wrote; uncached input_tokens never count as reuse.
+        const explicitBreakpoints = !isImplicitPrefixCache(current.usage.provider);
+        // Gemini's cachedContentTokenCount over a byte-identical prefix routinely
+        // reads a few tokens (8-9 in Code Assist exports) below the previous read,
+        // so the 64-token allowance is added on top of the previous uncached input
+        // instead of only standing in for a smaller one. Without it every such dip
+        // reads as a short read.
+        const epsilon = explicitBreakpoints
+            ? CACHE_READ_EPSILON_TOKENS
+            : referenceUsage.provider === "gemini"
+              ? 64 + referenceUsage.input
+              : Math.max(64, referenceUsage.input);
+        // For the implicit caches, prevTotal - epsilon is at most the previous
+        // read: the previous uncached tail may not be cached yet.
+        const meterFloor = explicitBreakpoints
+            ? cachedPrefixFloor({
+                  read: referenceUsage.cacheRead,
+                  write: referenceUsage.cacheCreation ?? 0,
+                  input: referenceUsage.input,
+              })
+            : prevTotal - epsilon;
+        // Only the provider cache read counts as reuse, on every meter. OpenAI's
+        // and Gemini's uncached prompt tokens include rewritten prefix tokens, and
+        // Anthropic's input_tokens are billed in full and cached nothing.
+        const comparableRead = current.usage.cacheRead;
         // A rewrite cannot use the prior rewrite's direct input as forgiveness
         // while cacheRead remains at the same floor.
         const rebust: boolean =
             previousShortRead && current.usage.cacheRead <= previous.usage.cacheRead;
         const shortRead: boolean = rebust || comparableRead < meterFloor;
         previousShortRead = shortRead;
+        const reading = {
+            read: current.usage.cacheRead,
+            write: current.usage.cacheCreation ?? 0,
+            input: current.usage.input,
+        };
+        const idleGapMs =
+            current.requestTimestampMs - (prefixRefreshedAtMs ?? previous.requestTimestampMs);
+        const idleCacheExpiry =
+            shortRead &&
+            isIdleCacheExpiry(
+                current.requestTimestampMs,
+                prefixRefreshedAtMs ?? previous.requestTimestampMs,
+                cacheTtlMs,
+            );
+        const missingBreakpointAfterRead = isMissingBreakpointAfterRead(reading, {
+            shortRead,
+            explicitBreakpoints,
+        });
+        if (refreshesCachedPrefix(reading, { shortRead, explicitBreakpoints })) {
+            prefixRefreshedAtMs = current.requestTimestampMs;
+        }
+        // A missing breakpoint is the request's own shape, not provider latency,
+        // so it is a BUST even when the reusable bytes are unchanged.
         const verdict: MeterVerdict = shortRead
-            ? byteVerdict === "BUST"
+            ? byteVerdict === "BUST" || (missingBreakpointAfterRead && !idleCacheExpiry)
                 ? "BUST"
                 : "LATENCY"
             : "STABLE";
+        latencyReference = verdict === "LATENCY" ? reference : undefined;
         const meterVsBytes: MeterVsBytes =
             verdict === "LATENCY"
                 ? "LATENCY"
@@ -889,6 +1138,7 @@ export function analyzeSnapshots(
             divergenceIndex < 0
                 ? undefined
                 : (current.segments[divergenceIndex] ?? previous.segments[divergenceIndex]);
+        const tailShrink = isTailShrink(previous, current, divergenceIndex);
         // A LATENCY row is also classified: a short read over an unchanged reusable
         // prefix is a provider-side fact and deserves a name, not a blank cell.
         const divergenceClass =
@@ -898,15 +1148,18 @@ export function analyzeSnapshots(
                       divergenceIndex,
                       previousMessageCount: previous.segments.length,
                       previousBustDivergenceIndex,
+                      idleCacheExpiry,
+                      missingBreakpointAfterRead,
                       previousProvider: previous.provider,
                       currentProvider: current.provider,
                       firstDivergenceRole: divergentSegment?.role,
                       firstDivergenceSize: divergentSegment?.bytes,
-                       rewrittenTokens,
-                       cacheCreationTokens: current.usage.cacheCreation,
-                       promptTokens: prevTotal,
-                       providerComparableRead: current.usage.cacheRead,
-                       directInput: current.usage.input,
+                      rewrittenTokens,
+                      cacheCreationTokens: current.usage.cacheCreation,
+                      promptTokens: prevTotal,
+                      tailShrink,
+                      providerComparableRead: current.usage.cacheRead,
+                      directInput: current.usage.input,
                        previousTotal: prevTotal,
                        previousModel: previous.wireModel,
                        currentModel: current.wireModel,
@@ -959,10 +1212,12 @@ export function analyzeSnapshots(
             verdict,
             meterVsBytes,
             prevTotal,
+            ...(reference !== previous ? { meterReference: reference } : {}),
             epsilon,
             meterFloor,
             comparableRead,
             shortRead,
+            idleGapMs,
             rewrittenTokens,
             divergenceClass,
             decision: attributionDecision,
@@ -1018,17 +1273,22 @@ function meterCell(row: AnalysisRow): string {
             ? ""
             : `; rewritten≈${row.rewrittenTokens.toLocaleString()}`;
     const directInput = row.current.usage?.input ?? 0;
-    const comparable =
-        row.current.provider === "openai"
-            ? `cached=${read.toLocaleString()}`
-            : `read=${read.toLocaleString()} + input=${directInput.toLocaleString()} = ${row.comparableRead?.toLocaleString()}`;
+    const comparable = isImplicitPrefixCache(row.current.usage?.provider ?? row.current.provider)
+        ? `cached=${read.toLocaleString()}`
+        : `read=${read.toLocaleString()} (write=${(row.current.usage?.cacheCreation ?? 0).toLocaleString()}, uncached input=${directInput.toLocaleString()})`;
     const wireModel =
         row.previous?.wireModel &&
         row.current.wireModel &&
         row.previous.wireModel !== row.current.wireModel
             ? `; wireModel=${row.previous.wireModel} → ${row.current.wireModel}`
             : "";
-    return `${comparable}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()}, ε=${row.epsilon?.toLocaleString()})${rewritten}${wireModel}`;
+    const reference = row.meterReference
+        ? `; ref=${fmtTime(row.meterReference.createdAt)} (last read before the LATENCY run)`
+        : "";
+    const floorBasis = isImplicitPrefixCache(row.current.usage?.provider ?? row.current.provider)
+        ? `prevTotal=${row.prevTotal?.toLocaleString()}, ε=${row.epsilon?.toLocaleString()}`
+        : `prev read+write-${row.epsilon?.toLocaleString()}; prevTotal=${row.prevTotal?.toLocaleString()}`;
+    return `${comparable}; floor=${row.meterFloor?.toLocaleString()} (${floorBasis})${reference}${rewritten}${wireModel}`;
 }
 
 const HELP = `usage: bun scripts/analyze-cache-busts.ts --session <prefix> [options]
@@ -1040,14 +1300,25 @@ Sources (both searched by default):
              Responses instructions + input[] bodies; implicit prefix cache,
              prompt_tokens_details.cached_tokens, and no write premium.
              WebSocket captures can have no response file and are UNMETERED.
+  Broca:     cache-dump exports (pass the export dir as --dir). meta.json
+             wire_family picks the body shape and meter: anthropic_messages,
+             openai_responses(_chatgpt), gemini and google_codeassist (Gemini
+             usageMetadata: promptTokenCount includes cachedContentTokenCount).
+
+Any analysed request without a usable meter reading makes the run refuse with
+a named reason (meter_missing / wire_family_unsupported) and exit 2 instead of
+printing a clean result.
 
 Options:
   --mc-log <path>       scheduler log fallback (default: MAGIC_CONTEXT_LOG_PATH or harness log)
   --dir <path>          inspect one explicit directory (legacy override)
   --anthropic-dir <p>   override the Anthropic source
   --openai-dir <path>   override the OpenAI source
+  --meter <kind>        force the anthropic, openai, or gemini meter for every request
   --since/--until <t>   ISO timestamp or duration ago (for example 2h)
   --limit <N>           keep the last N requests in range
+  --cache-ttl <dur>     idle time after which the provider prefix counts as
+                        expired (default 5m; for example 1h)
   --show-diff           print both versions of the first-diverging message
   --all-busts           list every diverging message
   --all-rows            also print STABLE and UNMETERED rows`;
@@ -1081,20 +1352,49 @@ function main(): void {
         );
         console.log("");
     }
-    const rows = analyzeSnapshots(snaps, withSchedulerLogFallback([], snaps[0].session, opts.mcLogPath));
+    const rows = analyzeSnapshots(
+        snaps,
+        withSchedulerLogFallback([], snaps[0].session, opts.mcLogPath),
+        { cacheTtlMs: parseCacheTtl(opts.cacheTtl) },
+    );
     const provider = snaps[0].provider;
+    const meterKind = snaps[0].meter ?? provider;
     const meterRule =
-        snaps.find((snapshot) => snapshot.usage)?.usage?.rule ??
-        (provider === "openai"
-            ? "OpenAI implicit-prefix cache: prompt_tokens_details.cached_tokens; no write premium"
-            : "Anthropic explicit cache: cache_read_input_tokens/cache_creation_input_tokens");
+        snaps.find((snapshot) => snapshot.usage)?.usage?.rule ?? METER_RULES[meterKind];
+    const wireFamilies = [
+        ...new Set(snaps.flatMap((snapshot) => (snapshot.wireFamily ? [snapshot.wireFamily] : []))),
+    ];
+    const meterKinds = [
+        ...new Set(snaps.map((snapshot) => snapshot.meter ?? "none")),
+    ];
+    // Dumps without a recorded wire family and without --meter keep the original
+    // header byte for byte; the extra lines describe a choice those dumps never had.
+    const describeMeterChoice = wireFamilies.length > 0 || opts.meter !== undefined;
     console.log(`Session:  ${snaps[0].session}`);
-    console.log(`Provider: ${provider} (${selection.selected?.source.label})`);
+    console.log(
+        wireFamilies.length > 0
+            ? `Provider: ${provider} (from wire_family; searched as ${selection.selected?.source.label})`
+            : `Provider: ${provider} (${selection.selected?.source.label})`,
+    );
+    if (describeMeterChoice) {
+        console.log(
+            `Wire family: ${wireFamilies.length > 0 ? wireFamilies.join(", ") : "absent (filename/directory detection)"}`,
+        );
+        console.log(
+            `Meter:    ${meterKinds.map((kind) => (kind === "none" ? "none (wire family has no meter)" : `${kind} (${METER_FIELDS[kind]})`)).join(", ")}${opts.meter ? " (forced by --meter)" : ""}`,
+        );
+    }
     console.log(`Dumps:    ${snaps.length}  (dir: ${snaps[0].sourceDir})`);
     console.log("");
     console.log("Dashboard times are local (UTC+2); table times are UTC.");
+    const shortRule =
+        meterKind === "gemini"
+            ? "Short when the provider-comparable read < prevTotal - ε, ε=64 + previous uncached input, measured from the last request before a run of LATENCY rows"
+            : meterKind === "anthropic"
+              ? "Short when the cache read < previous read + previous write - 64, and a short read with no write and ≥1,024 uncached input tokens is a missing-breakpoint BUST"
+              : "Short when the provider-comparable read < prevTotal - ε, ε=max(64, previous direct/uncached input)";
     console.log(
-        `Meter rule (${provider}): ${meterRule}. Short when the provider-comparable read < prevTotal - ε, ε=max(64, previous direct/uncached input); bytes distinguish BUST from LATENCY.`,
+        `Meter rule (${meterKind}): ${meterRule}. ${shortRule}; bytes distinguish BUST from LATENCY.`,
     );
     console.log(
         "time(UTC)          | segs | verdict          | meter                                                  | meterVsBytes | first-divergence                | prevBodyBytes → curBodyBytes | reusableNormalizedPrefix@breakpoint",
@@ -1125,7 +1425,15 @@ function main(): void {
         if (row.verdict === "LATENCY") latencyCount += 1;
         if (row.verdict === "UNMETERED" && row.byteVerdict === "BUST") unmeteredBustCount += 1;
 
-        const previous = row.previous as Snapshot;
+        const previous = row.previous;
+        if (!previous) {
+            // An unmetered request with no metered predecessor has nothing to diff
+            // against; it is still listed so the refusal below has visible rows.
+            console.log(
+                `${fmtTime(row.current.createdAt)} | ${String(row.current.segments.length).padStart(4)} | ${"UNMETERED".padEnd(16)} | ${"unavailable; no metered predecessor".padEnd(54)} | ${(row.meterVsBytes ?? "").padEnd(12)} | ${"(no metered predecessor)".padEnd(31)} | ${`${row.current.bodyBytes.toLocaleString()}B`.padEnd(27)} |`,
+            );
+            continue;
+        }
         const index = row.divergenceIndex;
         const segment =
             index < 0 ? undefined : (row.current.segments[index] ?? previous.segments[index]);
@@ -1173,7 +1481,22 @@ function main(): void {
     }
 
     console.log("");
-    if (bustCount === 0) {
+    const coverage = meterCoverage(snaps);
+    if (describeMeterChoice || coverage.refusals.length > 0) {
+        console.log(
+            `Metered:  ${coverage.metered} of ${coverage.analysed} analysed request(s) carry a usable meter reading.`,
+        );
+    }
+    if (coverage.refusals.length > 0) {
+        // A request whose meter was never read cannot count as "not a bust", so
+        // a clean summary would be vacuous. Positive findings on the metered
+        // requests are still printed; the clean-result line never is.
+        if (bustCount > 0) {
+            console.log(
+                `${bustCount} metered bust(s) across ${coverage.metered} metered request(s).`,
+            );
+        }
+    } else if (bustCount === 0) {
         console.log(`No metered busts across ${snaps.length} request(s).`);
     } else {
         console.log(
@@ -1185,17 +1508,68 @@ function main(): void {
             `${latencyCount} latency-only short read(s) had no reusable-prefix byte divergence.`,
         );
     }
+    const expiryCount = rows.filter((row) => row.divergenceClass === "idle_cache_expiry").length;
+    if (expiryCount > 0) {
+        console.log(
+            `${expiryCount} short read(s) came more than ${opts.cacheTtl ?? "5m"} after the prefix was last read in full or written (idle_cache_expiry; --cache-ttl changes the window).`,
+        );
+    }
     if (unmeteredBustCount > 0) {
         console.log(
             `${unmeteredBustCount} unmetered byte-attributed bust candidate(s); response usage was unavailable.`,
         );
     }
+    if (coverage.refusals.length > 0) {
+        for (const refusal of coverage.refusals) console.log(refusal);
+        console.log(
+            "Refusing to report a clean result: the meter was not read on every analysed request.",
+        );
+        process.exitCode = 2;
+    }
+}
+
+interface MeterCoverage {
+    analysed: number;
+    metered: number;
+    /** One named reason per (wire family, meter) group of unmetered requests. */
+    refusals: string[];
+}
+
+/**
+ * Count the requests whose meter was actually read and name every group that
+ * was not. A missing meter is not a cache hit: before this check a Gemini dump
+ * read with the OpenAI meter looked unmetered on every request and the analyzer
+ * still printed "No metered busts".
+ */
+function meterCoverage(snaps: readonly Snapshot[]): MeterCoverage {
+    const groups = new Map<string, { count: number; snapshot: Snapshot }>();
+    let metered = 0;
+    for (const snapshot of snaps) {
+        if (!isUsageMissing(snapshot)) {
+            metered += 1;
+            continue;
+        }
+        const key = `${snapshot.wireFamily ?? ""}\0${snapshot.meter ?? ""}`;
+        const group = groups.get(key) ?? { count: 0, snapshot };
+        group.count += 1;
+        groups.set(key, group);
+    }
+    const refusals = [...groups.values()].map(({ count, snapshot }) => {
+        const family = `wire_family=${snapshot.wireFamily ?? "absent"}`;
+        if (!snapshot.meter) {
+            return `wire_family_unsupported: ${count} of ${snaps.length} requests carry ${family}, which has no meter in this analyzer`;
+        }
+        const forced = snapshot.meterForced ? "; meter forced by --meter" : "";
+        return `meter_missing: ${count} of ${snaps.length} requests carry no ${snapshot.meter} usage (${METER_FIELDS[snapshot.meter]}) (${family}${forced})`;
+    });
+    return { analysed: snaps.length, metered, refusals };
 }
 
 export const __test = {
     analyzeSnapshots,
     loadMeterUsage,
     loadSnapshots,
+    meterCoverage,
     parseArgs,
     parseDumpFilename,
     resolveTimeBound,

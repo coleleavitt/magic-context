@@ -206,8 +206,7 @@ function extractExplicitHttpStatus(error: unknown): number | undefined {
 /**
  * Classify Anthropic's thinking-prefix binding rejection (Claude Fable 5.1 and
  * Claude Opus 5.5). Only the stable phrase is matched; the surrounding prose
- * and SDK wrappers vary. The live 400 (captured in
- * docs/reports/anthropic-thinking-binding.md) carries no message id, only
+ * and SDK wrappers vary. The provider's 400 carries no message id, only
  * provider request-array paths, so the result never names a host message.
  * Source: https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
  */
@@ -230,6 +229,17 @@ export function detectThinkingBindingMismatch(error: unknown): ThinkingBindingMi
     };
 }
 
+/** Distinct from prefix binding: the provider rejected edits to its active turn. */
+export function detectLatestTurnThinkingMismatch(error: unknown): boolean {
+    const status = extractExplicitHttpStatus(error);
+    return (
+        (status === undefined || status === 400) &&
+        /(?:thinking|redacted_thinking)[\s\S]*latest assistant (?:message|turn)[\s\S]*cannot be modified/i.test(
+            extractErrorMessage(error),
+        )
+    );
+}
+
 /**
  * Claude models whose signed thinking blocks Anthropic binds to the request
  * prefix, as `[family, major, minor]`. The source of truth is Anthropic's
@@ -241,6 +251,7 @@ export const PREFIX_BOUND_THINKING_MODELS: ReadonlyArray<readonly [string, numbe
     ["fable", 5, 1],
     ["opus", 5, 5],
     ["sonnet", 5, 5],
+    ["haiku", 5, 5],
 ];
 
 // One pattern built from the list: the family, then the version with `-`, `_`

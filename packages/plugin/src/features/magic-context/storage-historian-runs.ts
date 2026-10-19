@@ -1,4 +1,5 @@
 import type { Database } from "../../shared/sqlite";
+import { capHistorianFailureReason } from "./historian-failure-reason";
 
 /**
  * Per historian-invocation telemetry.
@@ -65,13 +66,32 @@ export interface HistorianRunInput {
     legacy?: boolean;
 }
 
-/**
- * Record one historian run. Best-effort: never throws into the historian path —
- * telemetry must not break compaction. Returns the new row id, or null on
- * failure.
- */
+/** Count recorded attempts for one session, regardless of their outcome. */
+export function countHistorianRuns(db: Database, sessionId: string): number {
+    try {
+        const row = db
+            .prepare<[string], { count: number }>(
+                "SELECT COUNT(*) AS count FROM historian_runs WHERE session_id = ?",
+            )
+            .get(sessionId);
+        return row?.count ?? 0;
+    } catch {
+        // Older stores may not have the telemetry table yet; status stays usable.
+        return 0;
+    }
+}
+
 export function recordHistorianRun(db: Database, input: HistorianRunInput): number | null {
     try {
+        const failureReason =
+            input.failureReason == null
+                ? input.status === "failed"
+                    ? "provider_error"
+                    : null
+                : capHistorianFailureReason(
+                      input.failureReason,
+                      input.status === "failed" ? "provider_error" : "",
+                  );
         const result = db
             .prepare(
                 `INSERT INTO historian_runs (
@@ -89,7 +109,7 @@ export function recordHistorianRun(db: Database, input: HistorianRunInput): numb
                 input.subagentInvocationId ?? null,
                 input.runKind,
                 input.status,
-                input.failureReason ?? null,
+                failureReason,
                 input.chunkStartOrdinal ?? null,
                 input.chunkEndOrdinal ?? null,
                 input.unprocessedFrom ?? null,

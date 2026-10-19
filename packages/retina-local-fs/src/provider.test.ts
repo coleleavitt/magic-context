@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFile } from "node:child_process";
-import { mkdir, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -153,6 +153,48 @@ describe("filesystem predicates", () => {
 });
 
 describe("git predicates", () => {
+    test.skipIf(process.platform === "win32")(
+        "unchanged git_commit_after validates refs but skips the ancestry process",
+        async () => {
+            const { repo, firstSha } = await createRepository();
+            await commit(repo, "two\n");
+            await git(repo, "tag", "audit-base", firstSha);
+            const config = {
+                kind: "git_commit_after",
+                repo_path: repo,
+                sha: "audit-base",
+            } as const;
+            const first = await poll(config);
+            const bin = await temporaryDirectory("retina-local-fs-git-trace-");
+            const trace = join(bin, "trace");
+            const { stdout } = await execFileAsync("which", ["git"], { encoding: "utf8" });
+            const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+            await writeFile(
+                join(bin, "git"),
+                `#!/bin/sh\nprintf '%s\\n' "$*" >> ${shellQuote(trace)}\nexec ${shellQuote(stdout.trim())} "$@"\n`,
+                { mode: 0o755 },
+            );
+            const originalPath = process.env.PATH;
+            try {
+                process.env.PATH = `${bin}:${originalPath}`;
+                expect(await poll(config, first.scalar)).toEqual({
+                    events: [],
+                    scalar: first.scalar,
+                });
+                const calls = (await readFile(trace, "utf8")).trim().split("\n");
+                expect(calls).toHaveLength(2);
+                expect(calls.every((call) => call.includes("rev-parse --verify"))).toBe(true);
+                // Quiet polling must still fail on a base that no longer resolves.
+                await git(repo, "tag", "--delete", "audit-base");
+                await expect(poll(config, first.scalar)).rejects.toMatchObject({
+                    code: "git_error",
+                });
+            } finally {
+                process.env.PATH = originalPath;
+            }
+        },
+    );
+
     test("git_commit_after fires for strict descendants and each new commit", async () => {
         const { repo, firstSha } = await createRepository();
         const equal = await poll({
@@ -409,9 +451,10 @@ describe("path fence", () => {
         const danglingLink = join(home, "dangling-link");
         await mkdir(join(missingTarget, ".."), { recursive: true });
         await symlink(missingTarget, danglingLink);
+        // Reject dangling links as unreadable before checking whether their targets are fenced.
         await expect(
             poll({ kind: "path_exists", path: danglingLink, gone: true }, null, home),
-        ).rejects.toMatchObject({ code: "fenced_path" });
+        ).rejects.toMatchObject({ code: "unreadable_path" });
     });
 
     test("admits every documented file-granular carve-in", async () => {

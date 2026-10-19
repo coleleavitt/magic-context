@@ -664,7 +664,9 @@ const tui: TuiPlugin = async (api, _options, meta) => {
     }
 
     initRpcClient(directory)
-    await refreshToastDurationMs()
+    // RPC discovery can outlive the host's plugin-load deadline. Register the
+    // sidebar immediately; toast delivery still awaits its own current setting.
+    void refreshToastDurationMs()
 
     // Register sidebar slot
     const sidebarSlot = createSidebarContentSlot(api)

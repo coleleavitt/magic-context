@@ -22,6 +22,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { hostExtractCache } from '../host-extract-cache';
+import { seedModelsCatalog } from "../models-catalog";
 import { prepareContextDatabase } from "../prepare-context-db";
 import { assertMockEndpoint, assertMockProviders, pinMockAgents } from "../mock-routing";
 import {
@@ -155,6 +156,17 @@ export interface SpawnOptions {
      * per-suite file). Merged last, overriding inherited values.
      */
     extraEnv?: Record<string, string>;
+    /**
+     * models.dev catalogue copied into the host cache before boot. Fetching is then
+     * disabled so the host's model metadata comes from this file alone.
+     */
+    modelsCatalog?: string;
+    /**
+     * Register this provider/model on the mock (Anthropic wire) next to the session
+     * model and pin the historian to it, so the historian can use a real provider id
+     * while the session keeps the default mock model.
+     */
+    historianProviderModel?: { providerID: string; modelID: string };
 }
 
 /**
@@ -272,10 +284,6 @@ export function sweepOrphanedServes(): number {
  * the plugin's Rust module client reads), and it reuses the same env across a
  * serve restart so opencode.db + context.db survive the restart.
  */
-export function resolveIsolatedHome(env: IsolatedEnv): string {
-    return dirname(env.configDir);
-}
-
 export function createIsolatedEnv(): IsolatedEnv {
     const base = createE2ETempDir("opencode-e2e-");
     const configDir = join(base, "config");
@@ -296,7 +304,7 @@ export function createIsolatedEnv(): IsolatedEnv {
  * - magic-context.jsonc: starts with small thresholds so tests trigger historian
  *   deterministically with modest scripted token counts.
  */
-function writeConfigs(
+export function writeConfigs(
     env: IsolatedEnv,
     mockProviderURL: string,
     opts: SpawnOptions,
@@ -349,6 +357,14 @@ function writeConfigs(
         compaction: { auto: false, prune: false },
         provider: {
             [mockProviderID]: providerConfig(mockProviderAPI, mockModelID, true),
+            ...(opts.historianProviderModel
+                ? {
+                      [opts.historianProviderModel.providerID]: providerConfig(
+                          "@ai-sdk/anthropic",
+                          opts.historianProviderModel.modelID,
+                      ),
+                  }
+                : {}),
             ...(mockProviderAPI === "@ai-sdk/openai"
                 ? {
                       "mock-anthropic-setup": providerConfig(
@@ -389,7 +405,13 @@ function writeConfigs(
             opts.magicContextConfig,
             `${mockProviderID}/${mockModelID}`,
             "opencode",
-            historianModel ? { historian: `${mockProviderID}/${historianModel.id}` } : {},
+            opts.historianProviderModel
+                ? {
+                      historian: `${opts.historianProviderModel.providerID}/${opts.historianProviderModel.modelID}`,
+                  }
+                : historianModel
+                  ? { historian: `${mockProviderID}/${historianModel.id}` }
+                  : {},
         ),
     };
     if (opts.userSubcConnectionFile) {
@@ -403,25 +425,23 @@ function writeConfigs(
         console.error(`[mock-config] ${JSON.stringify({ configDir: env.configDir, mockProviderURL, opencodeConfig, magicContext })}`);
     }
 
-    // The plugin's loadPluginConfig() looks for magic-context.jsonc under
-    // ${XDG_CONFIG_HOME}/opencode/magic-context.jsonc (user config) or
-    // <workdir>/magic-context.jsonc (project root).
-    //
-    // We set XDG_CONFIG_HOME=env.configDir in the child env, so the user
-    // config path resolves to env.configDir/opencode/magic-context.jsonc.
-    // Put the file there; a sibling one in env.configDir is never read.
-    const userConfigDir = join(env.configDir, "opencode");
+    // Write the authoritative shared user config on every boot, including restarts.
+    // A legacy OpenCode file is ignored once startup migration has created the
+    // CortexKit file, so rewriting that legacy path would leave old settings live.
+    const userConfigDir = join(env.configDir, "cortexkit");
     mkdirSync(userConfigDir, { recursive: true });
     writeFileSync(
         join(userConfigDir, "magic-context.jsonc"),
         JSON.stringify(magicContext, null, 2),
     );
 
-    // Same directory, but this file is OpenCode's own global config — the layer
+    // OpenCode's own global config stays in its host-specific directory — the layer
     // a launcher's OPENCODE_CONFIG_DIR sits on top of rather than replacing.
     if (opts.openCodeGlobalConfigExtra) {
+        const openCodeConfigDir = join(env.configDir, "opencode");
+        mkdirSync(openCodeConfigDir, { recursive: true });
         writeFileSync(
-            join(userConfigDir, "opencode.json"),
+            join(openCodeConfigDir, "opencode.json"),
             JSON.stringify(
                 { $schema: "https://opencode.ai/config.json", ...opts.openCodeGlobalConfigExtra },
                 null,
@@ -624,15 +644,17 @@ interface RustSpawnResources {
  * decision here means a suite body never needs a mode branch: the same harness
  * creates either a regular isolated process or the real ck-subc + ck-mc path.
  */
-async function provisionRustMode(): Promise<RustSpawnResources> {
+async function provisionRustMode(existingEnv?: IsolatedEnv): Promise<RustSpawnResources> {
     const prereqs = detectRustModePrereqs();
-    if (!prereqs.ok || !prereqs.subconsciousRoot) {
+    if (!prereqs.ok) {
         throw new Error(
             `MC_E2E_MODE=rust prerequisite failure: ${prereqs.skipReason ?? "unknown prerequisite"}`,
         );
     }
     const { ckMcBin, ckSubcBin } = await buildHermeticBinaries(prereqs.subconsciousRoot);
-    const env = createIsolatedEnv();
+    // A host restart must reconnect to the same isolated databases and session.
+    // The daemon/module are new processes, not a reason to allocate a new root.
+    const env = existingEnv ?? createIsolatedEnv();
     try {
         const stack = await HermeticSubcStack.start({ dataDir: env.dataDir, ckMcBin, ckSubcBin });
         return { env, connectionFile: stack.connectionFile, stack };
@@ -646,7 +668,9 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     // suites that already supplied a daemon connection keep their existing
     // stack; ordinary suites get one provisioned here for the rust invocation.
     const rustMode = process.env.MC_E2E_MODE === "rust";
-    const resources = rustMode && !opts.userSubcConnectionFile ? await provisionRustMode() : null;
+    const resources = rustMode && !opts.userSubcConnectionFile
+        ? await provisionRustMode(opts.existingEnv)
+        : null;
     const resolvedOpts: SpawnOptions = resources
         ? {
               ...opts,
@@ -674,6 +698,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
 
         if (resolvedOpts.prepareContextDatabase !== false) prepareContextDatabase(env.dataDir);
         writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
+        if (resolvedOpts.modelsCatalog) seedModelsCatalog(env.cacheDir, resolvedOpts.modelsCatalog);
 
         // Explicitly strip any inherited OPENCODE_SERVER_PASSWORD from the parent shell —
         // our tests run unsecured on a random localhost port, and inherited auth would
@@ -705,10 +730,12 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
             if (key === "SUBC_LAUNCH_NONCE") continue;
             childEnv[key] = value;
         }
-        // Keep host-global ~/.claude, ~/.agents, and ~/.opencode content out of
-        // hermetic prompts. Those files can add hundreds of thousands of system
-        // characters and invalidate fixed-window failure-mode tests.
-        childEnv.HOME = resolveIsolatedHome(env);
+        // OpenCode also scans ~/.opencode outside the XDG config tree. Keep that
+        // lookup in the fixture, not in the operator's home directory.
+        childEnv.HOME = dirname(env.dataDir);
+        // Foundation's HTTP cache on macOS ignores HOME/XDG unless its user home
+        // is overridden too. Keep that SQLite cache in the same private fixture.
+        childEnv.CFFIXED_USER_HOME = childEnv.HOME;
         childEnv.OPENCODE_CONFIG_DIR = env.configDir;
         childEnv.XDG_CONFIG_HOME = env.configDir;
         childEnv.XDG_DATA_HOME = env.dataDir;
@@ -723,6 +750,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         // Caller overrides (e.g. MAGIC_CONTEXT_LOG_PATH pointing the plugin log at a
         // per-suite file so Rust-mode scenarios can assert on transform decisions).
         // Merged last so an explicit override wins over the inherited value.
+        if (resolvedOpts.modelsCatalog) childEnv.OPENCODE_DISABLE_MODELS_FETCH = "1";
         for (const [key, value] of Object.entries(resolvedOpts.extraEnv ?? {})) {
             childEnv[key] = value;
         }

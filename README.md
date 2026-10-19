@@ -1,27 +1,4 @@
-<p align="center">
-  <strong>English</strong> |
-  <a href="./README.zh.md">简体中文</a> |
-  <a href="./README.zht.md">繁體中文</a> |
-  <a href="./README.ko.md">한국어</a> |
-  <a href="./README.de.md">Deutsch</a> |
-  <a href="./README.es.md">Español</a> |
-  <a href="./README.fr.md">Français</a> |
-  <a href="./README.it.md">Italiano</a> |
-  <a href="./README.da.md">Dansk</a> |
-  <a href="./README.ja.md">日本語</a> |
-  <a href="./README.pl.md">Polski</a> |
-  <a href="./README.ru.md">Русский</a> |
-  <a href="./README.bs.md">Bosanski</a> |
-  <a href="./README.ar.md">العربية</a> |
-  <a href="./README.no.md">Norsk</a> |
-  <a href="./README.br.md">Português (Brasil)</a> |
-  <a href="./README.th.md">ไทย</a> |
-  <a href="./README.tr.md">Türkçe</a> |
-  <a href="./README.uk.md">Українська</a> |
-  <a href="./README.bn.md">বাংলা</a> |
-  <a href="./README.gr.md">Ελληνικά</a> |
-  <a href="./README.vi.md">Tiếng Việt</a>
-</p>
+**English** · [简体中文](docs/i18n/README.zh-CN.md) · [繁體中文](docs/i18n/README.zh-TW.md) · [한국어](docs/i18n/README.ko.md) · [Deutsch](docs/i18n/README.de.md) · [Español](docs/i18n/README.es.md) · [Français](docs/i18n/README.fr.md) · [Italiano](docs/i18n/README.it.md) · [Dansk](docs/i18n/README.da.md) · [日本語](docs/i18n/README.ja.md) · [Polski](docs/i18n/README.pl.md) · [Русский](docs/i18n/README.ru.md) · [Bosanski](docs/i18n/README.bs.md) · [العربية](docs/i18n/README.ar.md) · [Norsk](docs/i18n/README.nb.md) · [Português (Brasil)](docs/i18n/README.pt-BR.md) · [ไทย](docs/i18n/README.th.md) · [Türkçe](docs/i18n/README.tr.md) · [Українська](docs/i18n/README.uk.md) · [বাংলা](docs/i18n/README.bn.md) · [Ελληνικά](docs/i18n/README.el.md) · [Tiếng Việt](docs/i18n/README.vi.md)
 
 <h1 align="center">Magic Context</h1>
 
@@ -79,24 +56,11 @@ Run one session per project and keep it going for weeks, months, or years. It re
 
 ## Quick start
 
-Run the interactive setup wizard. It detects your models, configures everything, and handles compatibility.
-
-**macOS / Linux:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/cortexkit/magic-context/master/scripts/install.sh | bash
-```
-
-**Windows (PowerShell):**
-```powershell
-irm https://raw.githubusercontent.com/cortexkit/magic-context/master/scripts/install.ps1 | iex
-```
-
-**Or run directly (any OS):**
 ```bash
 npx @cortexkit/magic-context@latest setup
 ```
 
-The wizard auto-detects which harnesses you have (OpenCode, Pi, OMP, or any combination), adds the plugin, disables built-in compaction, helps you pick models for the historian and dreamer, and resolves conflicts with other context-management plugins. Target one with `--harness opencode`, `--harness pi`, or `--harness omp`.
+Auto-detects which harnesses you have installed (OpenCode, Pi, OMP, or any combination) and configures each one: it registers the plugin, turns off the host's built-in compaction, helps you pick models for the historian and dreamer, and resolves conflicts with other context-management plugins. Restart the harness afterwards to load Magic Context. Target a specific harness with `--harness opencode`, `--harness pi`, or `--harness omp`.
 
 > **Why disable built-in compaction?** Magic Context manages context itself. The host's compaction would interfere with its cache-aware deferred operations and double-compress.
 
@@ -279,7 +243,7 @@ Because it runs during idle time, the dreamer pairs well with local models, even
 
 Recall works **across sessions** (a new session inherits everything) and **across harnesses** (write a memory in OpenCode, retrieve it in Pi or OMP).
 
-> **Auto search hints** *(on by default)* run a background `ctx_search` each turn and whisper a "vague recall" when something relevant exists — like almost remembering a note you took. It appends only compact fragments, never full content; set `memory.auto_search.enabled: false` to turn it off. **Git commit indexing** *(opt-in)* makes your project history semantically searchable as an additional `ctx_search` source — enable with `memory.git_commit_indexing.enabled: true`.
+> **Auto search hints** *(on by default)* run a background `ctx_search` each turn and whisper a "vague recall" when something relevant exists — like almost remembering a note you took. It appends only compact fragments, never full content; set `memory.auto_search.enabled: false` to turn it off. It also searches past conversation with `memory.enabled: false`, so turning memory off does not turn it off. **Git commit indexing** *(opt-in)* makes your project history semantically searchable as an additional `ctx_search` source — enable with `memory.git_commit_indexing.enabled: true`.
 
 ### Agent tools at a glance
 
@@ -403,6 +367,32 @@ bun run format      # Format (Biome)
 ```
 
 Dream execution requires a live OpenCode server (the dreamer creates ephemeral child sessions). Use `/ctx-dream` inside OpenCode for on-demand maintenance.
+
+### Mutation catalogue
+
+A passing safety test proves little until it has been seen to fail. [`mutations.toml`](mutations.toml) is the checked-in catalogue: each row deliberately breaks one guard in production code and names the test that must fail because of it, so a guard cannot quietly stop guarding. A row earns its place by guarding a silent, costly failure: a prompt-cache bust, a refusal that must fail closed, a wire contract, crash safety, data loss, file permissions. Every exactly-once guard (a lease, a compare-and-set clear) has at least one row through the real production path. Style and cosmetics do not get rows.
+
+The pinned [`ck-mutate`](https://github.com/cortexkit/commons/tree/7d08e73722fa3e79bbcc2607753978ab768f1c6b/crates/cortexkit-mutate) runner replays it from a clean tree: it checks that each named test passes, applies the break, requires the test to fail, and restores the source byte for byte.
+
+```sh
+cargo install --locked --git https://github.com/cortexkit/commons --rev 7d08e73722fa3e79bbcc2607753978ab768f1c6b cortexkit-mutate
+bun install --frozen-lockfile
+ck-mutate check                       # anchors match exactly once; cargo test names exist
+ck-mutate run --all                   # every row (slow: the Rust rows rebuild mc-module)
+ck-mutate run --diff origin/master    # only the rows a change touches
+ck-mutate run --only ts-schema-fence-refuses-newer-database
+```
+
+Every row must report CAUGHT. [`mutations.yml`](.github/workflows/mutations.yml) replays the rows a pull request (or a `train/**` push) touches, the full catalogue on every push to master, and the full catalogue with `--broad` nightly. Never `git checkout` a file while a replay runs: it removes the mutation and fakes a survivor.
+
+To add a row:
+
+1. Pick the production line that *is* the guard and copy `old` from the file, never from memory. Make `new` the smallest edit that removes the protection (`if (false)`, `return true`, a dropped condition), not an edit that breaks compilation.
+2. Find the test that should catch it. Apply the edit by hand, run that test file, and confirm the test goes red for the guarded reason, then restore the file. If nothing goes red, that is a finding: add the missing test first, in its own commit.
+3. Add the row. Bun tests are `command` rows: copy an existing row and set `expect_red` to the anchored `-t` regex of the full test name (describe names and test name joined by spaces, regex metacharacters escaped, each space written `\s`). Rust tests in mc-module are `command` rows running `cargo test --lib -- --exact`; small Rust targets are `cargo` rows with `only = true`. Add `expect_message` (a substring, or `/regex/`) whenever the test could also fail for an unrelated reason.
+4. Run `ck-mutate check`, then `ck-mutate run --only <id>`, and commit the row only once it reports CAUGHT.
+
+A row that stops being caught is a finding to fix, not a row to delete.
 
 ---
 

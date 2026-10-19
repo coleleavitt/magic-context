@@ -1,16 +1,18 @@
-import { harnessOwnsOpenCodeStore } from "../../shared/harness";
+import { getHarness, harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
     assertOpenCodeStoreGeneration,
     claimOpenCodeDbDiagnosticOnce,
     clearOpenCodeDbReadFailure,
     type OpenCodeDbPathResolution,
+    type OpenCodeHostGeneration,
     openCodeDbPathExists,
     recordOpenCodeDbReadFailure,
     resolveOpenCodeDbPath,
 } from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { forgetRawSessionOrdinalWatermark, forgetRawSessionSummaryRows } from "./read-session-raw";
 
 interface RawCountRow {
     count?: number;
@@ -52,23 +54,30 @@ export function openCodeDbExists(): boolean {
     return harnessOwnsOpenCodeStore() && openCodeDbPathExists(resolveOpenCodeDbPath());
 }
 
-let cachedReadOnlyDb: { path: string; db: Database } | null = null;
+// One cached read-only handle per store generation. The v1 handle serves every
+// OpenCode 1 reader in this module; the v2 handle serves only the readers that
+// also know the OpenCode 2 schema (see getMessageTimesFromOpenCodeDb).
+const cachedReadOnlyDbs: Record<OpenCodeHostGeneration, { path: string; db: Database } | null> = {
+    v1: null,
+    v2: null,
+};
 
-function closeCachedReadOnlyDb(): void {
-    if (!cachedReadOnlyDb) {
+function closeCachedReadOnlyDb(generation: OpenCodeHostGeneration): void {
+    const cached = cachedReadOnlyDbs[generation];
+    if (!cached) {
         return;
     }
 
     try {
-        closeQuietly(cachedReadOnlyDb.db);
+        closeQuietly(cached.db);
     } catch (error) {
         log("[magic-context] failed to close cached OpenCode read-only DB:", error);
     } finally {
-        cachedReadOnlyDb = null;
+        cachedReadOnlyDbs[generation] = null;
     }
 }
 
-function getReadOnlySessionDb(): Database {
+function getReadOnlySessionDb(generation: OpenCodeHostGeneration = "v1"): Database {
     if (!harnessOwnsOpenCodeStore()) {
         throw new Error(
             "OpenCode session database is not readable from a Pi-compatible process; its history lives in Pi sessions",
@@ -81,19 +90,20 @@ function getReadOnlySessionDb(): Database {
             `OpenCode session database is unavailable at ${dbPath} (source=${resolution.source})`,
         );
     }
-    if (cachedReadOnlyDb?.path === dbPath) {
-        return cachedReadOnlyDb.db;
+    const cached = cachedReadOnlyDbs[generation];
+    if (cached?.path === dbPath) {
+        return cached.db;
     }
 
-    closeCachedReadOnlyDb();
+    closeCachedReadOnlyDb(generation);
     const db = new Database(dbPath, { readonly: true });
     try {
-        assertOpenCodeStoreGeneration(db, "v1", dbPath);
+        assertOpenCodeStoreGeneration(db, generation, dbPath);
     } catch (error) {
         closeQuietly(db);
         throw error;
     }
-    cachedReadOnlyDb = { path: dbPath, db };
+    cachedReadOnlyDbs[generation] = { path: dbPath, db };
     clearOpenCodeDbReadFailure();
     return db;
 }
@@ -104,7 +114,8 @@ export function withReadOnlySessionDb<T>(fn: (db: Database) => T): T {
 
 // Intentional: exported for tests; production relies on process-exit cleanup (same as closeDatabase)
 export function closeReadOnlySessionDb(): void {
-    closeCachedReadOnlyDb();
+    closeCachedReadOnlyDb("v1");
+    closeCachedReadOnlyDb("v2");
 }
 
 export function getRawSessionMessageCountFromDb(db: Database, sessionId: string): number {
@@ -228,8 +239,25 @@ export function shouldHoldIgnoredNotificationFromMessages(
 }
 
 function trackedMessages(session: TrackedSession): TurnStateMessage[] {
-    return [...session.messages.values()]
-        .sort((left, right) => left.timeCreated - right.timeCreated)
+    let assistant: TrackedMessage | undefined;
+    let user: TrackedMessage | undefined;
+    for (const message of session.messages.values()) {
+        if (
+            message.role === "assistant" &&
+            (!assistant || message.timeCreated >= assistant.timeCreated)
+        )
+            assistant = message;
+        if (
+            message.role === "user" &&
+            (!user || message.timeCreated >= user.timeCreated) &&
+            (message.parts.size === 0 || ![...message.parts.values()].every(isMachineGeneratedPart))
+        )
+            user = message;
+    }
+    // Retain historical flags so removal of the newest row reveals the same
+    // predecessor, but construct only the two rows the turn predicates inspect.
+    return [user, assistant]
+        .filter((message): message is TrackedMessage => !!message)
         .map((message) => ({
             info: {
                 id: message.id,
@@ -241,6 +269,19 @@ function trackedMessages(session: TrackedSession): TurnStateMessage[] {
         }));
 }
 
+function turnStatePart(part: Record<string, unknown>): unknown {
+    const marker = asRecord(asRecord(part.metadata)?.marker);
+    return {
+        type: part.type === "tool" ? "tool" : undefined,
+        providerExecuted: part.providerExecuted === true,
+        synthetic: truthyStoredFlag(part.synthetic),
+        ignored: truthyStoredFlag(part.ignored),
+        ...(marker?.kind !== null && marker?.kind !== undefined
+            ? { metadata: { marker: { kind: true } } }
+            : {}),
+    };
+}
+
 function pendingMessageParts(sessionId: string, messageId: string): Map<string, unknown> {
     return pendingParts.get(sessionId)?.get(messageId) ?? new Map<string, unknown>();
 }
@@ -249,6 +290,10 @@ function pendingMessageParts(sessionId: string, messageId: string): Map<string, 
 export function observeOpenCodeTurnEvent(type: string, properties: unknown): void {
     const props = asRecord(properties);
     if (!props) return;
+    if (type === "message.removed" && typeof props.sessionID === "string")
+        forgetRawSessionOrdinalWatermark(props.sessionID);
+    if (type === "session.deleted" && typeof props.sessionID === "string")
+        forgetRawSessionSummaryRows(props.sessionID);
 
     if (type === "message.part.updated") {
         const part = asRecord(props.part);
@@ -262,7 +307,7 @@ export function observeOpenCodeTurnEvent(type: string, properties: unknown): voi
         }
         const tracked = trackedSessions.get(part.sessionID)?.messages.get(part.messageID);
         if (tracked) {
-            tracked.parts.set(part.id, part);
+            tracked.parts.set(part.id, turnStatePart(part));
             return;
         }
         let byMessage = pendingParts.get(part.sessionID);
@@ -275,7 +320,7 @@ export function observeOpenCodeTurnEvent(type: string, properties: unknown): voi
             parts = new Map();
             byMessage.set(part.messageID, parts);
         }
-        parts.set(part.id, part);
+        parts.set(part.id, turnStatePart(part));
         return;
     }
 
@@ -363,6 +408,16 @@ export function assistantAwaitingTools(_deps: unknown, sessionId: string): boole
 }
 
 export const __openCodeTurnStateTest = {
+    retainedPartBytes(): number {
+        let bytes = 0;
+        for (const session of trackedSessions.values())
+            for (const message of session.messages.values())
+                for (const part of message.parts.values()) bytes += JSON.stringify(part).length;
+        for (const session of pendingParts.values())
+            for (const message of session.values())
+                for (const part of message.values()) bytes += JSON.stringify(part).length;
+        return bytes;
+    },
     reset(): void {
         trackedSessions.clear();
         pendingParts.clear();
@@ -471,6 +526,34 @@ export function latestPersistedMessageForRecovery(
     });
 }
 
+/** The real-user turn anchor used by thinking recovery, without reading text
+ * payloads. Synthetic users and tool-result-only carriers cannot own a turn. */
+export function latestRealUserTurnIdFromOpenCodeDb(sessionId: string): string | undefined {
+    try {
+        return (
+            withReadOnlySessionDb((db) => {
+                const row = db
+                    .prepare(`SELECT m.id FROM message m
+                WHERE m.session_id = ? AND json_extract(m.data, '$.role') = 'user'
+                  AND COALESCE(json_type(m.data, '$.synthetic'), 'null') != 'true'
+                  AND m.id NOT LIKE 'synth-user-%'
+                  AND NOT (EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id)
+                    AND NOT EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id
+                      AND COALESCE(json_type(p.data, '$.synthetic'), 'null') != 'true'
+                      AND COALESCE(json_type(p.data, '$.ignored'), 'null') != 'true'
+                      AND COALESCE(json_extract(p.data, '$.type'), '') NOT IN
+                          ('tool_result', 'toolResult', 'tool-result')))
+                ORDER BY m.time_created DESC, m.id DESC LIMIT 1`)
+                    .get(sessionId) as { id?: unknown } | null;
+                return typeof row?.id === "string" ? row.id : undefined;
+            }) ?? undefined
+        );
+    } catch {
+        // An unavailable or differently shaped host store is not proof of a turn.
+        return undefined;
+    }
+}
+
 export function hasNewerRealUserMessage(
     db: Database,
     sessionId: string,
@@ -571,6 +654,11 @@ interface MessageTimeRow {
  * Used by temporal-awareness to map compartment start/end message IDs to
  * wall-clock dates for `## start-end · date · title` headings in
  * `<session-history>`.
+ *
+ * An OpenCode 2 process reads its own store (native, or a v1 store the 2.x host
+ * migrated) from `session_message`, the table the v2 store reader uses. Reading
+ * the v1 `message` table there either refuses on the store-generation guard (a
+ * native v2 store) or reads rows the 2.x host no longer writes (a migrated one).
  */
 export function getMessageTimesFromOpenCodeDb(
     sessionId: string,
@@ -580,21 +668,30 @@ export function getMessageTimesFromOpenCodeDb(
     if (messageIds.length === 0 || !harnessOwnsOpenCodeStore()) return result;
 
     try {
-        withReadOnlySessionDb((db) => {
-            // SQLite limits on IN (?, ?, ...) are high (~999 by default) so a
-            // single batched query is safe for any realistic compartment count.
-            const placeholders = messageIds.map(() => "?").join(",");
-            const rows = db
-                .prepare(
-                    `SELECT id, time_created FROM message WHERE session_id = ? AND id IN (${placeholders})`,
-                )
-                .all(sessionId, ...messageIds) as MessageTimeRow[];
-            for (const row of rows) {
-                if (typeof row.id === "string" && typeof row.time_created === "number") {
-                    result.set(row.id, row.time_created);
-                }
+        const placeholders = messageIds.map(() => "?").join(",");
+        // Unary + excludes the session index from planning. The requested
+        // primary keys, not the size of the session, must bound this lookup.
+        const rows =
+            getHarness() === "opencode2"
+                ? (getReadOnlySessionDb("v2")
+                      .prepare(
+                          `SELECT id, COALESCE(time_created, json_extract(data, '$.time.created')) AS time_created
+                             FROM session_message WHERE +session_id = ? AND id IN (${placeholders})`,
+                      )
+                      .all(sessionId, ...messageIds) as MessageTimeRow[])
+                : withReadOnlySessionDb(
+                      (db) =>
+                          db
+                              .prepare(
+                                  `SELECT id, time_created FROM message WHERE +session_id = ? AND id IN (${placeholders})`,
+                              )
+                              .all(sessionId, ...messageIds) as MessageTimeRow[],
+                  );
+        for (const row of rows) {
+            if (typeof row.id === "string" && typeof row.time_created === "number") {
+                result.set(row.id, row.time_created);
             }
-        });
+        }
     } catch (error) {
         logProbeFailureOnce(resolveOpenCodeDbPath(), error);
     }

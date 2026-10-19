@@ -21,6 +21,8 @@ import { log } from "@magic-context/core/shared/logger";
 import type { PromptSurfaceConfig } from "@magic-context/core/shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "@magic-context/core/shared/prompt-surface-runtime";
 import { createPromptSurfaceRuntime } from "@magic-context/core/shared/prompt-surface-runtime";
+import { withoutSmartNoteText } from "@magic-context/core/tools/ctx-note/constants";
+import { CTX_NOTE_LIGHT_DESCRIPTION } from "@magic-context/core/tools/light-descriptions";
 import { applyJsonSchemaParameterDescriptions } from "@magic-context/core/tools/parameter-descriptions";
 import { createCtxExpandTool } from "./ctx-expand";
 import { createCtxMemoryListTool, createCtxMemoryTool } from "./ctx-memory";
@@ -62,6 +64,7 @@ export interface RegisterToolsOptions {
 	memoryEnabled?: boolean;
 	embeddingEnabled?: boolean;
 	gitCommitsEnabled?: boolean;
+	rerankConnectionFile?: string;
 	/** Resolve the current directory's project identity using the user-level home-project setting. */
 	resolveProjectIdentity?: (ctx: { cwd: string }) => string | undefined;
 	/** When true, register the separate ctx_memory_list tool and enable Curate-only
@@ -70,14 +73,20 @@ export interface RegisterToolsOptions {
 	/** Number of recent tags that ctx_reduce should treat as protected
 	 *  (deferred drops instead of immediate). Should match `magic_context.protected_tags`. */
 	protectedTags?: number;
+	protectedTools?: Readonly<Record<string, number>>;
+	resolveProtectedTools?: (ctx: {
+		cwd: string;
+	}) => Readonly<Record<string, number>> | undefined;
 	/** Resolve protected-tag config from the current cwd at tool-call time. */
 	resolveProtectedTags?: (ctx: { cwd: string }) => number | undefined;
 	/** When true, ctx_note accepts smart notes (surface_condition) because
 	 *  the dreamer is configured to evaluate them. When false, smart-note
 	 *  writes are rejected to avoid stuck-pending state. */
 	dreamerEnabled?: boolean;
+	smartNotesEnabled?: boolean;
 	/** Resolve smart-note enablement from the current cwd at tool-call time. */
 	resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
+	expandTools?: Record<string, string | false>;
 	/** When false, omit ctx_memory from the registered surface. */
 	memoryToolEnabled?: boolean;
 	/** When true, omit session-scoped tools (ctx_note, ctx_expand) from the
@@ -115,20 +124,33 @@ export function registerMagicContextTools(
 	const registration = promptSurfaceRuntime.resolveRegistration(
 		opts.promptSurface,
 	);
+	// Smart notes need smart_notes.enabled and a runnable dreamer, which evaluates
+	// their conditions. Either one off drops ctx_note's smart-note text; an
+	// omitted flag (as in subagent entries) counts as on.
+	const smartNotesAvailable =
+		opts.smartNotesEnabled !== false && opts.dreamerEnabled !== false;
 	const surfaceTool = <T extends ToolDefinition>(definition: T): T => {
 		const parameters = structuredClone(definition.parameters);
 		applyJsonSchemaParameterDescriptions(
 			definition.name,
 			parameters,
 			registration.preset,
+			smartNotesAvailable ? opts.smartNotesEnabled : false,
 		);
 		return throwReturnedToolErrors({
 			...definition,
 			parameters,
-			description: registration.descriptionFor(
-				definition.name,
-				definition.description,
-			),
+			description:
+				definition.name === "ctx_note" && !smartNotesAvailable
+					? withoutSmartNoteText(
+							registration.preset === "light"
+								? CTX_NOTE_LIGHT_DESCRIPTION
+								: definition.description,
+						)
+					: registration.descriptionFor(
+							definition.name,
+							definition.description,
+						),
 		});
 	};
 
@@ -140,6 +162,7 @@ export function registerMagicContextTools(
 				memoryEnabled: opts.memoryEnabled,
 				embeddingEnabled: opts.embeddingEnabled,
 				gitCommitsEnabled: opts.gitCommitsEnabled,
+				rerankConnectionFile: opts.rerankConnectionFile,
 				resolveProjectIdentity,
 			}),
 		),
@@ -172,14 +195,19 @@ export function registerMagicContextTools(
 			surfaceTool(
 				createCtxNoteTool({
 					db: opts.db,
-					dreamerEnabled: opts.dreamerEnabled ?? false,
+					dreamerEnabled: opts.dreamerEnabled,
+					smartNotesEnabled: opts.smartNotesEnabled,
 					resolveDreamerEnabled: opts.resolveDreamerEnabled,
 					resolveProjectIdentity,
 				}),
 			),
 		);
 
-		pi.registerTool(surfaceTool(createCtxExpandTool({ db: opts.db })));
+		pi.registerTool(
+			surfaceTool(
+				createCtxExpandTool({ db: opts.db, expandTools: opts.expandTools }),
+			),
+		);
 	}
 
 	if (opts.todowriteEnabled === true) {
@@ -204,6 +232,8 @@ export function registerMagicContextTools(
 				createCtxReduceTool({
 					db: opts.db,
 					protectedTags: opts.protectedTags ?? 20,
+					protectedTools: opts.protectedTools,
+					resolveProtectedTools: opts.resolveProtectedTools,
 					resolveProtectedTags: opts.resolveProtectedTags,
 				}),
 			),

@@ -56,7 +56,15 @@ const TOOL_OWNER_CACHE_KEY_SEP = "\x00";
 type InertWhitespaceTag = ReturnType<typeof getInertWhitespaceAssistantTags>[number];
 const inertWhitespaceCache = new WeakMap<
     ContextDatabase,
-    Map<string, { tagsVersion: number; ownersKey: string; tags: InertWhitespaceTag[] }>
+    Map<
+        string,
+        {
+            tagsVersion: number;
+            identityRevision: string | null | undefined;
+            ownersKey: string;
+            tags: InertWhitespaceTag[];
+        }
+    >
 >();
 
 function getCachedInertWhitespaceAssistantTags(
@@ -70,6 +78,7 @@ function getCachedInertWhitespaceAssistantTags(
     );
     const ownersKey = JSON.stringify(messageIds);
     const tagsVersion = tagger.getLoadedTagsVersion?.(sessionId, db);
+    const identityRevision = tagger.getLoadedTagIdentityRevision?.(sessionId, db);
     if (tagsVersion === undefined)
         return getInertWhitespaceAssistantTags(db, sessionId, messageIds);
 
@@ -79,10 +88,15 @@ function getCachedInertWhitespaceAssistantTags(
         inertWhitespaceCache.set(db, bySession);
     }
     const cached = bySession.get(sessionId);
-    if (cached?.tagsVersion === tagsVersion && cached.ownersKey === ownersKey) return cached.tags;
+    if (
+        cached?.tagsVersion === tagsVersion &&
+        cached.identityRevision === identityRevision &&
+        cached.ownersKey === ownersKey
+    )
+        return cached.tags;
 
     const tags = getInertWhitespaceAssistantTags(db, sessionId, messageIds);
-    bySession.set(sessionId, { tagsVersion, ownersKey, tags });
+    bySession.set(sessionId, { tagsVersion, identityRevision, ownersKey, tags });
     return tags;
 }
 
@@ -237,6 +251,7 @@ export type MessageInfo = {
     id?: string;
     role?: string;
     sessionID?: string;
+    time?: { created?: number; completed?: number };
     summary?: boolean;
     /** Marks one of the two m[0]/m[1] messages prepended by compartment injection. */
     syntheticHead?: boolean;
@@ -260,6 +275,22 @@ export interface TagNormalizationTarget {
 }
 
 export type TagTarget = {
+    /** Parts a drop neutralizes, distinct from a meaning-preserving text rewrite. */
+    dropReasoningParts?: readonly unknown[];
+    /** Original coordinates of the content this target edits. */
+    mutationParts?: readonly { message: MessageLike; part: unknown }[];
+    /** New drops are withheld; persisted replay uses the original target map. */
+    thinkingDropProtected?: boolean;
+    /** A rewrite here would invalidate a later protected signed block. */
+    thinkingRewriteProtected?: boolean;
+    /**
+     * Pi only: the number a duplicate tag identity was just folded into. This
+     * pass keeps the bytes already served for it, so drops are withheld like
+     * `thinkingDropProtected`, but unlike that flag it does not keep a pending
+     * flush signal alive: the flush is consumed on this pass and the queued
+     * drop waits for the next pass that busts for its own reason.
+     */
+    identityRepairProtected?: boolean;
     /** Non-mutating count of current and replacement token-bearing fields for a planned drop. */
     measureReclaim?: (skeleton: boolean) => {
         beforeTools: number;
@@ -267,8 +298,23 @@ export type TagTarget = {
         beforeProse: number;
         afterProse: number;
     };
-    setContent: (content: string) => boolean;
+    /**
+     * Replace the part's text. A text target treats this as a drop by default
+     * and also takes the reasoning of its message off the wire, since that
+     * reasoning answered the text that left. `keepReasoning` marks an in-place
+     * rewrite that keeps the text's meaning (caveman compression, a partial
+     * system-injection strip): the reasoning stays, because removing it would
+     * leave a gap in the middle of the history that prefix-bound models reject
+     * for every later thinking block.
+     */
+    setContent: (content: string, options?: { keepReasoning?: boolean }) => boolean;
     getContent?: () => string | null;
+    /**
+     * Text targets: the `§N§ ` prefix this pass puts in front of the text, or
+     * "" when prefixes are not injected. A rewrite computed from the stored
+     * source (which never carries the prefix) puts it back with this.
+     */
+    textPrefix?: string;
     drop?: () => ToolDropResult;
     /** Legacy skeleton: arguments replaced by the `{"dropped": …}` marker.
      * Replay-only, for `drop_mode = 'truncated'` tags not yet converted. */
@@ -297,6 +343,8 @@ export type TagTarget = {
     /** Non-mutating: would drop()/truncate() actually reclaim bytes? Tool
      * targets only; absent on message/file targets. */
     canDrop?: () => boolean;
+    /** Prepare durable host removal authorization; false defers the new drop without changing bytes. */
+    prepareDrop?: () => boolean;
     /** A full arc removal would strand or merge native reasoning, so keep a paired skeleton. */
     requiresToolArcSkeleton?: boolean;
     /** Non-mutating read of the tool invocation's input object (e.g. to read
@@ -429,6 +477,8 @@ function extractToolTagMetadata(part: unknown): {
 }
 
 export interface TagMessagesOptions {
+    /** Original part references in the provider's unfinished signed assistant turn. */
+    protectedThinkingMessages?: ReadonlySet<MessageLike>;
     /**
      * When true, skip injecting §N§ prefix into message text/tool output parts.
      * DB-level tag records are still created normally — this flag only affects
@@ -451,6 +501,14 @@ export interface TagMessagesOptions {
      * remove its emptied rows from the served array as well.
      */
     servedMessages?: MessageLike[];
+    /**
+     * Applied to assistant text that a pass restores from its saved source copy.
+     * OpenCode 2 cannot strip copied `§N§` notation before the host stores a reply,
+     * so its adapter strips it from the request copy instead; a source copy saved
+     * before that strip existed still holds the copies and would put them back.
+     * Unset on every other host, where restored text is served as saved.
+     */
+    normalizeRestoredAssistantText?: (text: string) => string;
     /** @internal diagnostic hook used by cache-stability/perf tests. */
     onToolOwnerFallbackLookup?: (lookup: ToolOwnerFallbackLookup) => void;
 }
@@ -483,6 +541,9 @@ export function tagMessages(
     db: ContextDatabase,
     options: TagMessagesOptions = {},
 ): TagMessagesResult {
+    const protectedThinkingParts = new Set(
+        [...(options.protectedThinkingMessages ?? [])].flatMap((message) => message.parts),
+    );
     const skipPrefixInjection = options.skipPrefixInjection === true;
     const onToolOwnerFallbackLookup = options.onToolOwnerFallbackLookup;
     const targets = new Map<number, TagTarget>();
@@ -541,6 +602,30 @@ export function tagMessages(
         collectRelevantSourceTagIds(messages, assignments),
     );
     logTransformTiming(sessionId, "tag.getSourceContents", tGetSourceContents);
+    // Partial compartment ends (a compartment that stops inside a message at
+    // end_block_index), read once per pass on first use. Every text and file
+    // target's setContent needs this, and a per-call query on a large session
+    // costs hundreds of milliseconds per pass. When several partial compartments
+    // end in the same message, text and file targets keep the first row and tool
+    // targets the last, which is what their former per-target queries returned.
+    let partialEndsCache: { first: Map<string, number>; last: Map<string, number> } | undefined;
+    const loadPartialEnds = (): { first: Map<string, number>; last: Map<string, number> } => {
+        if (partialEndsCache) return partialEndsCache;
+        const first = new Map<string, number>();
+        const last = new Map<string, number>();
+        const rows = db
+            .prepare(
+                "SELECT end_message_id, end_block_index FROM compartments WHERE session_id=? AND end_block_index IS NOT NULL ORDER BY rowid",
+            )
+            .all(sessionId) as Array<{ end_message_id: string; end_block_index: number }>;
+        for (const row of rows) {
+            if (!first.has(row.end_message_id)) first.set(row.end_message_id, row.end_block_index);
+            last.set(row.end_message_id, row.end_block_index);
+        }
+        partialEndsCache = { first, last };
+        return partialEndsCache;
+    };
+    const getPartialEnds = (): Map<string, number> => loadPartialEnds().first;
     let precedingThinkingParts: ThinkingLikePart[] = [];
     let lastReduceMessageIndex = -1;
     const RECENT_REDUCE_LOOKBACK = 10;
@@ -853,7 +938,10 @@ export function tagMessages(
                 // than what the resolver expected.
                 const persistedSource = sourceContents.get(tagId);
                 if (persistedSource !== undefined) {
-                    textPart.text = persistedSource;
+                    textPart.text =
+                        options.normalizeRestoredAssistantText && message.info.role === "assistant"
+                            ? options.normalizeRestoredAssistantText(persistedSource)
+                            : persistedSource;
                 } else {
                     const sourceContent = stripTagPrefix(textPart.text);
                     if (sourceContent.trim().length > 0) {
@@ -877,24 +965,18 @@ export function tagMessages(
                 }
                 targets.set(tagId, {
                     message,
-                    setContent: (content) => {
+                    dropReasoningParts: thinkingParts,
+                    mutationParts: [{ message, part: textPart }],
+                    textPrefix: skipPrefixInjection ? "" : prependTag(tagId, ""),
+                    setContent: (content, options) => {
                         if (textPart.text === content) return false;
-                        const partialEnd = messageId
-                            ? (db
-                                  .prepare(
-                                      "SELECT end_block_index FROM compartments WHERE session_id=? AND end_message_id=? AND end_block_index IS NOT NULL LIMIT 1",
-                                  )
-                                  .get(sessionId, messageId) as
-                                  | { end_block_index: number }
-                                  | undefined)
-                            : undefined;
-                        if (partialEnd && partIndex > partialEnd.end_block_index) return false;
+                        const partialEnd = messageId ? getPartialEnds().get(messageId) : undefined;
+                        if (partialEnd !== undefined && partIndex > partialEnd) return false;
                         textPart.text = content;
+                        if (options?.keepReasoning === true) return true;
                         for (const tp of thinkingParts) {
-                            if (
-                                partialEnd &&
-                                message.parts.indexOf(tp) > partialEnd.end_block_index
-                            )
+                            if (protectedThinkingParts.has(tp)) continue;
+                            if (partialEnd !== undefined && message.parts.indexOf(tp) > partialEnd)
                                 continue;
                             neutralizeDroppedReasoningPart(tp);
                         }
@@ -1023,7 +1105,10 @@ export function tagMessages(
                 );
                 targets.set(tagId, {
                     message,
+                    mutationParts: [{ message, part: filePart }],
                     setContent: (content) => {
+                        // File edits do not clear reasoning; their position can
+                        // still invalidate a later prefix-bound signature.
                         const prev = messageParts[partIndex];
                         const prevText =
                             typeof prev === "object" && prev !== null && "text" in prev
@@ -1031,14 +1116,8 @@ export function tagMessages(
                                 : "";
                         if (prevText === content) return false;
                         if (messageId) {
-                            const partialEnd = db
-                                .prepare(
-                                    "SELECT end_block_index FROM compartments WHERE session_id=? AND end_message_id=? AND end_block_index IS NOT NULL LIMIT 1",
-                                )
-                                .get(sessionId, messageId) as
-                                | { end_block_index: number }
-                                | undefined;
-                            if (partialEnd && partIndex > partialEnd.end_block_index) return false;
+                            const partialEnd = getPartialEnds().get(messageId);
+                            if (partialEnd !== undefined && partIndex > partialEnd) return false;
                         }
                         messageParts[partIndex] = {
                             type: "text",
@@ -1064,20 +1143,7 @@ export function tagMessages(
     logTransformTiming(sessionId, "tag.saveSource", performance.now() - accSaveSource);
 
     const partialEnds =
-        toolTagByCallId.size > 0
-            ? new Map(
-                  (
-                      db
-                          .prepare(
-                              "SELECT end_message_id, end_block_index FROM compartments WHERE session_id=? AND end_block_index IS NOT NULL",
-                          )
-                          .all(sessionId) as Array<{
-                          end_message_id: string;
-                          end_block_index: number;
-                      }>
-                  ).map((row) => [row.end_message_id, row.end_block_index]),
-              )
-            : new Map<string, number>();
+        toolTagByCallId.size > 0 ? loadPartialEnds().last : new Map<string, number>();
     for (const [compositeKey, tagId] of toolTagByCallId) {
         const occurrences = toolCallIndex.get(compositeKey)?.occurrences ?? [];
         const touchesUncoveredPart = occurrences.some(({ message, part }) => {
@@ -1090,7 +1156,13 @@ export function tagMessages(
         const thinkingParts = toolThinkingByCallId.get(compositeKey) ?? [];
         targets.set(
             tagId,
-            createToolDropTarget(compositeKey, thinkingParts, toolCallIndex, batch, tagId),
+            createToolDropTarget(
+                compositeKey,
+                thinkingParts.filter((part) => !protectedThinkingParts.has(part)),
+                toolCallIndex,
+                batch,
+                tagId,
+            ),
         );
     }
 

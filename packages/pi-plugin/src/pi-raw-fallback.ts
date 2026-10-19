@@ -1,11 +1,15 @@
 import {
 	calibrationForModelKey,
 	type DecisionCalibration,
+	hasMeasuredDecisionCalibration,
 	providerMass,
 } from "@magic-context/core/hooks/magic-context/decision-calibration";
-import { hasTokenizerForFit } from "@magic-context/core/hooks/magic-context/read-session-formatting";
-
-import { tokenizePiMessages } from "./tokenize-pi-messages";
+import {
+	hasTokenizerForFit,
+	tokenCountUsesByteBound,
+} from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import { UNKNOWN_FIT_RATIO } from "@magic-context/core/hooks/magic-context/tokenizer-calibration";
+import { piFitMessageBytes, tokenizePiMessages } from "./tokenize-pi-messages";
 
 export class PiStorageBusyError extends Error {
 	readonly code = "PI_STORAGE_BUSY";
@@ -69,12 +73,280 @@ export interface PiFitEnvelope {
 	modelKey: string;
 	systemTokens: number;
 	toolDefinitionTokens: number;
-	/** Serialized complete envelope with an empty messages array. */
+	/** Token count for definitions active on this route, not all registered tools. */
+	refusalToolDefinitionTokens?: number;
+	toolDefinitionsMeasured?: boolean;
+	/** Serialized system-and-tool envelope before conversation messages are added. */
 	envelopeBytes?: number;
-	/** Fingerprint of the complete host system/tools snapshot. */
+	/** Identity of the system prompt and tool definitions used for this route. */
 	envelopeSignature?: string;
-	/** The session's frozen policy; an absent freeze uses the unknown-model fit rule. */
+	/** Session's saved fit policy; without one, use the unknown-model rule. */
 	calibration?: DecisionCalibration;
+}
+
+/** Require current system/tool counts for an estimate. Missing metadata alone
+ * must not reject a request. */
+export function estimatePiOutgoingInputTokens(
+	messages: readonly unknown[],
+	observed?: PiFitEnvelope,
+	measuredPrefix?: PiMeasuredPrefixFit,
+	contextLimit?: number,
+): {
+	tokens: number;
+	trusted: boolean;
+	refusalGrade?: boolean;
+	refusalTokens?: number;
+	refusalBasis?: "calibrated" | "provider-prefix" | "byte-bound";
+} {
+	if (
+		!observed ||
+		!Number.isFinite(observed.systemTokens) ||
+		observed.systemTokens <= 0 ||
+		!Number.isFinite(observed.toolDefinitionTokens) ||
+		observed.toolDefinitionTokens < 0 ||
+		!hasTokenizerForFit()
+	)
+		return { tokens: 0, trusted: false };
+	const knownRole = (message: unknown) => {
+		if (!message || typeof message !== "object") return false;
+		return ["user", "assistant", "toolResult", "custom"].includes(
+			(message as { role?: string }).role ?? "",
+		);
+	};
+	const countable = (message: unknown) => {
+		if (!knownRole(message)) return false;
+		const m = message as { role?: string; content?: unknown };
+		return (
+			typeof m.content === "string" ||
+			(Array.isArray(m.content) &&
+				m.content.every(
+					(p) =>
+						p &&
+						typeof p === "object" &&
+						["text", "thinking", "redacted_thinking", "toolCall"].includes(
+							String(p.type),
+						),
+				))
+		);
+	};
+	const complete = messages.every(countable);
+	const measuredForBounds =
+		measuredPrefix &&
+		measuredPrefix.modelKey === observed.modelKey &&
+		observed.envelopeSignature &&
+		measuredPrefix.envelopeSignature === observed.envelopeSignature &&
+		Number.isSafeInteger(measuredPrefix.inputTokens) &&
+		measuredPrefix.inputTokens > 0
+			? measuredPrefix
+			: undefined;
+	if (contextLimit && Number.isFinite(contextLimit) && contextLimit > 0) {
+		const priced = measuredForBounds?.appendedMessages ?? messages;
+		const baseline = measuredForBounds?.inputTokens ?? 0;
+		let contentBytes = 0;
+		for (const rawMessage of priced.filter(knownRole)) {
+			const message = rawMessage as {
+				content:
+					| string
+					| Array<{
+							type?: string;
+							text?: string;
+							thinking?: string;
+							redacted?: boolean;
+							thinkingSignature?: string;
+							textSignature?: string;
+							name?: string;
+							arguments?: unknown;
+					  }>;
+			};
+			if (typeof message.content === "string")
+				contentBytes += Buffer.byteLength(message.content);
+			else if (Array.isArray(message.content))
+				for (const part of message.content) {
+					if (!part || typeof part !== "object") continue;
+					// Count known provider text even beside an image or extension part.
+					// Unsupported parts may add input, but cannot subtract that text.
+					for (const value of [
+						part.type === "text" ? part.text : undefined,
+						part.type === "thinking" && !part.redacted
+							? part.thinking
+							: undefined,
+						part.type === "toolCall" ? part.name : undefined,
+					])
+						if (typeof value === "string")
+							contentBytes += Buffer.byteLength(value);
+					if (part.type === "toolCall" && part.arguments !== undefined)
+						contentBytes += Buffer.byteLength(JSON.stringify(part.arguments));
+				}
+			if (baseline + Math.ceil(contentBytes / 4) > contextLimit) break;
+		}
+		const lower = baseline + Math.ceil(contentBytes / 4);
+		if (lower > contextLimit)
+			return {
+				tokens: lower,
+				trusted: false,
+				refusalGrade: true,
+				refusalTokens: lower,
+				refusalBasis: "byte-bound",
+			};
+		const envelope = measuredForBounds
+			? baseline
+			: providerMass(
+					{
+						system: observed.systemTokens,
+						tools: observed.toolDefinitionTokens,
+					},
+					observed.calibration ?? calibrationForModelKey(observed.modelKey),
+					true,
+				);
+		const fit =
+			observed.calibration ?? calibrationForModelKey(observed.modelKey);
+		const upper =
+			envelope +
+			Math.max(UNKNOWN_FIT_RATIO, fit.toolsRatio, fit.proseRatio) *
+				priced.reduce<number>(
+					(sum, message) => sum + piFitMessageBytes(message),
+					0,
+				);
+		if (upper <= contextLimit)
+			return {
+				tokens: upper,
+				trusted: true,
+				refusalGrade: false,
+				refusalBasis: "byte-bound",
+			};
+	}
+	if (!complete) {
+		// Unrecognized extension roles/parts require counting their entire JSON,
+		// including metadata the provider might omit. That estimate can request
+		// reclaim, but cannot prove that the actual request exceeds the window.
+		return {
+			tokens: providerMass(
+				{
+					system: observed.systemTokens,
+					tools:
+						observed.toolDefinitionTokens +
+						messages.reduce<number>(
+							(sum, message) => sum + piFitMessageBytes(message),
+							0,
+						),
+				},
+				observed.calibration ?? calibrationForModelKey(observed.modelKey),
+				true,
+			),
+			trusted: true,
+			refusalGrade: false,
+		};
+	}
+	const bounded = messages.some((rawMessage) => {
+		const content = (rawMessage as { content: unknown }).content;
+		if (typeof content === "string") return tokenCountUsesByteBound(content);
+		return (content as Array<Record<string, unknown>>).some((part) =>
+			[
+				part.text,
+				part.redacted ? undefined : part.thinking,
+				part.name,
+				part.arguments === undefined
+					? undefined
+					: JSON.stringify(part.arguments),
+			].some(
+				(value) => typeof value === "string" && tokenCountUsesByteBound(value),
+			),
+		);
+	});
+	if (bounded)
+		return {
+			tokens: providerMass(
+				{
+					system: observed.systemTokens,
+					tools:
+						observed.toolDefinitionTokens +
+						messages.reduce<number>(
+							(sum, message) => sum + piFitMessageBytes(message),
+							0,
+						),
+				},
+				observed.calibration ?? calibrationForModelKey(observed.modelKey),
+				true,
+			),
+			trusted: true,
+			refusalGrade: false,
+			refusalBasis: "byte-bound",
+		};
+	const raw = tokenizePiMessages([...messages]);
+	const calibration =
+		observed.calibration ?? calibrationForModelKey(observed.modelKey);
+	// Admission (deciding whether to send) uses the session's saved fit policy.
+	// Refusal-grade evidence must instead use this route's measured model seed,
+	// never the unknown-model fit multiplier.
+	const refusalCalibration = calibrationForModelKey(observed.modelKey);
+	const tokens = providerMass(
+		{
+			system: observed.systemTokens,
+			tools: observed.toolDefinitionTokens + raw.toolCall,
+			prose: raw.conversation,
+		},
+		calibration,
+		true,
+	);
+	const refusalGrade =
+		Number.isFinite(tokens) &&
+		messages.every((rawMessage) => {
+			const content = (rawMessage as { content: unknown }).content;
+			if (typeof content === "string") return !tokenCountUsesByteBound(content);
+			return (content as Array<Record<string, unknown>>).every((part) =>
+				[
+					part.text,
+					part.redacted ? undefined : part.thinking,
+					part.name,
+					part.arguments === undefined
+						? undefined
+						: JSON.stringify(part.arguments),
+				].every(
+					(value) =>
+						typeof value !== "string" || !tokenCountUsesByteBound(value),
+				),
+			);
+		}) &&
+		hasMeasuredDecisionCalibration(refusalCalibration) &&
+		observed.toolDefinitionsMeasured === true &&
+		Number.isFinite(observed.refusalToolDefinitionTokens) &&
+		observed.refusalToolDefinitionTokens! >= 0;
+	const measured =
+		measuredPrefix &&
+		measuredPrefix.modelKey === observed.modelKey &&
+		observed.envelopeSignature &&
+		measuredPrefix.envelopeSignature === observed.envelopeSignature &&
+		Number.isSafeInteger(measuredPrefix.inputTokens) &&
+		measuredPrefix.inputTokens > 0
+			? measuredPrefix
+			: undefined;
+	const tail = measured
+		? tokenizePiMessages([...measured.appendedMessages])
+		: raw;
+	const refusalTokens = refusalGrade
+		? (measured?.inputTokens ?? 0) +
+			providerMass(
+				{
+					system: measured ? 0 : observed.systemTokens,
+					tools:
+						(measured ? 0 : observed.refusalToolDefinitionTokens!) +
+						tail.toolCall,
+					prose: tail.conversation,
+				},
+				refusalCalibration,
+			)
+		: undefined;
+	return {
+		tokens,
+		trusted: Number.isFinite(tokens),
+		refusalGrade,
+		refusalTokens,
+		refusalBasis: refusalGrade
+			? measured
+				? "provider-prefix"
+				: "calibrated"
+			: undefined,
+	};
 }
 
 export interface PiMeasuredPrefixFit {
@@ -82,6 +354,8 @@ export interface PiMeasuredPrefixFit {
 	envelopeSignature: string;
 	inputTokens: number;
 	appendedMessages: readonly unknown[];
+	/** Messages sent in the previous request, used only to measure estimate drift. */
+	previousMessages?: readonly unknown[];
 }
 
 /** Prefer correlated provider input plus the new tail; otherwise price the full envelope. */
@@ -131,12 +405,7 @@ export function assertPiRawFallbackFits(
 	let serializationFailed = false;
 	try {
 		for (const message of pricedMessages) {
-			const serialized = JSON.stringify(message);
-			if (typeof serialized !== "string") {
-				serializationFailed = true;
-				break;
-			}
-			bytes += Buffer.byteLength(serialized) + 1;
+			bytes += piFitMessageBytes(message) + 1;
 			if (baseInputTokens + Math.ceil(bytes / 4) > contextLimit) break;
 		}
 	} catch {
@@ -153,14 +422,14 @@ export function assertPiRawFallbackFits(
 		if (!message || typeof message !== "object") return false;
 		const m = message as { role?: string; content?: unknown };
 		return (
-			["user", "assistant", "toolResult"].includes(m.role ?? "") &&
+			["user", "assistant", "toolResult", "custom"].includes(m.role ?? "") &&
 			(typeof m.content === "string" ||
 				(Array.isArray(m.content) &&
 					m.content.every(
 						(p: unknown) =>
 							p !== null &&
 							typeof p === "object" &&
-							["text", "thinking", "toolCall"].includes(
+							["text", "thinking", "redacted_thinking", "toolCall"].includes(
 								String((p as { type?: unknown }).type),
 							),
 					)))
@@ -195,4 +464,24 @@ export function assertPiRawFallbackFits(
 		);
 		throw new PiStorageBusyError({ cause });
 	}
+}
+
+/** Reject a request only when its proven minimum exceeds the window; an estimated excess requests reclaim. */
+export function classifyPiOutgoingFit(
+	estimate: ReturnType<typeof estimatePiOutgoingInputTokens>,
+	limit: number | undefined,
+): "over-window-proof" | "upper-estimate-pressure" | "fits-or-unknown" {
+	if (!limit || !Number.isFinite(limit) || limit <= 0) return "fits-or-unknown";
+	if (
+		estimate.refusalGrade &&
+		typeof estimate.refusalTokens === "number" &&
+		Number.isFinite(estimate.refusalTokens) &&
+		estimate.refusalTokens > limit
+	)
+		return "over-window-proof";
+	return estimate.trusted &&
+		Number.isFinite(estimate.tokens) &&
+		estimate.tokens > limit
+		? "upper-estimate-pressure"
+		: "fits-or-unknown";
 }

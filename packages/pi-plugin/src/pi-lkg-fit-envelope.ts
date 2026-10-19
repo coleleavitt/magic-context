@@ -8,7 +8,9 @@ import {
 	hasTokenizerForFit,
 } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
+import { readHostSystemPrompt } from "./host-system-prompt";
 import type { PiFitEnvelope } from "./pi-raw-fallback";
+import type { PiToolWireSchema } from "./pi-tool-wire-schema";
 
 /** Only complete current host metadata can make a replay admissible. Counting
  * every registered tool (including inactive tools) and serialized wrappers is
@@ -18,15 +20,11 @@ export function readPiLkgFitEnvelope(
 	pi: { getAllTools?: () => unknown; getActiveTools?: () => unknown },
 	modelKey: string | null | undefined,
 	frozen: DecisionCalibration,
+	wireSchema?: PiToolWireSchema,
 ): PiFitEnvelope | undefined {
 	try {
-		if (
-			!modelKey ||
-			typeof ctx.getSystemPrompt !== "function" ||
-			typeof pi.getAllTools !== "function"
-		)
-			return;
-		const system = ctx.getSystemPrompt();
+		if (!modelKey || typeof pi.getAllTools !== "function") return;
+		const system = readHostSystemPrompt(ctx);
 		const allTools = pi.getAllTools();
 		if (
 			typeof system !== "string" ||
@@ -41,7 +39,8 @@ export function readPiLkgFitEnvelope(
 		}> = [];
 		for (const tool of allTools) {
 			if (!tool || typeof tool !== "object") return;
-			const { name, description, parameters } = tool;
+			const { name, description } = tool;
+			const parameters = wireSchema ? wireSchema(tool) : tool.parameters;
 			if (
 				typeof name !== "string" ||
 				!name.length ||
@@ -122,11 +121,22 @@ export function readPiLkgFitEnvelope(
 		}
 		const systemTokens = estimateTokens(systemJson);
 		const toolDefinitionTokens = estimateTokens(toolsJson);
+		const refusalToolDefinitionTokens = activeNames
+			? estimateTokens(
+					JSON.stringify({
+						tools: serializedTools.tools.filter((tool) =>
+							activeNames.includes(String(tool.name)),
+						),
+					}),
+				)
+			: undefined;
 		if (!hasTokenizerForFit()) return;
 		return {
 			modelKey: canonical,
 			systemTokens,
 			toolDefinitionTokens,
+			refusalToolDefinitionTokens,
+			toolDefinitionsMeasured: refusalToolDefinitionTokens !== undefined,
 			envelopeBytes: Buffer.byteLength(envelopeJson),
 			envelopeSignature: activeNames
 				? createHash("sha256")

@@ -94,6 +94,62 @@ test("git verification timeout reports the stalled command", async () => {
 });
 
 describe("partitionVerifyScope (per-memory verified_at gate)", () => {
+    test("a failed top-level lookup retains full verification even if git log could succeed", async () => {
+        const db = freshDb();
+        const dir = makeGitMetadataDirectory("mc-verify-no-worktree-");
+        __setVerificationPathsTestHooks({
+            execFile: async (_binary, args) => {
+                if (args[0] === "rev-parse") throw new Error("not a working tree");
+                return { stdout: "", stderr: "" };
+            },
+        });
+        try {
+            const id = mem(db, PROJECT, "mapped fact without a working tree");
+            recordMemoryVerifications(db, id, ["a.ts"], 10000);
+            const result = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+            });
+            expect(result.mode).toBe("full");
+            expect(result.inScopeIds).toEqual([id]);
+        } finally {
+            db.close();
+        }
+    });
+    test("incremental verification resolves the repository once and preserves skipped ids", async () => {
+        const db = freshDb();
+        const dir = makeGitMetadataDirectory("mc-verify-one-root-");
+        const calls: string[][] = [];
+        __setVerificationPathsTestHooks({
+            execFile: async (_binary, args) => {
+                calls.push([...args]);
+                if (args[0] === "rev-parse")
+                    return { stdout: `${args[1] === "HEAD" ? HEAD_SHA : dir}\n`, stderr: "" };
+                return { stdout: "", stderr: "" };
+            },
+        });
+        try {
+            const id = mem(db, PROJECT, "unchanged mapped fact");
+            recordMemoryVerifications(db, id, ["a.ts"], 10000);
+            const result = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+                now: 20000,
+            });
+            expect(result.skippedIds).toEqual([id]);
+            expect(result.inScopeIds).toEqual([]);
+            expect(calls).toEqual([
+                ["rev-parse", "--show-toplevel"],
+                ["log", "--since=@10", "--name-only", "--format=%ct"],
+                ["rev-parse", "HEAD"],
+                ["diff", "--name-only", "-z", HEAD_SHA],
+            ]);
+        } finally {
+            db.close();
+        }
+    });
     test("excludes both no-file sentinel origins and unmapped memories", async () => {
         const db = freshDb();
         const dir = makeGitMetadataDirectory("mc-verify-gate-scope-");

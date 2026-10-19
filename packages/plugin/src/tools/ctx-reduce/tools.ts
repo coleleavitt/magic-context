@@ -1,25 +1,22 @@
 import { createHash } from "node:crypto";
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
-import {
-    getProtectionWindowForSession,
-    type ProtectionWindowResult,
-} from "../../features/magic-context/protection-window";
+import type { ProtectionWindowResult } from "../../features/magic-context/protection-window";
 import { parseRangeString } from "../../features/magic-context/range-parser";
 import {
     getOrCreateSessionMeta,
     getPendingOps,
-    getTagsBySession,
+    getTagsByNumbers,
     queuePendingOp,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
-import { getInertWhitespaceAssistantTags } from "../../features/magic-context/storage-tags";
+import { getInertWhitespaceAssistantTagsByNumbers } from "../../features/magic-context/storage-tags";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { renderCapabilityRefusal } from "../../shared/user-facing-codes";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
-import { CTX_REDUCE_DESCRIPTION } from "./constants";
+import { CTX_REDUCE_DESCRIPTION, formatCtxReduceReply } from "./constants";
 import type { CtxReduceArgs } from "./types";
 
 export { CTX_REDUCE_LIGHT_DESCRIPTION } from "../light-descriptions";
@@ -27,27 +24,16 @@ export { CTX_REDUCE_LIGHT_DESCRIPTION } from "../light-descriptions";
 export interface CtxReduceToolDeps {
     db: Database;
     /**
-     * Union projection form: protectedSet (tag-number set form).
-     * Coordinate space: tag-number space.
-     * Empty-window behavior: empty set means zero tool tags are protected by the window;
-     * requested drops apply immediately, and non-tool tags are never reclaim targets.
+     * Tag numbers protected by the current token window. An empty set means no
+     * results are held by that window; per-tool keep counts still hold queued
+     * drops until newer calls displace the result and a rebuilding pass applies them.
      */
     protectedSet?: ReadonlySet<number> | ((sessionId: string) => ReadonlySet<number>);
+    protectedTools?: Readonly<Record<string, number>>;
     getProtectionWindow?: (sessionId: string) => ProtectionWindowResult;
     floor?: number;
     getSessionTokens?: (sessionId: string) => number;
     rustToolBackends?: RustToolBackends;
-}
-
-function formatRawDropForAck(rawDrop: string): string {
-    return rawDrop
-        .trim()
-        .split(",")
-        .map((token) => {
-            const trimmed = token.trim();
-            return /^\d+$/.test(trimmed) ? `§${trimmed}§` : trimmed;
-        })
-        .join(", ");
 }
 
 const ctxReduceArgsShape = {
@@ -135,13 +121,45 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
                         return renderCapabilityRefusal("context_cleanup");
                     }
                     const queued = typeof record.queued === "number" ? record.queued : 0;
+                    const refusedStamps = Array.isArray(record.ctx_reduce_self_stamps)
+                        ? record.ctx_reduce_self_stamps.filter(
+                              (tagNumber): tagNumber is number =>
+                                  typeof tagNumber === "number" && Number.isInteger(tagNumber),
+                          )
+                        : [];
+                    const refusedStampCount = new Set(refusedStamps).size;
+                    const acceptedTagNumbers = Array.isArray(record.ctx_reduce_queued_tags)
+                        ? record.ctx_reduce_queued_tags.filter(
+                              (tagNumber): tagNumber is number =>
+                                  typeof tagNumber === "number" && Number.isInteger(tagNumber),
+                          )
+                        : null;
                     if (queued <= 0) {
+                        const alreadyStampedCount = acceptedTagNumbers
+                            ? new Set(acceptedTagNumbers).size
+                            : 0;
+                        const reply = formatCtxReduceReply(alreadyStampedCount, refusedStampCount);
+                        if (reply) return reply;
                         return "All requested tags were already queued or processed. No new action is needed.";
                     }
-                    // The module owns range parsing and tag canonicalization. Keep the
-                    // existing queued acknowledgement shape without reimplementing that
-                    // parsing in the OpenCode tool.
-                    return `Queued: drop ${formatRawDropForAck(args.drop)}.`;
+                    const reportedTagNumbers = [
+                        ...(Array.isArray(record.held_tag_numbers)
+                            ? record.held_tag_numbers.filter(
+                                  (number): number is number => typeof number === "number",
+                              )
+                            : []),
+                        ...(Array.isArray(record.immediate_tag_numbers)
+                            ? record.immediate_tag_numbers.filter(
+                                  (number): number is number => typeof number === "number",
+                              )
+                            : []),
+                    ];
+                    const stampedCount = acceptedTagNumbers
+                        ? new Set(acceptedTagNumbers).size
+                        : reportedTagNumbers.length > 0
+                          ? new Set(reportedTagNumbers).size
+                          : queued;
+                    return formatCtxReduceReply(stampedCount, refusedStampCount);
                 } catch (error) {
                     sessionLog(sessionId, "ctx_reduce capability refusal", error);
                     return renderCapabilityRefusal("context_cleanup");
@@ -158,35 +176,30 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
 
             const allIds = [...new Set(dropIds)];
 
-            const allTags = getTagsBySession(deps.db, sessionId);
+            const allTags = getTagsByNumbers(deps.db, sessionId, allIds);
             const foundSet = new Set(allTags.map((tag) => tag.tagNumber));
             const unknownIds = allIds.filter((id) => !foundSet.has(id));
             if (unknownIds.length > 0) {
                 return `Error: Unknown tag(s) ${formatIds(unknownIds)}. Check available tags in conversation.`;
             }
 
-            // Form: protectedSet (tag-number set form). Coordinate space: tag-number space.
-            // Empty-window behavior: empty set means zero tool tags are protected by the window;
-            // non-tool tags never become reclaim targets.
-            let protectedSet: ReadonlySet<number>;
-            if (deps.protectedSet) {
-                protectedSet =
-                    typeof deps.protectedSet === "function"
-                        ? deps.protectedSet(sessionId)
-                        : deps.protectedSet;
-            } else if (deps.getProtectionWindow) {
-                protectedSet = deps.getProtectionWindow(sessionId).protectedTagNumbers;
-            } else {
-                protectedSet = getProtectionWindowForSession(
-                    deps.db,
-                    sessionId,
-                    deps.floor,
-                ).protectedTagNumbers;
-            }
+            const ctxReduceSelfStampIds = new Set(
+                allTags
+                    .filter((tag) => tag.toolName?.toLowerCase() === "ctx_reduce")
+                    .map((tag) => tag.tagNumber),
+            );
+            const ctxReduceSelfStampCount = new Set(
+                dropIds.filter((id) => ctxReduceSelfStampIds.has(id)),
+            ).size;
+            dropIds = dropIds.filter((id) => !ctxReduceSelfStampIds.has(id));
 
             const tagStatusMap = new Map(allTags.map((tag) => [tag.tagNumber, tag.status]));
+            // Only membership of the requested tags is consulted below, so look
+            // up just those instead of every inert tag in the session.
             const inertWhitespaceTagNumbers = new Set(
-                getInertWhitespaceAssistantTags(deps.db, sessionId).map((tag) => tag.tagNumber),
+                getInertWhitespaceAssistantTagsByNumbers(deps.db, sessionId, dropIds).map(
+                    (tag) => tag.tagNumber,
+                ),
             );
             const inertDropIds = [
                 ...new Set(dropIds.filter((id) => inertWhitespaceTagNumbers.has(id))),
@@ -211,22 +224,19 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
                 return `Error: Conflicting operations — ${conflicts.join("; ")}.`;
             }
 
-            const preFilterDropCount = dropIds.length;
+            const stampedCount = new Set(dropIds.filter((id) => !inertWhitespaceTagNumbers.has(id)))
+                .size;
             dropIds = dropIds.filter(
                 (id) =>
                     !inertWhitespaceTagNumbers.has(id) &&
                     tagStatusMap.get(id) !== "dropped" &&
                     pendingMap.get(id) !== "drop",
             );
-            const skippedCount = preFilterDropCount - dropIds.length;
-
             if (dropIds.length === 0) {
-                return [
-                    inertNote,
-                    "All requested tags were already queued or processed. No new action is needed.",
-                ]
-                    .filter(Boolean)
-                    .join(" ");
+                const reply = formatCtxReduceReply(stampedCount, ctxReduceSelfStampCount);
+                if (reply) return `${reply}${inertNote ? ` ${inertNote}` : ""}`;
+                if (inertNote) return inertNote;
+                return "All requested tags were already queued or processed. No new action is needed.";
             }
 
             try {
@@ -248,30 +258,8 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
                 getOrCreateSessionMeta(deps.db, sessionId).lastInputTokens;
             updateSessionMeta(deps.db, sessionId, { lastNudgeTokens: currentInputTokens });
 
-            const immediateDropIds = dropIds.filter((id) => !protectedSet.has(id));
-            const deferredDropIds = [...new Set(dropIds.filter((id) => protectedSet.has(id)))];
-            const skippedNote =
-                skippedCount > 0
-                    ? ` ${skippedCount} requested tag${skippedCount === 1 ? " was" : "s were"} already queued and need no action.`
-                    : "";
-
-            let heldSentence = "";
-            if (deferredDropIds.length === 1) {
-                heldSentence = `Held: §${deferredDropIds[0]} is inside the protected working set; it applies once newer work displaces it.`;
-            } else if (deferredDropIds.length > 1) {
-                heldSentence = `Held: ${deferredDropIds.map((id) => `§${id}`).join(", ")} are inside the protected working set; they apply once newer work displaces them.`;
-            }
-
-            if (immediateDropIds.length > 0 && heldSentence.length > 0) {
-                return `Queued: drop ${formatIds(immediateDropIds)}.${skippedNote}${inertNote ? ` ${inertNote}` : ""} ${heldSentence}`;
-            }
-            if (immediateDropIds.length > 0) {
-                return `Queued: drop ${formatIds(immediateDropIds)}.${skippedNote}${inertNote ? ` ${inertNote}` : ""}`;
-            }
-            if (heldSentence.length > 0) {
-                return `${heldSentence}${skippedNote}${inertNote ? ` ${inertNote}` : ""}`;
-            }
-            return `Queued: drop ${formatIds(dropIds)}.${skippedNote}${inertNote ? ` ${inertNote}` : ""}`;
+            const reply = formatCtxReduceReply(stampedCount, ctxReduceSelfStampCount);
+            return `${reply}${inertNote ? ` ${inertNote}` : ""}`;
         },
     });
 }

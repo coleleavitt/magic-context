@@ -1,12 +1,13 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     clearPendingOps,
     getPendingOps,
     getPendingOpsCount,
+    hasPendingDropOps,
     queuePendingOp,
     removePendingOp,
 } from "./storage-ops";
@@ -34,6 +35,75 @@ afterEach(() => {
 
 describe("storage-ops", () => {
     describe("pending ops", () => {
+        it("100 enqueues are idempotent per session, tag and operation and preserve the first row", () => {
+            db = makeMemoryDatabase();
+            queuePendingOp(db, "ses-1", 1, "drop", 10);
+            const first = getPendingOps(db, "ses-1");
+            for (let n = 0; n < 99; n++) queuePendingOp(db, "ses-1", 1, "drop", 20 + n);
+            expect(getPendingOps(db, "ses-1")).toEqual(first);
+            expect(getPendingOpsCount(db, "ses-1")).toBe(1);
+            // Queue identity includes the operation and session: a noop can coexist
+            // with a drop, and tag numbers are independent across sessions.
+            db.prepare(
+                "INSERT INTO pending_ops (session_id, tag_id, operation, queued_at) VALUES (?, ?, ?, ?)",
+            ).run("ses-1", 2, "noop", 1);
+            queuePendingOp(db, "ses-1", 2, "drop", 200);
+            queuePendingOp(db, "ses-2", 1, "drop", 300);
+            expect(getPendingOps(db, "ses-1").map((op) => op.tagId)).toEqual([1, 2]);
+            expect(getPendingOps(db, "ses-2")).toHaveLength(1);
+            removePendingOp(db, "ses-1", 1);
+            queuePendingOp(db, "ses-1", 1, "drop", 400);
+            expect(getPendingOps(db, "ses-1").map((op) => op.queuedAt)).toEqual([200, 400]);
+        });
+
+        it("probes pending drops with a scalar read instead of materializing queue rows", () => {
+            db = makeMemoryDatabase();
+            queuePendingOp(db, "ses-probe", 1, "drop", 1);
+            let allCalls = 0;
+            const prepare = db.prepare.bind(db);
+            const spy = spyOn(db, "prepare").mockImplementation(((
+                ...args: Parameters<typeof db.prepare>
+            ) => {
+                const statement = prepare(...args);
+                return new Proxy(statement, {
+                    get(target, key) {
+                        const value = Reflect.get(target, key);
+                        if (key === "all")
+                            return (...params: unknown[]) => {
+                                allCalls++;
+                                return value.apply(target, params);
+                            };
+                        return typeof value === "function" ? value.bind(target) : value;
+                    },
+                });
+            }) as typeof db.prepare);
+            try {
+                expect(hasPendingDropOps(db, "ses-probe")).toBe(true);
+                expect(allCalls).toBe(0);
+            } finally {
+                spy.mockRestore();
+            }
+        });
+
+        it("probes only valid session-local drops, including real-valued number fields", () => {
+            db = makeMemoryDatabase();
+            const insert = db.prepare(
+                "INSERT INTO pending_ops (session_id, tag_id, operation, queued_at) VALUES (?, ?, ?, ?)",
+            );
+            insert.run("ses-1", 1, "noop", 1);
+            insert.run("ses-1", null, "drop", 1);
+            insert.run("ses-1", 1, "drop", null);
+            insert.run("ses-1", "malformed", "drop", 1);
+            queuePendingOp(db, "ses-2", 2, "drop", 2);
+            expect(hasPendingDropOps(db, "ses-1")).toBe(false);
+            expect(hasPendingDropOps(db, "ses-2")).toBe(true);
+            expect(hasPendingDropOps(db, "missing")).toBe(false);
+            insert.run("ses-1", 1.5, "drop", 2.5);
+            expect(hasPendingDropOps(db, "ses-1")).toBe(true);
+            removePendingOp(db, "ses-1", 1.5);
+            expect(hasPendingDropOps(db, "ses-1")).toBe(false);
+        });
+
         it("queues and returns drop ops in order", () => {
             db = makeMemoryDatabase();
 
@@ -100,6 +170,7 @@ describe("storage-ops", () => {
 
             expect(() => queuePendingOp(failingDb, "s", 1, "drop")).toThrow("db-error");
             expect(() => getPendingOps(failingDb, "s")).toThrow("db-error");
+            expect(() => hasPendingDropOps(failingDb, "s")).toThrow("db-error");
             expect(() => clearPendingOps(failingDb, "s")).toThrow("db-error");
             expect(() => removePendingOp(failingDb, "s", 1)).toThrow("db-error");
         });

@@ -13,7 +13,8 @@
 #   Prints schema versions and the ALF spot-check counts before and after.
 #
 # Environment: CK_MC must name the ck-mc binary built from this tree (never the
-# installed one). Runs the built CLI with Node, as the previous rehearsal did.
+# installed one). The drill stages and runs it as ckdev-mc so it cannot be
+# mistaken for a live fleet process. Runs the built CLI with Node, as before.
 set -euo pipefail
 
 ROOT_ARG="${1:?drill root}"
@@ -32,10 +33,11 @@ SNAP="$DRILL_ROOT/snapshot"
 RUN="$DRILL_ROOT/$NAME"
 DATA="$RUN/data/cortexkit/magic-context"
 [ -e "$RUN" ] && { echo "refusing to reuse $RUN" >&2; exit 2; }
-mkdir -p "$DATA" "$RUN/data/opencode" "$RUN/home" "$RUN/config" "$RUN/state" "$RUN/cache" "$RUN/runtime" "$RUN/tmp"
+mkdir -p "$DATA" "$RUN/data/opencode" "$RUN/home" "$RUN/config" "$RUN/state" "$RUN/cache" "$RUN/runtime" "$RUN/tmp" "$RUN/bin"
 # The migration engine reads only context.db and store.db; OpenCode's database is
 # cloned into the host roots later, not here.
 cp -c "$SNAP/context.db" "$SNAP/store.db" "$DATA/"
+CK_MC="$(bun "$WORKTREE/packages/e2e-tests/scripts/stage-executable.ts" "$CK_MC" ckdev-mc ck-mc)"
 
 export HOME="$RUN/home" XDG_DATA_HOME="$RUN/data" XDG_CONFIG_HOME="$RUN/config"
 export XDG_STATE_HOME="$RUN/state" XDG_CACHE_HOME="$RUN/cache" XDG_RUNTIME_DIR="$RUN/runtime"

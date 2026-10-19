@@ -8,6 +8,7 @@
  *     --fix           Repair safe, Magic Context-owned store rows.
  *     --issue         Bundle a sanitized issue report and submit/open.
  *     --clear         Interactive picker to clear plugin caches.
+ *     --verbose       Print long listings in full instead of a capped summary.
  *   doctor migrate  Migrate OpenCode session content to Pi/OMP JSONL.
  *   doctor migrate-session  Re-home an OpenCode session to another directory/project.
  *   doctor merge-identity   Merge all project-scoped rows between identities.
@@ -20,6 +21,8 @@
  *   --help, -h              Print help and exit
  */
 import { createRequire } from "node:module";
+import { loadPluginConfig } from "@magic-context/core/config";
+import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 import { subcommandHelp } from "./lib/cli-help";
 import { isPromptCancelledError } from "./lib/prompts";
 import { runSqlitePreflight } from "./lib/sqlite-preflight";
@@ -122,6 +125,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     }
 
     try {
+        setStoragePrivatePermissionEnforcement(
+            loadPluginConfig(process.cwd()).storage.enforce_private_permissions,
+        );
         // Await here, inside the try: returning the command's promise directly
         // would let a cancelled prompt reject past this handler, so the
         // process-level handler printed "Cancelled." again and exited 1.
@@ -163,6 +169,10 @@ async function runCommand(command: string | undefined, rest: string[]): Promise<
             const { runRepairDbCli } = await import("./commands/doctor-repair-db");
             return runRepairDbCli(rest.slice(1));
         }
+        if (rest[0] === "git-fts-map") {
+            const { runDoctorGitFtsMapCli } = await import("./commands/doctor-git-fts-map");
+            return runDoctorGitFtsMapCli(rest.slice(1));
+        }
         if (rest[0] === "list-hidden-sessions") {
             const { runListHiddenSessions } = await import("./commands/doctor-hidden-sessions");
             return runListHiddenSessions();
@@ -188,6 +198,7 @@ async function runCommand(command: string | undefined, rest: string[]): Promise<
             issue: rest.includes("--issue") || report !== null,
             ...(report !== null ? { report } : {}),
             clear: rest.includes("--clear"),
+            verbose: rest.includes("--verbose"),
             checkV22Backfill: rest.includes("--check-v22-backfill"),
             retryV22Backfill: rest.includes("--retry-v22-backfill"),
             ...(rekeyV22DirIdentity !== null ? { rekeyV22DirIdentity } : {}),

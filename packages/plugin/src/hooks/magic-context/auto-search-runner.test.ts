@@ -1,10 +1,26 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as embedding from "../../features/magic-context/memory/embedding";
 import { runMigrations } from "../../features/magic-context/migrations";
-import * as searchModule from "../../features/magic-context/search";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import * as storageMeta from "../../features/magic-context/storage-meta-persisted";
+import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
+import { getUnpublishedAutoSearchNoHint } from "../../shared/auto-search-lifecycle";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { _resetAutoSearchCache, runAutoSearchHint } from "./auto-search-runner";
+import {
+    createAutoSearchReplayFixture,
+    replayHint,
+    replayPrompt,
+    replayScenarios,
+} from "./auto-search-replay.fixture";
+import {
+    _resetAutoSearchCache,
+    clearAutoSearchForSession,
+    runAutoSearchHint,
+} from "./auto-search-runner";
+import { autoSearchTestSnapshot } from "./auto-search-snapshot.fixture";
+import * as searchModule from "./auto-search-worker-client";
+import { injectM0M1, materializeM0 } from "./inject-compartments";
 import type { MessageLike } from "./transform-operations";
 
 function makeUserMsg(id: string, text: string): MessageLike {
@@ -25,7 +41,192 @@ function findUserPromptText(msg: MessageLike): string {
     return out;
 }
 
+for (const host of ["opencode", "opencode2"] as const) {
+    test(`review exception CAS failure still freezes served omission ${host}`, async () => {
+        const fixture = createAutoSearchReplayFixture(host, "failed-omission-save");
+        const { sessionId, projectPath } = fixture;
+        const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(
+            autoSearchTestSnapshot(projectPath),
+        );
+        const search = spyOn(searchModule, "searchAutoHint")
+            .mockResolvedValue([replayHint])
+            .mockImplementationOnce(async () => {
+                throw new Error("transient search failure");
+            });
+        const options = {
+            enabled: true,
+            projectPath,
+            scoreThreshold: 0.6,
+            minPromptChars: 12,
+            memoryEnabled: true,
+            embeddingEnabled: false,
+        };
+        const invoke = async (database = fixture.db, id = "served") => {
+            const messages = [makeUserMsg(id, replayPrompt)];
+            const outcome = await runAutoSearchHint({ db: database, sessionId, messages, options });
+            return { bytes: JSON.stringify(messages[0]), outcome };
+        };
+        try {
+            fixture.db.exec(
+                `CREATE TRIGGER review_fail_cas BEFORE UPDATE OF auto_search_hint_decisions ON session_meta BEGIN SELECT RAISE(IGNORE); END;`,
+            );
+            const first = await invoke();
+            expect(first.outcome).toEqual({ ok: false, kind: "cas-exhaustion" });
+            expect(first.bytes).not.toContain("<ctx-search-hint>");
+            expect(getAutoSearchHintDecisions(fixture.db, sessionId)).toEqual([]);
+            clearAutoSearchForSession(sessionId);
+            fixture.db.exec("DROP TRIGGER review_fail_cas");
+            fixture.reopen(true);
+            expect((await invoke()).bytes).toBe(first.bytes);
+            expect(search).toHaveBeenCalledTimes(1);
+            expect(getAutoSearchHintDecisions(fixture.db, sessionId)).toEqual([
+                { messageId: "served", decision: "no-hint", reason: "error" },
+            ]);
+            expect(getUnpublishedAutoSearchNoHint(sessionId, "served")).toBeUndefined();
+            fixture.db.exec(
+                `CREATE TRIGGER review_fail_cas BEFORE UPDATE OF auto_search_hint_decisions ON session_meta BEGIN SELECT RAISE(IGNORE); END;`,
+            );
+            const failedHintSave = await invoke(fixture.db, "hint-save-failed");
+            expect(failedHintSave.bytes).not.toContain("<ctx-search-hint>");
+            expect((await invoke(fixture.db, "hint-save-failed")).bytes).toBe(failedHintSave.bytes);
+            expect(search).toHaveBeenCalledTimes(2);
+            expect(getUnpublishedAutoSearchNoHint(sessionId, "hint-save-failed")).toBe("error");
+            fixture.db.exec("DROP TRIGGER review_fail_cas");
+            expect((await invoke(fixture.db, "hint-save-failed")).bytes).toBe(failedHintSave.bytes);
+            expect(getUnpublishedAutoSearchNoHint(sessionId, "hint-save-failed")).toBeUndefined();
+            expect((await invoke(fixture.db, "new-user")).bytes).toContain(
+                "Independent search-only hint",
+            );
+            expect(search).toHaveBeenCalledTimes(3);
+        } finally {
+            search.mockRestore();
+            snapshot.mockRestore();
+            fixture.close();
+        }
+    });
+    test(`a busy store while saving the decision serves the turn plain instead of refusing it ${host}`, async () => {
+        const fixture = createAutoSearchReplayFixture(host, "busy-decision-save");
+        const { sessionId, projectPath } = fixture;
+        const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(
+            autoSearchTestSnapshot(projectPath),
+        );
+        const search = spyOn(searchModule, "searchAutoHint").mockResolvedValue([replayHint]);
+        const busy = Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+        const append = spyOn(storageMeta, "appendAutoSearchHintDecision").mockImplementationOnce(
+            () => {
+                throw busy;
+            },
+        );
+        const options = {
+            enabled: true,
+            projectPath,
+            scoreThreshold: 0.6,
+            minPromptChars: 12,
+            memoryEnabled: true,
+            embeddingEnabled: false,
+        };
+        const invoke = async () => {
+            const messages = [makeUserMsg("busy", replayPrompt)];
+            const outcome = await runAutoSearchHint({
+                db: fixture.db,
+                sessionId,
+                messages,
+                options,
+            });
+            return { bytes: JSON.stringify(messages[0]), outcome };
+        };
+        try {
+            // Saving the auto-search decision hits a locked store. The pass still returns
+            // the message, without a hint, and remembers the omission for a later save.
+            const first = await invoke();
+            expect(first.outcome).toEqual({ ok: false, kind: "storage-busy" });
+            expect(first.bytes).not.toContain("<ctx-search-hint>");
+            expect(getUnpublishedAutoSearchNoHint(sessionId, "busy")).toBe("error");
+            // The next pass saves the served omission and keeps the bytes, even though
+            // search would now return a hint.
+            const second = await invoke();
+            expect(second.bytes).toBe(first.bytes);
+            expect(getUnpublishedAutoSearchNoHint(sessionId, "busy")).toBeUndefined();
+            expect(getAutoSearchHintDecisions(fixture.db, sessionId)).toEqual([
+                { messageId: "busy", decision: "no-hint", reason: "error" },
+            ]);
+            expect(search).toHaveBeenCalledTimes(1);
+        } finally {
+            append.mockRestore();
+            search.mockRestore();
+            snapshot.mockRestore();
+            fixture.close();
+        }
+    });
+    for (const scenario of replayScenarios) {
+        test(`${host} search exception preserves served user bytes after ${scenario}`, async () => {
+            const fixture = createAutoSearchReplayFixture(host, scenario);
+            const { sessionId, projectPath } = fixture;
+            const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(
+                autoSearchTestSnapshot(projectPath),
+            );
+            const search = spyOn(searchModule, "searchAutoHint")
+                .mockResolvedValue([replayHint])
+                .mockImplementationOnce(async () => {
+                    throw new Error("transient search failure");
+                });
+            const options = {
+                enabled: true,
+                projectPath,
+                scoreThreshold: 0.6,
+                minPromptChars: 12,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+            };
+            const invoke = async (id: string, answered = false) => {
+                const messages = [makeUserMsg(id, replayPrompt)];
+                if (answered) {
+                    messages.push({
+                        info: { id: "answer", role: "assistant" },
+                        parts: [{ type: "text", text: "Answer" }],
+                    } as MessageLike);
+                }
+                await runAutoSearchHint({ db: fixture.db, sessionId, messages, options });
+                return JSON.stringify(messages[0]);
+            };
+            const pair = () => {
+                const result = injectM0M1({
+                    ...fixture.renderOptions(),
+                    isCacheBustingPass: false,
+                });
+                return [result.m0Bytes?.toString("utf8"), result.m1Text];
+            };
+            try {
+                materializeM0(fixture.renderOptions());
+                const baseline = pair();
+                expect(baseline[0]).toContain("Pair baseline distinct from hint.");
+                const served = await invoke("u1");
+                expect(served).not.toContain("<ctx-search-hint>");
+                expect(pair()).toEqual(baseline);
+                if (scenario === "revert") expect(await invoke("u1", true)).toBe(served);
+                if (scenario === "reopen") fixture.reopen();
+                if (scenario === "model fold") {
+                    const fold = materializeM0(fixture.renderOptions("anthropic/other"));
+                    expect(fold.snapshotMarkers.modelKey).toBe("anthropic/other");
+                }
+                expect(await invoke("u1")).toBe(served);
+                expect(search).toHaveBeenCalledTimes(1);
+                expect(getAutoSearchHintDecisions(fixture.db, sessionId)).toEqual([
+                    { messageId: "u1", decision: "no-hint", reason: "error" },
+                ]);
+                expect(await invoke("u2")).toContain("Independent search-only hint");
+                expect(search).toHaveBeenCalledTimes(2);
+            } finally {
+                search.mockRestore();
+                snapshot.mockRestore();
+                fixture.close();
+            }
+        });
+    }
+}
+
 describe("auto-search-runner", () => {
+    let snapshotSpy: ReturnType<typeof spyOn<typeof embedding, "getProjectEmbeddingSnapshot">>;
     let db: Database;
     const baseOptions = {
         enabled: true,
@@ -38,6 +239,9 @@ describe("auto-search-runner", () => {
     };
 
     beforeEach(() => {
+        snapshotSpy = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(
+            autoSearchTestSnapshot(baseOptions.projectPath),
+        );
         db = new Database(":memory:");
         initializeDatabase(db);
         runMigrations(db);
@@ -46,11 +250,12 @@ describe("auto-search-runner", () => {
 
     afterEach(() => {
         _resetAutoSearchCache();
+        snapshotSpy.mockRestore();
         closeQuietly(db);
     });
 
     test("caches no-hint decision on empty results so defer passes don't re-search", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(async () => []);
         try {
             const messages: MessageLike[] = [
                 makeUserMsg("u1", "please explain how the historian decides when to run"),
@@ -82,8 +287,9 @@ describe("auto-search-runner", () => {
         }
     });
 
-    test("caps project preparation before OpenCode search and drops its late continuation", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+    test("cold preparation is deferred and its late continuation never searches the skipped turn", async () => {
+        snapshotSpy.mockReturnValue(null);
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(async () => []);
         let release: (() => void) | undefined;
         const preparation = new Promise<void>((resolve) => {
             release = resolve;
@@ -108,7 +314,7 @@ describe("auto-search-runner", () => {
                     watchdog = setTimeout(() => resolve("watchdog"), 3500);
                 }),
             ]);
-            expect(outcome).toEqual({ ok: false, kind: "timeout" });
+            expect(outcome).toEqual({ ok: true });
             expect(JSON.stringify(messages)).toBe(before);
             release?.();
             await pass;
@@ -123,7 +329,7 @@ describe("auto-search-runner", () => {
     }, 6000);
 
     test("excludes Primers from transform-time auto-search hints", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(async () => []);
         try {
             const messages: MessageLike[] = [
                 makeUserMsg(
@@ -147,10 +353,10 @@ describe("auto-search-runner", () => {
     });
 
     test("caches no-hint decision on below-threshold score", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async () =>
                 [{ source: "memory", score: 0.4, id: 1, text: "x" }] as unknown as Awaited<
-                    ReturnType<typeof searchModule.unifiedSearch>
+                    ReturnType<typeof searchModule.searchAutoHint>
                 >,
         );
         try {
@@ -180,8 +386,9 @@ describe("auto-search-runner", () => {
 
     test("timeout path: returns without hanging transform and does NOT inject a hint", async () => {
         // Hanging search: never resolves.
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
-            () => new Promise(() => {}) as unknown as ReturnType<typeof searchModule.unifiedSearch>,
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
+            () =>
+                new Promise(() => {}) as unknown as ReturnType<typeof searchModule.searchAutoHint>,
         );
         try {
             const messages: MessageLike[] = [
@@ -207,18 +414,15 @@ describe("auto-search-runner", () => {
             // Timeout must not inject a hint into the user message.
             expect(findUserPromptText(messages[0])).not.toContain("<ctx-search-hint>");
 
-            // Timeout is RETRYABLE: it does NOT persist a permanent no-hint
-            // decision, so a later pass (with the user message still at the tail)
-            // re-attempts the search rather than being suppressed forever. The
-            // live-tail gate (user message must be the last element) is what bounds
-            // re-search to new-turn passes, not a cached no-hint decision.
+            // A served timeout skip is sticky. Adding a hint on a later pass of
+            // the same tail turn would rewrite bytes already sent to the provider.
             await runAutoSearchHint({
                 sessionId: "s1",
                 db,
                 messages,
                 options: baseOptions,
             });
-            expect(spy).toHaveBeenCalledTimes(2);
+            expect(spy).toHaveBeenCalledTimes(1);
             expect(findUserPromptText(messages[0])).not.toContain("<ctx-search-hint>");
         } finally {
             spy.mockRestore();
@@ -227,7 +431,7 @@ describe("auto-search-runner", () => {
 
     test("strips magic-context tag prefix, temporal markers, and system-reminder content before search", async () => {
         let capturedPrompt = "";
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _s, _p, prompt) => {
                 capturedPrompt = prompt;
                 return [];
@@ -282,7 +486,7 @@ describe("auto-search-runner", () => {
      */
     test("strips nested system-reminders without leaking the outer reminder's tail or close tag", async () => {
         let capturedPrompt = "";
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _s, _p, prompt) => {
                 capturedPrompt = prompt;
                 return [];
@@ -330,7 +534,7 @@ describe("auto-search-runner", () => {
 
     test("strips orphan system-reminder close tag (malformed input) without leaving it in the prompt", async () => {
         let capturedPrompt = "";
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _s, _p, prompt) => {
                 capturedPrompt = prompt;
                 return [];
@@ -361,7 +565,7 @@ describe("auto-search-runner", () => {
 
     test("strips arbitrary XML/HTML tags and HTML comments (generic, not allowlisted) before embedding", async () => {
         let capturedPrompt = "";
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _s, _p, prompt) => {
                 capturedPrompt = prompt;
                 return [];
@@ -414,7 +618,7 @@ describe("auto-search-runner", () => {
 
     test("preserves canonical whitespace bytes while sanitizing adversarial multi-part prompts", async () => {
         let capturedPrompt = "";
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _s, _p, prompt) => {
                 capturedPrompt = prompt;
                 return [];
@@ -453,7 +657,7 @@ describe("auto-search-runner", () => {
 
     test("strips week-format temporal markers (+Xw / +Xw Yd) before embedding", async () => {
         let capturedPrompt = "";
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _s, _p, prompt) => {
                 capturedPrompt = prompt;
                 return [];
@@ -484,7 +688,7 @@ describe("auto-search-runner", () => {
     });
 
     test("skips suppressed context (existing augmentation) without running search", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(async () => []);
         try {
             const messages: MessageLike[] = [
                 makeUserMsg(
@@ -527,12 +731,12 @@ describe("auto-search-runner", () => {
 
     test("timeout triggers AbortSignal so underlying search can cancel in-flight work", async () => {
         let capturedSignal: AbortSignal | undefined;
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             (_db, _s, _p, _prompt, options) => {
                 capturedSignal = (options as { signal?: AbortSignal } | undefined)?.signal;
                 // Hang forever — simulates a stuck embedding fetch.
                 return new Promise(() => {}) as unknown as ReturnType<
-                    typeof searchModule.unifiedSearch
+                    typeof searchModule.searchAutoHint
                 >;
             },
         );
@@ -557,7 +761,7 @@ describe("auto-search-runner", () => {
     }, 10_000);
 
     test("caches skip when prompt is shorter than minPromptChars", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(async () => []);
         try {
             const messages: MessageLike[] = [makeUserMsg("u1", "short")];
 
@@ -582,7 +786,7 @@ describe("auto-search-runner", () => {
     });
 
     test("skips ignored plugin-internal messages — does not embed announcements/warnings", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(async () => []);
         try {
             // Mimic the startup announcement (or any sendIgnoredMessage payload) —
             // text part with `ignored: true`. These are persisted as ordinary
@@ -615,7 +819,7 @@ describe("auto-search-runner", () => {
 
     test("ignored part next to a real user message: real prompt embedded, ignored text excluded", async () => {
         let capturedQuery: string | undefined;
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _sessionId, _projectPath, query) => {
                 capturedQuery = query as string;
                 return [];

@@ -21,6 +21,77 @@ function oneEventContext() {
 }
 
 describe("OpenCode 2 update notice", () => {
+    it("rechecks storage at expiry before starting another host's duplicate check", async () => {
+        const originalNow = Date.now;
+        let now = 1_800_000_000_000;
+        let stored: unknown;
+        let gets = 0;
+        let sets = 0;
+        let checks = 0;
+        Date.now = () => now;
+        try {
+            const context = {
+                event: {
+                    subscribe: async function* () {
+                        yield {};
+                        now += 60 * 60 * 1000;
+                        stored = now; // A different host has just checked the registry.
+                        yield {};
+                        yield {};
+                    },
+                },
+                storage: {
+                    get: async () => {
+                        gets++;
+                        return stored;
+                    },
+                    set: async (_key: string, value: unknown) => {
+                        sets++;
+                        stored = value;
+                    },
+                },
+            };
+            await startUpdateChecks(context, async () => {
+                checks++;
+                return null;
+            }).done;
+            expect(gets).toBe(2);
+            expect(sets).toBe(1);
+            expect(checks).toBe(1);
+        } finally {
+            Date.now = originalNow;
+        }
+    });
+
+    it("reads the persisted throttle once for an hourly burst of host events", async () => {
+        let gets = 0;
+        let checks = 0;
+        let sets = 0;
+        const context = {
+            event: {
+                subscribe: async function* () {
+                    for (let i = 0; i < 1000; i++) yield {};
+                },
+            },
+            storage: {
+                get: async () => {
+                    gets++;
+                    return undefined;
+                },
+                set: async () => {
+                    sets++;
+                },
+            },
+        };
+        await startUpdateChecks(context, async () => {
+            checks++;
+            return null;
+        }).done;
+        expect(gets).toBe(1);
+        expect(sets).toBe(1);
+        expect(checks).toBe(1);
+    });
+
     it("points the user at OpenCode's own plugin update instead of an automatic update", async () => {
         const checks = startUpdateChecks(
             oneEventContext() as unknown as Parameters<typeof startUpdateChecks>[0],

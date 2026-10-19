@@ -52,6 +52,7 @@ export {
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     type OpenDatabaseOptions,
+    openCurrentDatabase,
     openDatabase,
     runSqliteOptimize,
     schemaVersionIsSupported,
@@ -67,6 +68,7 @@ export {
     recordEmbeddingMeasurement,
     type SynapseBatchLedgerInput,
 } from "./storage-embedding-measurements";
+export { countHistorianRuns } from "./storage-historian-runs";
 export {
     deleteIdentityRekeyMap,
     getIdentityRekeyMap,
@@ -100,6 +102,7 @@ export {
 export {
     type AcquireWrapupResult,
     type AppendAutoSearchHintOutcome,
+    AUTO_SEARCH_DECISION_SOFT_LIMIT,
     type AutoSearchHintDecision,
     acquireWrapupInProgress,
     addProcessedImageStrippedIds,
@@ -131,6 +134,7 @@ export {
     DRAIN_WINDOW_MS,
     deliverNoteNudgeAtomic,
     describeProtectedTailDrainBudgetSkip,
+    flushAutoSearchHintDecisionRetirement,
     getAutoSearchHintDecisions,
     getChannel1NudgeState,
     getChannel2NudgeClaim,
@@ -182,6 +186,7 @@ export {
     protectedTailWindowBudget,
     pruneAutoSearchHintDecisions,
     pruneNoteNudgeAnchors,
+    queueAutoSearchHintDecisionRetirement,
     recordDetectedContextLimit,
     recordHistorianDrainFailure,
     recordOverflowDetected,
@@ -293,6 +298,7 @@ export {
     getMaxDroppedTagNumber,
     getMaxTagNumberBySession,
     getMinMessageTagNumberForRawId,
+    getNewestToolTagNumbers,
     getOldestActiveUnprotectedToolTags,
     getPersistedToolTagAccounting,
     getTagById,

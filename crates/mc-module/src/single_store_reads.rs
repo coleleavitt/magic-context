@@ -38,6 +38,13 @@ impl ModuleContextDomain {
     /// Open an existing `context.db`. A missing file is refused rather than created: an
     /// empty file would not be the host's database.
     pub fn open(path: &Path) -> Result<Self, McStoreError> {
+        Self::open_with_private_permissions(path, true)
+    }
+
+    pub fn open_with_private_permissions(
+        path: &Path,
+        enforce_private_permissions: bool,
+    ) -> Result<Self, McStoreError> {
         if !path.exists() {
             return Err(context_error(
                 "context_db_missing",
@@ -47,12 +54,15 @@ impl ModuleContextDomain {
                 ),
             ));
         }
-        let writer = HostStore::open(path).map_err(host_error)?;
+        let writer = HostStore::open_with_private_permissions(path, enforce_private_permissions)
+            .map_err(host_error)?;
         let reader = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(context_sql_error)?;
+        mc_store::single_store_domain::set_wal_synchronous_normal(&reader)
+            .map_err(context_sql_error)?;
         reader
             .pragma_update(None, "query_only", "ON")
             .map_err(context_sql_error)?;
@@ -74,6 +84,18 @@ impl ModuleContextDomain {
 }
 
 impl ContextDomain for ModuleContextDomain {
+    fn try_write(
+        &self,
+        tables: &[&str],
+        write: &mut dyn FnMut(&Transaction<'_>) -> rusqlite::Result<()>,
+    ) -> Result<(), McStoreError> {
+        self.writer
+            .try_lock()
+            .map_err(|_| context_error("context_busy", "telemetry writer is occupied"))?
+            .try_domain_transaction(tables, write)
+            .map_err(host_error)
+    }
+
     fn read(
         &self,
         read: &mut dyn FnMut(&Connection) -> rusqlite::Result<()>,
@@ -184,13 +206,24 @@ pub fn attach(
     store: &McStore,
     context_path: &Path,
 ) -> Result<Arc<ModuleContextDomain>, McStoreError> {
+    attach_with_private_permissions(store, context_path, true)
+}
+
+pub fn attach_with_private_permissions(
+    store: &McStore,
+    context_path: &Path,
+    enforce_private_permissions: bool,
+) -> Result<Arc<ModuleContextDomain>, McStoreError> {
     let marker =
         store
             .single_store_marker()?
             .ok_or_else(|| McStoreError::SingleStoreStateSplit {
                 detail: "store.db is at migration 61 without its single-store marker".to_string(),
             })?;
-    let domain = Arc::new(ModuleContextDomain::open(context_path)?);
+    let domain = Arc::new(ModuleContextDomain::open_with_private_permissions(
+        context_path,
+        enforce_private_permissions,
+    )?);
     let mut flag = None;
     domain.read(&mut |conn| {
         flag = read_context_flag(conn)?;
@@ -224,6 +257,8 @@ pub fn attach(
                 });
             }
             let conn = Connection::open_with_flags(context_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(context_sql_error)?;
+            mc_store::single_store_domain::set_wal_synchronous_normal(&conn)
                 .map_err(context_sql_error)?;
             conn.busy_timeout(std::time::Duration::from_millis(u64::from(
                 CONTEXT_BUSY_TIMEOUT_MS,
@@ -272,6 +307,32 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rust_store_directory_stays_private_when_the_plugin_permission_setting_is_disabled() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join("magic-context").join(format!(
+            "rust-store-private-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = McStore::open_with_private_permissions(&descriptor(&root), false).unwrap();
+        drop(store);
+
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// A `context.db` from the schema snapshot, with `single_store_state` as given.
     fn context_db(dir: &Path, state: Option<(&str, Option<i64>)>) -> PathBuf {
         let path = dir.join("context.db");
@@ -318,6 +379,22 @@ mod tests {
             .to_string()
             .contains("npx @cortexkit/magic-context doctor store init"));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn freshly_opened_module_context_reader_uses_wal_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = context_db(dir.path(), Some(("migrated", Some(0))));
+        let domain = ModuleContextDomain::open(&path).unwrap();
+        let reader = domain.reader.lock().unwrap();
+        let journal: String = reader
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = reader
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+        assert_eq!(synchronous, 1);
     }
 
     #[test]

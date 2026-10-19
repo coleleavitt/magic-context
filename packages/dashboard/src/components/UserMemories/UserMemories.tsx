@@ -7,6 +7,7 @@ import {
   getUserMemories,
   getUserMemoryCandidates,
   promoteUserMemoryCandidate,
+  restoreUserMemory,
   updateUserMemoryContent,
 } from "../../lib/api";
 import FilterSelect from "../shared/FilterSelect";
@@ -79,6 +80,16 @@ export default function UserMemories() {
     }
   };
 
+  const handleRestore = async (id: number) => {
+    try {
+      setError(null);
+      await restoreUserMemory(id);
+      refetchMemories();
+    } catch (e: unknown) {
+      setError(`Failed to restore memory: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
   const handleDeleteMemory = async (id: number) => {
     try {
       setError(null);
@@ -133,12 +144,12 @@ export default function UserMemories() {
         <div style={{ padding: "8px 20px" }}>
           <div
             style={{
-              background: "var(--error-bg, #3a1c1c)",
-              border: "1px solid var(--error-border, #6b2c2c)",
+              background: "var(--error-bg)",
+              border: "1px solid var(--error-border)",
               "border-radius": "var(--radius-md)",
               padding: "8px 12px",
               "font-size": "12px",
-              color: "var(--error-text, #ef4444)",
+              color: "var(--error-text)",
               display: "flex",
               "justify-content": "space-between",
               "align-items": "center",
@@ -272,6 +283,15 @@ export default function UserMemories() {
                                 onClick={() => handleDismiss(memory.id)}
                               >
                                 Dismiss
+                              </button>
+                            </Show>
+                            <Show when={memory.status === "dismissed"}>
+                              <button
+                                type="button"
+                                class="btn sm"
+                                onClick={() => handleRestore(memory.id)}
+                              >
+                                Restore
                               </button>
                             </Show>
                             <button

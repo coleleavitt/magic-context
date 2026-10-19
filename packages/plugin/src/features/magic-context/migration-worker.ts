@@ -14,7 +14,7 @@
  * finishes.
  */
 import { parentPort, workerData } from "node:worker_threads";
-import { setLogLineForwarder } from "../../shared/logger";
+import { log, setLogLineForwarder } from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import type { MigrationWorkerData, MigrationWorkerMessage } from "./migration-worker-protocol";
@@ -43,6 +43,14 @@ async function main(): Promise<void> {
                 post({ type: "lock-wait", waiting: false });
             },
         });
+        // Close before reporting done. Closing the last connection checkpoints the
+        // WAL under a lock, and the caller reads the schema as soon as it hears
+        // "done": reporting first let that read race this checkpoint and fail
+        // with SQLITE_BUSY when the caller's busy timeout is short.
+        const finished = db;
+        db = undefined;
+        finished.close();
+        log(`[migrations] migration worker connection closed: ${data.dbPath}`);
         post({ type: "done" });
     } catch (error) {
         post({

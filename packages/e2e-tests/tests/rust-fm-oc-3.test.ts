@@ -5,6 +5,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";
 import {
+    rustPassTurnsForFullBranch,
+    waitForRustPassTurns,
+} from "../src/rust-pass-observation";
+import {
     assertLoudModuleFailure,
     assertMessagesHaveNoPlaceholders,
     driveToSteadyState,
@@ -55,6 +59,19 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
                 { label: "FM-OC-3 park transition" },
             );
 
+            // Log batches can lag completed host turns. Join the submitted turns
+            // to their raw input prefixes before marking the recovery boundary.
+            const outageTurns = rustPassTurnsForFullBranch(
+                await h.listMessages(sessionId),
+                [
+                    ...[1, 2, 3].map(turn => `steady turn ${turn}:`),
+                    ...Array.from(
+                        { length: outagePasses },
+                        (_, offset) => `FM-OC-3 outage turn ${4 + offset}:`,
+                    ),
+                ],
+            );
+            await waitForRustPassTurns(h.logPath, outageTurns, () => h.readRustPasses());
             await h.subc.restoreModule();
             const recoveryStart = h.readRustPasses().length;
             await sendOutagePasses(
@@ -65,12 +82,20 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
                 "FM-OC-3 recovery",
             );
 
+            // A recovered module can apply a healthy defer while the host keeps
+            // serving frozen LKG bytes. Recovery must not require a cache rewrite.
+            // A parked shortcut cannot satisfy this: it neither applies nor advances
+            // the producer's row version.
+            const healthyAppliedPass = (pass: ReturnType<typeof h.readRustPasses>[number]) =>
+                pass.applied &&
+                pass.rowVersion > (healthyVersions.at(-1) ?? 0) &&
+                (pass.servedFrom === "transform" || pass.servedFrom === "lkg_frozen");
             const passes = await h.waitFor(
                 () => {
                     const observed = h.readRustPasses();
                     return observed
                         .slice(recoveryStart)
-                        .some((pass) => pass.servedFrom === "transform")
+                        .some(healthyAppliedPass)
                         ? observed
                         : undefined;
                 },
@@ -78,7 +103,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
             );
             const recovery = passes.slice(recoveryStart);
             expect(recovery.length).toBeLessThanOrEqual(RUST_PARK_RETRY_INTERVAL * 2);
-            expect(recovery.some((pass) => pass.servedFrom === "transform")).toBe(true);
+            expect(recovery.some(healthyAppliedPass)).toBe(true);
 
             const recoveryVersions = recovery
                 .map((pass) => pass.rowVersion)

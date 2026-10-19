@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
-import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
+import {
+	getSlot,
+	resetLkgSlotsForTest,
+} from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 
@@ -49,6 +52,71 @@ afterEach(() => {
 });
 
 describe("Pi incremental LKG capture", () => {
+	it("detaches exact nested output fields and rejects same-length in-place rewrites", () => {
+		const harness = createHarness();
+		databases.push(harness.db);
+		const output = [
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						name: "read",
+						arguments: { path: "alpha", values: [null, true, 1, undefined] },
+					},
+				],
+				timestamp: 1,
+			},
+		];
+		const snapshot = harness.coordinator.beginPass({
+			sessionId: "nested-output",
+			messages: output,
+			entryIds: ["entry"],
+			modelKey: "test/model",
+			providerKey: "test",
+		});
+		const capture = () =>
+			harness.coordinator.captureAppliedPass({
+				snapshot,
+				outputMessages: output,
+				outputEntryIds: ["entry"],
+				cacheBusting: false,
+			});
+		const originalJson = JSON.stringify(output);
+		expect(capture()?.json).toBe(originalJson);
+		harness.flushCapture();
+		output[0].content[0].arguments.path = "bravo";
+		const changedJson = JSON.stringify(output);
+		expect(changedJson).not.toBe(originalJson);
+		expect(capture()?.json).toBe(changedJson);
+		harness.flushCapture();
+		expect(getSlot("nested-output")?.jsonPrefix).toBe(changedJson);
+	});
+
+	it("keeps sparse and custom-JSON output on the one-shot serialization path", () => {
+		const harness = createHarness();
+		databases.push(harness.db);
+		const snapshot = harness.coordinator.beginPass({
+			sessionId: "custom-output",
+			messages: [message("input")],
+			entryIds: ["entry"],
+			modelKey: "test/model",
+			providerKey: "test",
+		});
+		for (const content of [new Array(2), { toJSON: () => "custom" }]) {
+			const output = [{ role: "user", content, timestamp: 1 }];
+			expect(
+				harness.coordinator.captureAppliedPass({
+					snapshot,
+					outputMessages: output,
+					outputEntryIds: ["entry"],
+					cacheBusting: false,
+				}),
+			).toBeUndefined();
+			harness.flushCapture();
+			expect(getSlot("custom-output")?.jsonPrefix).toBe(JSON.stringify(output));
+		}
+	});
 	it("refuses replay when the same entry id returns to old same-length content", () => {
 		const harness = createHarness();
 		databases.push(harness.db);
@@ -564,4 +632,32 @@ it("serializes custom output accessors exactly once", () => {
 	expect(
 		harness.coordinator.replay(harness.coordinator.beginPass(args)),
 	).toEqual({ ok: true, messages: [{ role: "user", content: "read-1" }] });
+});
+
+it("LKG own-slot digest reuse stops at a same-id same-length input rewrite", () => {
+	const harness = createHarness();
+	databases.push(harness.db);
+	const capture = (text: string) => {
+		const messages = [message("prefix"), message(text)];
+		const snapshot = harness.coordinator.beginPass({
+			sessionId: "own-digest-rewrite",
+			messages,
+			entryIds: ["one", "two"],
+			modelKey: "test/model",
+			providerKey: "test",
+		});
+		harness.coordinator.captureAppliedPass({
+			snapshot,
+			outputMessages: messages,
+			outputEntryIds: ["one", "two"],
+			cacheBusting: false,
+		});
+		harness.flushCapture();
+		return getSlot("own-digest-rewrite")?.inputContentDigests;
+	};
+	const before = capture("alpha");
+	const after = capture("bravo");
+	expect(before?.length).toBe(2);
+	expect(after?.[0]).toBe(before?.[0] as string);
+	expect(after?.[1]).not.toBe(before?.[1] as string);
 });

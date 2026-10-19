@@ -4,7 +4,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { chmodSync, createWriteStream, mkdirSync, rmSync } from "node:fs";
+import { closeSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { COMPACTION_ENABLED_PATH, isCompactionEnabled } from "../config/agent-disable";
@@ -14,6 +14,7 @@ import type { MagicContextConfig } from "../config/schema/magic-context";
 import {
     getFailingDreamTasks,
     getMostRecentTaskRunAt,
+    getSkippedDreamTasks,
 } from "../features/magic-context/dreamer/storage-task-schedule";
 import { getDreamTaskBacklogs } from "../features/magic-context/dreamer/task-gates";
 import {
@@ -46,7 +47,7 @@ import { readSessionCacheTtl } from "../features/magic-context/session-cache-ttl
 import { getQuickJsNativeMemoryStats } from "../features/magic-context/smart-notes/sandbox-runner";
 import {
     type ContextDatabase as Database,
-    openDatabase,
+    openCurrentDatabase as openDatabase,
     setSessionWorkMetrics,
 } from "../features/magic-context/storage";
 import {
@@ -123,7 +124,13 @@ import type {
     StatusDetail,
 } from "../shared/rpc-types";
 import { getSqliteMemoryStats } from "../shared/sqlite";
-import { shouldEnforcePrivateStoragePermissions } from "../shared/storage-permissions";
+import { importPluginModule } from "../shared/stale-plugin-build";
+import {
+    createStorageWriteStream,
+    ensureStorageDirectorySync,
+    shouldEnforcePrivateStoragePermissions,
+    writeStorageFileAsync,
+} from "../shared/storage-permissions";
 import {
     resolveTailHygieneStatus,
     type WireTailHygieneBaseline,
@@ -351,6 +358,8 @@ export function buildSidebarSnapshot(
     moduleStatus?: RustSessionStatus,
     compactionEnabled = true,
 ): SidebarSnapshot {
+    const smartNotesEnabled =
+        (config?.smart_notes as { enabled?: boolean } | undefined)?.enabled !== false;
     try {
         const projectIdentity = resolveProjectIdentityForSession(directory);
         if (projectIdentity === undefined)
@@ -498,12 +507,19 @@ export function buildSidebarSnapshot(
         let lastDreamerRunAt: number | null = null;
         let dreamerBacklog: DreamTaskBacklogMap | undefined;
         let dreamerFailures: DreamTaskFailureState[] | undefined;
+        let dreamerSkipped: string[] | undefined;
         const dreamerProgress = projectIdentity
             ? (liveSessionState?.dreamerProgressByProject?.get(projectIdentity) ?? null)
             : null;
         if (projectIdentity) {
             try {
-                dreamerBacklog = getDreamTaskBacklogs(db, projectIdentity, CANONICAL_DREAM_TASKS);
+                dreamerBacklog = getDreamTaskBacklogs(
+                    db,
+                    projectIdentity,
+                    CANONICAL_DREAM_TASKS.filter(
+                        (task) => smartNotesEnabled || task !== "evaluate-smart-notes",
+                    ),
+                );
             } catch {
                 // A pre-Dreamer-V2 database may not have all task tables yet.
             }
@@ -516,7 +532,12 @@ export function buildSidebarSnapshot(
                 lastDreamerRunAt = getMostRecentTaskRunAt(db, projectIdentity);
                 // A scheduled task can fail on every slot for weeks. Without this the
                 // only in-session trace is a backlog count that never falls.
-                dreamerFailures = getFailingDreamTasks(db, projectIdentity);
+                dreamerFailures = getFailingDreamTasks(db, projectIdentity).filter(
+                    (state) => smartNotesEnabled || state.task !== "evaluate-smart-notes",
+                );
+                dreamerSkipped = getSkippedDreamTasks(db, projectIdentity).filter(
+                    (task) => smartNotesEnabled || task !== "evaluate-smart-notes",
+                );
             } catch {
                 // task_schedule_state may not exist on a pre-V2 DB
             }
@@ -681,6 +702,7 @@ export function buildSidebarSnapshot(
             dreamerBacklog,
             dreamerProgress,
             ...(dreamerFailures === undefined ? {} : { dreamerFailures }),
+            ...(dreamerSkipped === undefined ? {} : { dreamerSkipped }),
             compartmentTokens: calibrated.compartmentTokens,
             factTokens: calibrated.factTokens,
             memoryTokens: calibrated.memoryTokens,
@@ -800,6 +822,7 @@ export function buildStatusDetail(
               }
             : undefined;
     const liveConfig = currentPluginConfigReader(directory);
+    const liveTtlConfig = liveConfig?.poll().effective;
     const liveFailure = liveConfig?.lastFailure();
     const detail: StatusDetail = {
         ...base,
@@ -960,6 +983,7 @@ export function buildStatusDetail(
             // pending_ops may not exist
         }
 
+        modelKey ??= persistedModelKey ?? undefined;
         const modelSlash = modelKey?.indexOf("/") ?? -1;
         if (modelKey && modelSlash > 0) {
             detail.windowGeometry = resolveContextWindowGeometry(
@@ -1003,8 +1027,11 @@ export function buildStatusDetail(
 
             const ttlDisplay = resolveCacheTtlDisplay({
                 frozen: readSessionCacheTtl(db, sessionId),
-                configured: (config.cache_ttl ?? "5m") as MagicContextConfig["cache_ttl"],
-                configuredExplicitly: config.cacheTtlConfigured === true,
+                configured: (liveTtlConfig?.cache_ttl ??
+                    config.cache_ttl ??
+                    "5m") as MagicContextConfig["cache_ttl"],
+                configuredExplicitly:
+                    (liveTtlConfig?.cacheTtlConfigured ?? config.cacheTtlConfigured) === true,
                 modelKey,
                 sessionValue: persistedCacheTtl,
                 sessionModelKey: persistedModelKey,
@@ -1283,7 +1310,7 @@ async function writeSnapshotJson(
     snapshot: Record<string, unknown>,
     enforcePrivatePermissions: boolean,
 ): Promise<void> {
-    const writer = createWriteStream(path, enforcePrivatePermissions ? { mode: 0o600 } : undefined);
+    const writer = createStorageWriteStream(path, enforcePrivatePermissions);
     const writeChunk = async (chunk: string): Promise<void> => {
         if (!writer.write(chunk)) await once(writer, "drain");
     };
@@ -1356,10 +1383,7 @@ async function generateDebugHeapSnapshot(
 
     const directory = join(storageDir, "heap-snapshots");
     const enforcePrivatePermissions = shouldEnforcePrivateStoragePermissions();
-    mkdirSync(
-        directory,
-        enforcePrivatePermissions ? { recursive: true, mode: 0o700 } : { recursive: true },
-    );
+    ensureStorageDirectorySync(directory);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const path = join(directory, `${timestamp}-${process.pid}.heapsnapshot`);
 
@@ -1381,7 +1405,7 @@ async function generateDebugHeapSnapshot(
     }
 
     if (typeof snapshot === "string") {
-        await Bun.write(path, snapshot);
+        await writeStorageFileAsync(path, snapshot, enforcePrivatePermissions);
     } else {
         await writeSnapshotJson(
             path,
@@ -1394,13 +1418,6 @@ async function generateDebugHeapSnapshot(
             },
             enforcePrivatePermissions,
         );
-    }
-    if (enforcePrivatePermissions) {
-        try {
-            chmodSync(path, 0o600);
-        } catch {
-            // A tightening failure does not invalidate the completed diagnostic capture.
-        }
     }
     return { ...memory, path, format, snapshotVersion };
 }
@@ -1448,6 +1465,11 @@ export function registerRpcHandlers(
         liveSessionState: LiveSessionState;
         rustModeModuleClient?: RustModeModuleClient;
         hiddenCompletionExecutor?: HiddenCompletionExecutor;
+        compactionMarkerStrategy?: ManagedRecompContext["compactionMarkerStrategy"];
+        /** Install the host's history source even before a reopened session's first pass. */
+        prepareHistorySession?: (sessionId: string) => void;
+        /** Read the session's current host directory, not the plugin's pre-move cached directory. */
+        readSessionDirectory?: (sessionId: string) => Promise<string | null>;
         storageDir?: string;
         getDebugMemoryHolders?: () => RuntimeDebugMemoryHolders | undefined;
         getDatabase?: () => Database | null;
@@ -1517,9 +1539,10 @@ export function registerRpcHandlers(
     rpcServer.handle("session-owner", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { owner: false };
-        const sessionDirectory =
-            liveSessionState.sessionDirectoryBySession.get(sessionId) ??
-            (await readHostSessionDirectory(args.client, sessionId));
+        const sessionDirectory = args.readSessionDirectory
+            ? await args.readSessionDirectory(sessionId)
+            : ((await readHostSessionDirectory(args.client, sessionId)) ??
+              liveSessionState.sessionDirectoryBySession.get(sessionId));
         if (!sessionDirectory) return { owner: false };
         return {
             owner:
@@ -1617,13 +1640,13 @@ export function registerRpcHandlers(
     const buildManagedCtx = async (
         db: NonNullable<ReturnType<typeof getDb>>,
     ): Promise<ManagedRecompContext> => {
-        const { deriveHistorianChunkTokens, resolveHistorianContextLimit } = await import(
-            "../hooks/magic-context/derive-budgets"
+        const { deriveHistorianChunkTokens, resolveHistorianContextLimit } =
+            await importPluginModule(() => import("../hooks/magic-context/derive-budgets"));
+        const { resolveHistorianModel } = await importPluginModule(
+            () => import("../shared/model-resolution"),
         );
-        const { resolveHistorianModel } = await import("../shared/model-resolution");
-        const { userMemoryCollectionEnabled } = await import(
-            "../features/magic-context/dreamer/task-config"
-        );
+        const { userObservationCollectionEnabled, userObservationsRequested } =
+            await importPluginModule(() => import("../features/magic-context/dreamer/task-config"));
         const DEFAULT_HISTORIAN_TIMEOUT_MS = 10 * 60 * 1000;
         const runConfig = historianRunConfig(
             config,
@@ -1633,6 +1656,7 @@ export function registerRpcHandlers(
         return {
             client: args.client as ManagedRecompContext["client"],
             hiddenCompletionExecutor: args.hiddenCompletionExecutor,
+            compactionMarkerStrategy: args.compactionMarkerStrategy,
             db,
             liveSessionState,
             directory,
@@ -1640,12 +1664,15 @@ export function registerRpcHandlers(
                 resolveHistorianContextLimit(historianModel.primary?.model),
             ),
             historianTimeoutMs: runConfig.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
+            historianMaxOutputTokens: runConfig.historian?.maxTokens,
             memoryEnabled: config.memory?.enabled ?? true,
             autoPromote: runConfig.memory?.auto_promote ?? true,
             historianModel: historianModel.primary,
             fallbackModels: historianModel.fallbacks,
-            userMemoriesEnabled: userMemoryCollectionEnabled(runConfig.dreamer),
+            userMemoriesEnabled: userObservationCollectionEnabled(runConfig.dreamer),
+            userObservationsRequested: userObservationsRequested(runConfig.dreamer),
             historianTwoPass: runConfig.historian?.two_pass === true,
+            historianExpandTools: runConfig.historian?.expand_tools,
             getNotificationParams: (sessionId) =>
                 getLiveNotificationParams(
                     sessionId,
@@ -1660,6 +1687,19 @@ export function registerRpcHandlers(
     rpcServer.handle("recomp", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
+        const readDirectory = args.readSessionDirectory;
+        if (readDirectory) {
+            const { handoffHistoryWork } = await import("../shared/history-owner");
+            const handed = await handoffHistoryWork({
+                storageDir: args.storageDir ?? getMagicContextStorageDir(),
+                directory,
+                sessionId,
+                method: "recomp",
+                params,
+                readDirectory: () => readDirectory(sessionId),
+            });
+            if (handed) return handed;
+        }
         const dir = String(params.directory ?? directory);
         if (config.transform_mode === "rust") {
             return executeRustRecompRpc(rustModeModuleClient, sessionId, dir);
@@ -1667,9 +1707,11 @@ export function registerRpcHandlers(
         const db = readDatabase();
         if (!db) return { ok: false, error: "db unavailable" };
 
-        const { runManagedRecomp } = await import("../hooks/magic-context/recomp-orchestrator");
-        const { sendIgnoredMessage } = await import(
-            "../hooks/magic-context/send-session-notification"
+        const { runManagedRecomp } = await importPluginModule(
+            () => import("../hooks/magic-context/recomp-orchestrator"),
+        );
+        const { sendIgnoredMessage } = await importPluginModule(
+            () => import("../hooks/magic-context/send-session-notification"),
         );
         log(`[rpc] recomp requested for session ${sessionId}`);
         // The historian needs a way to run hidden completions: OpenCode 1 opens
@@ -1683,6 +1725,7 @@ export function registerRpcHandlers(
             };
         }
         const ctx = await buildManagedCtx(db);
+        args.prepareHistorySession?.(sessionId);
         // Fire-and-forget. OpenCode 1 force-persists the outcome as a chat row so a
         // multi-minute recomp's result stays in scrollback instead of a 5s toast.
         // OpenCode 2 has no SDK client to write that row with, so the outcome goes
@@ -1705,11 +1748,9 @@ export function registerRpcHandlers(
         return { ok: true };
     });
 
-    // The three handlers below exist for a host whose only command seam is the
-    // TUI (OpenCode 2 registers /ctx-* through its keymap layer, and its lane
-    // never runs the OpenCode 1 `command.execute.before` hook). Each performs the
-    // same server-side work as the matching command branch and returns its text,
-    // so the caller can render it in a dialog or toast instead of a chat row.
+    // OpenCode 2 server command callbacks dispatch to these RPC handlers. The
+    // command API has no response-text channel, so callbacks send handler replies
+    // to a connected TUI as notifications instead of adding them to chat history.
     const compactionOffRefusal = (command: string): string =>
         `Magic Context compaction is disabled (${COMPACTION_ENABLED_PATH}: false) — /${command} manages compacted history and has no effect in this mode.`;
 
@@ -1751,11 +1792,29 @@ export function registerRpcHandlers(
         // pass instead of leaving the flush invisible until one happens anyway.
         liveSessionState.historyRefreshSessions.add(sessionId);
         liveSessionState.systemPromptRefreshSessions.add(sessionId);
-        liveSessionState.pendingMaterializationSessions.add(sessionId);
+        requestPendingMaterialization(
+            liveSessionState.pendingMaterializationSessions,
+            sessionId,
+            "user_flush",
+        );
         return { ok: true, message };
     });
 
     rpcServer.handle("wrapup", async (params) => {
+        const readDirectory = args.readSessionDirectory;
+        if (readDirectory && params.sessionId) {
+            const { handoffHistoryWork } = await import("../shared/history-owner");
+            const sessionId = String(params.sessionId);
+            const handed = await handoffHistoryWork({
+                storageDir: args.storageDir ?? getMagicContextStorageDir(),
+                directory,
+                sessionId,
+                method: "wrapup",
+                params,
+                readDirectory: () => readDirectory(sessionId),
+            });
+            if (handed) return handed;
+        }
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
         if (!compactionEnabled) return { ok: true, message: compactionOffRefusal("ctx-wrapup") };
@@ -1767,7 +1826,9 @@ export function registerRpcHandlers(
         const db = readDatabase();
         if (!db) return { ok: false, error: "db unavailable" };
 
-        const { runManagedWrapup } = await import("../hooks/magic-context/wrapup-orchestrator");
+        const { runManagedWrapup } = await importPluginModule(
+            () => import("../hooks/magic-context/wrapup-orchestrator"),
+        );
         const model = liveSessionState.liveModelBySession.get(sessionId);
         const contextLimit = model
             ? resolveContextLimit(model.providerID, model.modelID, { db, sessionID: sessionId })
@@ -1791,6 +1852,7 @@ export function registerRpcHandlers(
                 liveSessionState.pendingMaterializationSessions.has(sid),
         };
         log(`[rpc] wrapup requested for session ${sessionId} (keep ${messagesToKeep})`);
+        args.prepareHistorySession?.(sessionId);
         // Fire-and-forget: a wrapup runs the historian over the live tail and can
         // take minutes, which is far longer than an RPC caller can wait.
         void runManagedWrapup(ctx, sessionId, { messagesToKeep })
@@ -1881,3 +1943,5 @@ export function registerRpcHandlers(
         return { ok: true } as unknown as Record<string, unknown>;
     });
 }
+
+import { requestPendingMaterialization } from "../hooks/magic-context/pending-materialization";

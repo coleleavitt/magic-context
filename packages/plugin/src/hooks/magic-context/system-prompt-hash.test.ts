@@ -120,6 +120,7 @@ function buildHandler(opts?: {
     promptSurface?: PromptSurfaceConfig;
     promptSurfaceRuntime?: PromptSurfaceRuntime;
     resolveModel?: (sessionId: string) => { providerID: string; modelID: string } | undefined;
+    consumeMessagesPrepared?: (sessionId: string) => boolean;
 }): ReturnType<typeof createSystemPromptHashHandler> {
     return createSystemPromptHashHandler({
         db: openDatabase(),
@@ -139,10 +140,170 @@ function buildHandler(opts?: {
         internalChildSessions: opts?.internalChildSessions,
         experimentalCavemanTextCompression: opts?.experimentalCavemanTextCompression,
         experimentalTemporalAwareness: opts?.experimentalTemporalAwareness,
+        consumeMessagesPrepared: opts?.consumeMessagesPrepared,
     });
 }
 
 describe("system-prompt-hash drain semantics (Oracle review 2026-04-26 Finding A1)", () => {
+    it("a cold handler adopts a midnight date change on the idle-expired request", async () => {
+        useTempDataHome("sph-cold-midnight-");
+        const sessionId = "ses-cold-midnight";
+        resolveCtxReduceAvailabilityFromMessages(sessionId, [
+            { info: { id: "u", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+        ] as never);
+        const first = buildHandler();
+        await first.handler(
+            { sessionID: sessionId },
+            { system: ["Base\nToday's date: Fri Oct 02 2026"] },
+        );
+        const oldHash = getOrCreateSessionMeta(openDatabase(), sessionId).systemPromptHash;
+        updateSessionMeta(openDatabase(), sessionId, {
+            cacheTtl: "1h",
+            lastResponseTime: Date.now() - 16.5 * 3_600_000,
+        });
+        // Desktop can dispose and recreate a plugin instance without restarting
+        // the host. The hash survives that lifecycle; the sticky-date map does not.
+        first.clearSession(sessionId);
+        const pendingMaterializationSessions = new Set<string>();
+        const cold = buildHandler({ pendingMaterializationSessions });
+        const output = { system: ["Base\nToday's date: Sat Oct 03 2026"] };
+        await cold.handler({ sessionID: sessionId }, output);
+        const meta = getOrCreateSessionMeta(openDatabase(), sessionId);
+        expect(output.system.join("\n")).toContain("Today's date: Sat Oct 03 2026");
+        expect(meta.systemPromptHash).not.toBe(oldHash);
+        expect(meta.cachedM0SystemHash).toBe(meta.systemPromptHash);
+        expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
+        clearCtxReduceAvailability(sessionId);
+    });
+    for (const expired of [true, false]) {
+        it(`${expired ? "adopts" : "flushes"} a late system change on an ${expired ? "expired" : "warm"} request`, async () => {
+            useTempDataHome("sph-idle-adopt-");
+            const sessionId = `ses-idle-adopt-${expired}`;
+            resolveCtxReduceAvailabilityFromMessages(sessionId, [
+                { info: { id: "u", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+            ] as never);
+            const historyRefreshSessions = new Set<string>();
+            const systemPromptRefreshSessions = new Set<string>();
+            const pendingMaterializationSessions = new Set<string>();
+            const { handler } = buildHandler({
+                historyRefreshSessions,
+                systemPromptRefreshSessions,
+                pendingMaterializationSessions,
+            });
+            const db = openDatabase();
+            getOrCreateSessionMeta(db, sessionId);
+            updateSessionMeta(db, sessionId, {
+                systemPromptHash: "old-system-hash",
+                cachedM0SystemHash: "old-system-hash",
+                cacheTtl: "1h",
+                lastResponseTime: Date.now() - (expired ? 16.5 * 3_600_000 : 1_000),
+            });
+            await handler(
+                { sessionID: sessionId },
+                { system: ["New stable system content\nToday's date: Sat Oct 03 2026"] },
+            );
+            const meta = getOrCreateSessionMeta(db, sessionId);
+            expect(meta.systemPromptHash).not.toBe("old-system-hash");
+            expect(meta.cachedM0SystemHash).toBe(
+                expired ? meta.systemPromptHash : "old-system-hash",
+            );
+            expect(historyRefreshSessions.has(sessionId)).toBe(!expired);
+            expect(systemPromptRefreshSessions.has(sessionId)).toBe(!expired);
+            expect(pendingMaterializationSessions.has(sessionId)).toBe(!expired);
+            clearCtxReduceAvailability(sessionId);
+        });
+    }
+    // OpenCode 1 runs the messages transform before this hook, so the request that
+    // first carries a changed system prompt cannot take Magic Context's fold. A
+    // flush would rebuild on the next request and rewrite the provider cache twice.
+    for (const messagesFirst of [true, false]) {
+        it(`${messagesFirst ? "adopts" : "flushes"} a warm system change when the messages transform ${messagesFirst ? "already ran" : "has not run"} for the request`, async () => {
+            useTempDataHome("sph-hook-order-");
+            const sessionId = `ses-hook-order-${messagesFirst}`;
+            resolveCtxReduceAvailabilityFromMessages(sessionId, [
+                { info: { id: "u", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+            ] as never);
+            const historyRefreshSessions = new Set<string>();
+            const systemPromptRefreshSessions = new Set<string>();
+            const pendingMaterializationSessions = new Set<string>();
+            const consulted: string[] = [];
+            const { handler } = buildHandler({
+                historyRefreshSessions,
+                systemPromptRefreshSessions,
+                pendingMaterializationSessions,
+                consumeMessagesPrepared: (sid) => {
+                    consulted.push(sid);
+                    return messagesFirst;
+                },
+            });
+            const db = openDatabase();
+            getOrCreateSessionMeta(db, sessionId);
+            updateSessionMeta(db, sessionId, {
+                systemPromptHash: "old-system-hash",
+                cachedM0SystemHash: "old-system-hash",
+                cacheTtl: "1h",
+                lastResponseTime: Date.now() - 1_000,
+            });
+            const output = {
+                system: [
+                    "Instructions from: AGENTS.md\nProject rule v2\nToday's date: Sat Oct 03 2026",
+                ],
+            };
+            await handler({ sessionID: sessionId }, output);
+            const meta = getOrCreateSessionMeta(db, sessionId);
+            expect(consulted).toEqual([sessionId]);
+            expect(output.system.join("\n")).toContain("Project rule v2");
+            expect(meta.systemPromptHash).not.toBe("old-system-hash");
+            expect(meta.cachedM0SystemHash).toBe(
+                messagesFirst ? meta.systemPromptHash : "old-system-hash",
+            );
+            expect(historyRefreshSessions.has(sessionId)).toBe(!messagesFirst);
+            expect(systemPromptRefreshSessions.has(sessionId)).toBe(!messagesFirst);
+            expect(pendingMaterializationSessions.has(sessionId)).toBe(!messagesFirst);
+            clearCtxReduceAvailability(sessionId);
+        });
+    }
+    it("keeps the sticky date frozen on a warm messages-first request without a content change", async () => {
+        useTempDataHome("sph-hook-order-date-");
+        const sessionId = "ses-hook-order-date";
+        resolveCtxReduceAvailabilityFromMessages(sessionId, [
+            { info: { id: "u", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+        ] as never);
+        const pendingMaterializationSessions = new Set<string>();
+        const { handler } = buildHandler({
+            pendingMaterializationSessions,
+            consumeMessagesPrepared: () => true,
+        });
+        await handler(
+            { sessionID: sessionId },
+            { system: ["Base\nToday's date: Fri Oct 02 2026"] },
+        );
+        const db = openDatabase();
+        const before = getOrCreateSessionMeta(db, sessionId);
+        updateSessionMeta(db, sessionId, { cacheTtl: "1h", lastResponseTime: Date.now() - 1_000 });
+        const output = { system: ["Base\nToday's date: Sat Oct 03 2026"] };
+        await handler({ sessionID: sessionId }, output);
+        const after = getOrCreateSessionMeta(db, sessionId);
+        expect(output.system.join("\n")).toContain("Today's date: Fri Oct 02 2026");
+        expect(after.systemPromptHash).toBe(before.systemPromptHash);
+        expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
+        clearCtxReduceAvailability(sessionId);
+    });
+    it("does not consume the request marker on a skipped internal-agent call", async () => {
+        useTempDataHome("sph-hook-order-skip-");
+        const consulted: string[] = [];
+        const { handler } = buildHandler({
+            consumeMessagesPrepared: (sid) => {
+                consulted.push(sid);
+                return true;
+            },
+        });
+        await handler(
+            { sessionID: "ses-hook-order-title" },
+            { system: ["You are a title generator. You output ONLY a thread title."] },
+        );
+        expect(consulted).toEqual([]);
+    });
     it("drains pre-existing systemPromptRefresh flag set by /ctx-flush", async () => {
         useTempDataHome("sph-drain-existing-");
         const sessionId = "ses-existing-flag";

@@ -23,6 +23,7 @@ import {
     recordMessageFtsRowid,
 } from "./message-fts-rowid-map";
 import { deleteSessionScopedRows, SESSION_SCOPED_TABLES } from "./storage-session-tables";
+import { TAG_TOMBSTONE_OWNER_PREFIX } from "./storage-tag-identity-revision";
 
 interface MessageHistoryIndexRow {
     last_indexed_ordinal?: number;
@@ -46,6 +47,8 @@ export interface MessageHistoryOrphanSweepResult {
     scanned: number;
     deleted: number;
     cursor: string;
+    /** Why a parked sweep did not run, when that is not simply a host without an OpenCode store. */
+    reason?: string;
 }
 
 export interface MessageHistoryOrphanSweepOptions {
@@ -77,6 +80,34 @@ const deleteMessageFtsStatements = new WeakMap<Database, PreparedStatement>();
 const deleteFtsMapStatements = new WeakMap<Database, PreparedStatement>();
 const deleteFtsMapRangeStatements = new WeakMap<Database, PreparedStatement>();
 const deleteMessageFtsMapStatements = new WeakMap<Database, PreparedStatement>();
+/** Large documents are source-accounted but omitted from FTS to bound tokenization under the writer. */
+export const MESSAGE_INDEX_MAX_FTS_BYTES = 64 * 1024;
+const skipStatements = new WeakMap<Database, Map<string, PreparedStatement>>();
+function skipStatement(db: Database, sql: string): PreparedStatement {
+    const statements = skipStatements.get(db) ?? new Map<string, PreparedStatement>();
+    skipStatements.set(db, statements);
+    let statement = statements.get(sql);
+    if (!statement) {
+        statement = db.prepare(sql);
+        statements.set(sql, statement);
+    }
+    return statement;
+}
+export const messageIndexSkipKey = (sessionId: string, messageId: string) =>
+    `message_index_skip:${JSON.stringify([sessionId, messageId])}`;
+export function deleteMessageIndexSkips(db: Database, sessionId: string, messageId?: string): void {
+    if (messageId !== undefined) {
+        skipStatement(db, "DELETE FROM schema_migrations_meta WHERE key=?").run(
+            messageIndexSkipKey(sessionId, messageId),
+        );
+    } else {
+        const prefix = `message_index_skip:${JSON.stringify([sessionId]).slice(0, -1)},`;
+        skipStatement(db, "DELETE FROM schema_migrations_meta WHERE substr(key,1,length(?))=?").run(
+            prefix,
+            prefix,
+        );
+    }
+}
 
 function normalizeIndexText(text: string): string {
     return text.replace(/\s+/g, " ").trim();
@@ -337,6 +368,8 @@ export interface MessageIndexSource {
     sourceVersion: string;
     contentHash: string;
     content: string;
+    /** Original byte mass when a worker deliberately omits an oversized FTS body. */
+    ftsSkippedBytes?: number;
 }
 
 export function toMessageIndexSource(message: RawMessage): MessageIndexSource {
@@ -373,9 +406,17 @@ export function isMessageIndexSourceCurrent(
     message: RawMessage,
 ): boolean {
     const source = getMessageSourceSnapshot(message);
+    return isIndexSourceCurrent(db, sessionId, source);
+}
+
+function isIndexSourceCurrent(
+    db: Database,
+    sessionId: string,
+    source: MessageIndexSource,
+): boolean {
     const row = getMessageSourceStatement(db).get(
         sessionId,
-        message.id,
+        source.id,
     ) as MessageHistorySourceRow | null;
     return (
         row?.message_ordinal === source.ordinal &&
@@ -383,15 +424,6 @@ export function isMessageIndexSourceCurrent(
         row.normalized_content_hash === source.contentHash &&
         row.role === source.role
     );
-}
-
-function setMessageSource(
-    db: Database,
-    sessionId: string,
-    message: RawMessage,
-    now: number,
-): string {
-    return writeMessageSource(db, sessionId, getMessageSourceSnapshot(message), now);
 }
 
 function writeMessageSource(
@@ -409,6 +441,26 @@ function writeMessageSource(
         source.role,
         getHarness(),
         now,
+    );
+    const bytes = Buffer.byteLength(source.content);
+    if (source.ftsSkippedBytes !== undefined || bytes > MESSAGE_INDEX_MAX_FTS_BYTES) {
+        skipStatement(
+            db,
+            "INSERT INTO schema_migrations_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ).run(
+            messageIndexSkipKey(sessionId, source.id),
+            JSON.stringify({
+                reason: "oversized",
+                bytes: source.ftsSkippedBytes ?? bytes,
+                contentHash: source.contentHash,
+                ordinal: source.ordinal,
+                complete: true,
+            }),
+        );
+        return "";
+    }
+    skipStatement(db, "DELETE FROM schema_migrations_meta WHERE key=?").run(
+        messageIndexSkipKey(sessionId, source.id),
     );
     return source.content;
 }
@@ -493,6 +545,7 @@ export function isMessageIndexReconciledThrough(
 }
 
 export function deleteIndexedMessage(db: Database, sessionId: string, messageId: string): number {
+    deleteMessageIndexSkips(db, sessionId, messageId);
     const row = getCountIndexedMessageStatement(db).get(sessionId, messageId) as CountRow | null;
     const count = typeof row?.count === "number" ? row.count : 0;
 
@@ -510,6 +563,7 @@ export function deleteIndexedMessage(db: Database, sessionId: string, messageId:
  * transaction; use `clearIndexedMessages` when it does not.
  */
 export function clearIndexedMessagesInTransaction(db: Database, sessionId: string): void {
+    deleteMessageIndexSkips(db, sessionId);
     getDeleteFtsStatement(db).run(sessionId);
     deleteUnmappedMessageFtsRows(db, [sessionId]);
     getDeleteFtsMapStatement(db).run(sessionId);
@@ -557,12 +611,13 @@ function indexSingleMessageInTransaction(
     message: RawMessage,
     now: number,
     dirtyFloorBeforeAttempt: number | null,
+    source: MessageIndexSource,
 ): boolean {
     const currentWatermark = getLastIndexedOrdinal(db, sessionId);
     const dirtyFloor = getDirtyIndexFloor(db, sessionId);
 
     if (message.ordinal <= currentWatermark) {
-        if (isMessageIndexSourceCurrent(db, sessionId, message)) {
+        if (isIndexSourceCurrent(db, sessionId, source)) {
             recordIndexedMessageTime(db, sessionId, message.ordinal, message.createdAt);
             return false;
         }
@@ -577,7 +632,7 @@ function indexSingleMessageInTransaction(
         // document without moving the contiguous watermark.
         getDeleteMessageFtsStatement(db).run(sessionId, message.id);
         getDeleteMessageFtsMapStatement(db).run(sessionId, sessionId, message.id);
-        const content = setMessageSource(db, sessionId, message, now);
+        const content = writeMessageSource(db, sessionId, source, now);
         if (content.length > 0 && (message.role === "user" || message.role === "assistant")) {
             insertMessageFtsRow(
                 db,
@@ -609,7 +664,7 @@ function indexSingleMessageInTransaction(
         return false;
     }
 
-    const content = setMessageSource(db, sessionId, message, now);
+    const content = writeMessageSource(db, sessionId, source, now);
     let inserted = false;
     if (
         content.length > 0 &&
@@ -638,12 +693,18 @@ function indexSingleMessageInTransaction(
     return inserted;
 }
 
-export function indexSingleMessage(db: Database, sessionId: string, message: RawMessage): boolean {
+export function indexSingleMessage(
+    db: Database,
+    sessionId: string,
+    message: RawMessage,
+    shouldCommit: () => boolean = () => true,
+    preparedSource?: MessageIndexSource,
+): boolean {
+    if (!shouldCommit()) return false;
+    // Normalization and hashing never belong inside a SQLite write transaction.
+    const source = preparedSource ?? getMessageSourceSnapshot(message);
     const currentWatermark = getLastIndexedOrdinal(db, sessionId);
-    if (
-        message.ordinal <= currentWatermark &&
-        isMessageIndexSourceCurrent(db, sessionId, message)
-    ) {
+    if (message.ordinal <= currentWatermark && isIndexSourceCurrent(db, sessionId, source)) {
         recordIndexedMessageTime(db, sessionId, message.ordinal, message.createdAt);
         return false;
     }
@@ -668,7 +729,9 @@ export function indexSingleMessage(db: Database, sessionId: string, message: Raw
             message,
             Date.now(),
             dirtyFloorBeforeAttempt,
+            source,
         );
+        if (!shouldCommit()) return false;
         db.exec("COMMIT");
         committed = true;
         logSlowWriteTransaction("message_index_incremental", transactionStartedAt);
@@ -719,6 +782,7 @@ function indexItemsAfterOrdinal<T extends { ordinal: number }>(
 ): number {
     const now = Date.now();
     let inserted = 0;
+    const sources = new Map(items.map((item) => [item.ordinal, toSource(item)]));
 
     // The writer lock protects both duplicate checks and the progress row. Each
     // caller supplies only one bounded source page, so lock hold time is bounded
@@ -776,7 +840,8 @@ function indexItemsAfterOrdinal<T extends { ordinal: number }>(
             const item = itemsByOrdinal.get(ordinal);
             if (!item) continue;
 
-            const message = toSource(item);
+            const message = sources.get(ordinal);
+            if (!message) continue;
             const content = writeMessageSource(db, sessionId, message, now);
             if (
                 content.length === 0 ||
@@ -855,11 +920,16 @@ export function ensureMessagesIndexed(
  * sweep reads. Pi and OMP keep theirs elsewhere, so there is nothing here for
  * the sweep to compare against — that is an absent source, not an error, and
  * the caller parks the sweep instead of failing the maintenance pass.
+ *
+ * OpenCode 2 is parked too. This sweep judges a session orphaned when OpenCode
+ * 1's `session` table has no row for it, but OpenCode 2 keeps its sessions in
+ * `session_v2`. A store OpenCode 2 migrated from OpenCode 1 still carries the
+ * old `session` table, so the OpenCode 1 store opens cleanly and every
+ * OpenCode 2 session looks orphaned: sweeping there would delete live session
+ * state. Sweeping OpenCode 2 needs a check against `session_v2` instead.
  */
-function harnessSupportsOpenCodeOrphanSweep(
-    harness: HarnessId,
-): harness is "opencode" | "opencode2" {
-    return harness === "opencode" || harness === "opencode2";
+function harnessSupportsOpenCodeOrphanSweep(harness: HarnessId): harness is "opencode" {
+    return harness === "opencode";
 }
 
 function getMessageHistoryOrphanSweepState(
@@ -895,13 +965,23 @@ function getOpenCodeSessionScopedCandidateSourceSql(harness: "opencode" | "openc
     // OpenCode sweep: the same shared row could belong to Pi. Once an
     // OpenCode-scoped table is listed for deletion, it automatically becomes a
     // discovery source too; storage-db.test.ts fences that list to the schema.
-    return SESSION_SCOPED_TABLES.filter((definition) => definition.harnessScoped === true)
-        .map((definition) => {
-            const predicates = ["session_id IS NOT NULL", `harness = '${harness}'`];
-            if (definition.extraPredicate) predicates.push(definition.extraPredicate);
-            return `SELECT session_id FROM ${definition.table} WHERE ${predicates.join(" AND ")}`;
-        })
-        .join("\nUNION\n");
+    const sources = SESSION_SCOPED_TABLES.filter(
+        (definition) => definition.harnessScoped === true,
+    ).map((definition) => {
+        const predicates = ["session_id IS NOT NULL", `harness = '${harness}'`];
+        if (definition.extraPredicate) predicates.push(definition.extraPredicate);
+        return `SELECT session_id FROM ${definition.table} WHERE ${predicates.join(" AND ")}`;
+    });
+    // A context reset can leave only its retained tag-change counters. The
+    // marker records the session ID and producing harness, so this sweep checks
+    // OpenCode's session table only for OpenCode-owned counters, not resumable Pi sessions.
+    const jsonId = `SUBSTR(key, ${TAG_TOMBSTONE_OWNER_PREFIX.length + 1}, LENGTH(key) - ${TAG_TOMBSTONE_OWNER_PREFIX.length + harness.length + 1})`;
+    sources.push(`SELECT CASE WHEN json_valid(${jsonId}) THEN
+        CASE WHEN json_type(${jsonId}) = 'text' THEN json_extract(${jsonId}, '$') END END AS session_id
+        FROM schema_migrations_meta WHERE value = '${harness}'
+        AND key >= '${TAG_TOMBSTONE_OWNER_PREFIX}' AND key < '${TAG_TOMBSTONE_OWNER_PREFIX.slice(0, -1)};'
+        AND SUBSTR(key, -${harness.length + 1}) = ':${harness}'`);
+    return sources.join("\nUNION\n");
 }
 
 /**
@@ -946,6 +1026,15 @@ function sweepOrphanedOpenCodeMessageIndexesInBackground(
             now + unavailableReprobeMs - cooldownMs,
             harness,
         );
+        if (harness === "opencode2") {
+            return {
+                status: "unavailable",
+                scanned: 0,
+                deleted: 0,
+                cursor,
+                reason: "OpenCode 2 keeps its sessions in session_v2, which this sweep does not read",
+            };
+        }
         return { status: "unavailable", scanned: 0, deleted: 0, cursor };
     }
 
@@ -1014,8 +1103,13 @@ function sweepOrphanedOpenCodeMessageIndexesInBackground(
                    )
                  LIMIT 1`,
             );
-            const eligibleSessionIds = missingSessionIds.filter((sessionId) =>
-                stillEligible.get(sessionId, cutoff),
+            // A session absent from OpenCode's first probe may have been imported
+            // while this worker waited for the context writer lock. Recheck just
+            // those IDs in OpenCode's session table before deleting their context
+            // rows, including any tags written since the initial probe.
+            const eligibleSessionIds = missingSessionIds.filter(
+                (sessionId) =>
+                    !sessionExists.get(sessionId) && stillEligible.get(sessionId, cutoff),
             );
             deleted = deleteSessionScopedRows(db, eligibleSessionIds, harness);
             persistMessageHistoryOrphanSweepState(db, nextCursor, completedAt, harness);

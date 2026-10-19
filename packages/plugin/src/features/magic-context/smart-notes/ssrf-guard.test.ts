@@ -331,27 +331,62 @@ describe("smart-note redirects", () => {
         expect(error.message).toMatch(/SMART_NOTE_NETWORK: response body too large/);
     });
 
-    test("enforces one wall-clock timeout across DNS and redirect requests", async () => {
+    // These tests hang the slow step until the deadline aborts it, rather than
+    // racing fixed sleeps against a tight budget: on a loaded CI runner the
+    // sleeps alone overran a 40 ms budget before the redirect was requested.
+    test("the wall-clock deadline also covers DNS on a redirect hop", async () => {
         let calls = 0;
+        let lookups = 0;
+        const error = await guardedSmartNoteHttpGet("https://public.test/", {
+            signal,
+            timeoutMs: 50,
+            resolver: {
+                lookup: async () => {
+                    lookups++;
+                    // The redirect target's DNS never answers.
+                    if (lookups > 1) await new Promise(() => {});
+                    return [{ address: "93.184.216.34", family: 4 }];
+                },
+            },
+            requestAddress: async () => {
+                calls++;
+                return { status: 302, body: "", location: "/final" };
+            },
+        }).catch((error) => error);
+        expect(calls).toBe(1);
+        expect(lookups).toBe(2);
+        expect(error).toBeInstanceOf(SmartNoteNetworkError);
+        expect(error.message).toBe("SMART_NOTE_NETWORK: request timed out");
+    });
+
+    test("one wall-clock budget spans DNS and every redirect request", async () => {
+        const budgets: number[] = [];
         let chainSignal: AbortSignal | undefined;
         const error = await guardedSmartNoteHttpGet("https://public.test/", {
             signal,
-            timeoutMs: 40,
+            timeoutMs: 500,
             resolver: {
                 lookup: async () => {
-                    await Bun.sleep(15);
+                    await Bun.sleep(20);
                     return [{ address: "93.184.216.34", family: 4 }];
                 },
             },
             requestAddress: async (_validation, _candidate, options) => {
-                calls++;
+                budgets.push(options.timeoutMs);
                 chainSignal = options.signal;
-                if (calls === 1) return { status: 302, body: "", location: "/final" };
-                await Bun.sleep(60);
+                if (budgets.length === 1) return { status: 302, body: "", location: "/final" };
+                // The redirected request hangs until the shared deadline aborts it.
+                await new Promise((resolve) =>
+                    options.signal.addEventListener("abort", resolve, { once: true }),
+                );
                 return { status: 200, body: "late" };
             },
         }).catch((error) => error);
-        expect(calls).toBe(2);
+        expect(budgets).toHaveLength(2);
+        // Two 20 ms lookups have already been spent, so the redirect gets what is
+        // left of the original budget, never a fresh one.
+        expect(budgets[1]).toBeLessThanOrEqual(500 - 40 + 1);
+        expect(budgets[1]).toBeLessThan(budgets[0] ?? 0);
         expect(error).toBeInstanceOf(SmartNoteNetworkError);
         expect(error.message).toBe("SMART_NOTE_NETWORK: request timed out");
         expect(chainSignal?.aborted).toBe(true);
@@ -441,7 +476,13 @@ describe("guarded HTTPS request agent", () => {
                         bodyLimitBytes: 10,
                     },
                 ),
-            ).toEqual({ status: 302, body: "�", location: "/cdn", bytesRead: 1 });
+            ).toEqual({
+                status: 302,
+                body: "�",
+                headers: { location: "/cdn" },
+                location: "/cdn",
+                bytesRead: 1,
+            });
         } finally {
             spy.mockRestore();
         }

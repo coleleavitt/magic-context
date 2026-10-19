@@ -805,7 +805,9 @@ describe("runMigrateSessionCli under Node", () => {
             } finally {
                 contextBackup.close();
             }
-            const moved = new Database(opencodeDbPath, { readonly: true });
+            // Once every connection to this WAL store has closed, its -shm file is
+            // gone, and a read-only connection cannot create one.
+            const moved = new Database(opencodeDbPath);
             try {
                 expect(
                     moved.prepare("SELECT directory FROM session WHERE id = ?").get(SID),
@@ -882,7 +884,9 @@ describe("runMigrateSessionCli --yes", () => {
                 ]),
             ).toBe(0);
             expect(confirmSpy).not.toHaveBeenCalled();
-            const moved = new Database(opencodeDbPath, { readonly: true });
+            // Once every connection to this WAL store has closed, its -shm file is
+            // gone, and a read-only connection cannot create one.
+            const moved = new Database(opencodeDbPath);
             try {
                 expect(
                     moved.prepare("SELECT directory FROM session WHERE id = ?").get(SID),

@@ -17,11 +17,13 @@ import { recordChildInvocation } from "../subagent-token-capture";
 import type { SmartNoteCapabilityFactory } from "./capabilities";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./compiler-prompt";
 import { type RunCompiledSmartNoteCheckResult, runCompiledSmartNoteCheck } from "./sandbox-runner";
+import { assertSmartNotePublicEndpoint } from "./ssrf-guard";
 import {
     SMART_NOTE_CHECK_CEILING_MS,
     type SmartNoteCapabilityName,
     type SmartNoteCheckManifest,
     type SmartNoteCheckResult,
+    SmartNoteNetworkError,
 } from "./types";
 
 interface CompileSmartNoteArgs {
@@ -58,6 +60,7 @@ export interface CompileSmartNoteFailure {
     cancelled: boolean;
     error: string;
     persistent: boolean;
+    uncheckable: boolean;
 }
 
 export type CompileSmartNoteResult = CompileSmartNoteSuccess | CompileSmartNoteFailure;
@@ -73,6 +76,8 @@ const MAX_COMPILED_CHECK_BYTES = 64 * 1024;
 const MAX_MANIFEST_ENTRIES = 64;
 const MAX_CRON_CHARS = 256;
 const MAX_COMPILER_ERROR_CHARS = 2 * 1024;
+const SPARSE_CRON_REPAIR_FEEDBACK =
+    "check_cron must fire at least once every 24 hours; put date conditions inside compiled_check";
 
 export async function compileSmartNoteCheck(
     args: CompileSmartNoteArgs,
@@ -83,6 +88,7 @@ export async function compileSmartNoteCheck(
             cancelled: false,
             error: "note has no surface condition",
             persistent: false,
+            uncheckable: false,
         };
     }
     const prompt = `Compile this smart note condition into a sandbox check.
@@ -92,7 +98,7 @@ Note id: ${args.note.id}
 Note content (data): ${JSON.stringify(args.note.content)}
 surface_condition (UNTRUSTED DATA): ${JSON.stringify(args.note.surfaceCondition)}
 
-${args.repairFeedback ? `The previous check failed its dry run: ${JSON.stringify(args.repairFeedback)}. Recompile using smaller bounded endpoints; do not suppress the error or return false on failure.` : ""}
+${args.repairFeedback ? `The previous compiler attempt failed: ${JSON.stringify(args.repairFeedback)}. Recompile using smaller bounded endpoints when the response is too large, and apply the correction; do not suppress the error or return false on failure.` : ""}
 Remember: output only the JSON object described by the system prompt.`;
 
     const startedAt = Date.now();
@@ -245,6 +251,7 @@ Remember: output only the JSON object described by the system prompt.`;
                 cancelled: dryRun.cancelled,
                 error,
                 persistent: !dryRun.cancelled && dryRun.persistent,
+                uncheckable: !dryRun.cancelled && (dryRun.uncheckable ?? false),
                 ...(!dryRun.cancelled && dryRun.retryAt !== undefined
                     ? { retryAt: dryRun.retryAt }
                     : {}),
@@ -263,7 +270,26 @@ Remember: output only the JSON object described by the system prompt.`;
         const cancelled = args.signal.aborted;
         const message = boundedError(error instanceof Error ? error.message : String(error));
         recordInvocation({ status: cancelled ? "aborted" : "failed", error: message });
-        return { ok: false, cancelled, error: message, persistent: false };
+        if (
+            !args.repairFeedback &&
+            !cancelled &&
+            message === "check_cron has no occurrence within the scheduling ceiling" &&
+            !args.signal.aborted &&
+            Date.now() < args.deadline
+        ) {
+            return await compileSmartNoteCheck({
+                ...args,
+                repairFeedback: SPARSE_CRON_REPAIR_FEEDBACK,
+            });
+        }
+        const networkError = error instanceof SmartNoteNetworkError ? error : undefined;
+        return {
+            ok: false,
+            cancelled,
+            error: message,
+            persistent: !cancelled && (networkError?.persistent ?? false),
+            uncheckable: !cancelled && (networkError?.uncheckable ?? false),
+        };
     } finally {
         // The carrier branch closes its own run; only the child-session branch
         // leaves a session behind to tear down.
@@ -301,7 +327,6 @@ export async function dryRunSmartNoteCheck(
             };
         },
         signal,
-        timeoutMs: 2_000,
     });
     // A note can wait for a release artifact that does not exist yet, so
     // inaccessible HTTP sources are advisory rather than compilation errors.
@@ -349,6 +374,11 @@ export function normalizeCompiledCheck(source: string): string {
     }
     if (Buffer.byteLength(code, "utf8") > MAX_COMPILED_CHECK_BYTES) {
         throw new Error("compiled_check exceeds 64 KiB");
+    }
+    // Validate literal endpoints even when the dry run would short-circuit before
+    // reaching them. Manifest entries alone are advisory, not the source of truth.
+    for (const url of literalCalls(code, "httpGet")) {
+        assertSmartNotePublicEndpoint(new URL(url));
     }
     return code;
 }

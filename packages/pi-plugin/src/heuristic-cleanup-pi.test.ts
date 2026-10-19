@@ -211,6 +211,98 @@ describe("applyPiHeuristicCleanup", () => {
 		}
 	});
 
+	it("deduplicates Pi's own bare read tool, not only the mcp_ form", () => {
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-heuristic-bare-read";
+			const read = (id: string) => ({
+				type: "toolCall",
+				id,
+				name: "read",
+				arguments: { path: "src/a.ts" },
+			});
+			const messages = [
+				userMessage("read twice", 1),
+				{
+					role: "assistant",
+					content: [read("read-call-a"), read("read-call-b")],
+					timestamp: 2,
+				},
+				toolResultMessage("read-call-a", "first result", 3),
+				toolResultMessage("read-call-b", "second result", 4),
+			];
+			const { transcript, targets } = tagMessages(sessionId, db, messages);
+
+			const result = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
+				protectedTags: 0,
+				staleReduceStripEnabled: true,
+			});
+			transcript.commit();
+
+			expect(result.deduplicatedTools).toBe(1);
+			expect(
+				getTagsBySession(db, sessionId)
+					.filter((tag) => tag.type === "tool")
+					.map((tag) => [tag.messageId, tag.status]),
+			).toEqual([
+				["read-call-a", "dropped"],
+				["read-call-b", "active"],
+			]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("keeps exactly one copy when the newest duplicate is protected", () => {
+		const db = createTestDb();
+		try {
+			const sessionId = "ses-heuristic-protected-newest";
+			const read = (id: string) => ({
+				type: "toolCall",
+				id,
+				name: "read",
+				arguments: { path: "src/a.ts" },
+			});
+			const messages = [
+				userMessage("read three times", 1),
+				{
+					role: "assistant",
+					content: [read("read-a"), read("read-b"), read("read-c")],
+					timestamp: 2,
+				},
+				toolResultMessage("read-a", "first result", 3),
+				toolResultMessage("read-b", "second result", 4),
+				toolResultMessage("read-c", "third result", 5),
+			];
+			const { transcript, targets } = tagMessages(sessionId, db, messages);
+			const toolTags = getTagsBySession(db, sessionId)
+				.filter((tag) => tag.type === "tool")
+				.map((tag) => tag.tagNumber)
+				.sort((left, right) => left - right);
+
+			const result = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
+				protectedTags: 0,
+				// Only the newest copy lies above the cutoff.
+				protectedCutoff: toolTags[1],
+				staleReduceStripEnabled: true,
+			});
+			transcript.commit();
+
+			expect(result.deduplicatedTools).toBe(2);
+			expect(
+				getTagsBySession(db, sessionId)
+					.filter((tag) => tag.type === "tool")
+					.map((tag) => [tag.messageId, tag.status]),
+			).toEqual([
+				["read-a", "dropped"],
+				["read-b", "dropped"],
+				["read-c", "active"],
+			]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("does not count an absent dedup target as a confirmed mutation", () => {
 		const db = createTestDb();
 		try {
@@ -546,4 +638,57 @@ describe("applyPiHeuristicCleanup emergency floor accounting", () => {
 			closeQuietly(db);
 		}
 	});
+});
+it("Pi stale removal honors a custom ctx_reduce keep count above three", () => {
+	const db = createTestDb();
+	const sessionId = "pi-protected-stale-six";
+	try {
+		const messages: unknown[] = [];
+		for (let n = 1; n <= 6; n++)
+			messages.push(
+				userMessage(`request ${n}`, n * 3 - 2),
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: `reduce-${n}`,
+							name: "ctx_reduce",
+							arguments: {},
+						},
+					],
+					timestamp: n * 3 - 1,
+				},
+				{
+					...toolResultMessage(`reduce-${n}`, `result ${n}`, n * 3),
+					toolName: "ctx_reduce",
+				},
+			);
+		const { transcript, targets } = tagMessages(sessionId, db, messages);
+		const result = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
+			protectedTags: 0,
+			protectedCutoff: 100,
+			staleReduceStripEnabled: true,
+			protectedTools: { ctx_reduce: 6 },
+		});
+		transcript.commit();
+		expect(result.droppedStaleReduceCalls).toBe(0);
+		expect(
+			getTagsBySession(db, sessionId).filter((tag) => tag.status === "dropped"),
+		).toEqual([]);
+		const disabled = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
+			protectedTags: 0,
+			protectedCutoff: 100,
+			staleReduceStripEnabled: true,
+			protectedTools: { ctx_reduce: 0 },
+		});
+		expect(disabled.droppedStaleReduceCalls).toBe(6);
+		expect(
+			getTagsBySession(db, sessionId)
+				.filter((tag) => tag.type === "tool")
+				.every((tag) => tag.status === "dropped"),
+		).toBe(true);
+	} finally {
+		closeQuietly(db);
+	}
 });

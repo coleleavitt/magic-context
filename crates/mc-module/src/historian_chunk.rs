@@ -20,7 +20,7 @@ use crate::historian::{
 use crate::historian_prompt::{
     build_compartment_agent_prompt, order_historian_memories, render_historian_memory_block,
     render_seed_examples_block, render_session_references_block_window, select_seeds,
-    CompartmentPromptInputs, ReferenceCompartment, SEED_FLOOR, SESSION_REF_WINDOW,
+    select_session_references, CompartmentPromptInputs, ReferenceCompartment, SEED_FLOOR,
 };
 use crate::historian_validate::{
     ChunkLine, HistorianChunk, MessageRange, StoredCompartmentRange, ValidateOptions,
@@ -118,6 +118,7 @@ struct Builder {
     commit_cluster_count: usize,
     last_flushed_role: String,
     tool_call_summaries: HashMap<String, String>,
+    tool_expansions: HashMap<String, String>,
     completed_tool_arcs: Vec<MessageRange>,
     completed_tool_components: Vec<MessageRange>,
     admitted_oversize_component_end: Option<u64>,
@@ -133,6 +134,7 @@ impl Builder {
         budget: usize,
         start_ordinal: u64,
         tool_call_summaries: HashMap<String, String>,
+        tool_expansions: HashMap<String, String>,
         completed_tool_arcs: Vec<MessageRange>,
     ) -> Self {
         let mut completed_tool_components: Vec<MessageRange> = Vec::new();
@@ -158,6 +160,7 @@ impl Builder {
             commit_cluster_count: 0,
             last_flushed_role: String::new(),
             tool_call_summaries,
+            tool_expansions,
             completed_tool_arcs,
             completed_tool_components,
             admitted_oversize_component_end: None,
@@ -172,6 +175,30 @@ impl Builder {
     fn accepts_ordinal(&self, ordinal: u64) -> bool {
         self.admitted_oversize_component_end
             .is_none_or(|end| ordinal <= end)
+    }
+
+    fn render_parts(&self, message: &FlatMessage<'_>, has_text: bool) -> Vec<String> {
+        message
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                if let Some(expansion) = self.tool_expansions.get(&block.id) {
+                    return vec![format!("TC: {expansion}")];
+                }
+                if let CkKind::ToolCall { name, input, .. } = &block.wire_shape().kind {
+                    return if has_text {
+                        Vec::new()
+                    } else {
+                        vec![format_tool_summary(name, input)]
+                    };
+                }
+                text_parts(&FlatMessage {
+                    ordinal: message.ordinal,
+                    role: message.role,
+                    blocks: vec![*block],
+                })
+            })
+            .collect()
     }
 
     fn pin_component_when_formatted_budget_crosses(&mut self, ordinal: u64) {
@@ -223,7 +250,21 @@ impl Builder {
         }
 
         if message.role == "tool" && !has_text_parts(message) {
-            let summaries = extract_tool_result_summaries(message, &self.tool_call_summaries);
+            let unexpanded = FlatMessage {
+                ordinal: message.ordinal,
+                role: message.role,
+                blocks: message
+                    .blocks
+                    .iter()
+                    .copied()
+                    .filter(|b| {
+                        !b.arc_id
+                            .as_ref()
+                            .is_some_and(|id| self.tool_expansions.contains_key(id))
+                    })
+                    .collect(),
+            };
+            let summaries = extract_tool_result_summaries(&unexpanded, &self.tool_call_summaries);
             if summaries.is_empty() {
                 self.pending_noise_meta.push(meta);
                 return true;
@@ -237,7 +278,7 @@ impl Builder {
         }
 
         if message.role == "user" && !has_meaningful_user_text(message) {
-            let tc_summaries = extract_tool_call_summaries(message);
+            let tc_summaries = self.render_parts(message, false);
             if tc_summaries.is_empty() {
                 self.pending_noise_meta.push(meta);
                 return true;
@@ -252,13 +293,7 @@ impl Builder {
 
         let role = compact_role(message.role);
         let text_parts = text_parts(message);
-        let tool_summaries = if text_parts.is_empty() {
-            extract_tool_call_summaries(message)
-        } else {
-            Vec::new()
-        };
-        let mut all_parts = text_parts.clone();
-        all_parts.extend(tool_summaries);
+        let all_parts = self.render_parts(message, !text_parts.is_empty());
         let compacted = compact_text_for_summary(&all_parts.join(" / "), message.role);
         if compacted.text.is_empty() {
             self.pending_noise_meta.push(meta);
@@ -498,6 +533,24 @@ pub fn build_historian_chunk(
     token_budget: usize,
     eligible_end_ordinal: u64,
 ) -> HistorianBuiltChunk {
+    build_historian_chunk_with_expansions(
+        messages,
+        blocks,
+        start_ordinal,
+        token_budget,
+        eligible_end_ordinal,
+        &BTreeMap::new(),
+    )
+}
+
+pub fn build_historian_chunk_with_expansions(
+    messages: &[CkIngressMessage],
+    blocks: &[FlatBlock],
+    start_ordinal: u64,
+    token_budget: usize,
+    eligible_end_ordinal: u64,
+    expansions: &crate::historian_tool_template::ExpansionMap,
+) -> HistorianBuiltChunk {
     let total_count = messages
         .iter()
         .filter(|message| !message.ck.meta.synthetic)
@@ -523,6 +576,7 @@ pub fn build_historian_chunk(
         token_budget,
         start,
         tool_call_summaries,
+        build_tool_expansion_lookup(blocks, eligible_end_ordinal, expansions),
         completed_tool_arc_ranges(blocks),
     );
     let blocks_by_mid = grouped_blocks_by_mid(blocks);
@@ -563,7 +617,42 @@ pub fn build_historian_chunk(
             );
         }
     }
-    let _ = builder.flush_current_block();
+    if builder.flush_current_block() {
+        highest_scanned_ordinal = highest_scanned_ordinal.max(
+            builder
+                .pending_noise_meta
+                .last()
+                .map_or(builder.last_ordinal, |meta| meta.ordinal),
+        );
+        // Filtered results and non-narrative rows still belong to raw coverage.
+        // Admit their metadata only if the preceding visible block was admitted,
+        // so a budget-rejected block cannot be skipped by its trailing noise.
+        if !builder.line_meta.is_empty() {
+            // Zero-block messages have no flat-block ID for a persisted endpoint.
+            // Leave an unanchorable suffix pending until a later real block can own it.
+            if let Some(index) = builder
+                .pending_noise_meta
+                .iter()
+                .rposition(|meta| meta.anchorable)
+            {
+                let last = &builder.pending_noise_meta[index];
+                builder.last_ordinal = last.ordinal;
+                builder.last_message_id.clone_from(&last.message_id);
+                builder
+                    .line_meta
+                    .extend(
+                        builder
+                            .pending_noise_meta
+                            .drain(..=index)
+                            .map(|meta| ChunkLine {
+                                ordinal: meta.ordinal,
+                                message_id: meta.message_id,
+                                anchorable: meta.anchorable,
+                            }),
+                    );
+            }
+        }
+    }
     let tool_only_ranges = merge_tool_only_ranges(&builder.tool_only_ranges);
     let end = builder.last_ordinal;
     // Filtering removes some scanned messages from the chunk text, but they still advance
@@ -606,11 +695,14 @@ pub fn build_historian_chunk(
 
 #[derive(Debug, Clone)]
 pub struct HistorianAssemblerConfig {
+    pub expand_tools: crate::historian_tool_template::ExpansionMap,
     pub session_id: String,
     pub project_path: String,
     pub project_slug: String,
     pub model_chain: Vec<String>,
     pub model_limits: std::collections::BTreeMap<String, crate::historian::HistorianModelLimits>,
+    /// Host-configured variant per chain model; see `HistorianFireRequest::model_variants`.
+    pub model_variants: std::collections::BTreeMap<String, String>,
     pub token_budget: usize,
     pub historian_context_limit_tokens: Option<usize>,
     pub max_output_tokens: u32,
@@ -618,6 +710,9 @@ pub struct HistorianAssemblerConfig {
     pub memory_enabled: bool,
     pub auto_promote: bool,
     pub user_memory_collection_enabled: bool,
+    /// False when the dreamer is not runnable; the historian prompt then asks it
+    /// to skip user observations (see `build_compartment_agent_prompt`).
+    pub user_observations_requested: bool,
     pub extraction_free: bool,
     pub in_emergency: bool,
     pub force_keep_last_compartment: bool,
@@ -668,6 +763,7 @@ pub struct AssembledHistorianFiring {
     pub prompt: String,
     pub model_chain: Vec<String>,
     pub model_limits: std::collections::BTreeMap<String, crate::historian::HistorianModelLimits>,
+    pub model_variants: std::collections::BTreeMap<String, String>,
     pub producer_source_tokens: usize,
     pub historian_context_limit_tokens: Option<usize>,
     pub max_output_tokens: u32,
@@ -723,6 +819,7 @@ impl AssembledHistorianFiring {
             historian_context_limit_tokens: self.historian_context_limit_tokens,
             fallback_context_limits: Default::default(),
             model_limits: self.model_limits.clone(),
+            model_variants: self.model_variants.clone(),
             max_output_tokens: self.max_output_tokens,
             from_ordinal: self.from_ordinal,
             to_ordinal: self.to_ordinal,
@@ -771,6 +868,9 @@ struct HistorianPromptFit {
     /// What was kept, for the log: (session references, memories, seeds).
     kept: (usize, usize, usize),
     trimmed: bool,
+    /// The calibration and input limit of each model the chunk was sized to
+    /// fit; empty when no model in the chain has a known window.
+    sized_for: Vec<(crate::decision_calibration::DecisionCalibration, usize)>,
 }
 
 struct HistorianPromptFitInput<'a> {
@@ -780,30 +880,51 @@ struct HistorianPromptFitInput<'a> {
     compartments: &'a [ReferenceCompartment],
     memories: &'a [mc_store::StoredMemory],
     memory_enabled: bool,
+    user_observations_requested: bool,
     extraction_free: bool,
     /// Producer input limit after the output reserve and estimator margin.
     limit: Option<usize>,
     seed: &'a crate::decision_calibration::DecisionCalibration,
+    /// The other models in the attempt chain that this same prompt may be sent
+    /// to, each with its own calibration and input limit (models with an
+    /// unknown window are left out). The chunk is sized to fit every one of
+    /// them that can hold a minimal prompt on its own, so a fallback with a
+    /// smaller window than the primary is not handed a prompt it must refuse.
+    fallback_limits: &'a [(crate::decision_calibration::DecisionCalibration, usize)],
     system_tokens: f64,
     /// Chunk budget the caller would use without a window, in local tokens.
     requested: usize,
 }
 
-/// Size the historian prompt to the producer window: reserve the system prompt,
-/// the fixed user-prompt blocks and the output first, and give the chunk what
-/// remains. When the full requested chunk does not fit, trim recent compartments
-/// (oldest first), then project-memory lines (lowest priority first), then seed
+/// Size the historian prompt to the attempt chain's windows: reserve the system
+/// prompt, the fixed user-prompt blocks and the output first, and give the chunk
+/// what remains in the smallest window among the primary and the fallbacks that
+/// can hold a minimal prompt. One prompt is built per firing and every attempt
+/// sends those same bytes, so it has to fit each model it may reach. When the
+/// full requested chunk does not fit, trim diverse older
+/// compartments before recent compartments (oldest first), then project-memory
+/// lines (lowest priority first), then seed
 /// examples, and only then shrink the chunk. When not even a minimal chunk fits,
 /// the untrimmed blocks are returned so the firing's admission check refuses the
 /// prompt and records the failure with a backoff. Untrimmed blocks are
 /// byte-identical to the ones the prompt golden pins.
 fn fit_historian_prompt(input: &HistorianPromptFitInput<'_>) -> HistorianPromptFit {
     let seeds = select_seeds(input.session_id, input.chunk_start as i64, SEED_FLOOR);
-    let memories = order_historian_memories(input.memories);
+    let references = select_session_references(
+        input.compartments,
+        &seeds,
+        input.session_id,
+        input.chunk_start as i64,
+    );
+    let memories = order_historian_memories(if input.memory_enabled {
+        input.memories
+    } else {
+        &[]
+    });
     let render = |refs: usize, memory_count: usize, seed_count: usize| {
         (
             render_seed_examples_block(&seeds[..seed_count]),
-            render_session_references_block_window(input.compartments, refs),
+            render_session_references_block_window(&references, refs),
             render_historian_memory_block(&memories[..memory_count]),
         )
     };
@@ -816,40 +937,25 @@ fn fit_historian_prompt(input: &HistorianPromptFitInput<'_>) -> HistorianPromptF
             session_references,
             memory_block,
             kept: (refs, memory_count, seed_count),
-            trimmed: refs < SESSION_REF_WINDOW
+            trimmed: refs < references.len()
                 || memory_count < memories.len()
                 || seed_count < seeds.len(),
+            sized_for: Vec::new(),
         }
     };
     let untrimmed = || {
         accept(
-            SESSION_REF_WINDOW,
+            references.len(),
             memories.len(),
             seeds.len(),
             input.requested,
         )
     };
-    let Some(limit) = input.limit else {
+    if input.limit.is_none() && input.fallback_limits.is_empty() {
         return untrimmed();
-    };
-    let mass = |prose: usize| {
-        input.seed.provider_mass(
-            crate::decision_calibration::LocalMass {
-                system: input.system_tokens,
-                prose: prose as f64,
-                tools: 0.0,
-            },
-            true,
-        )
-    };
-    let fits = |prose: usize| {
-        let tokens = mass(prose);
-        tokens.is_finite() && tokens > 0.0 && tokens <= limit as f64
-    };
+    }
     let header = format!("Messages {}-{}:\n\n", input.chunk_start, input.last_ordinal);
-    // Largest chunk (local tokens) that keeps the calibrated prompt within the
-    // limit, or None when the fixed parts alone do not fit.
-    let room = |refs: usize, memory_count: usize, seed_count: usize| -> Option<usize> {
+    let fixed_tokens = |refs: usize, memory_count: usize, seed_count: usize| -> usize {
         let (seed_examples, session_references, memory_block) =
             render(refs, memory_count, seed_count);
         let prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
@@ -858,9 +964,29 @@ fn fit_historian_prompt(input: &HistorianPromptFitInput<'_>) -> HistorianPromptF
             project_memory: &memory_block,
             input_source: &header,
             memory_enabled: input.memory_enabled,
+            user_observations_requested: input.user_observations_requested,
             extraction_free: input.extraction_free,
         });
-        let fixed = estimate_tokens(&prompt);
+        estimate_tokens(&prompt)
+    };
+    // Largest chunk (local tokens) that keeps the prompt within one model's
+    // calibrated limit, before the slack, or None when the fixed parts alone do
+    // not fit that model.
+    let room_one = |fixed: usize,
+                    seed: &crate::decision_calibration::DecisionCalibration,
+                    limit: usize|
+     -> Option<usize> {
+        let fits = |prose: usize| {
+            let tokens = seed.provider_mass(
+                crate::decision_calibration::LocalMass {
+                    system: input.system_tokens,
+                    prose: prose as f64,
+                    tools: 0.0,
+                },
+                true,
+            );
+            tokens.is_finite() && tokens > 0.0 && tokens <= limit as f64
+        };
         if !fits(fixed) {
             return None;
         }
@@ -877,44 +1003,88 @@ fn fit_historian_prompt(input: &HistorianPromptFitInput<'_>) -> HistorianPromptF
                 hi = mid;
             }
         }
-        Some(lo.saturating_sub(PROMPT_FIT_SLACK_TOKENS))
+        Some(lo)
+    };
+    // Largest chunk (local tokens) that keeps the calibrated prompt within the
+    // limit of every model in `models`, or None when the fixed parts alone do
+    // not fit one of them.
+    let room_under = |models: &[(&crate::decision_calibration::DecisionCalibration, usize)],
+                      refs: usize,
+                      memory_count: usize,
+                      seed_count: usize|
+     -> Option<usize> {
+        let fixed = fixed_tokens(refs, memory_count, seed_count);
+        let mut room = usize::MAX;
+        for (seed, limit) in models {
+            room = room.min(room_one(fixed, seed, *limit)?);
+        }
+        Some(room.saturating_sub(PROMPT_FIT_SLACK_TOKENS))
+    };
+    let floor = input.requested.min(MIN_FIT_CHUNK_TOKENS);
+    // The primary always takes part, so a primary that cannot hold the prompt is
+    // still refused at admission exactly as before. A fallback that cannot hold
+    // even a minimal prompt on its own is left out: shrinking the chunk for it
+    // would not make it fit, and the per-attempt check refuses it anyway.
+    let mut models: Vec<(&crate::decision_calibration::DecisionCalibration, usize)> = input
+        .limit
+        .map(|limit| (input.seed, limit))
+        .into_iter()
+        .collect();
+    for (seed, limit) in input.fallback_limits {
+        let alone = [(seed, *limit)];
+        if room_under(&alone, 0, 0, 0).is_some_and(|room| room >= floor && room > 0) {
+            models.push((seed, *limit));
+        }
+    }
+    if models.is_empty() {
+        return untrimmed();
+    }
+    let room = |refs: usize, memory_count: usize, seed_count: usize| {
+        room_under(&models, refs, memory_count, seed_count)
     };
     let has_room = |refs: usize, memory_count: usize, seed_count: usize| {
         room(refs, memory_count, seed_count).is_some_and(|room| room >= input.requested)
     };
-
-    // 1. Recent compartments, oldest dropped first.
-    for refs in (0..=SESSION_REF_WINDOW).rev() {
-        if has_room(refs, memories.len(), seeds.len()) {
-            return accept(refs, memories.len(), seeds.len(), input.requested);
-        }
-    }
-    // 2. Project-memory lines, lowest priority dropped first. Fewer lines never
-    //    need more room, so binary-search the longest prefix that fits.
-    if !memories.is_empty() && has_room(0, 0, seeds.len()) {
-        let (mut lo, mut hi) = (0usize, memories.len());
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if has_room(0, mid, seeds.len()) {
-                lo = mid;
-            } else {
-                hi = mid;
+    let sized_for = models
+        .iter()
+        .map(|(seed, limit)| (**seed, *limit))
+        .collect();
+    let pick = || -> HistorianPromptFit {
+        // 1. Diverse compartments first, then recent compartments oldest first.
+        for refs in (0..=references.len()).rev() {
+            if has_room(refs, memories.len(), seeds.len()) {
+                return accept(refs, memories.len(), seeds.len(), input.requested);
             }
         }
-        return accept(0, lo, seeds.len(), input.requested);
-    }
-    // 3. Seed examples.
-    for seed_count in (0..=seeds.len()).rev() {
-        if has_room(0, 0, seed_count) {
-            return accept(0, 0, seed_count, input.requested);
+        // 2. Project-memory lines, lowest priority dropped first. Fewer lines never
+        //    need more room, so binary-search the longest prefix that fits.
+        if !memories.is_empty() && has_room(0, 0, seeds.len()) {
+            let (mut lo, mut hi) = (0usize, memories.len());
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if has_room(0, mid, seeds.len()) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            return accept(0, lo, seeds.len(), input.requested);
         }
-    }
-    // 4. Everything trimmed: the chunk takes whatever room is left.
-    let floor = input.requested.min(MIN_FIT_CHUNK_TOKENS);
-    match room(0, 0, 0) {
-        Some(room) if room >= floor && room > 0 => accept(0, 0, 0, input.requested.min(room)),
-        _ => untrimmed(),
-    }
+        // 3. Seed examples.
+        for seed_count in (0..=seeds.len()).rev() {
+            if has_room(0, 0, seed_count) {
+                return accept(0, 0, seed_count, input.requested);
+            }
+        }
+        // 4. Everything trimmed: the chunk takes whatever room is left.
+        match room(0, 0, 0) {
+            Some(room) if room >= floor && room > 0 => accept(0, 0, 0, input.requested.min(room)),
+            _ => untrimmed(),
+        }
+    };
+    let mut fit = pick();
+    fit.sized_for = sized_for;
+    fit
 }
 
 /// Convert a producer allowance before formatted-source splitting; tool summaries use the larger class seed.
@@ -985,10 +1155,17 @@ pub fn assemble_historian_firing(
             },
         ));
     }
-    // Size the prompt to the producer window before selecting the chunk: the
+    // Size the prompt to the attempt chain before selecting the chunk: the
     // system prompt, the fixed user-prompt blocks and the output reserve come off
-    // the window first, and the chunk gets what is left.
-    let memories = store.load_active_memories(&config.project_path, now_ms)?;
+    // the window first, and the chunk gets what is left. Each model's limit is
+    // resolved exactly as the per-attempt admission check resolves it, so a
+    // prompt built here is not refused by that check for any model it was sized
+    // for.
+    let memories = if config.memory_enabled {
+        store.load_active_memories(&config.project_path, now_ms)?
+    } else {
+        Vec::new()
+    };
     let system_tokens = estimate_tokens(crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT) as f64;
     let primary_limits = config
         .model_chain
@@ -1000,11 +1177,33 @@ pub fn assemble_historian_firing(
     } else {
         config.historian_context_limit_tokens
     };
-    let producer_input_limit = crate::historian::producer_input_token_limit_with_input(
-        primary_context,
-        primary_input,
-        config.max_output_tokens,
-    );
+    let attempt_limit = |model: &str, legacy_window: Option<usize>| {
+        crate::historian::attempt_producer_input_limit(
+            model,
+            &config.model_limits,
+            legacy_window,
+            config.historian_context_limit_tokens,
+            config.max_output_tokens,
+        )
+    };
+    let producer_input_limit =
+        producer_key.and_then(|model| attempt_limit(model, config.historian_context_limit_tokens));
+    // The firing carries no per-fallback legacy windows, so a fallback's limit
+    // comes from its resolved model limits alone, as it does at attempt time.
+    let fallback_limits: Vec<_> = config
+        .model_chain
+        .iter()
+        .skip(1)
+        .filter(|model| Some(model.as_str()) != producer_key)
+        .filter_map(|model| {
+            attempt_limit(model, None).map(|limit| {
+                (
+                    crate::decision_calibration::DecisionCalibration::for_model(Some(model)),
+                    limit,
+                )
+            })
+        })
+        .collect();
     let reference_compartments: Vec<ReferenceCompartment> = compartments
         .iter()
         .map(ReferenceCompartment::from)
@@ -1016,9 +1215,11 @@ pub fn assemble_historian_firing(
         compartments: &reference_compartments,
         memories: &memories,
         memory_enabled: config.memory_enabled,
+        user_observations_requested: config.user_observations_requested,
         extraction_free: config.extraction_free,
         limit: producer_input_limit,
         seed: &seed,
+        fallback_limits: &fallback_limits,
         system_tokens,
         requested: source_budget,
     });
@@ -1035,7 +1236,14 @@ pub fn assemble_historian_firing(
         );
     }
     let source_budget = prompt_fit.chunk_tokens;
-    let chunk = build_historian_chunk(messages, live, chunk_start, source_budget, eligible_end);
+    let chunk = build_historian_chunk_with_expansions(
+        messages,
+        live,
+        chunk_start,
+        source_budget,
+        eligible_end,
+        &config.expand_tools,
+    );
     if chunk.text.is_empty() || chunk.chunk.lines.is_empty() {
         // An empty producer input is not necessarily an empty read. Persist only
         // complete observed ranges so absent raw messages cannot be declared noise.
@@ -1147,53 +1355,66 @@ pub fn assemble_historian_firing(
         session_references: prompt_fit.session_references,
     };
     let memory_block = prompt_fit.memory_block;
+    let sized_for = prompt_fit.sized_for;
     let oversize_atomic_unit =
         estimate_tokens(&chunk.text) > source_budget
             && chunk.chunk.completed_tool_arcs.iter().any(|arc| {
                 arc.start <= chunk.chunk.end_index && arc.end >= chunk.chunk.start_index
             });
     // A source-only allowance can consume the entire producer window before the
-    // historian's system instructions, references, and wrapper are counted.
+    // historian's system instructions, references, and wrapper are counted. The
+    // whole prompt has to fit every model the chunk was sized for.
     let fits_producer_prompt = |source: &str| {
-        let Some(limit) = producer_input_limit else {
+        if sized_for.is_empty() {
             return false;
-        };
+        }
+        let input_source =
+            historian_input_source(chunk.chunk.start_index, chunk.chunk.end_index, source);
         let prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
             seed_examples: &reference_blocks.seed_examples,
             session_references: &reference_blocks.session_references,
             project_memory: &memory_block,
-            input_source: source,
+            input_source: &input_source,
             memory_enabled: config.memory_enabled,
+            user_observations_requested: config.user_observations_requested,
             extraction_free: config.extraction_free,
         });
-        let full_tokens = seed.provider_mass(
-            crate::decision_calibration::LocalMass {
-                system: system_tokens,
-                prose: estimate_tokens(&prompt) as f64,
-                tools: 0.0,
-            },
-            true,
-        );
-        full_tokens.is_finite() && full_tokens > 0.0 && full_tokens <= limit as f64
+        let prose = estimate_tokens(&prompt) as f64;
+        sized_for.iter().all(|(seed, limit)| {
+            let full_tokens = seed.provider_mass(
+                crate::decision_calibration::LocalMass {
+                    system: system_tokens,
+                    prose,
+                    tools: 0.0,
+                },
+                true,
+            );
+            full_tokens.is_finite() && full_tokens > 0.0 && full_tokens <= *limit as f64
+        })
     };
     let fitted_atomic_source = oversize_atomic_unit.then(|| {
         fit_atomic_historian_source_to_producer_window(
             &chunk.text,
             &chunk.tool_result_boundaries,
-            primary_context,
-            primary_input,
-            config.max_output_tokens,
+            sized_for.iter().map(|(_, limit)| *limit).min(),
             &fits_producer_prompt,
         )
     });
-    let input_source = if oversize_atomic_unit {
+    let historian_text = if oversize_atomic_unit {
         fitted_atomic_source
             .as_ref()
             .map(|fitted| fitted.text.clone())
             .unwrap_or_else(|| chunk.text.clone())
     } else {
+        // The header is added after truncation, matching the TypeScript path where the
+        // rendered transcript is fitted first and its raw ordinal range is prepended.
         truncate_historian_input_if_needed(&chunk.text, source_budget)
     };
+    let input_source = historian_input_source(
+        chunk.chunk.start_index,
+        chunk.chunk.end_index,
+        &historian_text,
+    );
     let producer_source_tokens = estimate_tokens(&input_source);
     if let Some(fitted) = fitted_atomic_source
         .as_ref()
@@ -1238,6 +1459,7 @@ pub fn assemble_historian_firing(
         project_memory: &memory_block,
         input_source: &input_source,
         memory_enabled: config.memory_enabled,
+        user_observations_requested: config.user_observations_requested,
         extraction_free: config.extraction_free,
     });
     let fingerprint_items: Vec<_> = chunk
@@ -1257,6 +1479,7 @@ pub fn assemble_historian_firing(
     Ok(AssembleHistorianFiringOutcome::Fire(Box::new(
         AssembledHistorianFiring {
             model_limits: config.model_limits.clone(),
+            model_variants: config.model_variants.clone(),
             prompt,
             model_chain: config.model_chain,
             producer_source_tokens,
@@ -1318,16 +1541,9 @@ fn ceil_char_boundary(input: &str, requested: usize) -> usize {
 fn fit_atomic_historian_source_to_producer_window(
     input: &str,
     result_boundaries: &[HistorianResultBoundary],
-    context_limit_tokens: Option<usize>,
-    input_limit_tokens: Option<usize>,
-    max_output_tokens: u32,
+    producer_input_limit_tokens: Option<usize>,
     fits_producer_prompt: &impl Fn(&str) -> bool,
 ) -> FittedHistorianSource {
-    let producer_input_limit_tokens = crate::historian::producer_input_token_limit_with_input(
-        context_limit_tokens,
-        input_limit_tokens,
-        max_output_tokens,
-    );
     let original_tokens = estimate_tokens(input);
     let Some(limit) = producer_input_limit_tokens else {
         return FittedHistorianSource {
@@ -1386,6 +1602,10 @@ fn fit_atomic_historian_source_to_producer_window(
         split_boundary_ordinal: boundary.map(|boundary| boundary.ordinal),
         removed_tokens: original_tokens.saturating_sub(fitted_tokens),
     }
+}
+
+fn historian_input_source(start_index: u64, end_index: u64, text: &str) -> String {
+    format!("Messages {start_index}-{end_index}:\n\n{text}")
 }
 
 pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> String {
@@ -1480,10 +1700,11 @@ fn text_parts(message: &FlatMessage<'_>) -> Vec<String> {
     message
         .blocks
         .iter()
-        .filter_map(|block| match &block.wire.kind {
-            CkKind::Text { text } => {
+        .filter_map(|block| match &block.wire_shape().kind {
+            CkKind::Text { .. } => {
+                let text = block.scalar_text().expect("text payload");
                 let cleaned = if message.role == "user" {
-                    clean_user_text(text)
+                    clean_user_text(&text)
                 } else {
                     text.trim().to_string()
                 };
@@ -1520,22 +1741,11 @@ fn has_meaningful_user_text(message: &FlatMessage<'_>) -> bool {
         .any(|text| !text.is_empty() && !is_system_directive(text))
 }
 
-fn extract_tool_call_summaries(message: &FlatMessage<'_>) -> Vec<String> {
-    let mut summaries = Vec::new();
-    for block in &message.blocks {
-        let CkKind::ToolCall { name, input, .. } = &block.wire.kind else {
-            continue;
-        };
-        summaries.push(format_tool_summary(name, input));
-    }
-    summaries
-}
-
 fn tool_result_body_tokens(message: &FlatMessage<'_>) -> usize {
     message
         .blocks
         .iter()
-        .filter(|block| matches!(&block.wire.kind, CkKind::ToolResult { .. }))
+        .filter(|block| block.kind_tag == "tool_result")
         .map(|block| block.bytes.len().div_ceil(4))
         .sum()
 }
@@ -1546,7 +1756,7 @@ fn extract_tool_result_summaries(
 ) -> Vec<String> {
     let mut summaries = Vec::new();
     for block in &message.blocks {
-        let CkKind::ToolResult { tool_name, .. } = &block.wire.kind else {
+        let CkKind::ToolResult { tool_name, .. } = &block.wire_shape().kind else {
             continue;
         };
         summaries.push(
@@ -1564,12 +1774,65 @@ fn extract_tool_result_summaries(
 fn build_tool_call_summary_lookup(blocks: &[FlatBlock]) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for block in blocks.iter().filter(|block| !block.synthetic) {
-        let CkKind::ToolCall { name, input, .. } = &block.wire.kind else {
+        let CkKind::ToolCall { name, input, .. } = &block.wire_shape().kind else {
             continue;
         };
         out.insert(block.id.clone(), format_tool_summary(name, input));
     }
     out
+}
+
+fn build_tool_expansion_lookup(
+    blocks: &[FlatBlock],
+    eligible_end: u64,
+    overrides: &crate::historian_tool_template::ExpansionMap,
+) -> HashMap<String, String> {
+    use crate::ck_wire::CkOutputKind;
+    let mut results = HashMap::new();
+    for block in blocks
+        .iter()
+        .filter(|b| !b.synthetic && b.ordinal < eligible_end)
+    {
+        if let (Some(arc), CkKind::ToolResult { output, .. }) = (&block.arc_id, &block.wire().kind)
+        {
+            let value = match &output.kind {
+                CkOutputKind::Text { text } | CkOutputKind::ErrorText { text } => {
+                    Value::String(text.clone())
+                }
+                CkOutputKind::Json { value } | CkOutputKind::ErrorJson { value } => value.clone(),
+                CkOutputKind::Content { blocks } | CkOutputKind::ErrorContent { blocks } => {
+                    Value::String(
+                        blocks
+                            .iter()
+                            .filter_map(|b| {
+                                if let crate::ck_wire::ResultBlockKind::Text { text } = &b.kind {
+                                    Some(text.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                }
+                CkOutputKind::ExecutionDenied { reason } => {
+                    Value::String(reason.clone().unwrap_or_default())
+                }
+            };
+            results.insert(arc.clone(), value);
+        }
+    }
+    blocks
+        .iter()
+        .filter(|b| !b.synthetic)
+        .filter_map(|block| {
+            let CkKind::ToolCall { name, input, .. } = &block.wire_shape().kind else {
+                return None;
+            };
+            crate::historian_tool_template::expand(name, input, results.get(&block.id), overrides)
+                .map(|text| (block.id.clone(), text))
+        })
+        .collect()
 }
 
 fn format_tool_summary(name: &str, input: &Value) -> String {
@@ -1602,19 +1865,29 @@ fn extract_key_arg(input: &Value) -> Option<String> {
 }
 
 fn truncate_arg(value: &str) -> String {
-    if value.chars().count() <= 60 {
-        value.to_string()
-    } else {
-        format!("{}…", value.chars().take(60).collect::<String>())
-    }
+    crate::boundary::truncate_utf16(value, 60)
 }
 
+/// Strip system-reminder blocks and OMO markers from user text. OpenCode 1.17.8 and older wrapped
+/// a user message sent mid-run in a reminder whose body is the user's own words; that wrapper is
+/// kept verbatim, as the transform's injection strip keeps it, so the message is not dropped as
+/// noise. Twin of `cleanUserText` in
+/// `packages/plugin/src/hooks/magic-context/read-session-chunk.ts`.
 fn clean_user_text(text: &str) -> String {
-    system_reminder_regex()
-        .replace_all(text, "")
-        .replace(OMO_INTERNAL_INITIATOR_MARKER, "")
-        .trim()
-        .to_string()
+    let strip = |segment: &str| {
+        system_reminder_regex()
+            .replace_all(segment, "")
+            .replace(OMO_INTERNAL_INITIATOR_MARKER, "")
+    };
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for wrapper in crate::transform::steering_wrapper_regex().find_iter(text) {
+        result.push_str(&strip(&text[cursor..wrapper.start()]));
+        result.push_str(wrapper.as_str());
+        cursor = wrapper.end();
+    }
+    result.push_str(&strip(&text[cursor..]));
+    result.trim().to_string()
 }
 
 fn is_system_directive(text: &str) -> bool {
@@ -1739,12 +2012,16 @@ fn system_reminder_regex() -> &'static Regex {
 
 fn commit_hash_extract_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)`?\b([0-9a-f]{7,12})\b`?").unwrap())
+    // ASCII word boundaries and ASCII case folding, as in the TypeScript twin
+    // (shared/commit-detection.ts): JavaScript's `\b` and `/i` without the `u` flag.
+    // With Unicode boundaries a hash right after a letter such as `é` was not found.
+    RE.get_or_init(|| Regex::new(r"(?i-u)`?\b([0-9a-f]{7,12})\b`?").unwrap())
 }
 
 fn commit_verb_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)\b(?:commit(?:ted|ting|s)?|cherry-?pick(?:ed|ing|s)?|merge[ds]?|merging|rebas(?:e|ed|es|ing))\b").unwrap())
+    // ASCII boundaries and case folding, as in the TypeScript twin.
+    RE.get_or_init(|| Regex::new(r"(?i-u)\b(?:commit(?:ted|ting|s)?|cherry-?pick(?:ed|ing|s)?|merge[ds]?|merging|rebas(?:e|ed|es|ing))\b").unwrap())
 }
 
 fn empty_parens_regex() -> &'static Regex {
@@ -1775,6 +2052,7 @@ fn space_before_punct_regex() -> &'static Regex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::ck_wire::{
         project_messages, CkIngressMessage, CkWireBlock, CkWireMessage, HarnessMeta,
     };
@@ -1784,6 +2062,61 @@ mod tests {
     use serde::Deserialize;
     use serde_json::json;
     use sha2::Digest;
+
+    #[test]
+    fn historian_keeps_long_room_posts_and_peer_replies_whole() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../testdata/historian-tool-expansions.json"))
+                .unwrap();
+        let spec = &fixture["longMessage"];
+        let body = spec["sentence"]
+            .as_str()
+            .unwrap()
+            .repeat(spec["count"].as_u64().unwrap() as usize)
+            + spec["tail"].as_str().unwrap();
+        assert!(body.len() > 1000);
+        let messages = vec![msg(
+            "a",
+            1,
+            "assistant",
+            vec![
+                CkKind::ToolCall {
+                    id: "r".into(),
+                    name: "room".into(),
+                    input: json!({"action": "post", "room_id": "rm_review", "text": body, "description": "Room title…"}),
+                    provider_executed: false,
+                },
+                CkKind::ToolCall {
+                    id: "p".into(),
+                    name: "peer_send".into(),
+                    input: json!({"reply_to_pmid": "pm_42", "message": body, "description": "PM title…"}),
+                    provider_executed: false,
+                },
+                CkKind::Text {
+                    text: "Tail text.".into(),
+                },
+            ],
+        )];
+        let projection = project_messages(&messages).unwrap();
+        let chunk = build_historian_chunk(&messages, &projection.blocks, 1, 10_000, 2);
+        assert_eq!(chunk.text, format!("[1] A: TC: Room post rm_review: {body} / TC: PM reply to pm_42: {body} / Tail text."));
+    }
+
+    /// The historian chunk follows the TypeScript formatter: ASCII word boundaries for
+    /// commit hashes and verbs, and key arguments truncated in UTF-16 units.
+    #[test]
+    fn chunk_commit_patterns_and_key_arguments_follow_the_typescript_formatter() {
+        assert_eq!(
+            extract_commit_hashes("committed é1a2b3c4d"),
+            vec!["1a2b3c4d".to_string()]
+        );
+        assert!(commit_verb_regex().is_match("ücommitted 1a2b3c4d"));
+        assert!(extract_commit_hashes("x1a2b3c4d").is_empty());
+        assert_eq!(
+            truncate_arg(&"😀".repeat(40)),
+            format!("{}…", "😀".repeat(30))
+        );
+    }
 
     #[derive(Deserialize)]
     struct GoldenRoot {
@@ -1814,6 +2147,8 @@ mod tests {
         #[serde(rename = "tokenEstimate")]
         token_estimate: usize,
         text: String,
+        #[serde(rename = "inputSource")]
+        input_source: String,
         lines: Vec<GoldenLine>,
         #[serde(rename = "toolOnlyRanges")]
         tool_only_ranges: Vec<MessageRange>,
@@ -1900,6 +2235,71 @@ mod tests {
     ) -> HistorianBuiltChunk {
         let projection = project_messages(messages).unwrap();
         build_historian_chunk(messages, &projection.blocks, offset, budget, eligible_end)
+    }
+
+    /// Byte-exact shape OpenCode 1.17.8 and older gave a user message sent mid-run.
+    fn steering_wrapped(user_text: &str) -> String {
+        format!(
+            "<system-reminder>\nThe user sent the following message:\n{user_text}\n\nPlease address this message and continue with your tasks.\n</system-reminder>"
+        )
+    }
+
+    /// Same cases as the TypeScript chunk reader's test of `cleanUserText`.
+    #[test]
+    fn clean_user_text_keeps_the_steering_wrapper_verbatim() {
+        let wrapped = steering_wrapped("use staging");
+        assert_eq!(clean_user_text(&wrapped), wrapped);
+        let nested = steering_wrapped("quote <system-reminder>x</system-reminder> then go");
+        assert_eq!(clean_user_text(&nested), nested);
+        let mixed =
+            format!("{wrapped}\n\n<system-reminder>\nPlan mode is active.\n</system-reminder>");
+        assert_eq!(clean_user_text(&mixed), wrapped);
+        assert_eq!(
+            clean_user_text("<system-reminder>internal</system-reminder>"),
+            ""
+        );
+        assert_eq!(
+            clean_user_text("<!-- OMO_INTERNAL_INITIATOR -->hello"),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn a_steering_wrapped_user_message_is_read_as_the_users_words_not_noise() {
+        let messages = vec![
+            msg(
+                "u1",
+                1,
+                "user",
+                vec![text(&steering_wrapped(
+                    "Stop and use the staging database instead.",
+                ))],
+            ),
+            msg("a2", 2, "assistant", vec![text("switching")]),
+            msg("u3", 3, "user", vec![text("protected tail")]),
+        ];
+        let built = project_and_build(&messages, 1, 10_000, 3);
+        assert!(built.text.contains("[1] U:"), "{}", built.text);
+        assert!(
+            built
+                .text
+                .contains("Stop and use the staging database instead."),
+            "{}",
+            built.text
+        );
+    }
+
+    /// Commit detection uses ASCII word boundaries and ASCII case folding, as JavaScript's
+    /// non-Unicode `\b` and `/i` do in the TypeScript twin.
+    #[test]
+    fn commit_detection_uses_ascii_boundaries_like_typescript() {
+        assert_eq!(
+            extract_commit_hashes("committed \u{e9}1a2b3c4d"),
+            vec!["1a2b3c4d".to_string()]
+        );
+        assert!(!commit_verb_regex().is_match("reba\u{17f}ed 1a2b3c4d"));
+        assert!(!commit_verb_regex().is_match("cherry-pic\u{212a} 1a2b3c4d"));
+        assert!(commit_verb_regex().is_match("Rebased 1a2b3c4d"));
     }
 
     #[test]
@@ -2150,7 +2550,9 @@ mod tests {
             &projection.blocks,
             &projection.identity_by_mid,
             HistorianAssemblerConfig {
+                expand_tools: BTreeMap::new(),
                 model_limits: Default::default(),
+                model_variants: Default::default(),
                 session_id: "issue424-capacity".to_string(),
                 project_path: "/proj".to_string(),
                 project_slug: "proj".to_string(),
@@ -2172,6 +2574,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency: false,
                 force_keep_last_compartment: true,
@@ -2189,10 +2592,15 @@ mod tests {
             firing.prompt.contains(&built.text),
             "producer must receive the whole formatted component"
         );
+        assert!(
+            firing.prompt.contains("Messages 1-3:\n\n"),
+            "producer prompt must label the raw message ordinal range"
+        );
         let prompt_hash = format!("{:x}", sha2::Sha256::digest(firing.prompt.as_bytes()));
+        // The digest now covers the raw-ordinal header; transcript bytes stay unchanged.
         assert_eq!(
             prompt_hash,
-            "90e949d5ecab64b27a84497213d8aa03b450b025d2bf301e0d61593d98f2de27"
+            "de9fcb7dacb191f6b93bbb242ab08f00d1789d825e3d8645925e8285b2253066"
         );
         let validated = crate::historian_validate::validate_historian_output(
             &historian_output(1, 3, 4),
@@ -2202,6 +2610,316 @@ mod tests {
         )
         .expect("whole component validates");
         assert_eq!(validated.compartments[0].end_message, 3);
+    }
+
+    /// Small primary: a 200,000-token window with a 32,000-token output reserve
+    /// and the 3% estimator margin leaves an input limit of 162,960 tokens.
+    const SMALL_PRIMARY: &str = "opencode/small-free-historian";
+    /// Large fallback with a one-million-token window.
+    const LARGE_FALLBACK: &str = "google/large-flash-historian";
+
+    fn chain_limits(
+        entries: &[(&str, usize)],
+    ) -> BTreeMap<String, crate::historian::HistorianModelLimits> {
+        entries
+            .iter()
+            .map(|(model, context)| {
+                (
+                    model.to_string(),
+                    crate::historian::HistorianModelLimits {
+                        context: Some(*context),
+                        input: None,
+                        output: Some(32_000),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// `count` narrative turns of about 1,000 local tokens each, then one
+    /// protected-tail message.
+    fn long_narrative_session(count: u64) -> Vec<CkIngressMessage> {
+        let mut messages: Vec<_> = (1..=count)
+            .map(|ordinal| {
+                let role = if ordinal % 2 == 1 {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                msg(
+                    &format!("m{ordinal}"),
+                    ordinal,
+                    role,
+                    vec![text(&format!(
+                        "turn {ordinal}: {}",
+                        "the migration plan keeps every ledger entry ".repeat(110)
+                    ))],
+                )
+            })
+            .collect();
+        messages.push(msg("tail", count + 1, "user", vec![text("protected tail")]));
+        messages
+    }
+
+    fn assemble_for_chain(
+        messages: &[CkIngressMessage],
+        chain: &[&str],
+        model_limits: BTreeMap<String, crate::historian::HistorianModelLimits>,
+        token_budget: usize,
+    ) -> AssembledHistorianFiring {
+        let projection = project_messages(messages).unwrap();
+        let protected = messages.last().unwrap().ordinal;
+        let (_dir, store) = store_for_tests();
+        let outcome = assemble_historian_firing(
+            &store,
+            messages,
+            &projection.blocks,
+            &projection.identity_by_mid,
+            HistorianAssemblerConfig {
+                expand_tools: BTreeMap::new(),
+                model_limits,
+                model_variants: Default::default(),
+                session_id: "chain-window".to_string(),
+                project_path: "/proj".to_string(),
+                project_slug: "proj".to_string(),
+                model_chain: chain.iter().map(|model| model.to_string()).collect(),
+                token_budget,
+                historian_context_limit_tokens: None,
+                max_output_tokens: 32_000,
+                boundary: crate::boundary::BoundaryResolution {
+                    protected_start_ordinal: protected,
+                    eligible_head: 1..protected,
+                    n_tokens: 9910.0,
+                    floored_by_live_prompt: false,
+                    fenced_by_open_arc: false,
+                    true_raw_eligible_tokens: 1.0,
+                    oversize_atomic_unit: false,
+                    raw_message_count: protected,
+                    boundary_reason: "test".to_string(),
+                },
+                memory_enabled: false,
+                auto_promote: true,
+                user_memory_collection_enabled: false,
+                user_observations_requested: true,
+                extraction_free: false,
+                in_emergency: false,
+                force_keep_last_compartment: true,
+                fold_is_only_reclaim: true,
+                failure_backoff_at_ms: 0,
+                min_chunk_tokens: 0,
+            },
+            1,
+        )
+        .unwrap();
+        let AssembleHistorianFiringOutcome::Fire(firing) = outcome else {
+            panic!("expected firing: {outcome:?}");
+        };
+        *firing
+    }
+
+    /// The calibrated prompt size and limit the per-attempt admission check
+    /// compares when it sends `firing`'s prompt to chain entry `index`.
+    fn attempt_admission(firing: &AssembledHistorianFiring, index: usize) -> (f64, usize) {
+        let model = &firing.model_chain[index];
+        let calibrated = crate::decision_calibration::DecisionCalibration::for_model(Some(model))
+            .provider_mass(
+                crate::decision_calibration::LocalMass {
+                    system: estimate_tokens(crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT)
+                        as f64,
+                    prose: estimate_tokens(&firing.prompt) as f64,
+                    tools: 0.0,
+                },
+                true,
+            );
+        let limit = crate::historian::attempt_producer_input_limit(
+            model,
+            &firing.model_limits,
+            if index == 0 {
+                firing.historian_context_limit_tokens
+            } else {
+                None
+            },
+            firing.historian_context_limit_tokens,
+            firing.max_output_tokens,
+        )
+        .expect("chain model window is known");
+        (calibrated, limit)
+    }
+
+    #[test]
+    fn small_primary_gets_a_chunk_that_fits_its_window_before_a_large_fallback() {
+        let messages = long_narrative_session(400);
+        // A chunk request far above what the primary holds stands in for any
+        // run whose chunk would exceed the smallest window in the chain.
+        let firing = assemble_for_chain(
+            &messages,
+            &[SMALL_PRIMARY, LARGE_FALLBACK],
+            chain_limits(&[(SMALL_PRIMARY, 200_000), (LARGE_FALLBACK, 1_000_000)]),
+            400_000,
+        );
+        let (calibrated, limit) = attempt_admission(&firing, 0);
+        assert_eq!(limit, 162_960);
+        assert!(
+            calibrated <= limit as f64,
+            "primary would refuse: calibrated_tokens={calibrated} limit={limit}"
+        );
+        // The chunk shrank, and it still records exactly the range it covers so
+        // the next run continues right after it.
+        assert_eq!(firing.from_ordinal, 1);
+        assert!(firing.to_ordinal < 400, "to_ordinal={}", firing.to_ordinal);
+        assert_eq!(firing.chunk.chunk.end_index, firing.to_ordinal);
+        assert_eq!(
+            firing.chunk.chunk.lines.last().map(|line| line.ordinal),
+            Some(firing.to_ordinal)
+        );
+        assert!(firing
+            .prompt
+            .contains(&format!("Messages 1-{}:\n\n", firing.to_ordinal)));
+        assert!(!firing.prompt.contains("tokens truncated by Magic Context"));
+        let validated = crate::historian_validate::validate_historian_output(
+            &historian_output(1, firing.to_ordinal, firing.to_ordinal + 1),
+            &firing.chunk.chunk,
+            &firing.prior_compartments,
+            firing.validate_options,
+        )
+        .expect("the shrunk chunk validates over its recorded range");
+        assert_eq!(validated.compartments[0].end_message, firing.to_ordinal);
+    }
+
+    #[test]
+    fn large_primary_chunk_is_also_sized_for_a_smaller_fallback() {
+        let messages = long_narrative_session(400);
+        let firing = assemble_for_chain(
+            &messages,
+            &[LARGE_FALLBACK, SMALL_PRIMARY],
+            chain_limits(&[(LARGE_FALLBACK, 1_000_000), (SMALL_PRIMARY, 200_000)]),
+            400_000,
+        );
+        for index in 0..2 {
+            let (calibrated, limit) = attempt_admission(&firing, index);
+            assert!(
+                calibrated <= limit as f64,
+                "attempt {index} would refuse: calibrated_tokens={calibrated} limit={limit}"
+            );
+        }
+        assert!(firing.to_ordinal < 400);
+        assert_eq!(firing.chunk.chunk.end_index, firing.to_ordinal);
+    }
+
+    #[test]
+    fn fallback_too_small_for_any_prompt_does_not_shrink_the_chunk() {
+        let messages = long_narrative_session(60);
+        let alone = assemble_for_chain(
+            &messages,
+            &[LARGE_FALLBACK],
+            chain_limits(&[(LARGE_FALLBACK, 1_000_000)]),
+            32_000,
+        );
+        let with_tiny = assemble_for_chain(
+            &messages,
+            &[LARGE_FALLBACK, "tiny/model"],
+            chain_limits(&[(LARGE_FALLBACK, 1_000_000), ("tiny/model", 4_000)]),
+            32_000,
+        );
+        assert_eq!(with_tiny.prompt, alone.prompt);
+        assert_eq!(with_tiny.to_ordinal, alone.to_ordinal);
+    }
+
+    #[test]
+    fn chain_with_room_for_todays_chunk_keeps_prompt_bytes() {
+        // Every window in the chain holds the derived chunk, so the prompt is the
+        // same bytes it is with no window information at all.
+        let messages = long_narrative_session(120);
+        let budget = crate::config::derive_historian_chunk_tokens(128_000);
+        let unguarded = assemble_for_chain(
+            &messages,
+            &[SMALL_PRIMARY, LARGE_FALLBACK],
+            BTreeMap::new(),
+            budget,
+        );
+        let sized = assemble_for_chain(
+            &messages,
+            &[SMALL_PRIMARY, LARGE_FALLBACK],
+            chain_limits(&[(SMALL_PRIMARY, 200_000), (LARGE_FALLBACK, 1_000_000)]),
+            budget,
+        );
+        assert!(unguarded.to_ordinal < 120, "the budget must bind");
+        assert_eq!(sized.prompt, unguarded.prompt);
+        assert_eq!(
+            (sized.from_ordinal, sized.to_ordinal),
+            (unguarded.from_ordinal, unguarded.to_ordinal)
+        );
+    }
+
+    #[test]
+    fn oversize_component_is_split_to_fit_a_small_primary() {
+        // One completed tool arc far larger than the primary's window: the
+        // chunk reader keeps it whole, so only the atomic split can make it fit.
+        let steering = format!("{}CAPACITY_STEERING_END", "result value\n".repeat(80_000));
+        let messages = vec![
+            msg(
+                "a1",
+                1,
+                "assistant",
+                vec![CkKind::ToolCall {
+                    id: "call1".to_string(),
+                    name: "read".to_string(),
+                    input: json!({}),
+                    provider_executed: false,
+                }],
+            ),
+            msg(
+                "u2",
+                2,
+                "user",
+                vec![
+                    text(&steering),
+                    CkKind::ToolResult {
+                        id: "call1".to_string(),
+                        tool_name: "read".to_string(),
+                        output: mc_store::CkToolOutput::bare(mc_store::CkOutputKind::Text {
+                            text: "done".to_string(),
+                        }),
+                        provider_executed: false,
+                    },
+                ],
+            ),
+            msg("u3", 3, "user", vec![text("protected tail")]),
+        ];
+        let unguarded = assemble_for_chain(
+            &messages,
+            &[SMALL_PRIMARY, LARGE_FALLBACK],
+            BTreeMap::new(),
+            32_000,
+        );
+        let sized = assemble_for_chain(
+            &messages,
+            &[SMALL_PRIMARY, LARGE_FALLBACK],
+            chain_limits(&[(SMALL_PRIMARY, 200_000), (LARGE_FALLBACK, 1_000_000)]),
+            32_000,
+        );
+        // Control: the whole component overflows the primary.
+        let primary_limit = attempt_admission(&sized, 0).1 as f64;
+        let whole =
+            crate::decision_calibration::DecisionCalibration::for_model(Some(SMALL_PRIMARY))
+                .provider_mass(
+                    crate::decision_calibration::LocalMass {
+                        system: estimate_tokens(crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT)
+                            as f64,
+                        prose: estimate_tokens(&unguarded.prompt) as f64,
+                        tools: 0.0,
+                    },
+                    true,
+                );
+        assert!(whole > primary_limit);
+        let (calibrated, limit) = attempt_admission(&sized, 0);
+        assert!(
+            calibrated <= limit as f64,
+            "primary would refuse: calibrated_tokens={calibrated} limit={limit}"
+        );
+        assert!(sized.prompt.contains("tokens truncated by Magic Context"));
+        // Coverage of the component stays whole.
+        assert_eq!((sized.from_ordinal, sized.to_ordinal), (1, 2));
     }
 
     #[test]
@@ -2275,6 +2993,7 @@ mod tests {
                 project_memory: "",
                 input_source: source,
                 memory_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
             });
             let calibration = crate::decision_calibration::DecisionCalibration::for_model(Some(
@@ -2304,9 +3023,11 @@ mod tests {
                 source_offset: input.rfind("[4]").unwrap(),
                 body_tokens: 10_000,
             }],
-            Some(context_limit_tokens),
-            None,
-            max_output_tokens,
+            crate::historian::producer_input_token_limit_with_input(
+                Some(context_limit_tokens),
+                None,
+                max_output_tokens,
+            ),
             &fits_prompt,
         );
         let limit = crate::historian::producer_input_token_limit_with_input(
@@ -2323,6 +3044,7 @@ mod tests {
             project_memory: "",
             input_source: &fitted.text,
             memory_enabled: false,
+            user_observations_requested: true,
             extraction_free: false,
         });
         let calibration = crate::decision_calibration::DecisionCalibration::for_model(Some(
@@ -2348,6 +3070,171 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    fn expanded_result_pair() -> Vec<CkIngressMessage> {
+        vec![
+            msg(
+                "invocation",
+                1,
+                "assistant",
+                vec![
+                    text("Updating tasks."),
+                    CkKind::ToolCall {
+                        id: "tasks".to_string(),
+                        name: "todowrite".to_string(),
+                        input: json!({"todos": [{"content": "Investigate", "status": "in_progress"}]}),
+                        provider_executed: false,
+                    },
+                ],
+            ),
+            msg(
+                "result",
+                2,
+                "tool",
+                vec![CkKind::ToolResult {
+                    id: "tasks".to_string(),
+                    tool_name: "todowrite".to_string(),
+                    output: mc_store::CkToolOutput::bare(mc_store::CkOutputKind::Text {
+                        text: r#"[{"content":"Investigate","status":"in_progress"}]"#.to_string(),
+                    }),
+                    provider_executed: false,
+                }],
+            ),
+        ]
+    }
+
+    fn assert_result_coverage(messages: &[CkIngressMessage], expand: bool) {
+        let projection = project_messages(messages).unwrap();
+        let mut expansions = BTreeMap::new();
+        if !expand {
+            expansions.insert("todowrite".to_string(), serde_json::Value::Bool(false));
+        }
+        let built = build_historian_chunk_with_expansions(
+            messages,
+            &projection.blocks,
+            1,
+            32_000,
+            messages.len() as u64 + 1,
+            &expansions,
+        );
+        let end = messages.len() as u64;
+        assert_eq!(built.chunk.end_index, end);
+        assert_eq!(
+            built.end_message_id,
+            format!("{}#0", messages.last().unwrap().mid)
+        );
+        assert_eq!(built.chunk.lines.len(), messages.len());
+        assert_eq!(
+            built
+                .chunk
+                .lines
+                .iter()
+                .map(|line| line.ordinal)
+                .collect::<Vec<_>>(),
+            (1..=end).collect::<Vec<_>>()
+        );
+        assert!(!built.has_more);
+        assert_eq!(
+            built.chunk.completed_tool_arcs,
+            vec![MessageRange { start: 1, end: 2 }]
+        );
+        assert!(built.snapshot.iter().any(|item| item.id == "result#0"));
+        assert_eq!(
+            crate::historian_validate::validate_chunk_coverage(&built.chunk),
+            None
+        );
+        let validated = crate::historian_validate::validate_historian_output(
+            &historian_output(1, if end == 2 { 1 } else { end }, end + 1),
+            &built.chunk,
+            &[],
+            crate::historian_validate::ValidateOptions {
+                force_keep_last_compartment: true,
+                ..Default::default()
+            },
+        )
+        .expect("completed result heals to an anchorable endpoint");
+        assert_eq!(validated.compartments[0].end_message, end);
+        assert_eq!(
+            validated.compartments[0].end_message_id,
+            built.end_message_id
+        );
+        if expand {
+            assert_eq!(built.text.matches("Investigate").count(), 1);
+        }
+    }
+
+    #[test]
+    fn trailing_expanded_result_coverage() {
+        assert_result_coverage(&expanded_result_pair(), true);
+    }
+
+    #[test]
+    fn trailing_expanded_result_coverage_expansion_off_control() {
+        assert_result_coverage(&expanded_result_pair(), false);
+    }
+
+    #[test]
+    fn trailing_expanded_result_coverage_visible_successor_control() {
+        let mut messages = expanded_result_pair();
+        messages.push(msg("next", 3, "user", vec![text("Continue.")]));
+        assert_result_coverage(&messages, true);
+    }
+
+    #[test]
+    fn trailing_filtered_noise_coverage_stops_at_an_anchorable_row() {
+        for (role, parts) in [
+            (
+                "user",
+                vec![text("<system-reminder>finished</system-reminder>")],
+            ),
+            ("assistant", vec![text("")]),
+            ("system", vec![text("Pinned instructions")]),
+        ] {
+            let messages = vec![
+                msg("visible", 1, "user", vec![text("Work.")]),
+                msg("empty", 2, "assistant", vec![]),
+                msg("noise", 3, role, parts),
+                msg("empty-tail", 4, "assistant", vec![]),
+            ];
+            let built = project_and_build(&messages, 1, 32_000, 5);
+            assert_eq!(built.text, "[1] U: Work.");
+            assert_eq!(built.chunk.end_index, 3);
+            assert_eq!(built.end_message_id, "noise#0");
+            assert_eq!(built.chunk.lines.len(), 3);
+            assert!(!built.chunk.lines[1].anchorable);
+            assert!(!built.has_more);
+            assert_eq!(
+                crate::historian_validate::validate_chunk_coverage(&built.chunk),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_zero_block_noise_cannot_be_a_persisted_endpoint() {
+        let messages = vec![
+            msg("visible", 1, "user", vec![text("Work.")]),
+            msg("empty", 2, "assistant", vec![]),
+        ];
+        let built = project_and_build(&messages, 1, 32_000, 3);
+        assert_eq!(built.chunk.end_index, 1);
+        assert_eq!(built.end_message_id, "visible#0");
+        assert_eq!(built.chunk.lines.len(), 1);
+        assert!(!built.has_more);
+    }
+
+    #[test]
+    fn fenced_eligible_end_excludes_the_invocation_of_an_unavailable_result() {
+        let mut messages = vec![msg("prefix", 1, "user", vec![text("Earlier work.")])];
+        messages.extend(expanded_result_pair().into_iter().map(|mut message| {
+            message.ordinal += 1;
+            message
+        }));
+        let built = project_and_build(&messages, 1, 32_000, 2);
+        assert_eq!(built.chunk.end_index, 1);
+        assert_eq!(built.end_message_id, "prefix#0");
+        assert_eq!(built.text, "[1] U: Earlier work.");
     }
 
     #[test]
@@ -2418,7 +3305,9 @@ mod tests {
         ];
         let projection = project_messages(&messages).unwrap();
         let config = HistorianAssemblerConfig {
+            expand_tools: BTreeMap::new(),
             model_limits: Default::default(),
+            model_variants: Default::default(),
             session_id: "noise".to_string(),
             project_path: "/proj".to_string(),
             project_slug: "proj".to_string(),
@@ -2440,6 +3329,7 @@ mod tests {
             memory_enabled: false,
             auto_promote: false,
             user_memory_collection_enabled: false,
+            user_observations_requested: true,
             extraction_free: false,
             in_emergency: true,
             force_keep_last_compartment: false,
@@ -2558,7 +3448,9 @@ mod tests {
             &projection.blocks,
             &projection.identity_by_mid,
             HistorianAssemblerConfig {
+                expand_tools: BTreeMap::new(),
                 model_limits: Default::default(),
+                model_variants: Default::default(),
                 session_id: "ses-below-budget".to_string(),
                 project_path: "/proj".to_string(),
                 project_slug: "proj".to_string(),
@@ -2580,6 +3472,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency,
                 force_keep_last_compartment: false,
@@ -2616,7 +3509,9 @@ mod tests {
             &projection.blocks,
             &projection.identity_by_mid,
             HistorianAssemblerConfig {
+                expand_tools: BTreeMap::new(),
                 model_limits: Default::default(),
+                model_variants: Default::default(),
                 session_id: "ses-fold-only".to_string(),
                 project_path: "/proj".to_string(),
                 project_slug: "proj".to_string(),
@@ -2638,6 +3533,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency,
                 force_keep_last_compartment: false,
@@ -2699,7 +3595,9 @@ mod tests {
             &projection.blocks,
             &projection.identity_by_mid,
             HistorianAssemblerConfig {
+                expand_tools: BTreeMap::new(),
                 model_limits: Default::default(),
+                model_variants: Default::default(),
                 session_id: "ses-sparse".to_string(),
                 project_path: "/proj".to_string(),
                 project_slug: "proj".to_string(),
@@ -2721,6 +3619,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency: false,
                 force_keep_last_compartment: false,
@@ -3118,6 +4017,29 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn historian_input_source_matches_typescript_chunk_golden() {
+        let root: GoldenRoot =
+            serde_json::from_str(include_str!("../testdata/historian-chunk-golden.json")).unwrap();
+        for case in &root.cases {
+            let projection = project_messages(&case.ck).unwrap();
+            let built = build_historian_chunk(
+                &case.ck,
+                &projection.blocks,
+                case.offset,
+                case.budget,
+                case.eligible_end,
+            );
+            assert_eq!(
+                historian_input_source(built.chunk.start_index, built.chunk.end_index, &built.text,),
+                case.expected.input_source,
+                "{} historian input source",
+                case.label
+            );
+        }
+    }
+
     #[test]
     fn fixture_builder_drives_boundary_chunk_assembly() {
         let fixture = FixtureBuilder::session_with_boundary();
@@ -3201,9 +4123,11 @@ mod prompt_fit_tests {
             compartments,
             memories,
             memory_enabled: true,
+            user_observations_requested: true,
             extraction_free: false,
             limit: Some(limit),
             seed: &seed,
+            fallback_limits: &[],
             system_tokens,
             requested: 10_000,
         });
@@ -3213,6 +4137,7 @@ mod prompt_fit_tests {
             project_memory: &fit.memory_block,
             input_source: "Messages 61-400:\n\n",
             memory_enabled: true,
+            user_observations_requested: true,
             extraction_free: false,
         });
         let sent = seed.provider_mass(
@@ -3233,8 +4158,75 @@ mod prompt_fit_tests {
         let (fit, limit, sent) = fit_with(1_000_000, 8_000, &memories, &compartments);
         assert!(!fit.trimmed);
         assert_eq!(fit.chunk_tokens, 10_000);
-        assert_eq!(fit.kept, (SESSION_REF_WINDOW, 300, SEED_FLOOR));
+        assert_eq!(fit.kept, (compartments.len(), 300, SEED_FLOOR));
         assert!(sent <= limit as f64);
+    }
+
+    #[test]
+    fn fit_drops_diverse_before_recent_and_oldest_recent_first() {
+        let mut compartments = compartments();
+        // Twelve distinct rows give three diverse older examples and four recent.
+        while compartments.len() < 12 {
+            let i = compartments.len();
+            let mut row = compartments[0].clone();
+            row.start_message = i as i64 * 10 + 1;
+            row.end_message = i as i64 * 10 + 10;
+            row.title = format!("Compartment {i}");
+            compartments.push(row);
+        }
+        let seeds = select_seeds("ses-fit", 61, SEED_FLOOR);
+        let refs = select_session_references(&compartments, &seeds, "ses-fit", 61);
+        assert_eq!(refs.len(), 7);
+        let seed = DecisionCalibration::for_model(Some(MODEL));
+        let system_tokens =
+            estimate_tokens(crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT) as f64;
+        for remaining in [6, 4, 3] {
+            let expected = render_session_references_block_window(&refs, remaining);
+            let prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
+                seed_examples: &render_seed_examples_block(&seeds),
+                session_references: &expected,
+                project_memory: "",
+                input_source: "Messages 61-400:\n\n",
+                memory_enabled: true,
+                user_observations_requested: true,
+                extraction_free: false,
+            });
+            let limit = seed
+                .provider_mass(
+                    LocalMass {
+                        system: system_tokens,
+                        prose: (estimate_tokens(&prompt) + 10_000 + PROMPT_FIT_SLACK_TOKENS) as f64,
+                        tools: 0.0,
+                    },
+                    true,
+                )
+                .ceil() as usize;
+            let fit = fit_historian_prompt(&HistorianPromptFitInput {
+                session_id: "ses-fit",
+                chunk_start: 61,
+                last_ordinal: 400,
+                compartments: &compartments,
+                memories: &[],
+                memory_enabled: true,
+                user_observations_requested: true,
+                extraction_free: false,
+                limit: Some(limit),
+                seed: &seed,
+                fallback_limits: &[],
+                system_tokens,
+                requested: 10_000,
+            });
+            assert_eq!(fit.kept, (remaining, 0, 3));
+            assert_eq!(fit.session_references, expected);
+            for i in (12 - remaining.min(4))..12 {
+                assert!(fit
+                    .session_references
+                    .contains(&format!("title=\"Compartment {i}\"")));
+            }
+            if remaining == 3 {
+                assert!(!fit.session_references.contains("title=\"Compartment 8\""));
+            }
+        }
     }
 
     #[test]
@@ -3247,12 +4239,18 @@ mod prompt_fit_tests {
         let full = build_compartment_agent_prompt(&CompartmentPromptInputs {
             seed_examples: &render_seed_examples_block(&select_seeds("ses-fit", 61, SEED_FLOOR)),
             session_references: &render_session_references_block_window(
-                &compartments,
-                SESSION_REF_WINDOW,
+                &select_session_references(
+                    &compartments,
+                    &select_seeds("ses-fit", 61, SEED_FLOOR),
+                    "ses-fit",
+                    61,
+                ),
+                crate::historian_prompt::SESSION_REF_LIMIT,
             ),
             project_memory: &render_historian_memory_block(&memories),
             input_source: "Messages 61-400:\n\n",
             memory_enabled: true,
+            user_observations_requested: true,
             extraction_free: false,
         });
         let full_mass = seed.provider_mass(
@@ -3272,6 +4270,43 @@ mod prompt_fit_tests {
         assert!(fit.kept.1 > 0 && fit.kept.1 < 300);
         assert_eq!(fit.kept.2, SEED_FLOOR);
         assert!(sent <= limit as f64);
+    }
+
+    #[test]
+    fn memory_off_fit_and_prompt_omit_project_memories() {
+        let memories = memories(3);
+        let seed = DecisionCalibration::for_model(Some(MODEL));
+        for limit in [None, Some(1_000_000)] {
+            let fit = fit_historian_prompt(&HistorianPromptFitInput {
+                session_id: "ses-memory-off",
+                chunk_start: 1,
+                last_ordinal: 5,
+                compartments: &[],
+                memories: &memories,
+                memory_enabled: false,
+                user_observations_requested: true,
+                extraction_free: false,
+                limit,
+                seed: &seed,
+                fallback_limits: &[],
+                system_tokens: 1000.0,
+                requested: 1000,
+            });
+            assert!(fit.memory_block.is_empty());
+            assert_eq!(fit.kept.1, 0);
+        }
+        let prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
+            seed_examples: "",
+            session_references: "",
+            project_memory: "<project-memory>private project memory</project-memory>",
+            input_source: "Messages 1-5: transcript",
+            memory_enabled: false,
+            user_observations_requested: true,
+            extraction_free: false,
+        });
+        assert!(!prompt.contains("private project memory"));
+        assert!(!prompt.contains("<project-memory>"));
+        assert!(prompt.contains("Messages 1-5: transcript"));
     }
 
     #[test]

@@ -448,6 +448,11 @@ export function buildPagedModuleTransformPayloads(
     pageMaxBytes = MODULE_PAGE_MAX_BYTES,
     forcePageEnvelope = false,
 ): ModuleTransformWirePage[] {
+    // SubcModuleTransport appends this capability after paging. The application
+    // cap applies to the transmitted frame, not just the page before that append.
+    // Reserve it even when a caller already supplied it; the small conservative
+    // allowance also keeps non-final pages (which omit scalars) within the cap.
+    pageMaxBytes -= Buffer.byteLength(',"accept_reply_pages":true');
     // The unpaged path must stringify once to know it fits. Return that length so
     // the transport telemetry does not serialize the same body a second time.
     const serializedBody = JSON.stringify(body);
@@ -484,7 +489,10 @@ export function buildPagedModuleTransformPayloads(
             transform_page_digest: transformPageDigest(pageContent),
             ...body,
         };
-        return [{ page, bytes: Buffer.byteLength(JSON.stringify(page)) }];
+        const bytes = Buffer.byteLength(JSON.stringify(page));
+        // A body can fit while its content-addressed envelope does not. In that
+        // case use the same bounded paging/continuation path as a larger body.
+        if (bytes <= pageMaxBytes) return [{ page, bytes }];
     }
 
     const arrayFields = [
@@ -518,6 +526,7 @@ export function buildPagedModuleTransformPayloads(
             value,
         })),
     );
+    const finishPages = new WeakMap<ModuleTransformWirePage, () => void>();
     const emptyArrays = (): Record<string, unknown[]> =>
         Object.fromEntries(arrayFields.map((field) => [field, []]));
     const emptyMaps = (): Record<string, Record<string, unknown>> =>
@@ -550,13 +559,20 @@ export function buildPagedModuleTransformPayloads(
             transform_page_index: args.index,
             transform_page_total: args.total,
             transform_page_complete: args.complete,
-            transform_page_digest: transformPageDigest(pageContent),
+            transform_page_digest: "0".repeat(64),
             ...pageContent,
         };
         if (args.complete) Object.assign(page, scalarFields);
         // Admission already counted candidate sizes incrementally. Stringify once
         // here so transport telemetry can reuse the exact UTF-8 length.
-        return { page, bytes: Buffer.byteLength(JSON.stringify(page)) };
+        const result = { page, bytes: Buffer.byteLength(JSON.stringify(page)) };
+        // Digests always occupy 64 ASCII bytes. Admission can use a placeholder
+        // while the page count converges; hash only the pages we actually send.
+        finishPages.set(result, () => {
+            page.transform_page_digest = transformPageDigest(pageContent);
+            if (args.complete) Object.assign(page, scalarFields);
+        });
+        return result;
     };
     const hasUnits = (
         arrays: Record<string, unknown[]>,
@@ -749,7 +765,10 @@ export function buildPagedModuleTransformPayloads(
             if (finalPage.bytes > pageMaxBytes) throw scalarTailError();
         }
         pages.push(finalPage);
-        if (pages.length === assumedTotal) return pages;
+        if (pages.length === assumedTotal) {
+            for (const page of pages) finishPages.get(page)?.();
+            return pages;
+        }
         assumedTotal = pages.length;
     }
     throw new Error("module transform page count did not stabilize");
@@ -847,6 +866,110 @@ export const __moduleWireTest = {
     resolveOrdinalsForModule,
     toFlatModuleWireBody,
 };
+
+/** Match the native codec's tool-result children, including their lossless carrier. */
+function moduleToolOutput(
+    part: Record<string, unknown>,
+    state: Record<string, unknown>,
+    text: string,
+): Record<string, unknown> {
+    const attachments = state.attachments ?? part.attachments;
+    const error = state.status === "error";
+    // Keep the old wire bytes for text-only results, including an empty attachment list.
+    if (!Array.isArray(attachments) || attachments.length === 0) {
+        return { kind: { type: error ? "error_text" : "text", text } };
+    }
+    // Even media-only results need a separate text carrier for their address tag.
+    const blocks: Record<string, unknown>[] = [{ kind: { type: "text", text } }];
+    for (const attachment of attachments) {
+        const child =
+            attachment !== null && typeof attachment === "object"
+                ? (attachment as Record<string, unknown>)
+                : {};
+        const string = (key: string): string | undefined =>
+            typeof child[key] === "string" ? (child[key] as string) : undefined;
+        const mime = string("mime") ?? string("mimeType");
+        const data = string("data");
+        const url = string("url");
+        let kind: Record<string, unknown>;
+        if (child.type === "text" && typeof child.text === "string") {
+            kind = { type: "text", text: child.text };
+        } else if (mime !== undefined && (data !== undefined || url !== undefined)) {
+            const prefix = `data:${mime};base64,`;
+            const nativeUrl = url ?? "";
+            const source =
+                data !== undefined
+                    ? { type: "data_base64", data }
+                    : nativeUrl.startsWith(prefix)
+                      ? { type: "data_base64", data: nativeUrl.slice(prefix.length) }
+                      : { type: "url", url };
+            const filename = string("filename") ?? string("name");
+            kind = {
+                type: "media",
+                media: {
+                    kind: mime.startsWith("image/")
+                        ? "image"
+                        : mime.startsWith("audio/")
+                          ? "audio"
+                          : mime.startsWith("video/")
+                            ? "video"
+                            : mime === "application/pdf"
+                              ? "document"
+                              : "file",
+                    media_type: mime,
+                    ...(filename !== undefined ? { filename } : {}),
+                    source,
+                },
+            };
+        } else {
+            // Unknown/malformed children remain opaque, never disappear on a text edit.
+            kind = {
+                type: "opaque",
+                opaque: {
+                    source: { type: "harness", harness: "opencode" },
+                    kind: string("type") ?? "attachment",
+                    raw: attachment,
+                },
+            };
+        }
+        // Store payload bytes once. Native encoding reconstructs only the recorded
+        // fields from the media source; all other carrier fields remain lossless.
+        const rawAttachment = { ...child };
+        const sourceFields: string[] = [];
+        if (kind.type === "media") {
+            const media = kind.media as { source: { type: string; data?: string; url?: string } };
+            const derivedUrl =
+                media.source.type === "data_base64"
+                    ? `data:${mime};base64,${media.source.data}`
+                    : media.source.url;
+            for (const [field, derived] of [
+                ["url", derivedUrl],
+                ["data", media.source.data],
+            ] as const) {
+                if (child[field] !== undefined && child[field] === derived) {
+                    delete rawAttachment[field];
+                    sourceFields.push(field);
+                }
+            }
+        }
+        blocks.push(
+            kind.type === "opaque"
+                ? { kind }
+                : {
+                      kind,
+                      provider_extras: {
+                          opencode: {
+                              rawAttachment,
+                              ...(sourceFields.length
+                                  ? { rawAttachmentSourceFields: sourceFields }
+                                  : {}),
+                          },
+                      },
+                  },
+        );
+    }
+    return { kind: { type: error ? "error_content" : "content", blocks } };
+}
 
 export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
     mid: string;
@@ -992,12 +1115,7 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
                             type: "tool_result",
                             id: callId,
                             tool_name: toolName,
-                            output: {
-                                kind: {
-                                    type: state.status === "error" ? "error_text" : "text",
-                                    text: output,
-                                },
-                            },
+                            output: moduleToolOutput(part, state, output),
                         },
                     });
                 }

@@ -130,7 +130,7 @@ export type NoteNudgeDeliveryOutcome =
 export type AppendAutoSearchHintOutcome =
     | { ok: true; kind: "appended"; decision: AutoSearchHintDecision }
     | { ok: true; kind: "already-present"; decision: AutoSearchHintDecision }
-    | { ok: false; kind: "cas-exhausted" };
+    | { ok: false; kind: "cas-exhausted" | "storage-busy" };
 
 export interface PersistedTodoSyntheticAnchor {
     callId: string;
@@ -191,8 +191,6 @@ export interface ProtectedTailDrainReservation {
 export interface ProtectedTailDrainBudgetState {
     windowStartedAt: number;
     resetsAt: number;
-    /** Earliest time a skipped reservation can become eligible (may precede the window reset during emergency backoff). */
-    retryAt: number;
     resetInMs: number;
     spentTokens: number;
     limitTokens: number;
@@ -833,6 +831,83 @@ export function emergencyDrainExitThreshold(executeThresholdPercentage: number):
     return Math.max(0, executeThresholdPercentage - EMERGENCY_DRAIN_EXIT_MARGIN);
 }
 
+function resolvedEmergencyDrainLatch(
+    meta: ProtectedTailMeta,
+    usagePercentage: number,
+    executeThresholdPercentage: number,
+    now: number,
+): number {
+    const { forceMaterializationPercentage } = escalationBands(executeThresholdPercentage);
+    if (usagePercentage >= forceMaterializationPercentage)
+        return meta.emergencyDrainActive > 0 ? meta.emergencyDrainActive : now;
+    if (
+        usagePercentage < emergencyDrainExitThreshold(executeThresholdPercentage) ||
+        now - meta.emergencyDrainActive > EMERGENCY_DRAIN_MAX_LATCH_MS
+    )
+        return 0;
+    return meta.emergencyDrainActive;
+}
+
+function drainFailureBackoffActive(meta: ProtectedTailMeta, now: number): boolean {
+    return (
+        meta.historianDrainFailureAt > 0 &&
+        meta.historianDrainFailureAt <= now &&
+        now - meta.historianDrainFailureAt < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS
+    );
+}
+
+/** Cheap admission check; the runner still reserves atomically before invoking a model. */
+export function getProtectedTailDrainBudgetSkip(args: {
+    db: Database;
+    sessionId: string;
+    usagePercentage: number;
+    usable: number;
+    perRunCap: number;
+    executeThresholdPercentage: number;
+    now?: number;
+}): (ProtectedTailDrainBudgetState & { nextEligibleAt: number }) | null {
+    const now = args.now ?? Date.now();
+    const meta = loadProtectedTailMeta(args.db, args.sessionId);
+    const latch = resolvedEmergencyDrainLatch(
+        meta,
+        args.usagePercentage,
+        args.executeThresholdPercentage,
+        now,
+    );
+    // Usage-driven catch-up transitions must survive even when admission skips the runner.
+    // Only write a changed latch; admission must not charge tokens or reset the window.
+    if (latch !== meta.emergencyDrainActive) {
+        args.db
+            .prepare(
+                "UPDATE session_meta SET emergency_drain_active = ? WHERE session_id = ? AND emergency_drain_active = ?",
+            )
+            .run(latch, args.sessionId, meta.emergencyDrainActive);
+    }
+    const startedAt = meta.protectedTailDrainWindowStartedAt;
+    if (startedAt <= 0 || startedAt > now || now - startedAt >= DRAIN_WINDOW_MS) return null;
+    const limitTokens = protectedTailWindowBudget(
+        args.usagePercentage,
+        args.usable,
+        args.perRunCap,
+    );
+    if (meta.protectedTailDrainTokens < limitTokens) return null;
+    if (latch > 0 && !drainFailureBackoffActive(meta, now)) return null;
+    return {
+        windowStartedAt: startedAt,
+        resetsAt: startedAt + DRAIN_WINDOW_MS,
+        nextEligibleAt:
+            latch > 0
+                ? Math.min(
+                      startedAt + DRAIN_WINDOW_MS,
+                      meta.historianDrainFailureAt + EMERGENCY_DRAIN_FAILURE_BACKOFF_MS,
+                  )
+                : startedAt + DRAIN_WINDOW_MS,
+        resetInMs: startedAt + DRAIN_WINDOW_MS - now,
+        spentTokens: meta.protectedTailDrainTokens,
+        limitTokens,
+    };
+}
+
 export function reserveProtectedTailDrainTokens(args: {
     db: Database;
     sessionId: string;
@@ -890,17 +965,12 @@ export function reserveProtectedTailDrainTokens(args: {
             // reaches the derived force band; exit once usage falls back below
             // the safe zone, or after a self-expiry backstop. Persisted unconditionally
             // so the next pass sees the resolved state even when we skip below.
-            const exitThreshold = emergencyDrainExitThreshold(args.executeThresholdPercentage);
-            let latchActiveSince = meta.emergencyDrainActive;
-            const { forceMaterializationPercentage } = escalationBands(
+            const latchActiveSince = resolvedEmergencyDrainLatch(
+                meta,
+                args.usagePercentage,
                 args.executeThresholdPercentage,
+                now,
             );
-            if (args.usagePercentage >= forceMaterializationPercentage) {
-                if (latchActiveSince <= 0) latchActiveSince = now;
-            } else if (latchActiveSince > 0) {
-                const expired = now - latchActiveSince > EMERGENCY_DRAIN_MAX_LATCH_MS;
-                if (args.usagePercentage < exitThreshold || expired) latchActiveSince = 0;
-            }
             if (latchActiveSince !== meta.emergencyDrainActive) {
                 args.db
                     .prepare(
@@ -922,28 +992,17 @@ export function reserveProtectedTailDrainTokens(args: {
             // the normal window budget unless a recent historian failure is still backing
             // off. A future failure timestamp is ignored because it cannot represent a
             // recent failure after the wall clock moved backward.
-            const inFailureBackoff =
-                meta.historianDrainFailureAt > 0 &&
-                meta.historianDrainFailureAt <= now &&
-                now - meta.historianDrainFailureAt < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS;
+            const inFailureBackoff = drainFailureBackoffActive(meta, now);
             if (reserved <= 0 && latchActive && !inFailureBackoff) {
                 reserved = Math.min(requested, args.perRunCap);
                 bypass = true;
             }
 
             const activeWindowStartedAt = meta.protectedTailDrainWindowStartedAt;
-            const resetsAt = activeWindowStartedAt + DRAIN_WINDOW_MS;
-            const retryAt = inFailureBackoff
-                ? Math.min(
-                      resetsAt,
-                      meta.historianDrainFailureAt + EMERGENCY_DRAIN_FAILURE_BACKOFF_MS,
-                  )
-                : resetsAt;
             const budgetState = (spentTokens: number): ProtectedTailDrainBudgetState => ({
                 windowStartedAt: activeWindowStartedAt,
-                resetsAt,
-                retryAt,
-                resetInMs: Math.max(0, resetsAt - now),
+                resetsAt: activeWindowStartedAt + DRAIN_WINDOW_MS,
+                resetInMs: Math.max(0, activeWindowStartedAt + DRAIN_WINDOW_MS - now),
                 spentTokens,
                 limitTokens: budget,
             });
@@ -1767,26 +1826,6 @@ export function pruneNoteNudgeAnchors(
     return pruned;
 }
 
-export function pruneAutoSearchHintDecisions(
-    db: Database,
-    sessionId: string,
-    visibleMessageIds: Set<string>,
-): number {
-    let pruned = 0;
-    casUpdateJsonArrayColumn(
-        db,
-        sessionId,
-        "auto_search_hint_decisions",
-        isValidAutoSearchHintDecision,
-        (current) => {
-            const next = current.filter((decision) => visibleMessageIds.has(decision.messageId));
-            pruned = current.length - next.length;
-            return pruned > 0 ? next : null;
-        },
-    );
-    return pruned;
-}
-
 export function removeNoteNudgeAnchorByMessageId(
     db: Database,
     sessionId: string,
@@ -1806,6 +1845,105 @@ export function removeNoteNudgeAnchorByMessageId(
         { ensureRow: false },
     );
     return ok && removed;
+}
+
+/**
+ * Discard saved search hints and no-hint omissions only for message IDs the caller
+ * proved were removed by a summary boundary or deleted by the host. An ID absent
+ * from today's branch may reappear and still needs its record to restore cached
+ * bytes, so callers must not pass the complement of today's visible IDs.
+ */
+export function pruneAutoSearchHintDecisions(
+    db: Database,
+    sessionId: string,
+    retiredMessageIds: ReadonlySet<string>,
+): number {
+    if (retiredMessageIds.size === 0) return 0;
+    return updateAutoSearchHintRetirement(db, sessionId, retiredMessageIds).pruned;
+}
+
+const pendingAutoSearchRetirements = new WeakMap<Database, Map<string, Set<string>>>();
+export const AUTO_SEARCH_DECISION_SOFT_LIMIT = 2000;
+
+/** Record IDs removed under a history summary in memory, without a SQLite write on replay. */
+export function queueAutoSearchHintDecisionRetirement(
+    db: Database,
+    sessionId: string,
+    messageIds: ReadonlySet<string>,
+): void {
+    if (messageIds.size === 0) return;
+    let sessions = pendingAutoSearchRetirements.get(db);
+    if (!sessions) {
+        sessions = new Map();
+        pendingAutoSearchRetirements.set(db, sessions);
+    }
+    let retired = sessions.get(sessionId);
+    if (!retired) {
+        retired = new Set();
+        sessions.set(sessionId, retired);
+    }
+    for (const id of messageIds) retired.add(id);
+}
+
+/** Flush only when the host permits a prefix rebuild (busting/HARD), not cached-prefix replay. */
+export function flushAutoSearchHintDecisionRetirement(
+    db: Database,
+    sessionId: string,
+    visibleMessageIds: ReadonlySet<string>,
+): number {
+    const sessions = pendingAutoSearchRetirements.get(db);
+    const retired = sessions?.get(sessionId) ?? new Set<string>();
+    const outcome = updateAutoSearchHintRetirement(db, sessionId, retired, visibleMessageIds);
+    if (outcome.ok) sessions?.delete(sessionId);
+    return outcome.pruned;
+}
+
+function updateAutoSearchHintRetirement(
+    db: Database,
+    sessionId: string,
+    retiredMessageIds: ReadonlySet<string>,
+    visibleMessageIds?: ReadonlySet<string>,
+): { ok: boolean; pruned: number } {
+    let pruned = 0;
+    const ok = casUpdateJsonArrayColumn(
+        db,
+        sessionId,
+        "auto_search_hint_decisions",
+        isValidAutoSearchHintDecision,
+        (current) => {
+            let next = current.filter(
+                (decision) =>
+                    !retiredMessageIds.has(decision.messageId) ||
+                    visibleMessageIds?.has(decision.messageId),
+            );
+            // After summaries replace raw messages, saved decisions normally track the
+            // remaining users. With compaction off all users remain: the blob is bounded
+            // by the session's own user-message count, not a hard cap. Keep every visible
+            // hint and no-hint record. Above the generous limit, discard only oldest
+            // hidden no-hint records; that removes no bytes from this request. Under the
+            // host's rebuild contract, restoring an evicted earlier ID as a new tail
+            // requires a revert and full prefix rebuild. Saved hints still require proof
+            // that their messages were summarized or deleted before they can be removed.
+            let excess = next.length - AUTO_SEARCH_DECISION_SOFT_LIMIT;
+            if (visibleMessageIds && excess > 0) {
+                next = next.filter((decision) => {
+                    if (
+                        excess > 0 &&
+                        decision.decision === "no-hint" &&
+                        !visibleMessageIds.has(decision.messageId)
+                    ) {
+                        excess--;
+                        return false;
+                    }
+                    return true;
+                });
+            }
+            pruned = current.length - next.length;
+            return pruned > 0 ? next : null;
+        },
+        { ensureRow: false },
+    );
+    return { ok, pruned: ok ? pruned : 0 };
 }
 
 export function removeAutoSearchHintDecisionByMessageId(
@@ -2188,8 +2326,8 @@ export function recordOverflowDetected(
             const percentage =
                 effectiveLimit > 0 ? (reportedInputTokens / effectiveLimit) * 100 : 100;
             db.prepare(
-                "UPDATE session_meta SET last_input_tokens = ?, last_context_percentage = MAX(last_context_percentage, ?), last_response_time = ? WHERE session_id = ?",
-            ).run(reportedInputTokens, percentage, Date.now(), sessionId);
+                "UPDATE session_meta SET last_input_tokens = ?, last_context_percentage = MAX(last_context_percentage, ?) WHERE session_id = ?",
+            ).run(reportedInputTokens, percentage, sessionId);
         }
     }).immediate();
 }
@@ -2811,10 +2949,48 @@ export function addStaleReduceStrippedIds(
  * because the empty sentinel is filtered off the Anthropic wire).
  */
 export function getProcessedImageStrippedIds(db: Database, sessionId: string): Set<string> {
+    return new Set(getProcessedImageMarkers(db, sessionId).keys());
+}
+
+export type ProcessedImageMarker = "" | "[image stripped]";
+
+/** Old string arrays stored message ids rendered with empty text; provider switches must preserve that text. */
+export function parseProcessedImageMarkers(
+    raw: string | null | undefined,
+): Map<string, ProcessedImageMarker> {
+    if (!raw) return new Map();
+    try {
+        const parsed = JSON.parse(raw);
+        const ids = Array.isArray(parsed) ? parsed : parsed?.ids;
+        const textIds = new Set(Array.isArray(parsed?.textMarkerIds) ? parsed.textMarkerIds : []);
+        return new Map(
+            (Array.isArray(ids) ? ids : [])
+                .filter((id): id is string => typeof id === "string")
+                .map((id) => [id, textIds.has(id) ? "[image stripped]" : ""]),
+        );
+    } catch {
+        return new Map();
+    }
+}
+
+export function serializeProcessedImageMarkers(
+    markers: ReadonlyMap<string, ProcessedImageMarker>,
+): string {
+    const ids = [...markers.keys()];
+    if (ids.length === 0) return "";
+    const textMarkerIds = ids.filter((id) => markers.get(id) === "[image stripped]");
+    // Sessions using only empty markers retain the original JSON id-array encoding.
+    return JSON.stringify(textMarkerIds.length > 0 ? { ids, textMarkerIds } : ids);
+}
+
+export function getProcessedImageMarkers(
+    db: Database,
+    sessionId: string,
+): Map<string, ProcessedImageMarker> {
     const row = db
         .prepare("SELECT processed_image_stripped_ids FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { processed_image_stripped_ids?: string } | null;
-    return new Set(parseStrippedBlob(row?.processed_image_stripped_ids));
+    return parseProcessedImageMarkers(row?.processed_image_stripped_ids);
 }
 
 /**
@@ -2827,6 +3003,7 @@ export function addProcessedImageStrippedIds(
     db: Database,
     sessionId: string,
     ids: Iterable<string>,
+    marker: ProcessedImageMarker | ReadonlyMap<string, ProcessedImageMarker> = "",
 ): boolean {
     const add = [...ids];
     if (add.length === 0) return true;
@@ -2837,16 +3014,16 @@ export function addProcessedImageStrippedIds(
             .prepare("SELECT processed_image_stripped_ids FROM session_meta WHERE session_id = ?")
             .get(sessionId) as { processed_image_stripped_ids?: string | null } | undefined;
         const rawStored = row ? (row.processed_image_stripped_ids ?? null) : null;
-        const current = new Set<string>(parseStrippedBlob(rawStored));
+        const current = parseProcessedImageMarkers(rawStored);
         let changed = false;
         for (const id of add) {
             if (!current.has(id)) {
-                current.add(id);
+                current.set(id, typeof marker === "string" ? marker : (marker.get(id) ?? ""));
                 changed = true;
             }
         }
         if (!changed) return true;
-        const nextBlob = JSON.stringify([...current]);
+        const nextBlob = serializeProcessedImageMarkers(current);
         const result = db
             .prepare(
                 "UPDATE session_meta SET processed_image_stripped_ids = ? WHERE session_id = ? AND processed_image_stripped_ids IS ?",
@@ -2968,6 +3145,7 @@ export function getCompactionMarkerHealth(
 export interface PostprocessReplaySnapshot {
     staleReduceStrippedIds: Set<string>;
     processedImageStrippedIds: Set<string>;
+    processedImageMarkers: Map<string, ProcessedImageMarker>;
     strippedPlaceholderIds: Set<string>;
     hiddenSeamPlaceholderIds: Set<string>;
     noteNudgeAnchors: NoteNudgeAnchor[];
@@ -3027,7 +3205,10 @@ export function loadPostprocessReplaySnapshot(
     const thinkingBindingRecoveryTarget = row?.thinking_binding_recovery_target;
     return {
         staleReduceStrippedIds: new Set(parseStrippedBlob(row?.stale_reduce_stripped_ids)),
-        processedImageStrippedIds: new Set(parseStrippedBlob(row?.processed_image_stripped_ids)),
+        processedImageStrippedIds: new Set(
+            parseProcessedImageMarkers(row?.processed_image_stripped_ids).keys(),
+        ),
+        processedImageMarkers: parseProcessedImageMarkers(row?.processed_image_stripped_ids),
         strippedPlaceholderIds: new Set(placeholders.ids),
         hiddenSeamPlaceholderIds: new Set(placeholders.hiddenSeamIds),
         noteNudgeAnchors: parseJsonArray(row?.note_nudge_anchors, isValidNoteNudgeAnchor),
@@ -3170,9 +3351,13 @@ export function getPendingPiCompactionMarkerState(
     } catch {
         // Fall through to clear malformed durable state below.
     }
-    db.prepare(
-        "UPDATE session_meta SET pending_pi_compaction_marker_state = NULL WHERE session_id = ? AND pending_pi_compaction_marker_state = ?",
-    ).run(sessionId, raw);
+    const cleared = db
+        .prepare(
+            "UPDATE session_meta SET pending_pi_compaction_marker_state = NULL WHERE session_id = ? AND pending_pi_compaction_marker_state = ?",
+        )
+        .run(sessionId, raw);
+    if (cleared.changes > 0)
+        sessionLog(sessionId, "Pi compaction-marker clear: reason=malformed-state");
     return null;
 }
 
@@ -3180,9 +3365,19 @@ export function setPendingPiCompactionMarkerState(
     db: Database,
     sessionId: string,
     state: PendingPiCompactionMarker | null,
+    clearReason = "explicit-reset",
 ): void {
     ensureSessionMetaRow(db, sessionId);
-    const blob = state ? stableStringify(state) : null;
+    if (state === null) {
+        const pending = getPendingPiCompactionMarkerState(db, sessionId);
+        if (pending) clearPendingPiCompactionMarkerStateIf(db, sessionId, pending, clearReason);
+        else
+            db.prepare(
+                "UPDATE session_meta SET pending_pi_compaction_marker_state = NULL WHERE session_id = ? AND pending_pi_compaction_marker_state = ''",
+            ).run(sessionId);
+        return;
+    }
+    const blob = stableStringify(state);
     db.prepare(
         "UPDATE session_meta SET pending_pi_compaction_marker_state = ? WHERE session_id = ?",
     ).run(blob, sessionId);
@@ -3192,6 +3387,8 @@ export function clearPendingPiCompactionMarkerStateIf(
     db: Database,
     sessionId: string,
     expected: PendingPiCompactionMarker,
+    // Pass null to log this marker's removal only after the caller commits its surrounding transaction.
+    reason: string | null = "explicit-clear",
 ): boolean {
     const expectedBlob = stableStringify(expected);
     const result = db
@@ -3200,7 +3397,20 @@ export function clearPendingPiCompactionMarkerStateIf(
              WHERE session_id = ? AND pending_pi_compaction_marker_state = ?`,
         )
         .run(sessionId, expectedBlob);
+    if (result.changes > 0 && reason !== null)
+        logPiCompactionMarkerClear(sessionId, expected, reason);
     return result.changes > 0;
+}
+
+export function logPiCompactionMarkerClear(
+    sessionId: string,
+    marker: PendingPiCompactionMarker,
+    reason: string,
+): void {
+    sessionLog(
+        sessionId,
+        `Pi compaction-marker clear: reason=${reason} endMessageId=${marker.endMessageId} ordinal=${marker.ordinal} firstKeptEntryId=${marker.firstKeptEntryId ?? "<none>"}`,
+    );
 }
 
 export function getSessionsWithPendingPiMarker(db: Database): string[] {

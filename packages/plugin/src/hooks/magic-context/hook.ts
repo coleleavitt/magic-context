@@ -17,6 +17,8 @@ import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/d
 import {
     buildDreamTaskRuntimeConfigs,
     userMemoryCollectionEnabled,
+    userObservationCollectionEnabled,
+    userObservationsRequested,
 } from "../../features/magic-context/dreamer/task-config";
 import { createDreamTaskExecutor } from "../../features/magic-context/dreamer/task-executor";
 import {
@@ -65,6 +67,7 @@ import { resolveHistorianModel } from "../../shared/model-resolution";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import type { Database } from "../../shared/sqlite";
+import { cavemanWordRulesForLanguage } from "./caveman";
 import { createMagicContextCommandHandler } from "./command-handler";
 import { clearToolPermissionDenied } from "./ctx-reduce-availability";
 import {
@@ -101,7 +104,7 @@ import { createModuleToolBackends } from "./module-tool-backends";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import { runManagedRecomp } from "./recomp-orchestrator";
-import type { RustModeModuleClient } from "./rust-mode-transform";
+import { type RustModeModuleClient, rustWrapupHistorianFields } from "./rust-mode-transform";
 import { createRustRefusalRecovery } from "./rust-refusal-recovery";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
@@ -118,6 +121,7 @@ import {
     getLiveNotificationParams,
 } from "./hook-handlers";
 import type { LiveSessionState } from "./live-session-state";
+import { createRequestHookOrder } from "./request-hook-order";
 import {
     type NotificationParams,
     sendCommandResult,
@@ -147,9 +151,11 @@ export interface MagicContextDeps {
         /** User-level setting that lets a session started exactly in the canonical home directory use it as the project. */
         allow_home_project?: boolean;
         language?: string;
-        smart_drops?: boolean;
+        smart_drops?: unknown;
+        protected_tools?: Readonly<Record<string, number>>;
         toast_duration_ms?: number;
-        clear_reasoning_age?: number;
+        clear_reasoning_age?: unknown;
+        keep_reasoning_tokens?: number | Record<string, number>;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
         execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
         cache_ttl: MagicContextConfig["cache_ttl"];
@@ -177,7 +183,7 @@ export interface MagicContextDeps {
             provider?: "local" | "openai-compatible" | "off" | "synapse";
         };
         dreamer?: DreamerConfig;
-        smart_notes?: { retina_handoff?: boolean };
+        smart_notes?: { enabled?: boolean; retina_handoff?: boolean };
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
         /** Issue #53: per-agent system-prompt injection opt-out. Optional in
          *  the inline type so legacy tests/callers don't have to construct it;
@@ -197,7 +203,7 @@ export interface MagicContextDeps {
          *  session-hook construction boundary via isCompactionEnabled; the
          *  resolved boolean is threaded to the transform phases. */
         compaction?: { enabled?: boolean };
-        mural?: { enabled: boolean; model?: string };
+        mural?: { enabled: boolean };
     };
     /** Registration-owned prompt-surface loader shared with the tool registry. */
     promptSurfaceRuntime?: PromptSurfaceRuntime;
@@ -322,8 +328,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             timeoutMs: config.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
             toastDurationMs: config.toast_duration_ms,
             twoPass: config.historian?.two_pass === true,
+            expandTools: config.historian?.expand_tools,
             autoPromote: config.memory?.auto_promote ?? true,
-            userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
+            userMemoriesEnabled: userObservationCollectionEnabled(config.dreamer),
+            userObservationsRequested: userObservationsRequested(config.dreamer),
             commitClusterTrigger: config.commit_cluster_trigger,
             chunkTokens: deriveHistorianChunkTokens(
                 resolveHistorianContextLimit(attempts.primary?.model),
@@ -370,6 +378,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     }
     const lastHeuristicsTurnId = new Map<string, string>();
     const commitSeenLastPass = new Map<string, boolean>();
+    // Whether this request's messages transform already ran when the system hook
+    // sees it; decides if a system-prompt change can still fold into the request.
+    const requestHookOrder = createRequestHookOrder();
     const variantBySession =
         deps.liveSessionState?.variantBySession ?? new Map<string, string | undefined>();
     const liveModelBySession =
@@ -495,11 +506,13 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 return model ? `${model.providerID}/${model.modelID}` : undefined;
             })(),
             historianTwoPass: historianRun.twoPass,
+            historianExpandTools: historianRun.expandTools,
             // Option C privacy gate: behavioral observation candidates are collected
             // during historian runs only when the user has SCHEDULED the
             // review-user-memories task (schedule != ""). Replaces the v1
             // user_memories.enabled flag that gated both collection and review.
             userMemoriesEnabled: historianRun.userMemoriesEnabled,
+            userObservationsRequested: historianRun.userObservationsRequested,
             ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
             getNotificationParams: (sid) =>
                 getLiveNotificationParams(
@@ -713,7 +726,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     registerLkgPersistence(createDbLkgPersistence(db));
 
     const transform = createTransform({
+        onMessagesPassStarted: requestHookOrder.messagesPrepared,
         cacheTtlConfig: deps.config.cache_ttl,
+        cacheTtlConfigured: deps.config.cacheTtlConfigured,
+        sampleCacheTtlConfig: () => deps.sampleHistorianConfig?.() ?? deps.config,
         tagger: deps.tagger,
         scheduler: deps.scheduler,
         contextUsageMap,
@@ -725,8 +741,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         channel2DirectiveTextBySession,
         protectedTokens: deps.config.protected_tokens,
         protectedTokenTierOverrides: deps.config.protectedTokenTierOverrides,
-        smartDrops: deps.config.smart_drops === true,
-        clearReasoningAge: deps.config.clear_reasoning_age ?? 50,
+        protectedTools: deps.config.protected_tools,
+        keepReasoningTokens: deps.config.keep_reasoning_tokens,
         commitClusterTrigger: bootHistorian.commitClusterTrigger,
         historyRefreshSessions,
         deferredHistoryRefreshSessions,
@@ -789,10 +805,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         projectPath,
         historianRunnable,
         compactionOff,
-        experimentalUserMemories: userMemoryCollectionEnabled(dreamerConfig),
+        experimentalUserMemories: userObservationCollectionEnabled(dreamerConfig),
+        userObservationsRequested: userObservationsRequested(dreamerConfig),
         experimentalTemporalAwareness: deps.config.temporal_awareness === true,
         muralEnabled: deps.config.mural?.enabled === true,
         historianTwoPass: deps.config.historian?.two_pass === true,
+        historianExpandTools: deps.config.historian?.expand_tools,
         historianRunner: deps.config.historian?.runner,
         historianHostRunnerEnabled: deps.config.historian?.host_runner?.enabled,
         liveModelBySession,
@@ -805,6 +823,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             minPromptChars: deps.config.memory?.auto_search?.min_prompt_chars ?? 20,
             directory: deps.directory,
             ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+            wordRules: cavemanWordRulesForLanguage(deps.config.language),
         },
         // Age-tier caveman text compression is an opt-in primary-session pass.
         // Subagents are excluded in transform.ts because their context is curated
@@ -816,6 +835,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
               ? {
                     enabled: true,
                     minChars: deps.config.caveman_text_compression.min_chars ?? 500,
+                    // `language` is user-level only; a project config cannot set it.
+                    wordRules: cavemanWordRulesForLanguage(deps.config.language),
                 }
               : undefined,
         maybeAutoEmbedSession,
@@ -830,6 +851,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         onRustEngineReconnectRefusal: (args) => rustRefusalRecovery?.arm(args),
     });
     const eventHandler = createEventHandler({
+        sampleCacheTtlConfig: () => deps.sampleHistorianConfig?.() ?? deps.config,
         contextUsageMap,
         compactionHandler: deps.compactionHandler,
         config: deps.config,
@@ -868,6 +890,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 await transform.clearRustSession(sessionId);
             } finally {
                 systemPromptHash.clearSession(sessionId);
+                requestHookOrder.clearSession(sessionId);
                 // Prune every per-session map this hook closure owns. These maps
                 // otherwise accumulate for the lifetime of a long-running plugin process.
                 lastHeuristicsTurnId.delete(sessionId);
@@ -917,7 +940,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             dreaming,
             "opencode",
             deps.config.language,
-            sampledDream.mural?.model,
+            deps.config.smart_notes?.enabled,
         );
         const executor = createDreamTaskExecutor({
             client: deps.client,
@@ -933,6 +956,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreaming),
             language: deps.config.language,
             retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
+            smartNotesEnabled: deps.config.smart_notes?.enabled,
             transformMode: deps.config.transform_mode,
             // Scheduled/message-triggered runs must share the same direct
             // authority.status transport as the transform path. The
@@ -954,12 +978,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             tasks: runtimeConfigs,
             executor,
             projectMemoryEnabled: deps.config.memory?.enabled !== false,
+            smartNotesEnabled: deps.config.smart_notes?.enabled,
         }).catch((error: unknown) => {
             log("[dreamer] scheduled task run failed:", error);
         });
     };
 
     const commandHandler = createMagicContextCommandHandler({
+        smartNotesEnabled: deps.config.smart_notes?.enabled,
         db,
         compactionOff,
         toastDurationMs: deps.config.toast_duration_ms,
@@ -969,6 +995,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         historyBudgetPercentage: deps.config.history_budget_percentage,
         transformMode: deps.config.transform_mode,
         rustModeModuleClient,
+        resolveRustWrapupHistorianFields: () => {
+            const run = sampleHistorian();
+            return rustWrapupHistorianFields({
+                historianModel: run.model,
+                fallbackModels: run.fallbackModels,
+                timeoutMs: run.timeoutMs,
+                maxOutputTokens: run.maxOutputTokens,
+            });
+        },
         projectRoot: deps.directory,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
         sampleCommitClusterTrigger: () =>
@@ -1012,7 +1047,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         onFlush: (sessionId) => {
             historyRefreshSessions.add(sessionId);
             systemPromptRefreshSessions.add(sessionId);
-            pendingMaterializationSessions.add(sessionId);
+            requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
         },
         // E3 (recomp) runs through the SHARED orchestrator (runManagedRecomp) so
         // the command path gets identical model fallback + live progress +
@@ -1056,11 +1091,13 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       return runManualDream({
                           db,
                           projectIdentity: projectPath,
+                          projectMemoryEnabled: sampledDream.memory?.enabled,
+                          smartNotesEnabled: deps.config.smart_notes?.enabled,
                           tasks: buildDreamTaskRuntimeConfigs(
                               currentDreamer,
                               "opencode",
                               deps.config.language,
-                              sampledDream.mural?.model,
+                              deps.config.smart_notes?.enabled,
                           ),
                           executor: createDreamTaskExecutor({
                               client: deps.client,
@@ -1078,6 +1115,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               memoryInjectionBudgetTokens:
                                   deps.config.memory?.injection_budget_tokens,
                               retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
+                              smartNotesEnabled: deps.config.smart_notes?.enabled,
                               transformMode: deps.config.transform_mode,
                               // Manual /ctx-dream uses the same live authority
                               // lookup and module transport as scheduled runs.
@@ -1104,6 +1142,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const systemPromptHash = createSystemPromptHashHandler({
         db,
         dreamerEnabled: dreamerRunnable,
+        smartNotesEnabled: deps.config.smart_notes?.enabled,
         // Gates ctx_memory guidance out of the prompt when memory is off (the
         // ctx_memory TOOL is gated in tool-registry.ts on the same flag).
         memoryEnabled: deps.config.memory?.enabled !== false,
@@ -1133,6 +1172,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // Mirror the primary-session caveman opt-in so the agent knows older
         // prose may be rewritten even when ctx_reduce is available.
         experimentalCavemanTextCompression: deps.config.caveman_text_compression?.enabled === true,
+        consumeMessagesPrepared: requestHookOrder.consumeMessagesPrepared,
     });
     const systemPromptHashHandler = systemPromptHash.handler;
 
@@ -1172,6 +1212,34 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             cacheTtlConfig: deps.config.cache_ttl,
         }),
         event: async (input: { event: { type: string; properties?: unknown } }) => {
+            if (input.event.type === "message.updated") {
+                // A finished assistant reply ends the request the last messages
+                // pass prepared. Record it before awaiting the other handlers so a
+                // following system hook already sees it.
+                const info = (
+                    input.event.properties as
+                        | {
+                              info?: {
+                                  id?: unknown;
+                                  role?: unknown;
+                                  sessionID?: unknown;
+                                  time?: { completed?: unknown };
+                              };
+                          }
+                        | undefined
+                )?.info;
+                if (
+                    info?.role === "assistant" &&
+                    typeof info.sessionID === "string" &&
+                    info.time?.completed !== undefined &&
+                    info.time.completed !== null
+                ) {
+                    requestHookOrder.assistantCompleted(
+                        info.sessionID,
+                        typeof info.id === "string" ? info.id : undefined,
+                    );
+                }
+            }
             await eventHook(input);
             if (input.event.type === "message.updated") {
                 runDreamQueueInBackground();
@@ -1204,6 +1272,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     };
     const hooksWithBackends = hooks as typeof hooks & {
         rustToolBackends?: RustToolBackends;
+        disposeRustAdapter?: () => void;
+        getRustReplayParticipant?: () => ReturnType<typeof transform.getRustReplayParticipant>;
         getDebugMemoryHolders?: () => {
             taggerCache: ReturnType<NonNullable<Tagger["getHeapStats"]>>;
             wireCache: ReturnType<typeof transform.getRustWireCacheHeapStats>;
@@ -1212,6 +1282,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     Object.defineProperties(hooksWithBackends, {
         rustToolBackends: {
             value: rustToolBackends,
+            enumerable: false,
+        },
+        disposeRustAdapter: {
+            value: () => transform.disposeRust(),
+            enumerable: false,
+        },
+        getRustReplayParticipant: {
+            value: () => transform.getRustReplayParticipant(),
             enumerable: false,
         },
         getDebugMemoryHolders: {
@@ -1258,3 +1336,5 @@ export async function createMagicContextHookAsync(
         openDatabaseForHook: () => database,
     });
 }
+
+import { requestPendingMaterialization } from "./pending-materialization";

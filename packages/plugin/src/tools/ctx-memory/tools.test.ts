@@ -31,6 +31,7 @@ import type {
     EmbeddingPurpose,
 } from "../../features/magic-context/memory/embedding-provider";
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
+import { getMemoriesForList } from "../../features/magic-context/memory/storage-memory";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -226,6 +227,40 @@ function createTestDb(dbPath = ":memory:"): Database {
     `);
     return db;
 }
+
+it("bounded memory lists preserve full-reader ordering, legacy categories and invalid-row filtering", () => {
+    const db = createTestDb();
+    try {
+        for (let i = 0; i < 30; i++)
+            insertMemory(db, {
+                projectPath: "list-project",
+                category: i % 2 ? "ARCHITECTURE_DECISIONS" : "ARCHITECTURE",
+                content: `claim ${i}`,
+            });
+        const bad = insertMemory(db, {
+            projectPath: "list-project",
+            category: "ARCHITECTURE",
+            content: "invalid first row",
+        });
+        db.prepare("UPDATE memories SET source_type = 'unknown', updated_at = ? WHERE id = ?").run(
+            Date.now() + 10000,
+            bad.id,
+        );
+        for (const categories of [
+            null,
+            ["ARCHITECTURE"],
+            ["ARCHITECTURE", "ARCHITECTURE_DECISIONS"],
+            ["missing"],
+        ]) {
+            const expected = getMemoriesByProject(db, "list-project")
+                .filter((m) => categories === null || categories.includes(m.category))
+                .slice(0, 10);
+            expect(getMemoriesForList(db, "list-project", categories, 10)).toEqual(expected);
+        }
+    } finally {
+        db.close();
+    }
+});
 
 const toolContext = (sessionID = "ses-memory", agent = "general") =>
     ({ sessionID, agent, directory: "/repo/project" }) as never;

@@ -1,5 +1,5 @@
 //! The contract a Broca-hosted session relies on before the transform is switched on
-//! for it. `docs/architecture/broca-transform-contract.md` is the prose half; these
+//! for it. The caller must pin the same manifest text it reports; these
 //! tests pin the parts a caller caches: the facade tool array it declares once per
 //! session, and what the transform serves on the first and second send under the
 //! `owned-broca` serializer profile.
@@ -141,6 +141,30 @@ fn find_tools_array(value: &Value) -> Option<&Vec<Value>> {
         Value::Array(items) => items.iter().find_map(find_tools_array),
         _ => None,
     }
+}
+
+#[test]
+fn legacy_bridge_startup_ctx_reduce_schema_bytes_are_pinned() {
+    // subc-mcp tools/list copies the startup manifest's schema unchanged into
+    // inputSchema. Pin those bytes, not tool.catalog's structural digest: the
+    // Claude Code gateway (thalamus-core tool_surface.rs,
+    // canonical_ctx_reduce_schema) checks this exact shape before it arms
+    // reduction, and refuses a schema it does not recognise. Adding the `drop`
+    // description on 2026-09-22 left Claude Code without reduction for nine
+    // days without any error. Any change here must be coordinated with the
+    // gateway owner first.
+    let startup = serde_json::to_value(manifest(DEFAULT_MODULE_ID)).unwrap();
+    let tools = find_tools_array(&startup["provides"]).unwrap();
+    let reduce = tools
+        .iter()
+        .find(|tool| tool["name"] == "ctx_reduce")
+        .unwrap();
+    let expected = br#"{"additionalProperties":false,"properties":{"drop":{"description":"Tag IDs to drop: \"3-5\", \"1,2,9\", \"1-5,8,12-15\".","type":"string"}},"required":["drop"],"type":"object"}"#;
+    assert_eq!(
+        serde_json::to_vec(&reduce["schema"]).unwrap(),
+        expected,
+        "changing the startup reduce schema can silently disarm Claude Code reduction"
+    );
 }
 
 /// Build one request exactly as Broca's transform plane sends it: the `owned-broca`
@@ -567,7 +591,7 @@ fn assert_meta_identity(send: &str, input: &[CkIngressMessage], served: &[Value]
 /// changes the array's length, across the operations that rewrite or remove messages under
 /// `owned-broca`: a coverage fold that removes covered history and adds the m[0]/m[1] head
 /// rows, the system message moving ahead of those rows, tag prefixes, caveman compression of
-/// an old user message, and a queued `ctx_reduce` drop that replaces a tool result and
+/// an old user message, and age reclaim of a stamped output that replaces its result and
 /// skeletonizes its call. Reasoning clearing never runs under `owned-broca`, so the
 /// reasoning block passes through.
 ///
@@ -575,7 +599,7 @@ fn assert_meta_identity(send: &str, input: &[CkIngressMessage], served: &[Value]
 /// `owned_broca_compaction_off_keeps_system_first`).
 #[tokio::test(flavor = "current_thread")]
 async fn owned_broca_retained_messages_keep_their_harness_id_and_ordinal() {
-    let (handler, _store, _dir, _project) = reduce_capable_handler();
+    let (handler, store, _dir, _project) = reduce_capable_handler();
     let imported = call_dispatch_request(
         &handler,
         state_import_request(
@@ -604,6 +628,8 @@ async fn owned_broca_retained_messages_keep_their_harness_id_and_ordinal() {
         tool_result("result-6", 7, &long_output),
         assistant_reasoning_then_text("r8", 8),
         ck("m9", 9, "Next request."),
+        ck("distance-user-1", 10, "Next task step."),
+        ck("distance-user-2", 11, "Continue the next step."),
     ]
     .into_iter()
     .map(broca_message)
@@ -622,7 +648,16 @@ async fn owned_broca_retained_messages_keep_their_harness_id_and_ordinal() {
         .collect::<Vec<_>>();
     assert_eq!(
         served_ids,
-        ["sys", "m5", "call-6", "result-6", "r8", "m9"],
+        [
+            "sys",
+            "m5",
+            "call-6",
+            "result-6",
+            "r8",
+            "m9",
+            "distance-user-1",
+            "distance-user-2"
+        ],
         "the fold removes m1..m4 and keeps the leading system message"
     );
     assert_eq!(send_1[0]["role"], json!("system"));
@@ -639,9 +674,28 @@ async fn owned_broca_retained_messages_keep_their_harness_id_and_ordinal() {
         .expect("the tool result is tagged")
         .to_string();
     let reduce = tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": tag })).await);
-    assert!(!reduce.contains("Refused"), "{reduce}");
+    assert_eq!(reduce, "1 tag stamped.");
+    assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
-    input.push(broca_message(ck("m10", 10, "Keep going.")));
+    // Stamping does not enqueue a manual drop. The first pass bookmarked this
+    // result after three user turns; newer persisted tools put it outside the
+    // unchanged protection floor so the next rebuilding pass can reclaim it.
+    store
+        .seed_tags_for_test(
+            "ses",
+            &(0..3)
+                .map(|index| mc_store::TagMintInput {
+                    block_id: format!("newer-history-{index}#0"),
+                    kind: "tool_result".to_string(),
+                    token_count: 20_000,
+                    source_bytes: b"newer".to_vec(),
+                })
+                .collect::<Vec<_>>(),
+            1,
+        )
+        .unwrap();
+
+    input.push(broca_message(ck("m10", 12, "Keep going.")));
     let mut request = broca_reduce_request(&input, 190_000);
     request["caveman_enabled"] = json!(true);
     request["caveman_min_chars"] = json!(20);
@@ -655,7 +709,7 @@ async fn owned_broca_retained_messages_keep_their_harness_id_and_ordinal() {
         .unwrap();
     assert!(
         !dropped_result.to_string().contains("line of build log"),
-        "the queued drop replaced the tool output: {dropped_result}"
+        "the previously distant stamped output was reclaimed: {dropped_result}"
     );
     let by_id = |id: &str| {
         send_2

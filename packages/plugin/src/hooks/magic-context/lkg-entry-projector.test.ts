@@ -79,3 +79,51 @@ test("entry projector invalidates changed ids, nested content, order and session
     }
     expect(digests(project("other-session", raw))).toEqual(digests(projectLkgEntry(raw)));
 });
+
+test("entry projector retains bounded reuse when the restored history exceeds its budget", () => {
+    const raw = messages();
+    const project = createLkgEntryProjector({ maxBytes: 200_000 });
+    project("restored", raw);
+    const hash = spyOn(slot, "lkgContentDigestFromFields");
+    try {
+        const projected = project("restored", structuredClone(raw));
+        const calls = hash.mock.calls.length;
+        expect(calls).toBeGreaterThan(0);
+        expect(calls).toBeLessThan(raw.length);
+        expect(digests(projected)).toEqual(digests(projectLkgEntry(raw)));
+    } finally {
+        hash.mockRestore();
+    }
+});
+
+test("entry projector reuses unchanged successors after a leading metadata edit", () => {
+    const raw = messages();
+    const project = createLkgEntryProjector();
+    project("restored", raw);
+    const changed = structuredClone(raw);
+    (changed[0]!.info as unknown as { time: { created: number } }).time.created += 1;
+    const hash = spyOn(slot, "lkgContentDigestFromFields");
+    try {
+        const projected = project("restored", changed);
+        expect(hash).toHaveBeenCalledTimes(1);
+        expect(digests(projected)).toEqual(digests(projectLkgEntry(changed)));
+    } finally {
+        hash.mockRestore();
+    }
+});
+
+test("entry projector reuses exact entries across head trims without trusting ids alone", () => {
+    const raw = messages();
+    const project = createLkgEntryProjector();
+    project("trimmed", raw);
+    const shifted = structuredClone(raw.slice(5));
+    (shifted[4]!.parts[0] as { text: string }).text += "!";
+    const hash = spyOn(slot, "lkgContentDigestFromFields");
+    try {
+        const projected = project("trimmed", shifted);
+        expect(hash).toHaveBeenCalledTimes(1);
+        expect(digests(projected)).toEqual(digests(projectLkgEntry(shifted)));
+    } finally {
+        hash.mockRestore();
+    }
+});

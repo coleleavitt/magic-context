@@ -1,13 +1,17 @@
 import type { CredentialId } from "./ckcred";
 
 /** Request and response encodings the recorder knows how to read. */
-export type WireProtocol = "openai-responses" | "bedrock-converse" | "chat-completions";
+export type WireProtocol = "openai-responses" | "bedrock-converse" | "chat-completions" | "anthropic-messages";
+
+export type AuthPlugin = "anthropic-auth" | "openai-auth";
 
 /** One provider route under test: how the host reaches it and how its wire is read. */
 export interface ProviderRoute {
     /** Stable label used in result files and `--only` filters, e.g. `openai`. */
     id: string;
     credentialId: CredentialId;
+    /** Built OpenCode auth plugin loaded by absolute path, using only the disposable login slot. */
+    authPlugin?: AuthPlugin;
     /** OpenCode provider id written into the throwaway host config. */
     providerId: string;
     npm: string;
@@ -30,7 +34,7 @@ export interface ProviderRoute {
     notes?: string;
 }
 
-export type ScenarioKind = "age" | "drop";
+export type ScenarioKind = "age" | "drop" | "trim-only";
 
 export interface ScenarioSpec {
     route: ProviderRoute;
@@ -38,10 +42,9 @@ export interface ScenarioSpec {
     /** Number of single `bash` calls the first turn asks the model to make, one per step. */
     loopSteps: number;
     /**
-     * `clear_reasoning_age` for the throwaway Magic Context config: how many tags old an
-     * assistant message must be before its reasoning is removed (minimum 10).
+     * `keep_reasoning_tokens` in the throwaway config; removal rides rebuilding passes.
      */
-    clearReasoningAge: number;
+    keepReasoningTokens: number;
     /** Hard cap on provider calls this scenario may make; the recorder refuses beyond it. */
     callBudget: number;
 }
@@ -87,6 +90,9 @@ export interface CallRecord {
     /** Provider error text, truncated and scrubbed of anything key-shaped. */
     error: string | null;
     usage: UsageRecord | null;
+    /** Allowlisted response diagnostics; absence is recorded explicitly, including SSE metadata. */
+    diagnostics: Record<string, unknown>;
+    requestId: string | null;
     request: RequestShape;
     durationMs: number;
 }
@@ -107,8 +113,19 @@ export interface ScenarioResult {
     /** Magic Context log lines that show reasoning removal or the queued drop applying. */
     removalLog: string[];
     /** Database files the host process held open, all inside the throwaway root. */
-    isolation: { dbFiles: string[]; rootRemoved: boolean };
+    isolation: { hostPid: number | null; dbFiles: string[]; rootRemoved: boolean };
     summary: ScenarioSummary;
+    trimOnly?: TrimOnlyEvidence;
+}
+
+export interface TrimOnlyEvidence {
+    qualified: boolean;
+    failures: string[];
+    removedOldestBlocks: number;
+    retainedSignedBlocks: number;
+    trimCall: number | null;
+    cacheCall: number | null;
+    toolEditCall: number | null;
 }
 
 export interface ScenarioSummary {

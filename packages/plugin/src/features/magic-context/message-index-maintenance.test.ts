@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,7 @@ import { _resetHarnessForTesting, getHarness, setHarness } from "../../shared/ha
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { openOpenCodeDb } from "./dreamer/open-opencode-db";
 import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS,
@@ -17,6 +18,13 @@ import {
 import { runMigrations } from "./migrations";
 import { advanceSessionActivity, readSessionActivity } from "./session-activity";
 import { initializeDatabase } from "./storage-db";
+import { clearSession } from "./storage-meta-session";
+import { deleteSessionScopedRows } from "./storage-session-tables";
+import {
+    tagIdentityRevisionKey,
+    tagRevisionKey,
+    tagTombstoneOwnerRange,
+} from "./storage-tag-identity-revision";
 
 const tempDirectories: string[] = [];
 
@@ -395,9 +403,12 @@ test("a harness-scoped orphan sweep retains counters until the last harness's co
                 )
                 .get("shared-session"),
         ).toEqual({ ...before, version: before.version + 1 });
+        // OpenCode 2's sweep is parked (it cannot see session_v2), so its row
+        // goes through the same deletion routine the sweep uses, directly.
         _resetHarnessForTesting();
         setHarness("opencode2");
-        expect(sweep().deleted).toBe(1);
+        expect(sweep()).toMatchObject({ status: "unavailable", deleted: 0 });
+        expect(deleteSessionScopedRows(db, ["shared-session"], "opencode2")).toBe(1);
         expect(
             db
                 .prepare("SELECT generation FROM compartment_history_versions WHERE session_id=?")
@@ -407,5 +418,188 @@ test("a harness-scoped orphan sweep retains counters until the last harness's co
         db.close();
         _resetHarnessForTesting();
         setHarness(previousHarness);
+    }
+});
+
+/**
+ * The sweep decides a session is orphaned when OpenCode 1's `session` table has
+ * no row for it. OpenCode 2 keeps its sessions in `session_v2`, and a store
+ * OpenCode 2 migrated from OpenCode 1 keeps the old `session`, `message` and
+ * `part` tables too, so it opens as an OpenCode 1 store. Sweeping from an
+ * OpenCode 2 process would then call every OpenCode 2 session orphaned and
+ * delete its state. The sweep is parked on OpenCode 2 until it can read
+ * `session_v2`.
+ */
+describe("message history orphan sweep on OpenCode 2", () => {
+    beforeEach(() => {
+        _resetHarnessForTesting();
+    });
+    afterEach(() => {
+        _resetHarnessForTesting();
+    });
+
+    /** A store OpenCode 2 migrated from OpenCode 1: both generations' tables. */
+    function createMigratedStore(liveV2SessionIds: string[]): string {
+        const directory = createTestTempDirFromPath(join(tmpdir(), "message-index-migrated-"));
+        tempDirectories.push(directory);
+        const path = join(directory, "opencode.db");
+        const db = new Database(path);
+        db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY);
+            CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT);
+            CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT);
+            CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT);
+            CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT);`);
+        const insert = db.prepare("INSERT INTO session_v2 (id, directory) VALUES (?, '/work')");
+        for (const sessionId of liveV2SessionIds) insert.run(sessionId);
+        closeQuietly(db);
+        return path;
+    }
+
+    function seedOpenCode2Session(db: Database, sessionId: string, updatedAt: number): void {
+        db.prepare(
+            `INSERT INTO message_history_index
+                (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness)
+             VALUES (?, 1, 0, ?, 'opencode2')`,
+        ).run(sessionId, updatedAt);
+        db.prepare(
+            `INSERT INTO compartments(session_id,sequence,start_message,end_message,title,content,created_at,harness)
+             VALUES (?,0,1,4,'title','opencode2 body',1,'opencode2')`,
+        ).run(sessionId);
+    }
+
+    test("parks without opening any store, and keeps every OpenCode 2 session's state", () => {
+        setHarness("opencode2");
+        const db = createStoreDb();
+        const now = 2_000_000_000_000;
+        seedOpenCode2Session(db, "ses-v2-live", now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1);
+        const store = createMigratedStore(["ses-v2-live"]);
+        let openAttempts = 0;
+        const openSource = () => {
+            openAttempts += 1;
+            return new Database(store, { readonly: true });
+        };
+        try {
+            const result = sweepOrphanedOpenCodeMessageIndexes(db, openSource, {
+                now,
+                safetyAgeMs: 0,
+            });
+            expect(result).toMatchObject({ status: "unavailable", scanned: 0, deleted: 0 });
+            expect(result.reason).toContain("session_v2");
+            expect(openAttempts).toBe(0);
+            expect(countRows(db, "message_history_index", "ses-v2-live")).toBe(1);
+            expect(countRows(db, "compartments", "ses-v2-live")).toBe(1);
+
+            // Parked for a day like Pi's, then parked again on the re-probe.
+            const reprobed = sweepOrphanedOpenCodeMessageIndexes(db, openSource, {
+                now: now + MESSAGE_HISTORY_ORPHAN_UNAVAILABLE_REPROBE_MS + 1,
+                safetyAgeMs: 0,
+            });
+            expect(reprobed.status).toBe("unavailable");
+            expect(openAttempts).toBe(0);
+            expect(countRows(db, "compartments", "ses-v2-live")).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a migrated store the OpenCode 2 process opens as OpenCode 1's never reaches the sweep", () => {
+        setHarness("opencode2");
+        const db = createStoreDb();
+        const now = 2_000_000_000_000;
+        seedOpenCode2Session(db, "ses-v2-live", now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1);
+        const store = createMigratedStore(["ses-v2-live"]);
+        const previous = process.env.OPENCODE_DB;
+        process.env.OPENCODE_DB = store;
+        try {
+            // The hazard is real: the shared opener the timer passes opens this
+            // store from an OpenCode 2 process, because it looks like OpenCode 1's.
+            const opened = openOpenCodeDb();
+            expect(opened).not.toBeNull();
+            closeQuietly(opened);
+
+            const result = sweepOrphanedOpenCodeMessageIndexes(db, openOpenCodeDb, {
+                now,
+                safetyAgeMs: 0,
+            });
+            expect(result).toMatchObject({ status: "unavailable", deleted: 0 });
+            expect(countRows(db, "message_history_index", "ses-v2-live")).toBe(1);
+            expect(countRows(db, "compartments", "ses-v2-live")).toBe(1);
+        } finally {
+            if (previous === undefined) delete process.env.OPENCODE_DB;
+            else process.env.OPENCODE_DB = previous;
+            closeQuietly(db);
+        }
+    });
+});
+
+test("orphan sweep discovers tombstone-only sessions and preserves live-host and Pi epochs", () => {
+    const previous = getHarness();
+    const db = createStoreDb();
+    const epochs = (id: string) =>
+        db
+            .prepare(
+                "SELECT key FROM schema_migrations_meta WHERE key IN (?, ?) OR (key >= ? AND key < ?)",
+            )
+            .all(tagIdentityRevisionKey(id), tagRevisionKey(id), ...tagTombstoneOwnerRange(id));
+    try {
+        setHarness("opencode");
+        for (const [id, harness] of [
+            ["deleted-tombstone", "opencode"],
+            ["live-tombstone", "opencode"],
+            ["pi-tombstone", "pi"],
+        ]) {
+            db.prepare(
+                "INSERT INTO tags(session_id,message_id,type,status,tag_number,byte_size,harness) VALUES (?, 'm','message','active',1,1,?)",
+            ).run(id, harness);
+            clearSession(db, id);
+            expect(epochs(id).length).toBeGreaterThan(0);
+        }
+        const source = createOpenCodeDb(["live-tombstone"]);
+        const result = sweepOrphanedOpenCodeMessageIndexes(db, () => new Database(source), {
+            now: 10000,
+            safetyAgeMs: 0,
+            cooldownMs: 0,
+        });
+        expect(result).toMatchObject({ status: "swept", scanned: 2, deleted: 1 });
+        expect(epochs("deleted-tombstone")).toEqual([]);
+        expect(epochs("live-tombstone").length).toBeGreaterThan(0);
+        expect(epochs("pi-tombstone").length).toBeGreaterThan(0);
+    } finally {
+        db.close();
+        _resetHarnessForTesting();
+        setHarness(previous);
+    }
+});
+
+test("harness-scoped orphan retirement keeps another harness's tombstone-only epoch", () => {
+    const previous = getHarness();
+    const db = createStoreDb();
+    const epochs = () =>
+        db
+            .prepare("SELECT key FROM schema_migrations_meta WHERE key IN (?, ?)")
+            .all(tagIdentityRevisionKey("shared-tombstone"), tagRevisionKey("shared-tombstone"));
+    try {
+        setHarness("opencode");
+        for (const harness of ["opencode", "pi"]) {
+            db.prepare(
+                "INSERT INTO tags(session_id,message_id,type,status,tag_number,byte_size,harness) VALUES ('shared-tombstone','m','message','active',1,1,?)",
+            ).run(harness);
+            clearSession(db, "shared-tombstone");
+        }
+        const source = createOpenCodeDb([]);
+        expect(
+            sweepOrphanedOpenCodeMessageIndexes(db, () => new Database(source), {
+                now: 10000,
+                safetyAgeMs: 0,
+                cooldownMs: 0,
+            }),
+        ).toMatchObject({ status: "swept", deleted: 1 });
+        expect(epochs().length).toBe(2);
+        clearSession(db, "shared-tombstone", false, true);
+        expect(epochs()).toEqual([]);
+    } finally {
+        db.close();
+        _resetHarnessForTesting();
+        setHarness(previous);
     }
 });

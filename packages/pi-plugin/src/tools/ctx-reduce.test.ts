@@ -15,6 +15,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
 	getPendingOps,
 	queuePendingOp,
@@ -27,6 +28,7 @@ import {
 	updateTagTokenCount,
 } from "@magic-context/core/features/magic-context/storage-tags";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { formatCtxReduceReply } from "@magic-context/core/tools/ctx-reduce/constants";
 import { createTestDb, fakeContext } from "../test-utils.test";
 import { createCtxReduceTool } from "./ctx-reduce";
 
@@ -55,12 +57,14 @@ async function callDrop(args: {
 	protectedTags?: number;
 	floor?: number;
 	protectedTokens?: number;
+	protectedTools?: Readonly<Record<string, number>>;
 }) {
 	const tool = createCtxReduceTool({
 		db: args.db,
 		protectedTags: args.protectedTags,
 		floor: args.floor,
 		protectedTokens: args.protectedTokens,
+		protectedTools: args.protectedTools,
 	});
 	const result = await tool.execute(
 		"call-1",
@@ -74,6 +78,29 @@ async function callDrop(args: {
 }
 
 describe("Pi ctx_reduce tool", () => {
+	it("matches the shared cross-runtime ctx_reduce reply cases", () => {
+		const cases = JSON.parse(
+			readFileSync(
+				new URL(
+					"../../../plugin/src/tools/ctx-reduce/reply-cases.json",
+					import.meta.url,
+				),
+				"utf8",
+			),
+		) as Array<{
+			label: string;
+			stamped: number;
+			self_stamps: number;
+			expected: string;
+		}>;
+		for (const replyCase of cases) {
+			expect(
+				formatCtxReduceReply(replyCase.stamped, replyCase.self_stamps),
+				replyCase.label,
+			).toBe(replyCase.expected);
+		}
+	});
+
 	it("refuses empty drop filler without queuing a phantom command", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-reduce-empty";
@@ -109,13 +136,94 @@ describe("Pi ctx_reduce tool", () => {
 			drop: "2",
 		});
 		expect(isError).toBe(false);
-		expect(text).toContain("Queued");
-		expect(text).toContain("§2§");
+		expect(text).toBe("1 tag stamped.");
 
 		const ops = getPendingOps(db, sessionId);
 		expect(ops).toHaveLength(1);
 		expect(ops[0].operation).toBe("drop");
 		expect(ops[0].tagId).toBe(2);
+	});
+
+	it("skips ctx_reduce stamps while still queueing sibling tags", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-reduce-self-stamp";
+		seedTags(db, sessionId, [
+			{ tagNumber: 41, messageId: "m41" },
+			{ tagNumber: 42, messageId: "m42" },
+		]);
+		db.prepare(
+			"UPDATE tags SET type = 'tool', tool_name = 'ctx_reduce' WHERE session_id = ? AND tag_number = 41",
+		).run(sessionId);
+		db.prepare(
+			"UPDATE tags SET type = 'tool', tool_name = 'read' WHERE session_id = ? AND tag_number = 42",
+		).run(sessionId);
+
+		try {
+			const { isError, text } = await callDrop({
+				db,
+				sessionId,
+				drop: "41,42",
+				floor: 0,
+			});
+
+			expect(isError).toBe(false);
+			expect(text).toBe(
+				"1 tag stamped. 1 was a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+			);
+			expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([42]);
+			const selfOnly = await callDrop({ db, sessionId, drop: "41", floor: 0 });
+			expect(selfOnly.text).toBe(
+				"1 was a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("orders mixed outcomes as free drop, protected hold, then ctx_reduce self-stamp", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-reduce-mixed-outcomes";
+		try {
+			for (const [number, name] of [
+				[1, "custom"],
+				[2, "ctx_reduce"],
+				[3, "bash"],
+			] as const)
+				insertTag(db, sessionId, `call-${number}`, "tool", 4, number, 0, name);
+			// Large later results keep token-window protection separate from the per-tool hold being tested.
+			for (const number of [100, 101, 102])
+				insertTag(
+					db,
+					sessionId,
+					`pad-${number}`,
+					"tool",
+					32000,
+					number,
+					0,
+					"bash",
+					0,
+					null,
+					null,
+					{ tokenCount: 8000, inputTokenCount: 0, reasoningTokenCount: 0 },
+				);
+			const result = await callDrop({
+				db,
+				sessionId,
+				drop: "2,1,3",
+				floor: 0,
+				protectedTools: { custom: 1 },
+			});
+			expect(result.text).toBe(
+				"2 tags stamped. 1 was a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+			);
+			expect(
+				getPendingOps(db, sessionId)
+					.map((op) => op.tagId)
+					.sort(),
+			).toEqual([1, 3]);
+		} finally {
+			closeQuietly(db);
+		}
 	});
 
 	it("parses comma + dash ranges (3-5,7,9 → [3,4,5,7,9])", async () => {
@@ -210,8 +318,9 @@ describe("Pi ctx_reduce tool", () => {
 		const { isError, text } = await callDrop({ db, sessionId, drop: "6-8" });
 
 		expect(isError).toBe(false);
-		expect(text).toContain("drop §6§, §8§");
-		expect(text).toContain("§7§ is provider framing, nothing to reclaim");
+		expect(text).toBe(
+			"2 tags stamped. Skipped: §7§ is provider framing, nothing to reclaim.",
+		);
 		expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([6, 8]);
 	});
 
@@ -230,16 +339,17 @@ describe("Pi ctx_reduce tool", () => {
 			drop: "1,2",
 		});
 		expect(isError).toBe(false);
-		expect(text).toContain("Already dropped: §1§");
-		expect(text).toContain("Already queued: §2§");
+		expect(text).toBe("2 tags stamped.");
 
 		// Still exactly one pending op — no duplicate.
 		const ops = getPendingOps(db, sessionId);
 		expect(ops).toHaveLength(1);
 		expect(ops[0].tagId).toBe(2);
+		const alreadyQueued = await callDrop({ db, sessionId, drop: "2" });
+		expect(alreadyQueued.text).toBe("1 tag stamped.");
 	});
 
-	it("defers protected-tag drops with explicit 'deferred drop' messaging", async () => {
+	it("counts protected-tag drops without listing their ids", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-reduce-protected";
 		// 5 active tags. With protectedTags=2, the most recent 2 (tags 4 & 5)
@@ -259,8 +369,7 @@ describe("Pi ctx_reduce tool", () => {
 			protectedTags: 2,
 		});
 		expect(isError).toBe(false);
-		expect(text).toContain("drop §1§");
-		expect(text).toContain("deferred drop §4§");
+		expect(text).toBe("2 tags stamped.");
 	});
 
 	it("rejects empty or missing drop string", async () => {
@@ -300,8 +409,7 @@ describe("Pi ctx_reduce tool", () => {
 				floor: 16_000,
 			});
 			expect(isError).toBe(false);
-			expect(text).toContain("drop §1§");
-			expect(text).toContain("deferred drop §4§");
+			expect(text).toBe("2 tags stamped.");
 		} finally {
 			closeQuietly(db);
 		}
@@ -322,9 +430,7 @@ describe("Pi ctx_reduce tool", () => {
 				floor: 16_000,
 			});
 			expect(isError).toBe(false);
-			// Both dropped immediately, nothing deferred
-			expect(text).toContain("drop §1§, §2§");
-			expect(text).not.toContain("deferred drop");
+			expect(text).toBe("2 tags stamped.");
 		} finally {
 			closeQuietly(db);
 		}

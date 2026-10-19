@@ -1,15 +1,25 @@
 import { describe, expect, test } from "bun:test";
+import { inspectCurateMemoryOperations } from "../features/magic-context/dreamer/task-executor";
 import {
     HiddenCompletionRefusal,
     type HiddenRunIdentity,
 } from "../hooks/magic-context/compartment-runner-types";
+import {
+    getPromptFailureDetail,
+    promptSyncWithValidatedOutputRetry,
+} from "../shared/model-suggestion-retry";
 import { Database } from "../shared/sqlite";
-import { createV2HiddenCompletionExecutor, type HiddenChildHost } from "./hidden-completion";
+import {
+    createV2HiddenCompletionExecutor,
+    type HiddenChildHost,
+    toolLoopMessages,
+} from "./hidden-completion";
 import {
     HIDDEN_CURATE_AGENT,
     HIDDEN_DREAMER_AGENT,
     HIDDEN_HISTORIAN_AGENT,
     HiddenChildHook,
+    hiddenToolCallRefusal,
     registerHiddenChildAgents,
 } from "./hooks/hidden-child";
 import type { SessionContext } from "./hooks/types";
@@ -32,6 +42,56 @@ const dreamerRun: HiddenRunIdentity = {
     agent: HIDDEN_DREAMER_AGENT,
     kind: "dreamer-task",
 };
+
+test("host unknown terminal error retains the hook's typed local refusal", async () => {
+    const f = await setup();
+    const handle = await f.executor.open(dreamerRun);
+    f.setReadableSessionError({ type: "unknown", message: "host serialized hook failure" });
+    f.host.prompt = async (input) => {
+        try {
+            f.hook.apply({
+                sessionID: input.sessionID,
+                model: { providerID: "mock", id: "cheap" },
+                agent: "dreamer",
+                system: [],
+                tools: {},
+                options: {},
+                messages: [
+                    {
+                        role: "user",
+                        content: [
+                            { type: "text", text: "extra instruction before marker" },
+                            { type: "text", text: input.text },
+                        ],
+                    },
+                ],
+            });
+        } catch {
+            f.rows.appendIdle(input.sessionID, "failed");
+        }
+    };
+    let caught: unknown;
+    try {
+        await promptSyncWithValidatedOutputRetry(undefined, request(), {
+            transport: (args) => f.executor.attempt(handle, args),
+            fetchOutput: async () => "unreachable",
+            validateOutput: (value) => value,
+        });
+    } catch (error) {
+        caught = error;
+    }
+    expect(caught).toBeInstanceOf(HiddenCompletionRefusal);
+    expect((caught as HiddenCompletionRefusal).code).toBe("hidden_prompt_unrecognized");
+    expect((caught as Error).message).toContain("Refusing an unregistered prompt");
+    expect(getPromptFailureDetail(caught)?.failureClass).toBe("local_refusal");
+    await f.executor.close(handle, {
+        promptSettled: false,
+        privacySensitive: false,
+        context: "test",
+        log() {},
+    });
+    f.db.close();
+});
 
 const request = (
     modelID = "cheap",
@@ -160,6 +220,7 @@ async function setup(
     capabilities: {
         remove?: boolean;
         modelCatalog?: () => Promise<unknown>;
+        historianTemperature?: () => number | undefined;
         logs?: string[];
         /**
          * Which registration, if any, the fake host would report as its own. Undefined stands for
@@ -167,6 +228,7 @@ async function setup(
          */
         owner?: unknown;
         keepSubagents?: boolean;
+        skipContextHook?: boolean;
     } = {},
 ) {
     const db = new Database(":memory:");
@@ -240,7 +302,7 @@ async function setup(
                     { role: "user", content: [{ type: "text", text: input.text }] },
                 ],
             };
-            hook.apply(draft);
+            if (!capabilities.skipContextHook) hook.apply(draft);
             requests.push(structuredClone(draft));
             if (failPrompt) throw new Error("provider unavailable");
             if (promptError) throw promptError;
@@ -300,6 +362,9 @@ async function setup(
             ...(capabilities.keepSubagents ? { keepSubagents: true } : {}),
             log: (message) => capabilities.logs?.push(message),
             ...(capabilities.modelCatalog ? { modelCatalog: capabilities.modelCatalog } : {}),
+            ...(capabilities.historianTemperature
+                ? { historianTemperature: capabilities.historianTemperature }
+                : {}),
         });
     const executor = await create();
     return {
@@ -378,6 +443,55 @@ async function close(
 }
 
 describe("OpenCode 2 hidden child completion", () => {
+    test("names retrospective and curate at the missed context-shaping stage without model fallback", async () => {
+        for (const [task, agent] of [
+            ["retrospective", "dreamer-retrospective"],
+            ["curate", "dreamer"],
+        ]) {
+            // Simulate a host that settles a carrier turn without invoking its context hook.
+            // This exercises the executor's last-resort check, not the before-provider guard.
+            const state = await setup("missing-context", { skipContextHook: true });
+            let handle: Awaited<ReturnType<typeof state.executor.open>> | null = null;
+            try {
+                handle = await state.executor.open({
+                    ...dreamerRun,
+                    agent,
+                    title: `magic-context-dream-${task}`,
+                });
+                let caught: unknown;
+                try {
+                    await promptSyncWithValidatedOutputRetry(undefined, request(), {
+                        transport: (args) => state.executor.attempt(handle!, args),
+                        fallbackModels: ["mock/fallback"],
+                        callContext: `dreamer:${task}`,
+                        fetchOutput: () => state.executor.collect(handle!, 50),
+                        validateOutput: (completion) => completion.text,
+                    });
+                } catch (error) {
+                    caught = error;
+                }
+                expect(caught).toBeInstanceOf(HiddenCompletionRefusal);
+                expect(caught).toMatchObject({
+                    code: "hidden_prompt_unrecognized",
+                    terminal: true,
+                });
+                expect((caught as Error).message).toContain(`task=${task}`);
+                expect((caught as Error).message).toContain("stage=context/HiddenChildHook.apply");
+                expect((caught as Error).message).toContain(`child=${handle.id}`);
+                expect((caught as Error).message).toContain("directory=/project");
+                expect(getPromptFailureDetail(caught)).toMatchObject({
+                    failureClass: "local_refusal",
+                    modelsTried: ["mock/cheap"],
+                });
+                expect(state.requests).toHaveLength(1);
+                expect(state.creates).toHaveLength(1);
+                expect(state.switches).toEqual([]);
+            } finally {
+                if (handle) await close(state.executor, handle, false);
+                state.db.close();
+            }
+        }
+    });
     test.each([
         "historian",
         "dreamer-task",
@@ -404,7 +518,11 @@ describe("OpenCode 2 hidden child completion", () => {
         }
     });
     test("sends the exact calibrated pair with options and provider usage", async () => {
-        const state = await setup();
+        const state = await setup("host-generation-1", {
+            modelCatalog: async () => [
+                { id: "cheap", providerID: "mock", capabilities: { temperature: true } },
+            ],
+        });
         try {
             const handle = await state.executor.open(run);
             await state.executor.attempt(handle, request("cheap", { temperature: 0.25 }));
@@ -416,6 +534,9 @@ describe("OpenCode 2 hidden child completion", () => {
                     model: { providerID: "mock", id: "cheap" },
                     parentID: "user-session",
                     metadata: { magic_context: "hidden-run", role: "historian" },
+                    // The historian has no tools: the session rules deny everything,
+                    // and the host evaluates them after the user's own rules.
+                    permissions: [{ action: "*", resource: "*", effect: "deny" }],
                 },
             ]);
             expect(state.requests).toHaveLength(1);
@@ -861,6 +982,8 @@ describe("OpenCode 2 hidden child completion", () => {
         for (const [id, agent] of agents) {
             expect(agent.hidden).toBe(true);
             const tools: Record<string, string[]> = {
+                [HIDDEN_HISTORIAN_AGENT]: ["read"],
+                [HIDDEN_DREAMER_AGENT]: ["read"],
                 [HIDDEN_CURATE_AGENT]: ["ctx_memory"],
                 "dreamer-memory-mapper": ["read", "grep", "glob"],
                 "dreamer-primer-investigator": ["read", "grep", "glob", "ctx_search"],
@@ -973,4 +1096,498 @@ test("hidden tool-loop hard-stops at soft prompt budget when the host has no pre
         context: "test",
         log: () => {},
     });
+});
+
+describe("curate validation over the OpenCode 2 tool-loop transcript", () => {
+    // These tool results use the shapes `v2/fold/restore.ts` builds when it restores a
+    // child's transcript into provider messages, which is what toolLoopMessages reads.
+    const call = (id: string, action: string) => ({
+        role: "assistant",
+        content: [{ type: "tool-call", id, name: "ctx_memory", input: { action, ids: [1] } }],
+    });
+    const transcript = (results: unknown[]) =>
+        toolLoopMessages({ observedMessages: results } as never);
+
+    test("counts an applied operation from a single text result", () => {
+        const messages = transcript([
+            call("c1", "archive"),
+            {
+                role: "tool",
+                content: [
+                    {
+                        type: "tool-result",
+                        id: "c1",
+                        result: { type: "text", value: "Archived memory [ID: 1]." },
+                    },
+                ],
+            },
+        ]);
+        expect(inspectCurateMemoryOperations(messages)).toEqual({
+            totalCalls: 1,
+            completedActions: ["archive"],
+        });
+    });
+
+    test("counts an applied operation from a multi-part content result", () => {
+        const messages = transcript([
+            call("c1", "merge"),
+            {
+                role: "tool",
+                content: [
+                    {
+                        type: "tool-result",
+                        id: "c1",
+                        result: {
+                            type: "content",
+                            value: [{ type: "text", text: "Merged memories [1, 2] into [3]." }],
+                        },
+                    },
+                ],
+            },
+        ]);
+        expect(inspectCurateMemoryOperations(messages).completedActions).toEqual(["merge"]);
+    });
+
+    test("never counts a failed call, even when its content reads like success", () => {
+        const messages = transcript([
+            call("c1", "archive"),
+            {
+                role: "tool",
+                content: [
+                    {
+                        type: "tool-result",
+                        id: "c1",
+                        resultType: "error",
+                        result: {
+                            error: "refused",
+                            content: [{ type: "text", text: "Archived memory [ID: 1]." }],
+                        },
+                    },
+                ],
+            },
+            call("c2", "update"),
+            {
+                role: "tool",
+                content: [
+                    {
+                        type: "tool-result",
+                        id: "c2",
+                        result: { type: "text", value: "Error: unsafe target" },
+                    },
+                ],
+            },
+        ]);
+        expect(inspectCurateMemoryOperations(messages)).toEqual({
+            totalCalls: 2,
+            completedActions: [],
+        });
+        const [refused] = messages as { parts: { state: { status: string } }[] }[];
+        expect(refused?.parts[0]?.state.status).toBe("error");
+    });
+});
+
+describe("hidden completion temperature capabilities", () => {
+    test("OpenCode 2 decides per selected model and honours zero only with positive metadata", async () => {
+        const state = await setup("temperature-metadata", {
+            modelCatalog: async () => ({
+                data: [
+                    { id: "cheap", providerID: "mock", capabilities: { temperature: true } },
+                    { id: "fallback", providerID: "mock", capabilities: { temperature: false } },
+                ],
+            }),
+        });
+        try {
+            const handle = await state.executor.open(run);
+            await state.executor.attempt(handle, request("cheap", { temperature: 0 }));
+            await state.executor.attempt(handle, request("fallback", { temperature: 0.1 }));
+            await state.executor.attempt(handle, request("unknown", { temperature: 0.1 }));
+            expect(state.requests.map((draft) => draft.options)).toEqual([
+                { temperature: 0 },
+                {},
+                {},
+            ]);
+            await close(state.executor, handle, true);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("OpenCode 2 falls back to the models.dev cache when its catalog rows carry no temperature field", async () => {
+        const { mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+        const { tmpdir } = await import("node:os");
+        const { join } = await import("node:path");
+        const { __temperatureTest } = await import("../shared/subagent-temperature");
+        const cacheRoot = join(tmpdir(), `mc-oc2-temperature-${crypto.randomUUID()}`);
+        mkdirSync(join(cacheRoot, "opencode"), { recursive: true });
+        writeFileSync(
+            join(cacheRoot, "opencode", "models.json"),
+            JSON.stringify({
+                google: { models: { "gemini-3.8-flash": { temperature: true } } },
+                openai: { models: { "gpt-6.1-sol": { temperature: false } } },
+            }),
+        );
+        const saved = {
+            XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
+            OPENCODE_MODELS_PATH: process.env.OPENCODE_MODELS_PATH,
+        };
+        process.env.XDG_CACHE_HOME = cacheRoot;
+        delete process.env.OPENCODE_MODELS_PATH;
+        __temperatureTest.reset();
+        const notes: string[] = [];
+        // OpenCode 2.0.22 model rows: capabilities hold tools and modalities only.
+        const row = (providerID: string, id: string) => ({
+            id,
+            providerID,
+            capabilities: { tools: true, input: ["text"], output: ["text"] },
+        });
+        const state = await setup("temperature-catalog", {
+            logs: notes,
+            modelCatalog: async () => [
+                row("google", "gemini-3.8-flash"),
+                row("google", "antigravity-gemini-3.8-flash"),
+                row("openai", "gpt-6.1-sol"),
+            ],
+        });
+        try {
+            const handle = await state.executor.open(run);
+            for (const [providerID, modelID] of [
+                ["google", "gemini-3.8-flash"],
+                ["google", "antigravity-gemini-3.8-flash"],
+                ["openai", "gpt-6.1-sol"],
+            ] as const) {
+                await state.executor.attempt(
+                    handle,
+                    request(modelID, { model: { providerID, modelID }, temperature: 0.1 }),
+                );
+            }
+            expect(state.requests.map((draft) => draft.options)).toEqual([
+                { temperature: 0.1 },
+                { temperature: 0.1 },
+                {},
+            ]);
+            expect(notes.filter((line) => line.includes("Subagent temperature"))).toEqual([
+                expect.stringContaining(
+                    "sent for google/gemini-3.8-flash: models.dev cache entry google/gemini-3.8-flash says yes",
+                ),
+                expect.stringContaining(
+                    "sent for google/antigravity-gemini-3.8-flash: models.dev cache entry google/gemini-3.8-flash says yes",
+                ),
+                expect.stringContaining(
+                    "omitted for openai/gpt-6.1-sol: models.dev cache entry openai/gpt-6.1-sol says no",
+                ),
+            ]);
+            await close(state.executor, handle, true);
+        } finally {
+            state.db.close();
+            for (const [key, value] of Object.entries(saved)) {
+                if (value === undefined) delete process.env[key];
+                else process.env[key] = value;
+            }
+            __temperatureTest.reset();
+            rmSync(cacheRoot, { recursive: true, force: true });
+        }
+    });
+
+    test("OpenCode 2 authors historian.temperature on historian passes only when metadata accepts it", async () => {
+        const { mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+        const { tmpdir } = await import("node:os");
+        const { join } = await import("node:path");
+        const { __temperatureTest } = await import("../shared/subagent-temperature");
+        const cacheRoot = join(tmpdir(), `mc-oc2-authored-temperature-${crypto.randomUUID()}`);
+        mkdirSync(join(cacheRoot, "opencode"), { recursive: true });
+        writeFileSync(
+            join(cacheRoot, "opencode", "models.json"),
+            JSON.stringify({ google: { models: { "gemini-3.8-flash": { temperature: true } } } }),
+        );
+        const saved = {
+            XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
+            OPENCODE_MODELS_PATH: process.env.OPENCODE_MODELS_PATH,
+        };
+        process.env.XDG_CACHE_HOME = cacheRoot;
+        delete process.env.OPENCODE_MODELS_PATH;
+        __temperatureTest.reset();
+        // OpenCode 2.0.22 rows carry no temperature field, so the cached catalogue decides for
+        // google and openai; the mock row states its flag, so host metadata decides for it.
+        const rows = [
+            { id: "gemini-3.8-flash", providerID: "google", capabilities: { tools: true } },
+            { id: "gpt-6.1-sol", providerID: "openai", capabilities: { tools: true } },
+            { id: "cheap", providerID: "mock", capabilities: { temperature: true } },
+        ];
+        let configured: number | undefined = 0.1;
+        const state = await setup("authored-temperature", {
+            modelCatalog: async () => rows,
+            historianTemperature: () => configured,
+        });
+        const at = (providerID: string, modelID: string) =>
+            request(modelID, { model: { providerID, modelID } });
+        try {
+            for (const kind of ["historian", "historian-editor"] as const) {
+                const handle = await state.executor.open({ ...run, kind, agent: kind });
+                await state.executor.attempt(handle, at("google", "gemini-3.8-flash"));
+                await state.executor.attempt(handle, at("openai", "gpt-6.1-sol"));
+                await state.executor.attempt(handle, at("openai-codex", "gpt-6.1-sol"));
+                await close(state.executor, handle, true);
+            }
+            configured = 0;
+            const zero = await state.executor.open(run);
+            await state.executor.attempt(zero, at("mock", "cheap"));
+            await state.executor.attempt(zero, at("google", "gemini-3.8-flash"));
+            await close(state.executor, zero, true);
+            configured = undefined;
+            const unset = await state.executor.open(run);
+            await state.executor.attempt(unset, at("google", "gemini-3.8-flash"));
+            await close(state.executor, unset, true);
+            expect(state.requests.map((draft) => draft.options)).toEqual([
+                { temperature: 0.1 },
+                {},
+                {},
+                { temperature: 0.1 },
+                {},
+                {},
+                { temperature: 0 },
+                { temperature: 0 },
+                {},
+            ]);
+        } finally {
+            state.db.close();
+            for (const [key, value] of Object.entries(saved)) {
+                if (value === undefined) delete process.env[key];
+                else process.env[key] = value;
+            }
+            __temperatureTest.reset();
+            rmSync(cacheRoot, { recursive: true, force: true });
+        }
+    });
+
+    test("OpenCode 2 dreamer requests are unchanged by a configured historian temperature", async () => {
+        const capture = async (historianTemperature?: () => number | undefined) => {
+            const state = await setup("dreamer-untouched", {
+                modelCatalog: async () => [
+                    { id: "cheap", providerID: "mock", capabilities: { temperature: true } },
+                ],
+                ...(historianTemperature ? { historianTemperature } : {}),
+            });
+            const sent: unknown[] = [];
+            const prompt = state.host.prompt;
+            state.host.prompt = async (input) => {
+                sent.push(input);
+                await prompt(input);
+            };
+            try {
+                const handle = await state.executor.open(dreamerRun);
+                await state.executor.attempt(handle, request("cheap"));
+                await close(state.executor, handle, true);
+                expect(sent).toHaveLength(1);
+                expect(state.requests).toHaveLength(1);
+                // Each attempt carries a fresh random marker; everything else must match.
+                return JSON.stringify({ sent, drafts: state.requests }).replace(
+                    /mc:hidden:[0-9a-f-]+:[0-9a-f-]+/g,
+                    "mc:hidden:marker",
+                );
+            } finally {
+                state.db.close();
+            }
+        };
+        const without = await capture();
+        const withTemperature = await capture(() => 0.1);
+        expect(withTemperature).toBe(without);
+        expect(without).not.toContain("temperature");
+    });
+
+    test("OpenCode 2 Codex-shaped provider receives no temperature and needs no retry or fallback", async () => {
+        const state = await setup("temperature-codex");
+        const prompt = state.host.prompt;
+        let calls = 0;
+        state.host.prompt = async (input) => {
+            calls++;
+            await prompt(input);
+            if (state.requests.at(-1)?.options.temperature !== undefined)
+                throw new Error("Codex error: Unsupported parameter: temperature");
+        };
+        try {
+            const handle = await state.executor.open(run);
+            await state.executor.attempt(handle, request("cheap", { temperature: 0.1 }));
+            expect((await state.executor.collect(handle)).text).toBe("editor completion");
+            expect(calls).toBe(1);
+            expect(state.switches).toHaveLength(0);
+            expect(state.requests[0]?.options).not.toHaveProperty("temperature");
+            await close(state.executor, handle, true);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("OpenCode 2 rejection despite positive metadata is an ordinary provider error without replay", async () => {
+        const state = await setup("temperature-wrong-metadata", {
+            modelCatalog: async () => [
+                { id: "cheap", providerID: "mock", capabilities: { temperature: true } },
+            ],
+        });
+        try {
+            const handle = await state.executor.open(run);
+            state.setPromptError(new Error("Codex error: Unsupported parameter: temperature"));
+            await expect(
+                state.executor.attempt(handle, request("cheap", { temperature: 0.1 })),
+            ).rejects.toThrow("Unsupported parameter: temperature");
+            expect(state.requests).toHaveLength(1);
+            expect(state.requests[0]?.options.temperature).toBe(0.1);
+            await close(state.executor, handle, false);
+        } finally {
+            state.db.close();
+        }
+    });
+});
+
+test("v2 historian sums all blocked-call steps and excludes previous attempts", async () => {
+    const f = await setup();
+    const identity = {
+        ...run,
+        agent: "historian",
+        kind: "historian" as const,
+        model: "opencode/free",
+    };
+    const handle = await f.executor.open(identity);
+    f.rows.append(handle.id, "earlier run on this carrier");
+    const prompt = f.host.prompt.bind(f.host);
+    let filesystemOpens = 0;
+    let refusal: string | undefined;
+    f.host.prompt = async (input) => {
+        const first = f.rows.append(input.sessionID, "", { finish: "tool_calls" });
+        first.data.tokens = { input: 13, output: 5, cache: { read: 3, write: 2 } };
+        first.data.content = [
+            {
+                type: "tool-call",
+                id: "forced-read",
+                name: "read",
+                input: { path: "/project/sentinel" },
+            },
+        ] as never;
+        refusal = hiddenToolCallRefusal({ sessionID: input.sessionID, tool: "read" }, f.hook);
+        if (refusal === undefined) filesystemOpens += 1;
+        await prompt(input);
+    };
+    try {
+        await f.executor.attempt(
+            handle,
+            request("free", { model: { providerID: "opencode", modelID: "free" } }),
+        );
+        const completion = await f.executor.collect(handle, 50);
+        expect(refusal).toContain("tool use is disabled for this task");
+        expect(filesystemOpens).toBe(0);
+        expect(completion.text).toBe("editor completion");
+        expect(completion.usage).toEqual({ input: 114, output: 16, cacheRead: 10, cacheWrite: 7 });
+        expect(Object.keys(f.requests[0]!.tools)).toEqual(["read"]);
+        expect(f.requests[0]!.system).toEqual([
+            {
+                type: "text",
+                text: "calibrated editor system\n\nSummarize only the supplied conversation and memory context. Do not call tools.",
+            },
+        ]);
+    } finally {
+        await f.executor.close(handle, {
+            promptSettled: true,
+            privacySensitive: false,
+            context: "test",
+            log() {},
+        });
+        f.db.close();
+    }
+});
+
+for (const agent of [
+    "historian",
+    "historian-recomp",
+    "historian-editor",
+    "dreamer-classifier",
+    "dreamer-reviewer",
+    "smart-note-compiler",
+]) {
+    test(`v2 non-Zen ${agent} retains its original prompt and empty tool surface`, async () => {
+        const f = await setup();
+        const handle = await f.executor.open({
+            ...run,
+            agent,
+            kind: agent.startsWith("historian") ? "historian" : "dreamer-task",
+        });
+        try {
+            await f.executor.attempt(handle, request());
+            expect(JSON.stringify(f.requests[0]!.system)).toBe(
+                '[{"type":"text","text":"calibrated editor system"}]',
+            );
+            expect(JSON.stringify(f.requests[0]!.tools)).toBe("{}");
+        } finally {
+            await f.executor.close(handle, {
+                promptSettled: true,
+                privacySensitive: false,
+                context: "test",
+                log() {},
+            });
+            f.db.close();
+        }
+    });
+}
+
+test("v2 does not append the tool instruction when the host supplied no read definition", () => {
+    const hook = new HiddenChildHook(() => {});
+    const identity = {
+        ...run,
+        agent: "historian",
+        kind: "historian" as const,
+        model: "opencode/free",
+    };
+    const marker = "mc:hidden:aaaa:bbbb";
+    hook.registerChild("child", "historian");
+    hook.registerAttempt(marker, {
+        childSessionId: "child",
+        identity,
+        request: request("free"),
+        shaped: false,
+    });
+    const draft: SessionContext = {
+        sessionID: "child",
+        agent: "historian",
+        model: { providerID: "opencode", id: "free" },
+        system: [],
+        tools: {},
+        options: {},
+        messages: [{ role: "user", content: [{ type: "text", text: marker }] }],
+    };
+    hook.apply(draft);
+    expect(draft.system).toEqual([{ type: "text", text: identity.system }]);
+    expect(draft.tools).toEqual({});
+});
+
+test("v2 cross-provider fallback replaces the Zen surface without retaining its instruction", async () => {
+    const f = await setup();
+    const identity = {
+        ...run,
+        agent: "historian",
+        kind: "historian" as const,
+        model: "opencode/free",
+    };
+    const handle = await f.executor.open(identity);
+    try {
+        await f.executor.attempt(
+            handle,
+            request("free", { model: { providerID: "opencode", modelID: "free" } }),
+        );
+        const zenChild = handle.id;
+        expect(f.creates[0]?.permissions).toEqual([
+            { action: "*", resource: "*", effect: "deny" },
+            { action: "read", resource: "*", effect: "allow" },
+        ]);
+        await f.executor.attempt(handle, request("fallback"));
+        expect(handle.id).not.toBe(zenChild);
+        expect(f.creates[1]?.permissions).toEqual([{ action: "*", resource: "*", effect: "deny" }]);
+        expect(f.requests[1]?.tools).toEqual({});
+        expect(f.requests[1]?.system).toEqual([{ type: "text", text: identity.system }]);
+    } finally {
+        await f.executor.close(handle, {
+            promptSettled: true,
+            privacySensitive: false,
+            context: "test",
+            log() {},
+        });
+        f.db.close();
+    }
 });

@@ -65,12 +65,18 @@ function createTestDb(): Database {
 
 function seedTags(
     db: Database,
-    tags: Array<{ id: number; sessionId: string; status?: string; type?: string }>,
+    tags: Array<{
+        id: number;
+        sessionId: string;
+        status?: string;
+        type?: string;
+        toolName?: string | null;
+    }>,
 ) {
     for (const [index, tag] of tags.entries()) {
         const rowId = 10_000 + tag.id + index;
         db.prepare(
-            "INSERT INTO tags (id, message_id, type, status, byte_size, session_id, tag_number) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tags (id, message_id, type, status, byte_size, session_id, tag_number, tool_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         ).run(
             rowId,
             `msg-${tag.id}`,
@@ -79,6 +85,7 @@ function seedTags(
             100,
             tag.sessionId,
             tag.id,
+            tag.toolName ?? null,
         );
     }
 }
@@ -146,7 +153,7 @@ describe("createCtxReduceTools", () => {
                 toolContext(),
             );
 
-            expect(result).toContain("Queued");
+            expect(result).toBe("1 tag stamped.");
             expect(getPendingOps(db, "ses-1")).toEqual([
                 expect.objectContaining({ tag_id: 3, operation: "drop" }),
             ]);
@@ -164,13 +171,54 @@ describe("createCtxReduceTools", () => {
 
             const result = await tools.ctx_reduce.execute({ drop: "3-5" }, toolContext());
 
-            expect(result).toContain("Queued");
-            expect(result).toContain("drop §3§, §4§, §5§");
+            expect(result).toBe("3 tags stamped.");
             expect(getPendingOps(db, "ses-1")).toEqual([
                 expect.objectContaining({ tag_id: 3, operation: "drop" }),
                 expect.objectContaining({ tag_id: 4, operation: "drop" }),
                 expect.objectContaining({ tag_id: 5, operation: "drop" }),
             ]);
+        });
+
+        it("skips ctx_reduce stamps while still queueing sibling tags", async () => {
+            seedTags(db, [
+                { id: 41, sessionId: "ses-1", type: "tool", toolName: "ctx_reduce" },
+                { id: 42, sessionId: "ses-1", type: "tool", toolName: "read" },
+            ]);
+            const tool = createCtxReduceTools({ db, protectedSet: new Set() });
+
+            const result = await tool.ctx_reduce.execute({ drop: "41,42" }, toolContext());
+
+            expect(result).toBe(
+                "1 tag stamped. 1 was a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+            );
+            expect(getPendingOps(db, "ses-1")).toEqual([
+                expect.objectContaining({ tag_id: 42, operation: "drop" }),
+            ]);
+            expect(await tool.ctx_reduce.execute({ drop: "41" }, toolContext())).toBe(
+                "1 was a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+            );
+        });
+
+        it("orders free drops, protected tags, then ctx_reduce self-stamp counts", async () => {
+            seedTags(db, [
+                { id: 1, sessionId: "ses-1", type: "tool", toolName: "custom" },
+                { id: 2, sessionId: "ses-1", type: "tool", toolName: "ctx_reduce" },
+                { id: 3, sessionId: "ses-1", type: "tool", toolName: "bash" },
+            ]);
+            const tool = createCtxReduceTools({
+                db,
+                protectedSet: new Set(),
+                protectedTools: { custom: 1 },
+            });
+            const result = await tool.ctx_reduce.execute({ drop: "2,1,3" }, toolContext());
+            expect(result).toBe(
+                "2 tags stamped. 1 was a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+            );
+            expect(
+                getPendingOps(db, "ses-1")
+                    .map((op) => op.tag_id)
+                    .sort(),
+            ).toEqual([1, 3]);
         });
 
         it("resets the rolling nudge anchor to the current token count", async () => {
@@ -189,7 +237,7 @@ describe("createCtxReduceTools", () => {
             expect(getLastNudgeTokens(db, "ses-1")).toBe(125_000);
         });
 
-        it("queues protected tags as deferred with verbatim held copy for single and plural", async () => {
+        it("counts protected tags as stamped for single and plural requests", async () => {
             seedTags(db, [
                 { id: 1, sessionId: "ses-1" },
                 { id: 8, sessionId: "ses-1", type: "tool" },
@@ -199,9 +247,7 @@ describe("createCtxReduceTools", () => {
 
             // Plural held copy
             const resultPlural = await tools.ctx_reduce.execute({ drop: "9,10" }, toolContext());
-            expect(resultPlural).toBe(
-                "Held: §9, §10 are inside the protected working set; they apply once newer work displaces them.",
-            );
+            expect(resultPlural).toBe("2 tags stamped.");
 
             // Single held copy on fresh session
             seedTags(db, [
@@ -215,12 +261,10 @@ describe("createCtxReduceTools", () => {
                 { drop: "110" },
                 { ...toolContext(), sessionID: "ses-2" },
             );
-            expect(resultSingle).toBe(
-                "Held: §110 is inside the protected working set; it applies once newer work displaces it.",
-            );
+            expect(resultSingle).toBe("1 tag stamped.");
         });
 
-        it("queues protected tags alongside immediate drops with queued sentence first then held sentence", async () => {
+        it("counts immediate and protected drops together", async () => {
             seedTags(db, [
                 { id: 1, sessionId: "ses-1" },
                 { id: 8, sessionId: "ses-1", type: "tool" },
@@ -230,9 +274,7 @@ describe("createCtxReduceTools", () => {
 
             const result = await tools.ctx_reduce.execute({ drop: "1,9,10" }, toolContext());
 
-            expect(result).toBe(
-                "Queued: drop §1§. Held: §9, §10 are inside the protected working set; they apply once newer work displaces them.",
-            );
+            expect(result).toBe("3 tags stamped.");
             expect(getPendingOps(db, "ses-1")).toEqual([
                 expect.objectContaining({ tag_id: 1, operation: "drop" }),
                 expect.objectContaining({ tag_id: 9, operation: "drop" }),
@@ -293,13 +335,40 @@ describe("createCtxReduceTools", () => {
 
             const result = await tools.ctx_reduce.execute({ drop: "6-8" }, toolContext());
 
-            expect(result).toContain("drop §6§, §8§");
-            expect(result).toContain("§7§ is provider framing, nothing to reclaim");
-            expect(result).not.toContain("Error:");
+            expect(result).toBe(
+                "2 tags stamped. Skipped: §7§ is provider framing, nothing to reclaim.",
+            );
             expect(getPendingOps(db, "ses-1").map((op) => op.tag_id)).toEqual([6, 8]);
         });
 
-        it("skips duplicate drop requests", async () => {
+        it("reads inert whitespace state only for the requested tags", async () => {
+            seedTags(
+                db,
+                Array.from({ length: 30 }, (_, index) => ({ id: index + 1, sessionId: "ses-1" })),
+            );
+            // Inert tags outside the request must neither be read nor change the answer.
+            for (const tag of [2, 7, 20, 25]) {
+                markWhitespaceAssistantTagInert(db, "ses-1", tag, `assistant-${tag}:p0`);
+            }
+            const statements: string[] = [];
+            const prepare = db.prepare.bind(db);
+            db.prepare = ((sql: string) => {
+                statements.push(sql);
+                return prepare(sql);
+            }) as typeof db.prepare;
+
+            const result = await tools.ctx_reduce.execute({ drop: "6-8" }, toolContext());
+
+            expect(result).toBe(
+                "2 tags stamped. Skipped: §7§ is provider framing, nothing to reclaim.",
+            );
+            const inertReads = statements.filter((sql) => sql.includes("entry_fingerprint LIKE"));
+            expect(inertReads.length).toBe(1);
+            // Bounded by the requested tag numbers, not a scan of every retired tag.
+            expect(inertReads[0]).toContain("tags.tag_number = wanted.value");
+        });
+
+        it("counts previously queued tags without listing them", async () => {
             seedTags(db, [
                 { id: 10, sessionId: "ses-1" },
                 { id: 11, sessionId: "ses-1" },
@@ -315,13 +384,10 @@ describe("createCtxReduceTools", () => {
 
             const result = await tools.ctx_reduce.execute({ drop: "11-14" }, toolContext());
 
-            expect(result).toContain("Queued");
-            expect(result).toContain("§13§");
-            expect(result).toContain("§14§");
-            expect(result).toContain("2 requested tags were already queued and need no action");
+            expect(result).toBe("4 tags stamped.");
         });
 
-        it("returns terminal success wording when all requested tags are already queued", async () => {
+        it("returns a stamped count when all requested tags are already queued", async () => {
             seedTags(db, [
                 { id: 10, sessionId: "ses-1" },
                 { id: 11, sessionId: "ses-1" },
@@ -334,8 +400,48 @@ describe("createCtxReduceTools", () => {
 
             const result = await tools.ctx_reduce.execute({ drop: "10-12" }, toolContext());
 
+            expect(result).toBe("3 tags stamped.");
+        });
+
+        it("surfaces refused ctx_reduce self-stamps returned by the module backend", async () => {
+            const tool = createCtxReduceTools({
+                db,
+                protectedSet: new Set(),
+                rustToolBackends: {
+                    reduce: async () => ({
+                        ok: true,
+                        queued: 1,
+                        ctx_reduce_queued_tags: [42],
+                        ctx_reduce_self_stamps: [41],
+                    }),
+                },
+            });
+
+            const result = await tool.ctx_reduce.execute({ drop: "41,42" }, toolContext());
+
             expect(result).toBe(
-                "All requested tags were already queued or processed. No new action is needed.",
+                "1 tag stamped. 1 was a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+            );
+        });
+
+        it("counts free, protected and self-stamped outcomes from the Rust backend", async () => {
+            const tool = createCtxReduceTools({
+                db,
+                protectedSet: new Set(),
+                rustToolBackends: {
+                    reduce: async () => ({
+                        ok: true,
+                        queued: 2,
+                        ctx_reduce_queued_tags: [1, 3],
+                        ctx_reduce_self_stamps: [2],
+                        held_tag_numbers: [1],
+                        immediate_tag_numbers: [3],
+                    }),
+                },
+            });
+            const result = await tool.ctx_reduce.execute({ drop: "2,1,3" }, toolContext());
+            expect(result).toBe(
+                "2 tags stamped. 1 was a ctx_reduce call; leave those alone, they are cleaned up automatically.",
             );
         });
 
@@ -381,6 +487,40 @@ describe("createCtxReduceTools", () => {
             expect(calls[2]?.commandId).not.toBe(calls[0]?.commandId);
         });
 
+        it("counts protected Rust drops without listing their ids", async () => {
+            const rustTools = createCtxReduceTools({
+                db,
+                rustToolBackends: {
+                    reduce: async () => ({
+                        ok: true,
+                        queued: 2,
+                        held_tag_numbers: [9],
+                        immediate_tag_numbers: [1],
+                    }),
+                },
+            });
+            expect(await rustTools.ctx_reduce.execute({ drop: "1,9" }, toolContext())).toBe(
+                "2 tags stamped.",
+            );
+        });
+
+        it("counts Rust tags that were already queued", async () => {
+            const rustTools = createCtxReduceTools({
+                db,
+                rustToolBackends: {
+                    reduce: async () => ({
+                        ok: true,
+                        queued: 0,
+                        ctx_reduce_queued_tags: [1, 2],
+                    }),
+                },
+            });
+
+            expect(await rustTools.ctx_reduce.execute({ drop: "1,2" }, toolContext())).toBe(
+                "2 tags stamped.",
+            );
+        });
+
         it("returns capability copy when the engine rejects a drop", async () => {
             const tools = createCtxReduceTools({
                 db,
@@ -405,7 +545,7 @@ describe("createCtxReduceTools", () => {
                 protectedSet: new Set(),
             }).ctx_reduce.execute({ drop: "3" }, toolContext());
 
-            expect(result).toBe("Queued: drop §3§.");
+            expect(result).toBe("1 tag stamped.");
             expect(getPendingOps(db, "ses-1")).toHaveLength(1);
         });
 

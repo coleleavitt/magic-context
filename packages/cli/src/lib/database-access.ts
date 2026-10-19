@@ -1,4 +1,5 @@
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
+import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
     ensureContextStoreUuid,
@@ -10,6 +11,12 @@ import {
 } from "@magic-context/core/features/magic-context/storage-db";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 import { Database } from "@magic-context/core/shared/sqlite";
+import { configureContextDatabasePragmas } from "@magic-context/core/shared/sqlite-context-pragmas";
+import {
+    ensureStorageDirectorySync,
+    shouldEnforcePrivateStoragePermissions,
+    writeStorageFileSync,
+} from "@magic-context/core/shared/storage-permissions";
 
 export function getPersistedSchemaVersion(db: DatabaseType): number {
     return getCorePersistedSchemaVersion(db);
@@ -114,6 +121,7 @@ export function openExistingContextDatabase(
         if (minimumSupportedVersion !== undefined && persistedVersion < minimumSupportedVersion) {
             throw new OutdatedSchemaVersionError(path, persistedVersion, minimumSupportedVersion);
         }
+        configureContextDatabasePragmas(db, options.readonly);
         if (!options.readonly) {
             // The CLI has no module route during database open. It can mint the
             // local store identity, but REGRESSED detection remains a later
@@ -168,7 +176,8 @@ export async function backupDatabaseSnapshot(
 ): Promise<void> {
     const serializable = db as DatabaseType & { serialize?: () => Uint8Array };
     if (typeof serializable.serialize === "function") {
-        writeFileSync(destination, serializable.serialize(), { flag: "wx" });
+        ensureStorageDirectorySync(dirname(destination));
+        writeStorageFileSync(destination, serializable.serialize(), { flag: "wx" });
         return;
     }
 
@@ -183,6 +192,9 @@ export async function backupDatabaseSnapshot(
         throw new Error(`Refusing to overwrite existing backup ${destination}`);
     }
     const reader = new Database(sourcePath, { readonly: true });
+    const previousUmask = shouldEnforcePrivateStoragePermissions()
+        ? process.umask(0o077)
+        : undefined;
     try {
         await sqlite.backup(reader, destination);
     } catch (error) {
@@ -190,5 +202,6 @@ export async function backupDatabaseSnapshot(
         throw error;
     } finally {
         reader.close();
+        if (previousUmask !== undefined) process.umask(previousUmask);
     }
 }

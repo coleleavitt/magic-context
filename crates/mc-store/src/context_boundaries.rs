@@ -853,6 +853,27 @@ mod tests {
     }
 
     #[test]
+    fn a_row_rewritten_during_state_sync_is_reported_as_an_invalid_seed_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        seed(&store);
+        install_snapshot_race(&store, dir.path());
+        // The error is the host's cue to recover: its pass fails, and on the next
+        // one the stale sequence draws an authority-seq mismatch, which makes the
+        // host adopt the durable sequence and re-seed every boundary coordinate,
+        // the rewritten row's included. Reporting success instead would ack
+        // watermarks captured before the rewrite and skip that re-seed.
+        let outcome = store.apply_authority_state_sync(request(&[boundary()], 0));
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::ModuleStateSyncError::InvalidSeedBoundary { .. })
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
     fn rewrite_between_module_passes_invalidates_overlay_and_recovers_once() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();

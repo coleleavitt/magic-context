@@ -31,12 +31,88 @@ use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
 /// legitimately needs five figures. The provider clamps to its own per-model limit, so a
 /// generous request costs nothing unless the model actually generates that much.
 pub(crate) const HISTORIAN_MAX_OUTPUT_TOKENS: u32 = 32_000;
+const HISTORIAN_SESSION_RETENTION_SECONDS: u64 = 86_400;
 
 #[derive(Serialize)]
 struct GenerationRequest {
     max_output_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
+}
+
+/// The `model` object of a `session.send`. Broca decodes it as `{provider, model,
+/// variant?}` and freezes the variant (for example a reasoning effort such as `high`)
+/// on the run. A typed struct rather than a `json!` object keeps the field order
+/// `provider`, `model`, `variant` on the wire, byte-identical to Broca's own send
+/// goldens. `variant` is omitted, never sent empty, when the attempt names none.
+#[derive(Serialize)]
+struct SendModel<'a> {
+    provider: &'a str,
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    variant: Option<&'a str>,
+}
+
+/// Serialize `prompt`, `send_id`, and nested `model` first, followed by optional
+/// retention seconds, then this client's `tools`, `generation`, and `system` fields.
+/// Omitting `delivery` selects queued mode; put any requested variant in `model`.
+#[derive(Serialize)]
+struct SendParams<'a> {
+    prompt: &'a str,
+    send_id: &'a str,
+    model: SendModel<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retention: Option<u64>,
+    tools: &'a [Value],
+    generation: GenerationRequest,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    system: &'a str,
+}
+
+#[derive(Serialize)]
+struct SendRequest<'a> {
+    method: &'static str,
+    params: SendParams<'a>,
+}
+
+/// Build one `session.send` request. `model` is the canonical `provider/model` string,
+/// split at the FIRST slash so multi-slash model names keep their remainder intact.
+#[allow(clippy::too_many_arguments)] // Each argument corresponds to a separate wire value.
+fn session_send_request<'a>(
+    send_id: &'a str,
+    system: &'a str,
+    prompt: &'a str,
+    model: &'a str,
+    variant: Option<&'a str>,
+    max_output_tokens: u32,
+    temperature: Option<f64>,
+    retention: Option<u64>,
+) -> Result<SendRequest<'a>, HistorianProducerError> {
+    let (provider, model_name) = model.split_once('/').ok_or_else(|| {
+        HistorianProducerError::Subc(ProducerErrorBody::untagged(
+            "invalid_model",
+            format!("model '{model}' is not in canonical provider/model form"),
+        ))
+    })?;
+    Ok(SendRequest {
+        method: "session.send",
+        params: SendParams {
+            prompt,
+            send_id,
+            model: SendModel {
+                provider,
+                model: model_name,
+                variant: variant.filter(|variant| !variant.is_empty()),
+            },
+            retention,
+            tools: &[],
+            generation: GenerationRequest {
+                max_output_tokens,
+                temperature,
+            },
+            system,
+        },
+    })
 }
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -61,8 +137,8 @@ pub const ERROR_CLASS_WIRE_SET: [&str; 4] = [
     "context_overflow",
 ];
 
-/// Runner route-open contract. The received text remains authoritative; these literals only
-/// identify the stage that produced it.
+/// Runner route-open contract. Message literals identify the reporting stage;
+/// typed error classes, when supplied, decide retryability instead of that text.
 pub const RUNNER_REFUSAL_OPEN_CODES: [&str; 1] = ["open_failed"];
 pub const RUNNER_REFUSAL_OPEN_MESSAGE_LITERALS: [&str; 4] = [
     "run resolution failed",
@@ -109,9 +185,20 @@ pub struct RunnerRefusal {
     pub stage: RunnerRefusalStage,
     pub received_code: String,
     pub received_message: String,
+    classification: Option<ErrorClassification>,
+    class_field_present: bool,
 }
 
 impl RunnerRefusal {
+    /// Older runners supplied only text. Never let that text override a typed
+    /// class, or permanently cache a refusal with an unknown future class.
+    pub fn is_durable(&self) -> bool {
+        if let Some(classification) = self.classification {
+            return classification.class == ErrorClass::Permanent;
+        }
+        !self.class_field_present && self.stage.is_durable()
+    }
+
     fn from_open_body(body: &ProducerErrorBody) -> Option<Self> {
         if !RUNNER_REFUSAL_OPEN_CODES.contains(&body.code.as_str()) {
             return None;
@@ -132,6 +219,8 @@ impl RunnerRefusal {
             stage,
             received_code: body.code.clone(),
             received_message: body.message.clone(),
+            classification: body.classification(),
+            class_field_present: body.has_class_field(),
         })
     }
 }
@@ -230,7 +319,15 @@ impl ProducerErrorBody {
             .and_then(Value::as_str)
             .unwrap_or("producer error")
             .to_string();
-        let (classification, class_field_present) = classification_from_object(&value);
+        // Broca route-open failures carry their class in detail, not at the
+        // top level used by ordinary producer errors. Absent detail.class keeps
+        // the legacy message-based decision; unknown present classes do not.
+        let class_source = if code == "open_failed" {
+            value.get("detail").unwrap_or(&Value::Null)
+        } else {
+            &value
+        };
+        let (classification, class_field_present) = classification_from_object(class_source);
         Self {
             code,
             message,
@@ -395,6 +492,9 @@ pub enum HistorianProducerError {
         retracted: bool,
     },
     MissingSession,
+    RunnerSessionDeletionUnsupported {
+        session_id: String,
+    },
     HostRunnerRequiresHostTransport,
     UnexpectedStreamEnd,
     TimedOut,
@@ -530,6 +630,10 @@ impl HistorianProducerError {
         )
     }
 
+    pub(crate) fn is_expired(&self) -> bool {
+        matches!(self, HistorianProducerError::Subc(body) if body.code == "expired")
+    }
+
     /// Parse a route-open refusal while preserving the runner's code and message verbatim.
     pub fn runner_refusal(&self) -> Option<RunnerRefusal> {
         let HistorianProducerError::Subc(body) = self else {
@@ -629,6 +733,10 @@ impl fmt::Display for HistorianProducerError {
             HistorianProducerError::MissingSession => {
                 write!(f, "historian producer has no bound session")
             }
+            HistorianProducerError::RunnerSessionDeletionUnsupported { session_id } => write!(
+                f,
+                "runner cannot delete session {session_id}; Broca never deletes sessions, so it stays in Broca's store indefinitely"
+            ),
             HistorianProducerError::HostRunnerRequiresHostTransport => {
                 write!(f, "host historian runner does not use a subc module route")
             }
@@ -673,6 +781,7 @@ impl Error for HistorianProducerError {
             | HistorianProducerError::MissingRunId
             | HistorianProducerError::SendQueued { .. }
             | HistorianProducerError::MissingSession
+            | HistorianProducerError::RunnerSessionDeletionUnsupported { .. }
             | HistorianProducerError::HostRunnerRequiresHostTransport
             | HistorianProducerError::UnexpectedStreamEnd
             | HistorianProducerError::TimedOut
@@ -719,6 +828,12 @@ pub struct HistorianProducer {
     session_id: Option<String>,
     command_route: Option<OpenedRoute>,
     subscribe_route: Option<OpenedRoute>,
+    /// `None` means this route has not been queried; `Some(None)` means it declared no
+    /// usable retention group. This cache belongs to a route and is cleared on close.
+    route_retention: Option<Option<u64>>,
+    /// Freeze the first send's policy for this session. In particular, a session that
+    /// began without retention must not opt in on a later send.
+    session_retention: Option<Option<u64>>,
 }
 
 impl HistorianProducer {
@@ -752,13 +867,19 @@ impl HistorianProducer {
             session_id: None,
             command_route: None,
             subscribe_route: None,
+            route_retention: None,
+            session_retention: None,
         })
     }
 
     /// Bind subsequent status/subscribe/cancel calls to an existing session. Reattach
     /// probes open the route with the persisted session id and must not call send again.
     pub fn bind_session(&mut self, session_id: impl Into<String>) {
-        self.session_id = Some(session_id.into());
+        let session_id = session_id.into();
+        if self.session_id.as_deref() != Some(session_id.as_str()) {
+            self.session_retention = None;
+        }
+        self.session_id = Some(session_id);
     }
 
     pub async fn start(
@@ -773,6 +894,7 @@ impl HistorianProducer {
             system,
             prompt,
             model,
+            None,
             HISTORIAN_MAX_OUTPUT_TOKENS,
             None,
         )
@@ -785,6 +907,7 @@ impl HistorianProducer {
         system: &str,
         prompt: &str,
         model: &str,
+        variant: Option<&str>,
         temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
         self.start_with_generation(
@@ -792,23 +915,33 @@ impl HistorianProducer {
             system,
             prompt,
             model,
+            variant,
             HISTORIAN_MAX_OUTPUT_TOKENS,
             temperature,
         )
         .await
     }
 
+    /// `variant` is the host-configured model variant for this attempt's model (for
+    /// example an OpenCode reasoning variant). It rides `model.variant`; `None` omits it.
+    #[allow(clippy::too_many_arguments)] // Each value is a distinct field of one send.
     pub async fn start_with_generation(
         &mut self,
         session_id: &str,
         system: &str,
         prompt: &str,
         model: &str,
+        variant: Option<&str>,
         max_output_tokens: u32,
         temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
         self.bind_session(session_id.to_string());
         let route = self.ensure_command_route().await?;
+        // Check `role.describe` before building this send; include retention only when
+        // the runner advertises support. Its first accepted send fixes the session's
+        // lifetime, so repeat sends must keep that initial policy.
+        let declared_retention = self.retention_for_route(route).await;
+        let retention = select_session_retention(&mut self.session_retention, declared_retention);
         // The route identity is the session. Keeping `session` out of this body avoids
         // a second, diverging source of truth for the run lineage.
         //
@@ -819,38 +952,25 @@ impl HistorianProducer {
         // the wire's empty-as-absent rule, so we omit the field entirely.
         //
         // The params shape mirrors llm-runner's SendParams (llmr-module-serve wire.rs):
-        // `model` is a nested {provider, model} object, split from our canonical
-        // "provider/model" string at the FIRST slash so multi-slash model names keep
-        // their remainder intact. The server decodes strictly enough that a flat model
-        // string fails the whole send with invalid_params, which a live rig drive
-        // surfaced as firings dying before any producer run existed.
-        let (provider, model_name) = model.split_once('/').ok_or_else(|| {
-            HistorianProducerError::Subc(ProducerErrorBody::untagged(
-                "invalid_model",
-                format!("model '{model}' is not in canonical provider/model form"),
-            ))
-        })?;
-        let mut params = serde_json::Map::new();
-        params.insert("prompt".into(), json!(prompt));
-        params.insert(
-            "model".into(),
-            json!({ "provider": provider, "model": model_name }),
-        );
-        params.insert("tools".into(), json!([]));
-        params.insert(
-            "generation".into(),
-            json!(GenerationRequest {
-                max_output_tokens,
-                temperature,
-            }),
-        );
-        if !system.is_empty() {
-            params.insert("system".into(), json!(system));
-        }
-        let body = json!({
-            "method": "session.send",
-            "params": params
-        });
+        // `model` is a nested {provider, model, variant?} object. The server decodes
+        // strictly enough that a flat model string fails the whole send with
+        // invalid_params, which a live rig drive surfaced as firings dying before any
+        // producer run existed.
+        //
+        // Each historian firing (including model fallbacks) and dreamer attempt owns
+        // a distinct session id. Use that durable attempt identity as `send_id`, not a
+        // connection nonce or frame correlation id: resending after a lost reply must
+        // deduplicate, while a new attempt after a classified failure must start a new run.
+        let body = session_send_request(
+            session_id,
+            system,
+            prompt,
+            model,
+            variant,
+            max_output_tokens,
+            temperature,
+            retention,
+        )?;
         let response = self.unary_json(route, body).await?;
         match send_outcome(&response) {
             SendOutcome::Active(run_id) => Ok(RunHandle { run_id }),
@@ -942,16 +1062,18 @@ impl HistorianProducer {
         Ok(())
     }
 
-    /// Delete the bound provider session before releasing its routes. Dreamer
-    /// sessions contain memory-pool snapshots, so retention settings never apply.
+    /// Release routes, but report that the runner cannot delete session data.
+    /// Dreamer sessions contain memory-pool snapshots; closing a route does not
+    /// remove those snapshots from Broca's append-only write-ahead log.
     pub async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
-        self.bind_session(session_id.to_string());
-        let route = self.ensure_command_route().await?;
-        let _ = self
-            .unary_json(route, json!({ "method": "session.delete", "params": {} }))
-            .await?;
         self.close().await;
-        Ok(())
+        static RETENTION_WARNING: std::sync::Once = std::sync::Once::new();
+        RETENTION_WARNING.call_once(|| {
+            tracing::warn!("[mc-module] runner cannot delete sessions: Broca has no session.delete operation and never deletes a session. Its write-ahead log is append-only, an idle session is moved into an archive byte for byte after 7 days and kept, and engram backs both up. Dreamer memory-pool snapshots sent to the runner therefore stay indefinitely; closing routes does not delete them.");
+        });
+        Err(HistorianProducerError::RunnerSessionDeletionUnsupported {
+            session_id: session_id.to_string(),
+        })
     }
 
     pub async fn close(&mut self) {
@@ -961,6 +1083,29 @@ impl HistorianProducer {
         if let Some(route) = self.command_route.take() {
             let _ = self.send_goodbye(route).await;
         }
+        self.route_retention = None;
+    }
+
+    async fn retention_for_route(&mut self, route: OpenedRoute) -> Option<u64> {
+        if let Some(retention) = self.route_retention {
+            return retention;
+        }
+
+        let described = self
+            .unary_json(route, json!({ "method": "role.describe", "params": {} }))
+            .await;
+        let retention = match described {
+            Ok(answer) => retention_from_role_describe(&answer),
+            Err(_) => None,
+        };
+        if retention.is_none() {
+            static RETENTION_UNAVAILABLE_WARNING: std::sync::Once = std::sync::Once::new();
+            RETENTION_UNAVAILABLE_WARNING.call_once(|| {
+                tracing::warn!("[mc-module] Broca does not declare a usable retention capability; historian and dreamer sessions will use the runner's default lifetime");
+            });
+        }
+        self.route_retention = Some(retention);
+        retention
     }
 
     async fn subscribe_from_start(
@@ -1062,7 +1207,7 @@ impl HistorianProducer {
     async fn unary_json(
         &mut self,
         route: OpenedRoute,
-        body: Value,
+        body: impl Serialize + Send,
     ) -> Result<Value, HistorianProducerError> {
         let corr = self.send_request(route, body).await?;
         let frame = self
@@ -1079,7 +1224,7 @@ impl HistorianProducer {
     async fn send_request(
         &mut self,
         route: OpenedRoute,
-        body: Value,
+        body: impl Serialize + Send,
     ) -> Result<u64, HistorianProducerError> {
         let corr = self.next_corr();
         let bytes = serde_json::to_vec(&body)?;
@@ -1252,6 +1397,50 @@ impl HistorianProducer {
         self.next_corr = self.next_corr.saturating_add(1).max(1);
         corr
     }
+}
+
+/// Return a policy only when `role.describe` names `retention` and provides positive
+/// limits. Older runners may not support the field, so omitting it when the group is
+/// absent keeps their `session.send` requests valid.
+fn retention_from_role_describe(answer: &Value) -> Option<u64> {
+    let answer = answer.get("result").unwrap_or(answer);
+    let declares_retention = answer
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| {
+            groups
+                .iter()
+                .any(|group| group.as_str() == Some("retention"))
+        });
+    if !declares_retention {
+        return None;
+    }
+    let max_seconds = answer
+        .get("retention")
+        .and_then(|retention| retention.get("max_seconds"))
+        .and_then(Value::as_u64)
+        .filter(|max_seconds| *max_seconds > 0)?;
+    let delete_within_ms = answer
+        .get("retention")
+        .and_then(|retention| retention.get("delete_within_ms"))
+        .and_then(Value::as_u64)?;
+    if delete_within_ms == 0 {
+        return None;
+    }
+    Some(HISTORIAN_SESSION_RETENTION_SECONDS.min(max_seconds))
+}
+
+fn select_session_retention(
+    frozen: &mut Option<Option<u64>>,
+    declared: Option<u64>,
+) -> Option<u64> {
+    let original = *frozen.get_or_insert(declared);
+    let (Some(maximum), Some(original)) = (declared, original) else {
+        return None;
+    };
+    let selected = original.min(maximum);
+    *frozen = Some(Some(selected));
+    Some(selected)
 }
 
 impl Drop for HistorianProducer {
@@ -1777,6 +1966,70 @@ mod tests {
     }
 
     #[test]
+    fn open_failed_detail_class_overrides_message_and_unknown_classes_never_fall_back() {
+        for (class, message, durable, retryable) in [
+            ("permanent", "runner selection rejected", true, false),
+            (
+                "transient",
+                "run resolution failed: unknown model 'x'",
+                false,
+                true,
+            ),
+            (
+                "permanent",
+                "rate limit; no apikey credential for provider 'x'",
+                true,
+                false,
+            ),
+            (
+                "future_class",
+                "rate limit; unknown provider 'x'",
+                false,
+                false,
+            ),
+        ] {
+            let parsed = error_body(
+                &serde_json::to_vec(&json!({
+                    "code": "open_failed",
+                    "message": message,
+                    "detail": {"class": class, "retry_after_secs": 120}
+                }))
+                .unwrap(),
+            );
+            let error = HistorianProducerError::Subc(parsed);
+            assert!(error.has_class_field());
+            assert_eq!(error.is_retryable_model_failure(), retryable, "{class}");
+            assert_eq!(
+                error.runner_refusal().unwrap().is_durable(),
+                durable,
+                "{class}"
+            );
+            assert_eq!(
+                error.classification(),
+                ErrorClass::from_wire(class).map(|class| ErrorClassification {
+                    class,
+                    retry_after_secs: Some(120),
+                })
+            );
+        }
+        for detail in [Value::Null, json!({"cause": "catalog"})] {
+            let error = HistorianProducerError::Subc(error_body(
+                &serde_json::to_vec(&json!({
+                    "code": "open_failed",
+                    "message": "run resolution failed: unknown model 'x'",
+                    "detail": detail
+                }))
+                .unwrap(),
+            ));
+            assert!(!error.has_class_field());
+            assert!(
+                error.runner_refusal().unwrap().is_durable(),
+                "legacy stage fallback"
+            );
+        }
+    }
+
+    #[test]
     fn error_class_wire_strings_match_pinned_contract_set() {
         assert_eq!(
             ERROR_CLASS_WIRE_SET,
@@ -1874,6 +2127,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct ServerLog {
         route_sessions: Vec<String>,
+        role_describes: Vec<Value>,
         sends: Vec<Value>,
         subscribes: Vec<Value>,
         retracts: Vec<Value>,
@@ -1887,6 +2141,29 @@ mod tests {
     }
 
     async fn fake_server(send_response: Value, stream_events: Vec<Value>) -> FakeServer {
+        fake_server_with_lost_send_reply(send_response, stream_events, false).await
+    }
+
+    async fn fake_server_with_lost_send_reply(
+        send_response: Value,
+        stream_events: Vec<Value>,
+        lose_first_reply: bool,
+    ) -> FakeServer {
+        fake_server_with_role_describe(
+            send_response,
+            stream_events,
+            json!({"capabilities": [], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}}),
+            lose_first_reply,
+        )
+        .await
+    }
+
+    async fn fake_server_with_role_describe(
+        send_response: Value,
+        stream_events: Vec<Value>,
+        role_describe_response: Value,
+        mut lose_first_reply: bool,
+    ) -> FakeServer {
         let temp = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
@@ -1912,85 +2189,101 @@ mod tests {
         let log = Arc::new(Mutex::new(ServerLog::default()));
         let log_task = Arc::clone(&log);
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            authenticate_server(
-                &mut stream,
-                &key,
-                &daemon_id,
-                "fake",
-                Duration::from_secs(2),
-            )
-            .await
-            .unwrap();
-            let mut next_route = 10u16;
-            let mut route_sessions = std::collections::HashMap::<u16, String>::new();
             let mut stream_events: VecDeque<Value> = stream_events.into();
             loop {
-                let Some(frame) = read_frame(&mut stream).await.unwrap() else {
-                    break;
-                };
-                match frame.header.ty {
-                    FrameType::Goodbye => {
-                        log_task.lock().await.goodbyes.push(frame.header.channel);
-                    }
-                    FrameType::Request if frame.header.channel == 0 => {
-                        let req: ClientControlRequest =
-                            serde_json::from_slice(&frame.body).unwrap();
-                        if let ClientControlRequest::RouteOpen { identity, .. } = req {
-                            let route = next_route;
-                            next_route += 1;
-                            route_sessions.insert(route, identity.session.clone());
-                            log_task.lock().await.route_sessions.push(identity.session);
-                            send_response_frame(
-                                &mut stream,
-                                frame.header.channel,
-                                frame.header.epoch,
-                                frame.header.corr,
-                                serde_json::to_vec(&ClientControlResponse::RouteOpen {
-                                    route_channel: route,
-                                    route_epoch: 1,
-                                })
-                                .unwrap(),
-                            )
-                            .await;
+                let (mut stream, _) = listener.accept().await.unwrap();
+                authenticate_server(
+                    &mut stream,
+                    &key,
+                    &daemon_id,
+                    "fake",
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+                let mut next_route = 10u16;
+                let mut route_sessions = std::collections::HashMap::<u16, String>::new();
+                loop {
+                    let Some(frame) = read_frame(&mut stream).await.unwrap() else {
+                        break;
+                    };
+                    match frame.header.ty {
+                        FrameType::Goodbye => {
+                            log_task.lock().await.goodbyes.push(frame.header.channel);
                         }
-                    }
-                    FrameType::Request => {
-                        let req: Value = serde_json::from_slice(&frame.body).unwrap();
-                        match req.get("method").and_then(Value::as_str) {
-                            Some("session.send") => {
-                                log_task.lock().await.sends.push(req["params"].clone());
+                        FrameType::Request if frame.header.channel == 0 => {
+                            let req: ClientControlRequest =
+                                serde_json::from_slice(&frame.body).unwrap();
+                            if let ClientControlRequest::RouteOpen { identity, .. } = req {
+                                let route = next_route;
+                                next_route += 1;
+                                route_sessions.insert(route, identity.session.clone());
+                                log_task.lock().await.route_sessions.push(identity.session);
                                 send_response_frame(
                                     &mut stream,
                                     frame.header.channel,
                                     frame.header.epoch,
                                     frame.header.corr,
-                                    serde_json::to_vec(&send_response).unwrap(),
+                                    serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                                        route_channel: route,
+                                        route_epoch: 1,
+                                    })
+                                    .unwrap(),
                                 )
                                 .await;
                             }
-                            Some("session.subscribe") => {
-                                log_task.lock().await.subscribes.push(req["params"].clone());
-                                while let Some(event) = stream_events.pop_front() {
-                                    send_stream_data(
+                        }
+                        FrameType::Request => {
+                            let req: Value = serde_json::from_slice(&frame.body).unwrap();
+                            match req.get("method").and_then(Value::as_str) {
+                                Some("role.describe") => {
+                                    log_task.lock().await.role_describes.push(req.clone());
+                                    send_response_frame(
                                         &mut stream,
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        event,
+                                        serde_json::to_vec(&role_describe_response).unwrap(),
                                     )
                                     .await;
                                 }
-                                send_stream_end(
-                                    &mut stream,
-                                    frame.header.channel,
-                                    frame.header.epoch,
-                                    frame.header.corr,
-                                )
-                                .await;
-                            }
-                            Some("run.status") => {
-                                send_response_frame(
+                                Some("session.send") => {
+                                    log_task.lock().await.sends.push(req["params"].clone());
+                                    if lose_first_reply {
+                                        lose_first_reply = false;
+                                        continue;
+                                    }
+                                    send_response_frame(
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                        serde_json::to_vec(&send_response).unwrap(),
+                                    )
+                                    .await;
+                                }
+                                Some("session.subscribe") => {
+                                    log_task.lock().await.subscribes.push(req["params"].clone());
+                                    while let Some(event) = stream_events.pop_front() {
+                                        send_stream_data(
+                                            &mut stream,
+                                            frame.header.channel,
+                                            frame.header.epoch,
+                                            frame.header.corr,
+                                            event,
+                                        )
+                                        .await;
+                                    }
+                                    send_stream_end(
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                    )
+                                    .await;
+                                }
+                                Some("run.status") => {
+                                    send_response_frame(
                                     &mut stream,
                                     frame.header.channel,
                                     frame.header.epoch,
@@ -2001,35 +2294,36 @@ mod tests {
                                     .unwrap(),
                                 )
                                 .await;
+                                }
+                                Some("run.cancel") => {
+                                    send_response_frame(
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                        serde_json::to_vec(&json!({"ack":true})).unwrap(),
+                                    )
+                                    .await;
+                                }
+                                Some("session.retract") => {
+                                    log_task.lock().await.retracts.push(req["params"].clone());
+                                    send_response_frame(
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                        serde_json::to_vec(&json!({"result":"retracted"})).unwrap(),
+                                    )
+                                    .await;
+                                }
+                                other => panic!(
+                                    "unexpected request {other:?} on route {:?}",
+                                    route_sessions.get(&frame.header.channel)
+                                ),
                             }
-                            Some("run.cancel") => {
-                                send_response_frame(
-                                    &mut stream,
-                                    frame.header.channel,
-                                    frame.header.epoch,
-                                    frame.header.corr,
-                                    serde_json::to_vec(&json!({"ack":true})).unwrap(),
-                                )
-                                .await;
-                            }
-                            Some("session.retract") => {
-                                log_task.lock().await.retracts.push(req["params"].clone());
-                                send_response_frame(
-                                    &mut stream,
-                                    frame.header.channel,
-                                    frame.header.epoch,
-                                    frame.header.corr,
-                                    serde_json::to_vec(&json!({"result":"retracted"})).unwrap(),
-                                )
-                                .await;
-                            }
-                            other => panic!(
-                                "unexpected request {other:?} on route {:?}",
-                                route_sessions.get(&frame.header.channel)
-                            ),
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         });
@@ -2103,6 +2397,215 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn lost_send_reply_retry_reuses_attempt_send_id_after_reconnect() {
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            json!({"capabilities":["retention"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
+            true,
+        )
+        .await;
+        let mut first = client(&server).await;
+        first.config.request_timeout = Duration::from_millis(50);
+        let session = "mc-historian:proj:lineage:1";
+        let error = first
+            .start(session, "role", "prompt", "prov/model-a")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HistorianProducerError::TimedOut));
+        first.close().await;
+        drop(first);
+
+        // A retry of the same logical send survives a fresh connection and corr id.
+        let mut retry = client(&server).await;
+        let handle = retry
+            .start(session, "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        assert_eq!(handle.run_id, "run-1");
+        retry.close().await;
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), 2);
+        assert_eq!(log.sends[0]["send_id"], json!(session));
+        assert_eq!(log.sends[1]["send_id"], json!(session));
+        assert_eq!(log.sends[0]["retention"], json!(86_400));
+        assert_eq!(log.sends[1]["retention"], json!(86_400));
+        assert_eq!(
+            log.role_describes.len(),
+            2,
+            "each new route is queried once"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_send_includes_one_day_retention_when_role_declares_group() {
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            json!({"capabilities":["retention"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
+            false,
+        )
+        .await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:1", "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        client.close().await;
+
+        let log = server.log.lock().await;
+        assert_eq!(log.role_describes.len(), 1);
+        assert_eq!(
+            log.role_describes[0],
+            json!({"method":"role.describe","params":{}})
+        );
+        assert_eq!(log.sends[0]["retention"], json!(86_400));
+    }
+
+    #[tokio::test]
+    async fn first_send_omits_retention_when_role_does_not_declare_group() {
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:1", "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        client.close().await;
+
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), 1);
+        assert!(log.sends[0].get("retention").is_none());
+    }
+
+    #[tokio::test]
+    async fn first_send_clamps_retention_to_role_maximum() {
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            json!({"capabilities":["retention"],"retention":{"max_seconds":43_200,"delete_within_ms":3_600_000}}),
+            false,
+        )
+        .await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:1", "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        client.close().await;
+
+        assert_eq!(server.log.lock().await.sends[0]["retention"], json!(43_200));
+    }
+
+    #[tokio::test]
+    async fn new_historian_and_dreamer_attempts_get_distinct_send_ids() {
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
+        let mut client = client(&server).await;
+        let sessions = [
+            crate::historian::historian_producer_session_id("proj", "lineage", 1),
+            crate::historian::historian_producer_session_id("proj", "lineage", 2),
+            crate::classify::child_session_id("proj", "command", 1),
+            crate::classify::child_session_id("proj", "command", 2),
+        ];
+        for session in &sessions {
+            client
+                .start(session, "role", "prompt", "prov/model-a")
+                .await
+                .unwrap();
+            client.close().await;
+        }
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), sessions.len());
+        let ids = log
+            .sends
+            .iter()
+            .map(|params| params["send_id"].as_str().expect("send_id on every send"))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids.len(),
+            sessions.len(),
+            "even identical prompts need a new id for a new attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_session_reports_retention_and_closes_both_routes() {
+        const CHILD: &str = "MC_TEST_RUNNER_RETENTION_CHILD";
+        const TEST: &str =
+            "historian_producer::tests::purge_session_reports_retention_and_closes_both_routes";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate the process-wide once-only warning from parallel tests.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "retention child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Arc::clone(&logs);
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || LogWriter(Arc::clone(&writer)))
+                .finish(),
+        )
+        .unwrap();
+        let server = fake_server(json!({}), Vec::new()).await;
+        let mut client = client(&server).await;
+        client.bind_session("mc-dreamer:classify:snapshot");
+        client.ensure_command_route().await.unwrap();
+        client.ensure_subscribe_route().await.unwrap();
+        let error = crate::historian::HistorianProducerDriver::purge_session(
+            &mut client,
+            "mc-dreamer:classify:snapshot",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            HistorianProducerError::RunnerSessionDeletionUnsupported { .. }
+        ));
+        assert!(error
+            .to_string()
+            .contains("stays in Broca's store indefinitely"));
+        assert!(client.command_route.is_none());
+        assert!(client.subscribe_route.is_none());
+        client.purge_session("another-snapshot").await.unwrap_err();
+        // Goodbye frames reach the fake server asynchronously; a loaded runner can
+        // take longer than a fixed sleep, so wait for both with a deadline.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.log.lock().await.goodbyes.len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let log = server.log.lock().await;
+        assert_eq!(log.route_sessions, vec!["mc-dreamer:classify:snapshot"; 2]);
+        assert_eq!(log.goodbyes, vec![11, 10]);
+        assert!(log.sends.is_empty());
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.matches("runner cannot delete sessions").count(), 1);
+        assert!(logs.contains("memory-pool snapshots"));
+        assert!(logs.contains("never deletes a session"));
     }
 
     #[tokio::test]
@@ -2206,6 +2709,7 @@ mod tests {
                     "role guidance",
                     "prompt",
                     "prov/model-a",
+                    None,
                     Some(temperature),
                 )
                 .await
@@ -2219,6 +2723,179 @@ mod tests {
                 json!(temperature)
             );
         }
+    }
+
+    /// Broca's own `session.send` goldens, vendored byte-for-byte; see
+    /// `testdata/broca/README.md` for their source path and Broca commit.
+    const BROCA_SEND_MODEL_VARIANT_QUEUE: &str =
+        include_str!("../testdata/broca/send_request.model_variant_queue.json");
+    const BROCA_SEND_MODEL_VARIANT_STEER: &str =
+        include_str!("../testdata/broca/send_request.model_variant_steer.json");
+    const SEND_WITH_RETENTION: &str =
+        include_str!("../testdata/broca/send_request.model_variant_retention.json");
+
+    fn golden_send_params(variant: Option<&str>) -> String {
+        golden_send_params_with_retention(variant, None)
+    }
+
+    fn golden_send_params_with_retention(variant: Option<&str>, retention: Option<u64>) -> String {
+        let request = session_send_request(
+            "s-1",
+            "",
+            "continue",
+            "openai/gpt-6.1-sol",
+            variant,
+            HISTORIAN_MAX_OUTPUT_TOKENS,
+            None,
+            retention,
+        )
+        .unwrap();
+        assert_eq!(request.method, "session.send");
+        serde_json::to_string(&request.params).unwrap()
+    }
+
+    /// The send params this client serializes start with exactly Broca's queued-send
+    /// golden (`prompt`, `send_id`, `model` with its variant), byte for byte. Only the
+    /// fields Broca's golden leaves out (`tools`, `generation`) follow it.
+    #[test]
+    fn session_send_with_variant_matches_broca_queue_golden_bytes() {
+        let golden_body = BROCA_SEND_MODEL_VARIANT_QUEUE
+            .strip_suffix('}')
+            .expect("golden is one JSON object");
+        assert_eq!(
+            golden_send_params(Some("high")),
+            format!(
+                "{golden_body},\"tools\":[],\"generation\":{{\"max_output_tokens\":{HISTORIAN_MAX_OUTPUT_TOKENS}}}}}"
+            )
+        );
+    }
+
+    /// The retention fixture keeps the runner fields first: `prompt`, `send_id`, nested
+    /// `model`, and integer retention seconds. This producer appends `tools` and
+    /// `generation` afterward.
+    #[test]
+    fn session_send_retention_matches_runner_contract_field_order() {
+        let golden_body = SEND_WITH_RETENTION
+            .strip_suffix('}')
+            .expect("retention golden is one JSON object");
+        assert_eq!(
+            golden_send_params_with_retention(Some("high"), Some(86_400)),
+            format!(
+                "{golden_body},\"tools\":[],\"generation\":{{\"max_output_tokens\":{HISTORIAN_MAX_OUTPUT_TOKENS}}}}}"
+            )
+        );
+    }
+
+    #[test]
+    fn retention_requires_a_declared_group_and_clamps_to_its_maximum() {
+        assert_eq!(
+            retention_from_role_describe(
+                &json!({"capabilities": ["retention"], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}})
+            ),
+            Some(86_400)
+        );
+        assert_eq!(
+            retention_from_role_describe(
+                &json!({"capabilities": [], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}})
+            ),
+            None
+        );
+        assert_eq!(
+            retention_from_role_describe(
+                &json!({"capabilities": ["retention"], "retention": {"max_seconds": 43_200, "delete_within_ms": 3_600_000}})
+            ),
+            Some(43_200)
+        );
+    }
+
+    #[test]
+    fn a_session_without_first_send_retention_cannot_opt_in_later() {
+        let mut frozen = None;
+        assert_eq!(select_session_retention(&mut frozen, None), None);
+        assert_eq!(
+            select_session_retention(&mut frozen, Some(86_400)),
+            None,
+            "a later route cannot opt a session into retention"
+        );
+        assert_eq!(frozen, Some(None));
+    }
+
+    #[test]
+    fn a_reconnected_session_can_only_shorten_its_frozen_retention() {
+        let mut frozen = None;
+        assert_eq!(
+            select_session_retention(&mut frozen, Some(86_400)),
+            Some(86_400)
+        );
+        assert_eq!(
+            select_session_retention(&mut frozen, Some(43_200)),
+            Some(43_200)
+        );
+        assert_eq!(
+            select_session_retention(&mut frozen, Some(172_800)),
+            Some(43_200)
+        );
+    }
+
+    /// Broca's steer golden carries the same `model` object plus `delivery: "steer"`.
+    /// This client never sends `delivery` (every send is a queued send, which must name
+    /// its variant), so the steer golden pins only that the model object is shared.
+    #[test]
+    fn broca_steer_golden_shares_the_queue_golden_model_object() {
+        let steer_body = BROCA_SEND_MODEL_VARIANT_STEER
+            .strip_suffix(r#","delivery":"steer"}"#)
+            .expect("steer golden ends with its delivery field");
+        let queue_body = BROCA_SEND_MODEL_VARIANT_QUEUE
+            .strip_suffix('}')
+            .expect("golden is one JSON object");
+        assert_eq!(steer_body, queue_body);
+        assert!(
+            golden_send_params(Some("high")).starts_with(steer_body),
+            "the steer golden's model object must match this client's bytes too"
+        );
+    }
+
+    #[test]
+    fn session_send_without_variant_omits_the_field() {
+        let params = golden_send_params(None);
+        assert!(
+            params.contains(r#","model":{"provider":"openai","model":"gpt-6.1-sol"},"#),
+            "{params}"
+        );
+        assert!(!params.contains("variant"), "{params}");
+        // An empty configured variant is absent, never sent as "".
+        assert_eq!(golden_send_params(Some("")), params);
+    }
+
+    #[tokio::test]
+    async fn start_with_generation_sends_the_variant_on_the_wire() {
+        let server = fake_server(json!({"state":"active","run_id":"run-v"}), Vec::new()).await;
+        let mut client = client(&server).await;
+        client
+            .start_with_generation(
+                "mc-dreamer:classify:v",
+                "role",
+                "prompt",
+                "openai/gpt-6.1-sol",
+                Some("high"),
+                4_000,
+                Some(0.1),
+            )
+            .await
+            .unwrap();
+        client.close().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let log = server.log.lock().await;
+        assert_eq!(
+            log.sends[0]["model"],
+            json!({ "provider": "openai", "model": "gpt-6.1-sol", "variant": "high" })
+        );
+        assert_eq!(log.sends[0]["send_id"], json!("mc-dreamer:classify:v"));
+        assert_eq!(
+            log.sends[0]["generation"]["max_output_tokens"],
+            json!(4_000)
+        );
+        assert_eq!(log.sends[0]["system"], json!("role"));
     }
 
     #[tokio::test]

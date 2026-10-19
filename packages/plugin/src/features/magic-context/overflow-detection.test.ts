@@ -162,7 +162,7 @@ describe("overflow-detection / detectThinkingBindingMismatch", () => {
     });
 
     // Captured on 2026-09-26; the body was byte-identical for Claude Fable 5.1
-    // and Claude Opus 5.5 (docs/reports/anthropic-thinking-binding.md section 2).
+    // and Claude Opus 5.5.
     // It carries no message id of any kind, only lowered wire-array paths.
     const LIVE_BINDING_400_BODY = {
         type: "error",
@@ -252,6 +252,10 @@ describe("overflow-detection / isPrefixBoundThinkingModel", () => {
                 "us.anthropic.claude-sonnet-5-5-v1:0",
                 "anthropic.claude-fable-5-1-v1:0",
                 "claude-sonnet-5-5@20260930",
+                "claude-haiku-5-5",
+                "claude-haiku-5.5-20261001",
+                "us.anthropic.claude-haiku-5-5-v1:0",
+                "claude-haiku-5-5@20261001",
             ]) {
                 expect(isPrefixBoundThinkingModel(providerID, modelID)).toBe(true);
             }
@@ -265,6 +269,9 @@ describe("overflow-detection / isPrefixBoundThinkingModel", () => {
                 "claude-sonnet-5-50",
                 "claude-sonnet-15-5",
                 "notsonnet-5-5",
+                "claude-haiku-5",
+                "claude-haiku-4-5",
+                "claude-haiku-5-50",
                 "gpt-6-astra",
                 "",
                 null,

@@ -75,6 +75,15 @@ test("peer roster name takes precedence over project binding", async () => {
     const result = await runLatencySentinel({ files: [path], stateFile: join(root, "state.json"), db: join(root, "context.db"), peerDb: join(root, "peers.db"), connectionFile: "", send: false, now: () => BASE + 100_000, load: () => [0, 0, 0], stdout: () => {}, stderr: () => {} });
     expect(result.alerts[0]?.name).toBe("CEREB");
 });
+test("a roster without the legacy peers table still names sessions from agent rows", async () => {
+    writeFileSync(path, line("ses_slow", 0, 13000));
+    const roster = new Database(join(root, "peers.db"));
+    roster.exec("CREATE TABLE agent(name TEXT, residence_address_json TEXT, terminal_reason TEXT)");
+    roster.query("INSERT INTO agent VALUES (?, ?, NULL)").run("SUBC", JSON.stringify({ session: "ses_slow" }));
+    roster.close(false);
+    const result = await runLatencySentinel({ files: [path], stateFile: join(root, "state.json"), db: join(root, "missing.db"), peerDb: join(root, "peers.db"), connectionFile: "", send: false, now: () => BASE + 100_000, load: () => [0, 0, 0], stdout: () => {}, stderr: () => {} });
+    expect(result.alerts[0]?.name).toBe("SUBC");
+});
 test("LKG declines count by session and UTC hour, appear on refusals, and summary does not advance the cursor", async () => {
     const decline = (id: string, at: string, reason: string) => `[${at}] [magic-context][${id}] ${reason}\n`;
     const refusal = (id: string, at: string) => `[${at}] [magic-context][${id}] raw_fallback_over_context_limit\n`;
@@ -132,7 +141,7 @@ test("children of one project collapse to one line; only parks and refusals are 
         "- ALF: 1 slow p90; worst pass 7.1 s (module 5.8 s); p90 up to 6.1 s",
     ]);
     expect(text).toContain("load now 279/262/235");
-    expect(alertUrgency(alerts)).toBe("medium");
+    expect(alertUrgency(alerts)).toBe("normal");
     expect(alertUrgency([...alerts, { ...base, kind: "refusal", sessionId: "ses_head", name: "ALF", p90: 0, max: 0, moduleMax: 0 }])).toBe("high");
     expect(alertUrgency([{ ...base, kind: "park", sessionId: "ses_x", name: "CEREB", p90: 0, max: 0, moduleMax: 0 }])).toBe("high");
 });
@@ -148,7 +157,7 @@ test("busy-storage markers count by session and hour, threshold and dedupe; lock
     expect(first.alerts[2]).toMatchObject({ sessionId: "unknown-session", lock: { site: "smart_note_commit", count: 2, max: 5100, p90: 5100 } });
     expect(first.alerts[1]).toMatchObject({ sessionId: "ses_pi", busy: { refusals: 0, replays: 3 } });
     expect(formatAlerts(first.alerts)).toContain("smart_note_commit max 5.1 s, p90 5.1 s");
-    expect(alertUrgency(first.alerts)).toBe("medium");
+    expect(alertUrgency(first.alerts)).toBe("normal");
     expect(output.filter((value) => JSON.parse(value).kind === "transform_latency_daily_summary")).toHaveLength(1);
     appendFileSync(path, "[2026-09-28T18:00:10.000Z] [magic-context] storage-busy refusal stage=rust-mode-emergency: locked\n"
         + "[2026-09-28T18:00:11.000Z] [magic-context] slow write transaction: site=smart_note_commit held=5200.0ms\n"

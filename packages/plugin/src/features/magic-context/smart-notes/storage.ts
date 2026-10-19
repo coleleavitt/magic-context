@@ -157,6 +157,7 @@ export function getSmartNotesNeedingCompilation(
         .map(toSmartNote)
         .filter(
             (note) =>
+                note.checkStatus !== "parked" &&
                 (note.checkNextDueAt === null || note.checkNextDueAt <= now) &&
                 (note.checkStatus === "uncompiled" ||
                     note.checkStatus === "failing" ||
@@ -324,18 +325,44 @@ export function markSmartNoteCompilationFailure(
     persistent: boolean,
     fallbackSessionId?: string,
     retryAt?: number,
+    uncheckable = false,
 ): void {
     db.transaction(() => {
+        // Retryable transport failures have their own backoff counter. They must
+        // not spend logic strikes, even if a later attempt has a genuine bug.
+        if (!persistent && retryAt !== undefined) {
+            const networkFailureCount =
+                readFailureCount(db, noteId, "check_network_failure_count") + 1;
+            db.prepare(
+                `UPDATE notes SET check_network_failure_count = ?, check_status = 'uncompiled',
+                 check_next_due_at = ?, ready_reason = NULL, updated_at = ?
+                 WHERE id = ? AND type = 'smart'`,
+            ).run(
+                networkFailureCount,
+                Math.max(now + backoffMs(networkFailureCount), retryAt),
+                now,
+                noteId,
+            );
+            return;
+        }
         const failureCount = readFailureCount(db, noteId, "check_failure_count") + 1;
-        const status: NoteCheckStatus = persistent
-            ? "uncompiled"
-            : retryAt === undefined && failureCount >= maxFailures
-              ? "fallback"
-              : "uncompiled";
-        const nextDueAt = Math.max(
-            now + (persistent ? 7 * 24 * 60 * 60 * 1_000 : backoffMs(failureCount)),
-            retryAt ?? 0,
-        );
+        // Body-size failures can be reauthored later. Inaccessible sources cannot
+        // improve by retrying the same unauthenticated check; only a condition edit
+        // should enable compilation, scheduled checks or fallback evaluation again.
+        const parked = persistent && uncheckable && retryAt === undefined;
+        const status: NoteCheckStatus = parked
+            ? "parked"
+            : persistent
+              ? "uncompiled"
+              : retryAt === undefined && failureCount >= maxFailures
+                ? "fallback"
+                : "uncompiled";
+        const nextDueAt = parked
+            ? null
+            : Math.max(
+                  now + (persistent ? 7 * 24 * 60 * 60 * 1_000 : backoffMs(failureCount)),
+                  retryAt ?? 0,
+              );
         db.prepare(
             `UPDATE notes
          SET check_failure_count = ?,
@@ -375,7 +402,7 @@ export function markSmartNoteCompilationFailure(
                 if (!alreadyNotified) {
                     addNote(db, "session", {
                         sessionId: ownerSessionId,
-                        content: `${prefix}${error.slice(0, 2048)}\nRewrite the condition or repair its data source; this is not evidence that it is met.`,
+                        content: `${prefix}${error.slice(0, 2048)}\nRewrite the condition or repair its data source; this is not evidence that it is met.${parked ? " Checks are paused; update surface_condition to a different condition to retry." : ""}`,
                     });
                     setPersistedNoteNudgeTrigger(db, ownerSessionId);
                 }

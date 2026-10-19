@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
-export type BodyProvider = "anthropic" | "openai";
+export type BodyProvider = "anthropic" | "openai" | "gemini";
 
 type Json = Record<string, unknown>;
 
@@ -27,8 +27,16 @@ export interface NormalizedRequestBody {
 }
 
 export interface PiBodySnapshot {
+    /** The number in the `<n>-req.json` file name, counted by the capture extension. */
     sequence: number;
     path: string;
+    /**
+     * When the capture extension last wrote the body file. The extension numbers
+     * its files with its own per-process counter, which is not Magic Context's
+     * ledger sequence and restarts with every Pi process, so the write time is
+     * what ties a body to the context pass that produced it.
+     */
+    writtenAtMs: number;
     wireModel?: string;
     messages: NormalizedMessage[];
 }
@@ -189,7 +197,62 @@ function normalizeOpenAiBody(body: Json): NormalizedMessage[] {
     return messages;
 }
 
-/** Convert Anthropic `messages[]` and Responses `input[]` into the same diagnostic shape. */
+/** Gemini parts carry no `type`; the payload key (text, functionCall, ...) names the part. */
+function geminiPartType(value: unknown): string {
+    const object = asJson(value);
+    if (!object) return "text";
+    for (const key of [
+        "functionCall",
+        "functionResponse",
+        "inlineData",
+        "fileData",
+        "executableCode",
+        "codeExecutionResult",
+    ] as const) {
+        if (object[key] !== undefined) return key;
+    }
+    if (object.text !== undefined) return object.thought === true ? "thought" : "text";
+    return "part";
+}
+
+function geminiMessage(role: string, parts: unknown, original: unknown): NormalizedMessage {
+    const message = normalizedMessage(role, parts, original, "text");
+    return {
+        ...message,
+        parts: Array.isArray(parts)
+            ? parts.map((part) => normalizePart(part, geminiPartType(part)))
+            : message.parts,
+    };
+}
+
+/**
+ * Gemini `generateContent` bodies: `systemInstruction` + `tools` + `contents[]`.
+ * Google Code Assist (Antigravity) wraps the same request in a
+ * `{model, project, request: {...}}` envelope, so the inner request is read when
+ * present. Tool declarations are kept as their own message because they sit in the
+ * provider's cached prefix: a changed tool list is a real prefix rewrite.
+ */
+function normalizeGeminiBody(body: Json): NormalizedMessage[] {
+    const request = asJson(body.request) ?? body;
+    const messages: NormalizedMessage[] = [];
+    if (request.systemInstruction !== undefined) {
+        const system = asJson(request.systemInstruction);
+        messages.push(geminiMessage("system", system?.parts ?? request.systemInstruction, system));
+    }
+    if (request.tools !== undefined) {
+        messages.push(normalizedMessage("tools", request.tools, request.tools, "tools"));
+    }
+    if (!Array.isArray(request.contents)) return messages;
+    for (const value of request.contents) {
+        const content = asJson(value);
+        if (!content) continue;
+        const role = typeof content.role === "string" ? content.role : "unknown";
+        messages.push(geminiMessage(role, content.parts, content));
+    }
+    return messages;
+}
+
+/** Convert Anthropic `messages[]`, Responses `input[]`, and Gemini `contents[]` into the same diagnostic shape. */
 export function normalizeRequestBody(body: Json, provider?: BodyProvider): NormalizedRequestBody {
     const resolvedProvider = provider ?? (Array.isArray(body.input) ? "openai" : "anthropic");
     return {
@@ -197,7 +260,9 @@ export function normalizeRequestBody(body: Json, provider?: BodyProvider): Norma
         messages:
             resolvedProvider === "openai"
                 ? normalizeOpenAiBody(body)
-                : normalizeAnthropicBody(body),
+                : resolvedProvider === "gemini"
+                  ? normalizeGeminiBody(body)
+                  : normalizeAnthropicBody(body),
     };
 }
 
@@ -320,6 +385,7 @@ export function loadPiBodySnapshots(directory: string | undefined): Map<number, 
             snapshots.set(Number.parseInt(match[1], 10), {
                 sequence: Number.parseInt(match[1], 10),
                 path,
+                writtenAtMs: statSync(path).mtimeMs,
                 wireModel:
                     typeof body.model === "string" && body.model.length > 0 ? body.model : undefined,
                 messages: normalizeRequestBody(body, "openai").messages,

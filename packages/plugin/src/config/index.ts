@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 
-import { getMagicContextBuiltinCommands } from "../features/builtin-commands/commands";
+import { getMagicContextBuiltinCommands } from "../shared/builtin-commands";
 import {
     CONFIG_WARNING_CLASS,
     type ConfigParseFailure,
@@ -14,8 +14,8 @@ import {
 import { log } from "../shared/logger";
 import { setOutputReserveConfig } from "../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../shared/prompt-surface";
-import { setWindowOverlayPath } from "../shared/window-geometry";
 import { isCompactionEnabled, migrateLegacyAgentEnabledInMemory } from "./agent-disable";
+import { warnDeprecatedMuralModel, warnDeprecatedWindowOverlayPath } from "./deprecated-config";
 import {
     cortexKitProjectConfigBasePath,
     cortexKitUserConfigBasePath,
@@ -284,10 +284,22 @@ function deepMergeRawConfig(
             typeof overrideVal === "object" &&
             !Array.isArray(overrideVal)
         ) {
-            mergedValue = deepMergeRawConfig(
-                baseVal as Record<string, unknown>,
-                overrideVal as Record<string, unknown>,
-            );
+            mergedValue =
+                key === "protected_tools"
+                    ? Object.fromEntries(
+                          [baseVal, overrideVal].flatMap((value) =>
+                              Object.entries(value as Record<string, unknown>).map(
+                                  ([name, count]) => [
+                                      name.toLowerCase().replace(/^mcp_/, ""),
+                                      count,
+                                  ],
+                              ),
+                          ),
+                      )
+                    : deepMergeRawConfig(
+                          baseVal as Record<string, unknown>,
+                          overrideVal as Record<string, unknown>,
+                      );
         } else if (
             key === "disabled_hooks" &&
             Array.isArray(baseVal) &&
@@ -403,10 +415,21 @@ export function parsePluginConfig(
     // opt-in/out state survives upgrades even when they never run `doctor`.
     const preMigrationWarnings: string[] = [];
     const configWithoutRemovedAgent = stripRemovedAgentConfig(rawConfig, preMigrationWarnings);
+    if (Object.hasOwn(rawConfig, "clear_reasoning_age")) {
+        const warning =
+            "clear_reasoning_age is deprecated and ignored. Magic Context now keeps reasoning up to a token budget, keep_reasoning_tokens (default 10,000). Remove the key, or set keep_reasoning_tokens to a token count.";
+        preMigrationWarnings.push(warning);
+        log(`[magic-context] ${warning}`);
+    }
     if (Object.hasOwn(rawConfig, "protected_tags")) {
         warnProtectedTagsDeprecationOnce();
         preMigrationWarnings.push(
             "protected_tags is deprecated and ignored; use protected_tokens instead.",
+        );
+    }
+    if (Object.hasOwn(rawConfig, "smart_drops")) {
+        preMigrationWarnings.push(
+            "smart_drops is deprecated and ignored; supersession reclaim is always on. This key no longer does anything; remove it.",
         );
     }
     preMigrationWarnings.push(...misplacedAgentModelWarnings(rawConfig));
@@ -414,6 +437,8 @@ export function parsePluginConfig(
         configWithoutRemovedAgent,
         preMigrationWarnings,
     );
+    warnDeprecatedMuralModel(migratedExperimental, preMigrationWarnings);
+    warnDeprecatedWindowOverlayPath(migratedExperimental, preMigrationWarnings);
     // Dreamer v2: convert the legacy v1 dreamer shape (window schedule, tasks
     // array, user_memories/pin_key_files blocks) into the per-task `tasks` record.
     // Runs AFTER migrate-experimental so experimental.user_memories (already
@@ -847,7 +872,6 @@ export function loadPluginConfigDetailed(
     if (profileResolution.activeProfile) config.profile = profileResolution.activeProfile;
     if (applyRuntimeGlobals) {
         setOutputReserveConfig(config.output_reserve);
-        setWindowOverlayPath(config.models?.window_overlay_path);
     }
     const leafValidationWarnings = [...(config.configWarnings ?? [])];
     if (config.configWarnings?.length) {

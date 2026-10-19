@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
@@ -11,6 +11,9 @@ import {
 	insertMemory,
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
+	appendAutoSearchHintDecision,
+	flushAutoSearchHintDecisionRetirement,
+	getAutoSearchHintDecisions,
 	getCompartments,
 	getOrCreateSessionMeta,
 	queueMemoryMutation,
@@ -19,6 +22,7 @@ import {
 import {
 	getActiveUserMemories,
 	insertUserMemory,
+	type UserMemory,
 } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
 import {
 	COMPARTMENT_RENDER_EPOCH,
@@ -26,6 +30,7 @@ import {
 	MEMORY_RENDER_FORMAT_EPOCH,
 } from "@magic-context/core/hooks/magic-context/compartment-render-epoch";
 import { renderMemoryBlockV2 } from "@magic-context/core/hooks/magic-context/inject-compartments";
+import { withRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
@@ -36,8 +41,10 @@ import {
 	materializeM0Pi,
 	materializeM0PiWithRetry,
 	mustMaterializePi,
+	prepareCachedM0M1PiReplay,
 	renderM0Pi,
 	renderM1Pi,
+	trimPiMessagesToCachedBoundary,
 } from "./inject-compartments-pi";
 import { createTestDb, textOf, userMessage } from "./test-utils.test";
 
@@ -71,6 +78,380 @@ function result(toolCallId: string) {
 		timestamp: 1,
 	};
 }
+
+it("Pi reanchors an invisible cached boundary by active-branch order on repeated passes", () => {
+	const db = createTestDb();
+	const sessionId = "pi-out-of-order-boundary";
+	try {
+		appendCompartments(db, sessionId, [
+			{
+				sequence: 0,
+				startMessage: 1,
+				endMessage: 2,
+				startMessageId: "old",
+				endMessageId: "boundary",
+				title: "Summary",
+				content: "Old history.",
+			},
+		]);
+		materializeM0Pi({ sessionId, injectDocs: false }, db);
+		withRawMessageProvider(
+			sessionId,
+			{
+				readMessages: () =>
+					["old", "boundary", "tail"].map((id, index) => ({
+						id,
+						role: "user" as const,
+						ordinal: index + 1,
+						parts: [{ type: "text", text: id }],
+					})),
+			},
+			() => {
+				for (let pass = 0; pass < 3; pass++) {
+					const live = [userMessage("old"), userMessage("tail")];
+					const ids = ["old", "tail"];
+					expect(trimPiMessagesToCachedBoundary(db, sessionId, live, ids)).toBe(
+						1,
+					);
+					expect(live).toEqual([userMessage("tail")]);
+					expect(ids).toEqual(["tail"]);
+				}
+			},
+		);
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("pi applied compaction bounds auto-search blob across 20000 user messages", () => {
+	const db = createTestDb();
+	const sessionId = "pi-auto-search-bounded";
+	const state = { sessionId, injectDocs: false };
+	const window = 100;
+	const total = 20000;
+	const id = (number: number) => `user-${number}`;
+	let live: Parameters<typeof injectM0M1Pi>[2] = [];
+	let maxEntries = 0;
+	let maxBytes = 0;
+	const readBlob = db.prepare(
+		"SELECT auto_search_hint_decisions AS blob FROM session_meta WHERE session_id = ?",
+	);
+	try {
+		for (let number = 1; number <= total; number++) {
+			live.push(userMessage(`Question ${number}`, number));
+			expect(
+				appendAutoSearchHintDecision(
+					db,
+					sessionId,
+					number % 3 === 0
+						? { messageId: id(number), decision: "hint", text: "h".repeat(512) }
+						: {
+								messageId: id(number),
+								decision: "no-hint",
+								reason: number % 2 ? "error" : "timeout",
+							},
+				),
+			).toMatchObject({ ok: true, kind: "appended" });
+			if (number % window !== 0) continue;
+			const before = (readBlob.get(sessionId) as { blob: string }).blob;
+			const count = JSON.parse(before).length;
+			expect(count).toBe(live.length);
+			expect(count).toBeLessThanOrEqual(window * 2);
+			maxEntries = Math.max(maxEntries, count);
+			maxBytes = Math.max(maxBytes, Buffer.byteLength(before));
+			if (number === window) continue;
+			const cutoff = number - window;
+			appendCompartments(db, sessionId, [
+				{
+					sequence: number / window - 2,
+					startMessage: cutoff - window,
+					endMessage: cutoff - 1,
+					startMessageId: id(cutoff - window + 1),
+					endMessageId: id(cutoff),
+					title: "Compacted questions",
+					content: "Earlier questions were answered.",
+				},
+			]);
+			materializeM0Pi(state, db);
+			const entryIds = Array.from({ length: live.length }, (_, index) =>
+				id(number - live.length + index + 1),
+			);
+			const result = injectM0M1Pi(state, db, live, entryIds);
+			expect(result.skippedVisibleMessages).toBe(window);
+			live = live.slice(-window);
+			// Match postprocessing when the host permits rebuilding the request prefix.
+			flushAutoSearchHintDecisionRetirement(
+				db,
+				sessionId,
+				new Set(
+					Array.from({ length: window }, (_, index) => id(cutoff + index + 1)),
+				),
+			);
+			const after = (readBlob.get(sessionId) as { blob: string }).blob;
+			expect(
+				JSON.parse(after).map(
+					(decision: { messageId: string }) => decision.messageId,
+				),
+			).toEqual(
+				Array.from({ length: window }, (_, index) => id(cutoff + index + 1)),
+			);
+			expect(Buffer.byteLength(after)).toBeLessThanOrEqual(window * 800);
+		}
+		expect(getAutoSearchHintDecisions(db, sessionId)).toHaveLength(window);
+		console.log(
+			`AUTO_SEARCH_BOUNDED pi users=${total} live=${window} maxEntries=${maxEntries} maxBytes=${maxBytes}`,
+		);
+	} finally {
+		closeQuietly(db);
+	}
+}, 30000);
+
+it("pi cached boundary prunes decisions only after a complete prefix trim", () => {
+	const db = createTestDb();
+	const sessionId = "pi-auto-search-cut";
+	const state = { sessionId, injectDocs: false };
+	try {
+		for (const messageId of ["covered", "live", "hidden-branch"]) {
+			appendAutoSearchHintDecision(db, sessionId, {
+				messageId,
+				decision: "no-hint",
+				reason: "error",
+			});
+		}
+		appendCompartments(db, sessionId, [
+			{
+				sequence: 0,
+				startMessage: 0,
+				endMessage: 0,
+				startMessageId: "covered",
+				endMessageId: "covered",
+				endBlockIndex: 0,
+				title: "Partial turn",
+				content: "Only the first block was summarized.",
+			},
+		]);
+		materializeM0Pi(state, db);
+		const before = getAutoSearchHintDecisions(db, sessionId);
+		const live = [userMessage("covered"), userMessage("live")];
+		expect(
+			trimPiMessagesToCachedBoundary(db, sessionId, live, ["covered", "live"]),
+		).toBe(0);
+		expect(getAutoSearchHintDecisions(db, sessionId)).toEqual(before);
+		db.prepare(
+			"UPDATE compartments SET end_block_index = NULL WHERE session_id = ?",
+		).run(sessionId);
+		const absent = [userMessage("live")];
+		expect(
+			trimPiMessagesToCachedBoundary(db, sessionId, absent, ["live"]),
+		).toBe(0);
+		expect(getAutoSearchHintDecisions(db, sessionId)).toEqual(before);
+		expect(
+			trimPiMessagesToCachedBoundary(db, sessionId, live, ["covered", "live"]),
+		).toBe(1);
+		expect(getAutoSearchHintDecisions(db, sessionId)).toEqual(before);
+		flushAutoSearchHintDecisionRetirement(db, sessionId, new Set(["live"]));
+		expect(
+			getAutoSearchHintDecisions(db, sessionId).map((entry) => entry.messageId),
+		).toEqual(["live", "hidden-branch"]);
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+for (const prepared of [false, true]) {
+	it(`pi ${prepared ? "prepared" : "cached"} prefix defer writes nothing and defers decision retirement`, () => {
+		const db = createTestDb();
+		const sessionId = `pi-defer-read-only-${prepared}`;
+		const state = { sessionId, injectDocs: false };
+		const hint = {
+			messageId: "covered",
+			decision: "hint" as const,
+			text: "cached hint",
+		};
+		try {
+			appendAutoSearchHintDecision(db, sessionId, hint);
+			appendCompartments(db, sessionId, [
+				{
+					sequence: 0,
+					startMessage: 0,
+					endMessage: 0,
+					startMessageId: "covered",
+					endMessageId: "covered",
+					title: "Covered",
+					content: "Earlier question was answered.",
+				},
+			]);
+			const cached = materializeM0Pi(state, db);
+			const input = prepared
+				? { ...state, preparedPrefix: prepareCachedM0M1PiReplay(state, db) }
+				: state;
+			const live = [userMessage("covered", 1), userMessage("live", 2)];
+			db.exec("PRAGMA query_only=ON");
+			const before = db.prepare("SELECT total_changes() AS count").get();
+			const result = injectM0M1Pi(input, db, live, ["covered", "live"], false);
+			expect(result.skippedVisibleMessages).toBe(1);
+			expect(textOf(live[0])).toBe(cached.m0);
+			expect(textOf(live[1])).toBe(cached.m1);
+			expect(db.prepare("SELECT total_changes() AS count").get()).toEqual(
+				before,
+			);
+			expect(getAutoSearchHintDecisions(db, sessionId)).toEqual([hint]);
+			db.exec("PRAGMA query_only=OFF");
+			expect(
+				flushAutoSearchHintDecisionRetirement(db, sessionId, new Set(["live"])),
+			).toBe(1);
+			expect(getAutoSearchHintDecisions(db, sessionId)).toEqual([]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+}
+
+describe("Pi render-to-commit concurrency", () => {
+	for (const change of ["memory", "compartment"] as const) {
+		it(`two connections ${change === "memory" ? "include an additive memory in Pi's locked delta" : "retry a Pi fold for a new compartment"} before admission`, () => {
+			const dir = createTestTempDirFromPath(join(tmpdir(), "mc-pi-fold-cas-"));
+			const path = join(dir, "context.db");
+			const db = createTestDb(path);
+			db.exec("PRAGMA journal_mode=WAL");
+			const sibling = createTestDb(path);
+			const state = {
+				sessionId: "pi-concurrent",
+				projectIdentity: "git:pi-concurrent",
+				projectDirectory: dir,
+				injectDocs: false,
+			};
+			getOrCreateSessionMeta(db, state.sessionId);
+			let attempts = 0;
+			try {
+				const rendered = materializeM0PiWithRetry(
+					{
+						...state,
+						beforeCacheCommitForTest: () => {
+							attempts++;
+							if (attempts !== 1) return;
+							if (change === "memory")
+								insertMemory(sibling, {
+									projectPath: state.projectIdentity,
+									category: "ARCHITECTURE",
+									content: "Concurrent Pi memory",
+								});
+							else
+								appendCompartments(sibling, state.sessionId, [
+									{
+										sequence: 0,
+										startMessage: 0,
+										endMessage: 1,
+										startMessageId: "pi-concurrent-start",
+										endMessageId: "pi-concurrent-end",
+										title: "Concurrent Pi compartment",
+										content: "Concurrent Pi history",
+										p1: "Concurrent Pi history",
+										p2: "summary",
+										p3: "outcome",
+										p4: "anchor",
+										importance: 70,
+										legacy: 0,
+									},
+								]);
+						},
+					},
+					db,
+				);
+				expect(attempts).toBe(change === "memory" ? 1 : 2);
+				expect(change === "memory" ? rendered.m1 : rendered.m0).toContain(
+					change === "memory"
+						? "Concurrent Pi memory"
+						: "Concurrent Pi history",
+				);
+				const meta = getOrCreateSessionMeta(db, state.sessionId);
+				expect(meta.cachedM0Bytes?.toString("utf8")).toBe(rendered.m0);
+				expect(meta.cachedM1Bytes?.toString("utf8")).toBe(rendered.m1);
+			} finally {
+				closeQuietly(sibling);
+				closeQuietly(db);
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it(`two connections include a ${change} published before Pi soft-refresh admission`, () => {
+			const dir = createTestTempDirFromPath(
+				join(tmpdir(), "mc-pi-refresh-cas-"),
+			);
+			const path = join(dir, "context.db");
+			const db = createTestDb(path);
+			db.exec("PRAGMA journal_mode=WAL");
+			const sibling = createTestDb(path);
+			const state = {
+				sessionId: "pi-refresh-concurrent",
+				projectIdentity: "git:pi-concurrent",
+				projectDirectory: dir,
+				injectDocs: false,
+			};
+			try {
+				injectM0M1Pi(state, db, []);
+				const before = db
+					.prepare("SELECT * FROM session_meta WHERE session_id = ?")
+					.get(state.sessionId);
+				const m0Before = getOrCreateSessionMeta(
+					db,
+					state.sessionId,
+				).cachedM0Bytes;
+				injectM0M1Pi(
+					{
+						...state,
+						beforeCacheCommitForTest: () => {
+							if (change === "memory")
+								insertMemory(sibling, {
+									projectPath: state.projectIdentity,
+									category: "ARCHITECTURE",
+									content: "Concurrent Pi refresh memory",
+								});
+							else
+								appendCompartments(sibling, state.sessionId, [
+									{
+										sequence: 0,
+										startMessage: 0,
+										endMessage: 1,
+										startMessageId: "pi-concurrent-start",
+										endMessageId: "pi-refresh-end",
+										title: "Pi refresh compartment",
+										content: "Concurrent Pi refresh history",
+										p1: "Concurrent Pi refresh history",
+										p2: "summary",
+										p3: "outcome",
+										p4: "anchor",
+										importance: 70,
+										legacy: 0,
+									},
+								]);
+						},
+					},
+					db,
+					[],
+					undefined,
+					true,
+				);
+				const after = getOrCreateSessionMeta(db, state.sessionId);
+				expect(after.cachedM0Bytes).toEqual(m0Before);
+				expect(after.cachedM1Bytes?.toString("utf8")).toContain(
+					change === "memory"
+						? "Concurrent Pi refresh memory"
+						: "Concurrent Pi refresh history",
+				);
+				expect(
+					db
+						.prepare("SELECT * FROM session_meta WHERE session_id = ?")
+						.get(state.sessionId),
+				).not.toEqual(before);
+			} finally {
+				closeQuietly(sibling);
+				closeQuietly(db);
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+	}
+});
 
 describe("workspace memory sharing", () => {
 	it("filters foreign categories consistently in Pi m[0] and status counts", () => {
@@ -462,6 +843,97 @@ function piState(sessionId: string, cwd: string) {
 		injectionBudgetTokens: 10_000,
 	};
 }
+
+describe("user-profile rendering fixture", () => {
+	it("renders the shared Rust/TypeScript fixture through Pi m[0]", () => {
+		const fixture = JSON.parse(
+			readFileSync(
+				resolve(
+					import.meta.dir,
+					"../../../tests/fixtures/user-profile-render.json",
+				),
+				"utf8",
+			),
+		) as { cases: Array<{ input: string; expected: string }> };
+		const db = createTestDb();
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-user-profile-render-fixture-"),
+		);
+		try {
+			const profile: UserMemory[] = fixture.cases.map(({ input }, index) => ({
+				id: index + 1,
+				content: input,
+				status: "active",
+				promotedAt: 0,
+				sourceCandidateIds: [],
+				sourceProvenance: null,
+				createdAt: 0,
+				updatedAt: 0,
+			}));
+			const rendered = renderM0Pi(
+				{
+					...piState("ses-pi-user-profile-render", cwd),
+					userProfileBudgetTokens: 10_000,
+				},
+				db,
+				"",
+				1,
+				[],
+				[],
+				profile,
+			);
+			const expectedBlock = [
+				"<user-profile>",
+				...fixture.cases.map(({ expected }) => `- ${expected}`),
+				"</user-profile>",
+			].join("\n");
+			expect(rendered).toContain(expectedBlock);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("normalizes subject prefixes in both m[0] and the new-profile delta", () => {
+		const db = createTestDb();
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-user-profile-render-delta-"),
+		);
+		try {
+			const state = {
+				...piState("ses-pi-user-profile-render-delta", cwd),
+				userProfileBudgetTokens: 10_000,
+			};
+			insertUserMemory(
+				db,
+				"User strongly pushes back on untested changes.",
+				[],
+			);
+			setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
+			const baseline = materializeM0Pi(state, db);
+			expect(baseline.m0).toContain(
+				"<user-profile>\n- Strongly pushes back on untested changes.\n</user-profile>",
+			);
+
+			insertUserMemory(db, "User expects changes to be tested.", []);
+			setProjectState(db, "__global__", { projectUserProfileVersion: 2 });
+			expect(mustMaterializePi(state, db)).toMatchObject({
+				value: false,
+				reason: null,
+			});
+			const delta = renderM1Pi(
+				state,
+				db,
+				baseline.snapshotMarkers,
+				baseline.renderedMemoryIds,
+			);
+			expect(delta).toContain("<new-user-profile>");
+			expect(delta).toContain("- Strongly pushes back on untested changes.");
+			expect(delta).toContain("- Expects changes to be tested.");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+});
 
 describe("injectM0M1Pi memory feature gate", () => {
 	it("does NOT render project memories into m[0]/m[1] when memoryEnabled=false", () => {

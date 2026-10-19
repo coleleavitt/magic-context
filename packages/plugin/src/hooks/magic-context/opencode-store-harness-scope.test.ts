@@ -13,9 +13,11 @@
  * bounded whatever the session size.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
 import { buildPrimerSeed } from "../../features/magic-context/dreamer/primer-seed";
 import { runMigrations } from "../../features/magic-context/migrations";
@@ -35,8 +37,7 @@ import {
     readRawSessionMessages,
     visitRawSessionMessages,
 } from "./read-session-chunk";
-import { closeReadOnlySessionDb, withReadOnlySessionDb } from "./read-session-db";
-import { readRawSessionMessagesFromDb } from "./read-session-raw";
+import { closeReadOnlySessionDb } from "./read-session-db";
 
 const originalOpenCodeDb = process.env.OPENCODE_DB;
 let tempDir = "";
@@ -192,36 +193,35 @@ describe("bounded summary reads", () => {
                 diagnosticsPerTool: 40,
             },
         ]);
-        const heap = () => {
-            Bun.gc(true);
-            return process.memoryUsage().heapUsed;
-        };
-
-        // Streamed summary read of the whole session, sampling the heap as it goes.
-        const beforeVisit = heap();
-        let peakVisit = beforeVisit;
-        let visited = 0;
-        visitRawSessionMessages(
-            "ses_large",
-            1,
-            turns * 2,
-            () => {
-                visited += 1;
-                if (visited % 200 === 0) {
-                    peakVisit = Math.max(peakVisit, process.memoryUsage().heapUsed);
-                }
-                return true;
-            },
-            { summary: true },
+        // Other test files leave allocations and GC activity in the runner's
+        // heap. Measure both real readers in a fresh process, not that heap.
+        const child = spawnSync(
+            process.execPath,
+            [
+                fileURLToPath(
+                    new URL("../../../scripts/fixtures/summary-read-heap.ts", import.meta.url),
+                ),
+                join(tempDir, "opencode", "opencode.db"),
+                String(turns),
+            ],
+            { encoding: "utf8", windowsHide: true, timeout: 25_000 },
         );
-        const visitDelta = peakVisit - beforeVisit;
+        if (child.error || child.status !== 0) {
+            throw new Error(
+                `Heap measurement child failed (status=${child.status}): ${child.stderr}`,
+                {
+                    cause: child.error,
+                },
+            );
+        }
+        const { visited, fullCount, visitDelta, fullDelta } = JSON.parse(child.stdout) as {
+            visited: number;
+            fullCount: number;
+            visitDelta: number;
+            fullDelta: number;
+        };
         expect(visited).toBe(turns * 2);
-
-        // The whole-session reader holds every parsed part at once.
-        const beforeFull = heap();
-        const full = withReadOnlySessionDb((db) => readRawSessionMessagesFromDb(db, "ses_large"));
-        const fullDelta = process.memoryUsage().heapUsed - beforeFull;
-        expect(full).toHaveLength(turns * 2);
+        expect(fullCount).toBe(turns * 2);
 
         console.log(
             `[heap] session=${turns * 2} messages: full read +${(fullDelta / 2 ** 20).toFixed(1)} MiB, ` +

@@ -8,15 +8,15 @@ export type PassDegradationKind = "degraded" | "fatal";
  *   on (persisted drops and truncations, the history cut, the session-history
  *   head messages m[0]/m[1], and the reasoning, image and ctx_reduce strips
  *   replayed from earlier passes), so the served request can be larger than a
- *   healthy one or differ from it. Such a pass is not served when it is over
- *   the context limit.
+ *   healthy one or differ from it. With compaction enabled, failed stages
+ *   replay the last-good request or refuse, regardless of the context limit.
  * - `served`: the request equals a healthy pass's, or a healthy pass's minus
  *   text appended to a new, never-served turn, so it can be neither larger nor
  *   different in anything already served. The pass is served as a healthy one
  *   would be, over the limit or not.
  *
- * Every site a pass records is listed here, with its verdict from
- * docs/reports/degraded-pass-fail-open.md. Recording a site that is not listed
+ * Every site a pass records is listed here with its effect on served bytes.
+ * Recording a site that is not listed
  * does not type-check, so a new site cannot join or skip the size guard
  * without a verdict.
  */
@@ -41,15 +41,18 @@ export const PASS_DEGRADATION_EFFECTS = {
     "m0-m1-injection-degradation": "changes-request",
     "m0-m1-fallback-failure": "changes-request",
     "compaction-marker-drain-failure": "changes-request",
-    "note-nudge-cas-failure": "changes-request",
+    // An uncommitted reminder is not appended to the newest user turn.
+    "note-nudge-cas-failure": "served",
     // A timeout, failed search or lost write race on a fresh tail turn skips
     // appending a new hint. A hint served on an earlier pass was re-appended
     // before the search ran.
     "auto-search-timeout": "served",
     "auto-search-search-failure": "served",
     "auto-search-cas-exhaustion": "served",
-    // A throw can land before a served hint is re-appended.
-    "auto-search-internal-failure": "changes-request",
+    "auto-search-storage-busy": "served",
+    // Persisted hints already replayed from the snapshot before the runner.
+    // Failure to append an optional fresh-tail hint leaves managed history intact.
+    "auto-search-internal-failure": "served",
     "thinking-binding-recovery-persistence-failure": "changes-request",
     "merged-reasoning-strip-persistence-failure": "changes-request",
     "merged-reasoning-strip-exception": "changes-request",
@@ -60,8 +63,8 @@ export const PASS_DEGRADATION_EFFECTS = {
     "proactive-thinking-strip-persistence-failure": "changes-request",
     // The saved removal set is unreadable: the pass fails closed.
     "reasoning-removal-read-failure": "changes-request",
-    // This pass's new removals were not saved, so it serves the earlier set
-    // only and can be larger than a healthy pass.
+    // This pass's new removals were not saved: replay or refuse rather than
+    // serving a partially prepared request.
     "reasoning-removal-persistence-failure": "changes-request",
 } as const satisfies Record<string, "changes-request" | "served">;
 
@@ -101,10 +104,24 @@ export function createPassOutcome(): PassOutcome {
             finalized = true;
         },
         get captureEligible() {
-            return finalized && degradations.length === 0;
+            // A deadline skip is a finalized optional-hint decision, not an
+            // incomplete managed representation. Capture the bytes actually served.
+            return (
+                finalized &&
+                degradations.every(
+                    (item) => item.kind !== "fatal" && item.site === "auto-search-timeout",
+                )
+            );
         },
         isCaptureEligible() {
-            return finalized && degradations.length === 0;
+            // A deadline skip is a finalized optional-hint decision, not an
+            // incomplete managed representation. Capture the bytes actually served.
+            return (
+                finalized &&
+                degradations.every(
+                    (item) => item.kind !== "fatal" && item.site === "auto-search-timeout",
+                )
+            );
         },
     };
 }

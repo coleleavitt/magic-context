@@ -29,7 +29,7 @@ import {
     _setTestProviderFactoryForProject,
     getEmbeddingCoverageStatus,
 } from "../../features/magic-context/project-embedding-registry";
-import type { Scheduler } from "../../features/magic-context/scheduler";
+import { createScheduler, type Scheduler } from "../../features/magic-context/scheduler";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
     closeDatabase,
@@ -256,6 +256,63 @@ function countIndexedHookMessage(sessionId: string, messageId: string): number {
 }
 
 describe("magic-context hook", () => {
+    it("passes the selected OpenCode 1 model to per-model scheduling before any usage event", async () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-model-threshold-");
+        const sessionId = "ses-model-threshold";
+        const config = {
+            default: 50,
+            "opencode/mimo-v2.6-flash-free": 65,
+            "opencode/muse-spark-1.3-contributor-free": 20,
+        };
+        const deps = createMockDeps();
+        deps.config = { ...deps.config, execute_threshold_percentage: config };
+        const scheduler = createScheduler({ executeThresholdPercentage: config });
+        const shouldExecute = mock(scheduler.shouldExecute);
+        deps.scheduler = { shouldExecute };
+        const hook = requireHook(createMagicContextHook(deps));
+        await hook["chat.message"]!(
+            {
+                sessionID: sessionId,
+                model: { providerID: "opencode", modelID: "muse-spark-1.3-contributor-free" },
+            },
+            { message: {} as never, parts: [] },
+        );
+        const pass = async () =>
+            hook["experimental.chat.messages.transform"]!(
+                {},
+                {
+                    messages: [
+                        {
+                            info: { id: "u1", role: "user", sessionID: sessionId },
+                            parts: [{ type: "text", text: "hello" }],
+                        },
+                    ],
+                },
+            );
+        await pass();
+        expect(shouldExecute.mock.calls.at(-1)?.[4]).toBe(
+            "opencode/muse-spark-1.3-contributor-free",
+        );
+        updateSessionMeta(openDatabase(), sessionId, {
+            lastResponseTime: Date.now(),
+            lastInputTokens: 284_298,
+            lastContextPercentage: (284_298 / 917_504) * 100,
+            lastUsageContextLimit: 917_504,
+        });
+        await pass();
+        expect(shouldExecute.mock.results.at(-1)?.value).toBe("execute");
+        await hook["chat.message"]!(
+            {
+                sessionID: sessionId,
+                model: { providerID: "opencode", modelID: "mimo-v2.6-flash-free" },
+            },
+            { message: {} as never, parts: [] },
+        );
+        await pass();
+        expect(shouldExecute.mock.calls.at(-1)?.[4]).toBe("opencode/mimo-v2.6-flash-free");
+        expect(shouldExecute.mock.results.at(-1)?.value).toBe("defer");
+    });
+
     it("leaves the project unbound when git fails before any durable identity is known", () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-identity-fallback-data-");
         const projectDir = makeTempDir("hook-identity-fallback-project-");

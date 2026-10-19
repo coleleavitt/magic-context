@@ -8,17 +8,19 @@
  * by the m[0]/m[1] message materializer instead.
  */
 
-import { createHash } from "node:crypto";
 import { buildMagicContextSection } from "@magic-context/core/agents/magic-context-prompt";
+import { computeHardCacheExpired } from "@magic-context/core/features/magic-context/scheduler";
 import {
 	type ContextDatabase,
 	getOrCreateSessionMeta,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import { systemPromptDates } from "@magic-context/core/hooks/magic-context/system-prompt-dates";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { PromptSurfacePreset } from "@magic-context/core/shared/prompt-surface";
-import { promptSurfaceHashMaterial } from "@magic-context/core/shared/prompt-surface-runtime";
+import { systemPromptFingerprint } from "@magic-context/core/shared/prompt-surface-runtime";
+import { clearPiSystemPromptDelivery } from "./system-prompt-delivery-pi";
 
 const PROJECT_DOCS_MARKER = "<project-docs>";
 const USER_PROFILE_MARKER = "<user-profile>";
@@ -43,6 +45,7 @@ export interface BuildMagicContextBlockOptions {
 	protectedTags?: number;
 	ctxReduceCallable?: boolean;
 	dreamerEnabled?: boolean;
+	smartNotesEnabled?: boolean;
 	temporalAwarenessEnabled?: boolean;
 	cavemanTextCompressionEnabled?: boolean;
 	language?: string;
@@ -82,6 +85,7 @@ export function buildMagicContextBlock(
 		opts.memoryEnabled !== false,
 		opts.promptSurfacePreset,
 		opts.primaryGuidanceOverride,
+		opts.smartNotesEnabled,
 	);
 }
 
@@ -100,8 +104,6 @@ export interface SystemPromptHashResult {
 	/** The new content + prompt-surface preset hash persisted to session_meta. */
 	currentHash: string;
 }
-
-const DATE_PATTERN = /Today's date: .+/;
 
 /**
  * Process the assembled system prompt for cache stability:
@@ -147,21 +149,29 @@ export function processSystemPromptForCache(args: {
 	// Decide whether content or preset already requires a bust before choosing
 	// which date to hash. This lets a midnight date change ride the same fold.
 	let frozenPrompt = systemPrompt;
-	const dateMatch = systemPrompt.match(DATE_PATTERN);
-	const liveDate = dateMatch ? dateMatch[0] : null;
+	if (isFirstHash) stickyDateBySession.delete(sessionId);
 	const stickyDate = stickyDateBySession.get(sessionId);
-	const stableCandidate =
-		liveDate && stickyDate && liveDate !== stickyDate
-			? systemPrompt.replace(DATE_PATTERN, stickyDate)
-			: systemPrompt;
-	const stableCandidateHash = createHash("md5")
-		.update(
-			promptSurfaceHashMaterial(stableCandidate, args.promptSurfacePreset),
-		)
-		.digest("hex");
+	const dates = systemPromptDates(systemPrompt, stickyDate);
+	const liveDate = dates.live;
+	const stableCandidate = dates.stable;
+	const stableCandidateHash = systemPromptFingerprint(
+		stableCandidate,
+		args.promptSurfacePreset,
+	);
 	const contentOrPresetChanged =
 		!isFirstHash && stableCandidateHash !== previousHash;
-	const dateMayAdvance = isCacheBusting || contentOrPresetChanged;
+	// before_agent_start precedes the context scheduler. Read the provider's
+	// response clock here too, so the date advances on the already-expired
+	// request rather than staying frozen until an unrelated explicit refresh.
+	const idleCacheExpired =
+		sessionMeta !== undefined &&
+		computeHardCacheExpired(
+			sessionMeta.cacheTtl,
+			sessionMeta.lastResponseTime,
+			Date.now(),
+		);
+	const dateMayAdvance =
+		isCacheBusting || idleCacheExpired || contentOrPresetChanged;
 
 	if (liveDate && !stickyDate) {
 		stickyDateBySession.set(sessionId, liveDate);
@@ -173,7 +183,7 @@ export function processSystemPromptForCache(args: {
 				`system prompt date updated: ${stickyDate} → ${liveDate} (cache-busting pass)`,
 			);
 		} else {
-			frozenPrompt = systemPrompt.replace(DATE_PATTERN, stickyDate);
+			frozenPrompt = stableCandidate;
 			sessionLog(
 				sessionId,
 				`system prompt date frozen: real=${liveDate}, using=${stickyDate} (cache-stable pass)`,
@@ -181,9 +191,10 @@ export function processSystemPromptForCache(args: {
 		}
 	}
 
-	const currentHash = createHash("md5")
-		.update(promptSurfaceHashMaterial(frozenPrompt, args.promptSurfacePreset))
-		.digest("hex");
+	const currentHash = systemPromptFingerprint(
+		frozenPrompt,
+		args.promptSurfacePreset,
+	);
 	const hashChanged = !isFirstHash && currentHash !== previousHash;
 
 	if (hashChanged) {
@@ -227,6 +238,7 @@ export function processSystemPromptForCache(args: {
  * handlers in context-handler/index.
  */
 export function clearPiSystemPromptSession(sessionId: string): void {
+	clearPiSystemPromptDelivery(sessionId);
 	stickyDateBySession.delete(sessionId);
 }
 

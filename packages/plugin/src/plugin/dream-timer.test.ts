@@ -68,7 +68,64 @@ describe("dream-timer registration cleanup", () => {
     afterEach(() => {
         _resetDreamTimerForTests();
     });
+    test("does not overlap maintenance ticks and releases the guard after completion", async () => {
+        // Host boot completes the async storage open before registering timers.
+        expect(openDatabase()).toBeTruthy();
+        const directory = createTestTempDirFromPath(join(tmpdir(), "mc-dream-timer-overlap-"));
+        let interval: (() => void) | undefined;
+        const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(((
+            callback: () => void,
+        ) => {
+            interval = callback;
+            return { unref() {} } as unknown as ReturnType<typeof setInterval>;
+        }) as typeof setInterval);
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        let maintenanceCalls = 0;
+        let projectCalls = 0;
+        const restoreStages = _setDreamTimerStagesForTests({
+            runMessageHistoryMaintenance: async () => {
+                maintenanceCalls++;
+                await held;
+            },
+            runProjectMaintenance: async () => {
+                projectCalls++;
+            },
+        });
+        let cleanup: (() => void) | undefined;
+        try {
+            cleanup = await startDreamScheduleTimer({
+                directory,
+                projectIdentity: "git:timer-overlap",
+                harness: "pi",
+                client: {} as never,
+                ensureRegistered: async () => {},
+            });
+            interval?.();
+            interval?.();
+            expect(maintenanceCalls).toBe(1);
+            release();
+            for (let i = 0; i < 10; i++) await Promise.resolve();
+            expect(projectCalls).toBe(1);
+            interval?.();
+            for (let i = 0; i < 10; i++) await Promise.resolve();
+            expect(maintenanceCalls).toBe(2);
+            expect(projectCalls).toBe(2);
+        } finally {
+            release();
+            for (let i = 0; i < 10; i++) await Promise.resolve();
+            cleanup?.();
+            restoreStages();
+            setIntervalSpy.mockRestore();
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
     test("stale same-directory cleanup preserves the replacement registration", async () => {
+        // Registration may reuse current storage, but must not migrate a cold store.
+        expect(openDatabase()).toBeTruthy();
         const directory = createTestTempDirFromPath(join(tmpdir(), "mc-dream-timer-cleanup-"));
         const timerHandle = {
             unref: mock(() => {}),
@@ -330,7 +387,9 @@ describe("dream-timer message-history maintenance (static)", () => {
         );
         expect(tick).toContain("runMessageHistoryMaintenance(db)");
         expect(tick).toContain("retryPendingSessionCleanups(db)");
-        expect(tick).toContain("sweepOrphanedOpenCodeMessageIndexes(db, openOpenCodeDb)");
+        expect(tick).toContain(
+            "await sweepOrphanedOpenCodeMessageIndexesOffThread(db, openOpenCodeDb)",
+        );
     });
 });
 

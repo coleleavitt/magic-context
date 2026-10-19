@@ -1,15 +1,14 @@
 //! `tool.catalog` and `role.describe`: Magic Context's answers under the
 //! `tool-provider/v1` role (commons `cortexkit-role-tool-provider`).
 //!
-//! `docs/designs/mc-tool-catalog-v1.md` is the design; its example payloads in
-//! `docs/designs/mc-tool-catalog-v1/` are the exact bytes this module serves,
-//! and the tests compare against them byte for byte.
+//! Pinned request/response fixtures in `src/tests/fixtures/tool-catalog/`
+//! hold the exact bytes this module serves; tests compare them byte for byte.
 //!
 //! Everything the answer says comes from one shared definition,
 //! `assets/tool_catalog_v1.json` plus the two tools-only texts beside it: the
 //! tools, their argument-schema structures, descriptions and parameter
-//! descriptions, and the guidance templates. The documentation generator
-//! (`docs/designs/mc-tool-catalog-v1/generate.ts`) reads the same files and
+//! descriptions, and the guidance templates. The fixture generator
+//! (`gen/gen-tool-catalog.ts`) reads the same files and
 //! checks them against the plugin's shipped strings.
 //!
 //! The answer is a pure function of the request (preset, params, composition,
@@ -79,7 +78,9 @@ pub(crate) struct Definition {
     /// In catalog order.
     pub tools: Vec<ToolDefinition>,
     /// Allowed tools by preset, before config and request filtering.
-    preset_tools: BTreeMap<String, Vec<String>>,
+    preset_tools: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    /// Transitional input spellings, shared with the TypeScript generator.
+    preset_aliases: BTreeMap<String, String>,
     /// `{full: {tool: text}, light: {tool: text}}`.
     descriptions: Value,
     /// `{full: {tool: {param: text}}, light: ...}`.
@@ -156,37 +157,79 @@ impl Surface {
     }
 }
 
-/// The presets Magic Context defines. The session's starter picks one from the
-/// session's role; Magic Context never learns the role itself.
+/// Fleet roles. Compaction is selected separately by the frozen composition,
+/// never inferred from a preset name (including a transitional alias).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Preset {
-    /// Magic Context compacts the session, which is a long-lived or editing
-    /// agent (a head or a mason).
-    Primary,
-    /// Magic Context compacts the session, which is a short read-only helper
-    /// or a one-shot call.
-    Subagent,
-    /// Another provider compacts the session, or none does.
-    ToolsOnly,
+pub(crate) enum Preset {
+    Head,
+    Worker,
+    Reader,
 }
 
 impl Preset {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Primary => "primary",
-            Self::Subagent => "subagent",
-            Self::ToolsOnly => "tools-only",
+            Self::Head => "head",
+            Self::Worker => "worker",
+            Self::Reader => "reader",
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "primary" => Some(Self::Primary),
-            "subagent" => Some(Self::Subagent),
-            "tools-only" => Some(Self::ToolsOnly),
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let name = definition()
+            .preset_aliases
+            .get(value)
+            .map_or(value, String::as_str);
+        match name {
+            "head" => Some(Self::Head),
+            "worker" => Some(Self::Worker),
+            "reader" => Some(Self::Reader),
             _ => None,
         }
     }
+
+    fn tools(self, compacting: bool) -> &'static [String] {
+        &definition().preset_tools[if compacting {
+            "compacting"
+        } else {
+            "not_compacting"
+        }][self.as_str()]
+    }
+
+    pub(crate) fn serves(self, name: &str, compacting: bool) -> bool {
+        self.tools(compacting).iter().any(|tool| tool == name)
+    }
+}
+
+/// Only the plan's frozen compaction provider selects session compaction.
+/// A present value must be an object with a provider, never null.
+pub(crate) fn compacts_session(arguments: &Value) -> Result<bool, CatalogError> {
+    let Some(compaction) = arguments
+        .get("composition")
+        .and_then(|value| value.get("compaction"))
+    else {
+        return Ok(false);
+    };
+    let provider = compaction
+        .as_object()
+        .and_then(|item| item.get("provider"))
+        .and_then(Value::as_str)
+        .filter(|provider| !provider.is_empty())
+        .ok_or_else(|| {
+            CatalogError::invalid(
+                "composition.compaction",
+                "compaction must be an object with a non-empty provider",
+            )
+        })?;
+    Ok(provider == MODULE_ID)
+}
+
+/// Process-local copy of the admitted catalog, shared by the session's routes.
+/// Callers send a preset, not a mutable assertion about who compacts them.
+#[derive(Clone, Debug)]
+pub(crate) struct FrozenCatalog {
+    pub compacting: bool,
+    pub tools: BTreeSet<String>,
 }
 
 /// The configuration a catalog answer depends on, resolved from the user and
@@ -194,6 +237,7 @@ impl Preset {
 /// matches `config.json` beside the design's examples member for member.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CatalogConfig {
+    pub smart_notes_enabled: bool,
     pub compaction_enabled: bool,
     pub memory_enabled: bool,
     pub dreamer_runnable: bool,
@@ -217,6 +261,7 @@ impl CatalogConfig {
         let inputs = &config.catalog;
         Self {
             compaction_enabled: config.compaction_enabled,
+            smart_notes_enabled: config.smart_notes_enabled,
             memory_enabled: config.memory_enabled,
             dreamer_runnable: inputs.dreamer_runnable,
             temporal_awareness: config.temporal_awareness,
@@ -251,7 +296,7 @@ impl CatalogConfig {
             .iter()
             .map(|(key, surface)| (key.clone(), json!(surface.as_str())))
             .collect();
-        json!({
+        let mut resolved = json!({
             "compaction_enabled": self.compaction_enabled,
             "memory_enabled": self.memory_enabled,
             "dreamer_runnable": self.dreamer_runnable,
@@ -262,7 +307,11 @@ impl CatalogConfig {
             "guidance_override_sha256": self.guidance_override.as_deref().map(sha256_hex),
             "tool_descriptions": self.tool_descriptions,
             "disabled_tools": self.disabled_tools,
-        })
+        });
+        if !self.smart_notes_enabled {
+            resolved["smart_notes_enabled"] = json!(false);
+        }
+        resolved
     }
 
     /// The surface from Magic Context's own config: the request's `model`
@@ -288,6 +337,12 @@ pub(crate) enum CatalogError {
 }
 
 impl CatalogError {
+    pub(crate) fn unserved_preset(name: &str) -> Self {
+        Self::invalid(
+            "preset",
+            format!("Magic Context defines no preset {name:?}"),
+        )
+    }
     fn invalid(field: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Invalid {
             field: field.into(),
@@ -354,7 +409,8 @@ pub(crate) fn catalog_answer(
     if let Some(item) = &request.system_text {
         check_text_params(&item.params)?;
     }
-    let served = served_tools(preset, &request.params, config);
+    let compacting = compacts_session(arguments)?;
+    let served = served_tools(preset, compacting, &request.params, config);
     let own = own_tool_names(&request, &served);
     if request.composition.is_some() {
         let listed: BTreeSet<&str> = own.iter().map(String::as_str).collect();
@@ -386,7 +442,7 @@ pub(crate) fn catalog_answer(
         .collect::<Result<Vec<_>, _>>()?;
     content.insert("tools".to_string(), Value::Array(tools));
     if let Some(item) = &request.system_text {
-        let text = guidance_text(preset, item, &own, config)?;
+        let text = guidance_text(preset, compacting, item, &own, config)?;
         let mut system_text = Map::new();
         system_text.insert("item_digest".to_string(), json!(sha256_hex(&text)));
         system_text.insert(
@@ -411,15 +467,12 @@ pub(crate) fn catalog_answer(
 }
 
 fn request_preset(request: &CatalogRequest) -> Result<Preset, CatalogError> {
-    let name = request.preset.as_deref().unwrap_or("primary");
-    let preset = Preset::parse(name).ok_or_else(|| {
-        CatalogError::invalid(
-            "preset",
-            format!("Magic Context defines no preset {name:?}"),
-        )
-    })?;
+    let name = request.preset.as_deref().unwrap_or("head");
+    let preset = Preset::parse(name).ok_or_else(|| CatalogError::unserved_preset(name))?;
     if let Some(item) = &request.system_text {
-        if Preset::parse(&item.preset) != Some(preset) {
+        let text_preset = Preset::parse(&item.preset)
+            .ok_or_else(|| CatalogError::unserved_preset(&item.preset))?;
+        if text_preset != preset {
             return Err(CatalogError::invalid(
                 "system_text.preset",
                 format!(
@@ -492,6 +545,7 @@ fn one_of(value: &Value, allowed: &[&str]) -> bool {
 
 fn served_tools(
     preset: Preset,
+    compacting: bool,
     params: &Map<String, Value>,
     config: &CatalogConfig,
 ) -> Vec<&'static ToolDefinition> {
@@ -507,9 +561,7 @@ fn served_tools(
         .filter(|tool| {
             let name = tool.name.as_str();
             !(name == "ctx_reduce" && !config.compaction_enabled)
-                && definition().preset_tools[preset.as_str()]
-                    .iter()
-                    .any(|allowed| allowed == name)
+                && preset.serves(name, compacting)
                 && !(name == "ctx_memory" && !config.memory_enabled)
                 && !config
                     .disabled_tools
@@ -599,7 +651,10 @@ fn catalog_tool(
     surface: Surface,
     config: &CatalogConfig,
 ) -> Result<Value, CatalogError> {
-    let schema = input_schema(tool, surface)?;
+    let mut schema = input_schema(tool, surface)?;
+    if tool.name == "ctx_note" && !config.smart_notes_enabled {
+        crate::prompt_surface::disable_smart_note_schema(&mut schema);
+    }
     let schema_digest = catalog::schema_digest(&schema)
         .map_err(|error| CatalogError::Internal(error.to_string()))?;
     if tool.name == "ctx_reduce" && schema_digest != FROZEN_CTX_REDUCE_SCHEMA_DIGEST {
@@ -620,6 +675,15 @@ fn catalog_tool(
                 ))
             })?,
     };
+    let description = if tool.name == "ctx_note" && !config.smart_notes_enabled {
+        crate::prompt_surface::without_smart_note_description(
+            definition()
+                .description(surface, &tool.name)
+                .unwrap_or(description),
+        )
+    } else {
+        description.to_string()
+    };
     Ok(json!({
         "name": tool.name,
         "schema_digest": schema_digest,
@@ -633,12 +697,18 @@ fn catalog_tool(
 
 fn guidance_text(
     preset: Preset,
+    compacting: bool,
     item: &SystemTextItem,
     own: &BTreeSet<String>,
     config: &CatalogConfig,
 ) -> Result<String, CatalogError> {
-    let required = if preset == Preset::ToolsOnly {
+    if !compacting && preset != Preset::Head {
+        return Ok(String::new());
+    }
+    let required: &[&str] = if !compacting {
         &["ctx_search", "ctx_memory", "ctx_note"]
+    } else if preset != Preset::Head {
+        &["ctx_expand", "ctx_search"]
     } else {
         &TEXT_REQUIRED_TOOLS
     };
@@ -655,7 +725,7 @@ fn guidance_text(
         .and_then(crate::primary_language_directive);
     let flags = TextFlags {
         memory: config.memory_enabled && own.contains("ctx_memory"),
-        dreamer: config.dreamer_runnable,
+        dreamer: config.dreamer_runnable && config.smart_notes_enabled,
         temporal: config.temporal_awareness,
         caveman: config.caveman_text_compression,
         language: directive.is_some(),
@@ -666,20 +736,27 @@ fn guidance_text(
     let name = match preset {
         // Magic Context puts nothing into a tools-only session (no history,
         // tags or markings), so its text describes only the tools.
-        Preset::ToolsOnly => format!("tools_only/{surface}"),
+        Preset::Head if !compacting => format!("tools_only/{surface}"),
         // A subagent without ctx_reduce has no tagged messages, so it gets no
         // guidance at all; the runner skips an empty text.
-        Preset::Subagent if !reduce => return Ok(String::new()),
-        Preset::Subagent => format!("subagent/{surface}"),
-        Preset::Primary => match &config.guidance_override {
+        Preset::Worker | Preset::Reader if !reduce => return Ok(String::new()),
+        Preset::Worker | Preset::Reader => format!("worker/{surface}"),
+        Preset::Head => match &config.guidance_override {
             // A user's override replaces the whole primary section; the
             // runtime clauses (temporal, caveman, language) still follow it.
             Some(text) => {
-                values.insert("override", text.clone());
+                values.insert(
+                    "override",
+                    if config.smart_notes_enabled {
+                        text.clone()
+                    } else {
+                        crate::prompt_surface::without_smart_note_guidance(text)
+                    },
+                );
                 "override".to_string()
             }
-            None if reduce => format!("primary/reduce/{surface}"),
-            None => format!("primary/no_reduce/{surface}"),
+            None if reduce => format!("head/reduce/{surface}"),
+            None => format!("head/no_reduce/{surface}"),
         },
     };
     render_text(&name, &flags, &values).map_err(CatalogError::Internal)

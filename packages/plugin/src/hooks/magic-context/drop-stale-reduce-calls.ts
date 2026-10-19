@@ -53,17 +53,22 @@ function messageHasReducePart(message: MessageLike): boolean {
     return false;
 }
 
-function sentinelizeReduceParts(message: MessageLike): boolean {
+function sentinelizeReduceParts(
+    message: MessageLike,
+    onFirstApplication?: (message: MessageLike, partIndex: number) => void,
+): boolean {
     let touched = false;
     for (let j = 0; j < message.parts.length; j++) {
         const part = message.parts[j];
         if (isSentinel(part)) continue;
         if (isReduceToolPart(part)) {
+            onFirstApplication?.(message, j);
             message.parts[j] = makeSentinel(part);
             touched = true;
         }
     }
     if (touched && !hasAnyMeaningfulPart(message.parts)) {
+        onFirstApplication?.(message, 0);
         // Whole message becomes a single-sentinel-part shell. Preserves
         // messages.length so proxy cache hashes stay stable.
         message.parts.length = 0;
@@ -108,7 +113,14 @@ export interface StaleReduceStripResult {
 export function dropStaleReduceCalls(
     messages: MessageLike[],
     frozenIds: Set<string>,
-    options: { detect?: boolean; protectedCount?: number } = {},
+    options: {
+        detect?: boolean;
+        protectedCount?: number;
+        /** Per-tool keep counts apply on first stripping a call, not when replaying a saved strip. */
+        protectedCallIds?: ReadonlySet<string>;
+        /** Reports only newly edited locations, never frozen-id replay. */
+        onFirstApplication?: (message: MessageLike, partIndex: number) => void;
+    } = {},
 ): StaleReduceStripResult {
     const detect = options.detect ?? false;
     const protectedCount = options.protectedCount ?? 0;
@@ -130,11 +142,19 @@ export function dropStaleReduceCalls(
             i < protectedStart &&
             id !== undefined &&
             messageHasReducePart(message) &&
+            !message.parts.some((part) => {
+                if (!isRecord(part)) return false;
+                const callId = part.callID ?? part.toolCallId ?? part.id;
+                return typeof callId === "string" && options.protectedCallIds?.has(callId);
+            }) &&
             !message.parts.some(toolPartHasUserAnswer);
 
         if (!inFrozen && !isNewDetection) continue;
 
-        const touched = sentinelizeReduceParts(message);
+        const touched = sentinelizeReduceParts(
+            message,
+            isNewDetection ? options.onFirstApplication : undefined,
+        );
         if (touched) {
             didDrop = true;
             if (isNewDetection && id !== undefined) newlyStrippedIds.push(id);

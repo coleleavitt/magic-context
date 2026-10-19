@@ -14,6 +14,7 @@ import {
 } from "../../features/magic-context/dreamer/task-scheduler";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import type { HiddenCompletionExecutor } from "../../hooks/magic-context/compartment-runner-types";
+import { V2RetrospectiveRawProvider } from "../retrospective-raw-provider";
 
 /** Validate the optional `/ctx-dream <task>` argument (mirrors the v1 command). */
 export function resolveManualDreamTask(raw: unknown): { task?: DreamTaskName; error?: string } {
@@ -68,10 +69,12 @@ export interface ManualDreamOutcome {
 export async function runManualDreamNow(args: {
     db: ContextDatabase;
     dreamer: DreamerConfig;
+    smartNotesEnabled?: boolean;
+    memoryEnabled?: boolean;
     projectIdentity: string;
     directory: string;
     language?: string;
-    mural?: { enabled: boolean; model?: string };
+    mural?: { enabled: boolean };
     executor: HiddenCompletionExecutor;
     sessionId: string;
     task?: DreamTaskName;
@@ -80,15 +83,17 @@ export async function runManualDreamNow(args: {
         args.dreamer,
         "opencode",
         args.language,
-        args.mural?.model,
+        args.smartNotesEnabled,
     );
     const executor = createDreamTaskExecutor({
         hiddenCompletionExecutor: args.executor,
         parentSessionId: args.sessionId,
         sessionDirectory: args.directory,
         openOpenCodeDb: () => null,
+        retrospectiveRawProvider: (db) => new V2RetrospectiveRawProvider(db),
         language: args.language,
         mural: args.mural,
+        smartNotesEnabled: args.smartNotesEnabled,
     });
     const selection = selectRunnableDreamTasks({
         tasks,
@@ -98,6 +103,8 @@ export async function runManualDreamNow(args: {
     const summary = await runManualDream({
         db: args.db,
         projectIdentity: args.projectIdentity,
+        projectMemoryEnabled: args.memoryEnabled,
+        smartNotesEnabled: args.smartNotesEnabled,
         tasks: selection.runnable,
         executor,
         ...(args.task !== undefined ? { task: args.task } : {}),

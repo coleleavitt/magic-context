@@ -67,6 +67,11 @@ const SERIAL_LANE_MAX_WAITERS = 16;
 const SERIAL_LANE_MAX_WAITERS_PER_SESSION = 8;
 const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
+let monotonicClockForTests: (() => number) | undefined;
+
+function monotonicNow(): number {
+    return monotonicClockForTests?.() ?? performance.now();
+}
 
 /** Platform connection file used when resolved configuration has no subc block. */
 export function getDefaultSubcConnectionFile(): string {
@@ -219,6 +224,14 @@ export interface ModuleCallTimings {
     issue: number;
     responseWait: number;
     settle: number;
+}
+
+function moduleRequestBody(body: unknown, method: string): unknown {
+    if (!isRecord(body)) return body;
+    // Flat management requests dispatch on method; MCP facade calls dispatch on
+    // name/arguments and must remain method-free to reach the facade handler.
+    const facade = typeof body.name === "string" && isRecord(body.arguments);
+    return { ...body, ...(facade ? {} : { method }), accept_reply_pages: true };
 }
 
 export class SubcModuleTransport {
@@ -484,7 +497,7 @@ export class SubcModuleTransport {
          */
         bypassSessionLane?: boolean;
     }): Promise<unknown> {
-        const callStartedAt = performance.now();
+        const callStartedAt = monotonicNow();
         const timings: ModuleCallTimings = {
             lane: 0,
             route: 0,
@@ -553,7 +566,7 @@ export class SubcModuleTransport {
             }
             throw error;
         }
-        timings.lane = performance.now() - callStartedAt;
+        timings.lane = monotonicNow() - callStartedAt;
         let rejectAbort!: (reason: unknown) => void;
         const aborted = new Promise<never>((_resolve, reject) => {
             rejectAbort = reject;
@@ -567,6 +580,7 @@ export class SubcModuleTransport {
         try {
             for (let attempt = 0; attempt < 2; attempt += 1) {
                 let ensuredRoute: EnsuredRoute | null = null;
+                let initialResponseReceived = false;
                 try {
                     if (args.signal?.aborted) {
                         throw args.signal.reason ?? new Error("module transport call aborted");
@@ -574,7 +588,7 @@ export class SubcModuleTransport {
                     // Each attempt gets its own timeout, apart from the queue wait limit, so a dead
                     // socket can hit the deadline and still be replaced on one reconnect.
                     const attemptDeadlineMs = Date.now() + attemptTimeoutMs;
-                    const routeStartedAt = performance.now();
+                    const routeStartedAt = monotonicNow();
                     ensuredRoute = await this.ensureRoute(
                         args.sessionId,
                         args.projectRoot,
@@ -584,37 +598,32 @@ export class SubcModuleTransport {
                     if (args.signal?.aborted) {
                         throw args.signal.reason ?? new Error("module transport call aborted");
                     }
-                    timings.route += performance.now() - routeStartedAt;
-                    const encodeStartedAt = performance.now();
+                    timings.route += monotonicNow() - routeStartedAt;
+                    const encodeStartedAt = monotonicNow();
                     // Pre-encoded JSON retains the JSON frame flag; binary denotes an opaque
                     // request protocol, not a preference for how the reply is decoded.
                     const body =
                         args.body instanceof Uint8Array
                             ? args.body
                             : Buffer.from(
-                                  JSON.stringify(
-                                      args.body !== null &&
-                                          typeof args.body === "object" &&
-                                          !Array.isArray(args.body)
-                                          ? { ...args.body, accept_reply_pages: true }
-                                          : args.body,
-                                  ),
+                                  JSON.stringify(moduleRequestBody(args.body, args.method)),
                               );
-                    timings.encode += performance.now() - encodeStartedAt;
-                    const issueStartedAt = performance.now();
+                    timings.encode += monotonicNow() - encodeStartedAt;
+                    const issueStartedAt = monotonicNow();
                     const request = ensuredRoute.client.request(ensuredRoute.route, body, {
                         priority: Priority.Background,
                         admissionClass: AdmissionClass.Normal,
                         timeoutMs: Math.max(1, attemptDeadlineMs - Date.now()),
                     });
-                    timings.issue += performance.now() - issueStartedAt;
-                    const waitStartedAt = performance.now();
+                    timings.issue += monotonicNow() - issueStartedAt;
+                    const waitStartedAt = monotonicNow();
                     const response = await this.beforeDeadline(
                         Promise.race([request, aborted]),
                         attemptDeadlineMs,
                         "waiting for the module response",
                     );
-                    timings.responseWait += performance.now() - waitStartedAt;
+                    timings.responseWait += monotonicNow() - waitStartedAt;
+                    initialResponseReceived = true;
                     if (
                         this.client !== ensuredRoute.client ||
                         this.connectionGeneration !== ensuredRoute.generation
@@ -702,6 +711,25 @@ export class SubcModuleTransport {
                         } else {
                             this.invalidateConnection();
                         }
+                        // The SDK rejects a stale handle locally, before emitting any request
+                        // frame. Rebind that unsent request after a module restart. This is not
+                        // permission to resend a dispatched transform or a partial reply: their
+                        // outcome can already be committed, even when a later page is stale.
+                        // Remote error frames can reuse the code, but decode as SubcError,
+                        // not this SDK-local exception. A remote refusal is not unsent proof.
+                        const locallyUnsent =
+                            isRecord(error) &&
+                            error.name === "StaleRouteHandleError" &&
+                            error.code === "stale_route_handle";
+                        if (
+                            attempt === 0 &&
+                            ensuredRoute &&
+                            !initialResponseReceived &&
+                            locallyUnsent &&
+                            !args.generationSensitive
+                        ) {
+                            continue;
+                        }
                         // A disconnected transform may already have committed. Never resend
                         // its history automatically, including after a partial reply download.
                         if (args.method === "transform") {
@@ -732,7 +760,7 @@ export class SubcModuleTransport {
             releaseLane();
             timings.settle = Math.max(
                 0,
-                performance.now() -
+                monotonicNow() -
                     callStartedAt -
                     timings.lane -
                     timings.route -
@@ -865,10 +893,12 @@ export class SubcModuleTransport {
     }
 
     private connectClient(): Promise<SubcClient> {
-        return SubcClient.connect({
-            connectionFile: this.connectionFile,
-            handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
-        });
+        return inRootAsyncContext(() =>
+            SubcClient.connect({
+                connectionFile: this.connectionFile,
+                handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
+            }),
+        );
     }
 
     private backoffActiveError(): Error & { code?: string } {
@@ -968,4 +998,12 @@ export class SubcModuleTransport {
     }
 }
 
-export const __moduleTransportTest = { isConnectionFailure, isStaleOrDeadRouteFailure };
+export const __moduleTransportTest = {
+    isConnectionFailure,
+    isStaleOrDeadRouteFailure,
+    setMonotonicClockForTests(clock: (() => number) | null): void {
+        monotonicClockForTests = clock ?? undefined;
+    },
+};
+
+import { inRootAsyncContext } from "../../shared/sqlite";

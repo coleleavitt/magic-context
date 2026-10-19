@@ -7,6 +7,7 @@
 
 import { log } from "../../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
+import { isKnownAutocommit } from "../../../shared/sqlite-helpers";
 import { cosineSimilarity } from "../memory/cosine-similarity";
 import { sanitizeFtsQuery } from "../memory/storage-memory-fts";
 import { loadProjectCommitEmbeddings } from "./storage-git-commit-embeddings";
@@ -18,6 +19,66 @@ const ftsPlainStatements = new WeakMap<Database, PreparedStatement>();
 const datedFtsPlainStatements = new WeakMap<Database, PreparedStatement>();
 const getBySHAsStatements = new WeakMap<Database, PreparedStatement>();
 const datedGetBySHAsStatements = new WeakMap<Database, PreparedStatement>();
+const embeddingCache = new WeakMap<
+    Database,
+    {
+        revisionStatement: PreparedStatement;
+        revision: string;
+        entries: Map<string, Map<string, Float32Array>>;
+    }
+>();
+
+function getSearchEmbeddings(
+    db: Database,
+    projectPath: string,
+    modelId: string,
+): Map<string, Float32Array> {
+    if (!isKnownAutocommit(db)) {
+        // A rollback leaves every revision counter unchanged, so a vector read
+        // inside a transaction must never be cached or served from the cache.
+        embeddingCache.delete(db);
+        return loadProjectCommitEmbeddings(db, projectPath, modelId);
+    }
+    let cache = embeddingCache.get(db);
+    if (!cache) {
+        cache = {
+            revisionStatement: db.prepare(`SELECT total_changes() AS writes,
+                (SELECT data_version FROM pragma_data_version) AS dataVersion,
+                (SELECT schema_version FROM pragma_schema_version) AS schemaVersion`),
+            revision: "",
+            entries: new Map(),
+        };
+        embeddingCache.set(db, cache);
+    }
+    // total_changes sees writes on this connection; data_version sees commits
+    // from other connections; schema_version also covers table rebuilds. No TTL
+    // can serve vectors stale after a dashboard edit, sync or model-space change.
+    const revision = JSON.stringify(cache.revisionStatement.get());
+    if (revision !== cache.revision) {
+        cache.entries.clear();
+        cache.revision = revision;
+    }
+    const key = JSON.stringify([projectPath, modelId]);
+    const cached = cache.entries.get(key);
+    if (cached) {
+        cache.entries.delete(key);
+        cache.entries.set(key, cached);
+        return cached;
+    }
+    const vectors = loadProjectCommitEmbeddings(db, projectPath, modelId);
+    const size = (entries: Map<string, Float32Array>) =>
+        [...entries.values()].reduce((sum, vector) => sum + vector.byteLength, 0);
+    if (size(vectors) <= 32 * 1024 * 1024) cache.entries.set(key, vectors);
+    while (
+        cache.entries.size > 16 ||
+        [...cache.entries.values()].reduce((sum, entry) => sum + size(entry), 0) > 32 * 1024 * 1024
+    ) {
+        const oldest = cache.entries.keys().next().value;
+        if (oldest === undefined) break;
+        cache.entries.delete(oldest);
+    }
+    return vectors;
+}
 
 interface CommitRow {
     sha: string;
@@ -121,6 +182,8 @@ export interface SearchGitCommitsOptions {
     queryModelId?: string | null;
     from?: number;
     to?: number;
+    /** Capture independent lexical/vector rankings without repeating either retrieval pass. */
+    captureLanes?: (fts: GitCommitSearchHit[], vector: GitCommitSearchHit[]) => void;
 }
 
 function clamp01(value: number): number {
@@ -189,7 +252,7 @@ export function searchGitCommitsSync(
     // ---- Semantic pass --------------------------------------------------
     const semanticScores = new Map<string, number>();
     if (options.queryEmbedding && options.queryModelId && options.queryModelId !== "off") {
-        const embeddings = loadProjectCommitEmbeddings(db, projectPath, options.queryModelId);
+        const embeddings = getSearchEmbeddings(db, projectPath, options.queryModelId);
         for (const [sha, embedding] of embeddings.entries()) {
             const similarity = clamp01(cosineSimilarity(options.queryEmbedding, embedding));
             if (similarity > 0) {
@@ -214,6 +277,31 @@ export function searchGitCommitsSync(
         for (const row of rows) bySha.set(row.sha, rowToCommit(row));
     }
 
+    if (options.captureLanes) {
+        const fts = [...bySha.values()]
+            .filter((commit) => ftsScores.has(commit.sha))
+            .map(
+                (commit): GitCommitSearchHit => ({
+                    commit,
+                    matchType: "fts",
+                    score: (ftsScores.get(commit.sha) ?? 0) * singleSourcePenalty,
+                }),
+            )
+            .sort((a, b) => b.score - a.score || b.commit.committedAtMs - a.commit.committedAtMs)
+            .slice(0, 25);
+        const vector = [...bySha.values()]
+            .filter((commit) => (semanticScores.get(commit.sha) ?? 0) > 0)
+            .map(
+                (commit): GitCommitSearchHit => ({
+                    commit,
+                    matchType: "semantic",
+                    score: semanticScores.get(commit.sha) ?? 0,
+                }),
+            )
+            .sort((a, b) => b.score - a.score || b.commit.committedAtMs - a.commit.committedAtMs)
+            .slice(0, 25);
+        options.captureLanes(fts, vector);
+    }
     const results: GitCommitSearchHit[] = [];
     for (const [sha, commit] of bySha.entries()) {
         const sem = semanticScores.get(sha);

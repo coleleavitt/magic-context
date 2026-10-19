@@ -14,11 +14,16 @@ import {
 } from "@magic-context/core/shared/models-dev-cache";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
+import { clearContextHandlerSession } from "./context-handler";
 import {
 	__test,
 	injectM0M1Pi,
 	type PiM0M1State,
 } from "./inject-compartments-pi";
+import {
+	__test as hygieneTest,
+	measurePiTailHygiene,
+} from "./tail-hygiene-walk-pi";
 import { createTestDb, textOf, userMessage } from "./test-utils.test";
 
 const SESSION_ID = "ses_pi_mural_inject";
@@ -87,6 +92,36 @@ function findM0Image(messages: Array<{ content?: unknown }>): {
 }
 
 describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
+	it("session teardown frees mural and hygiene bodies without changing persisted replay bytes", () => {
+		const db = createTestDb();
+		try {
+			getOrCreateSessionMeta(db, SESSION_ID);
+			const first = [userMessage("hello")];
+			injectM0M1Pi(
+				baseState({ mural: muralOption() }),
+				db,
+				first as never,
+				undefined,
+				true,
+			);
+			measurePiTailHygiene({
+				messages: first,
+				tags: [],
+				protectedTagNumbers: new Set(),
+			});
+			expect(__test.hasMuralProcessCache(SESSION_ID)).toBe(true);
+			expect(hygieneTest.contentMemoStats().bytes).toBeGreaterThan(0);
+			clearContextHandlerSession(SESSION_ID);
+			expect(__test.hasMuralProcessCache(SESSION_ID)).toBe(false);
+			expect(hygieneTest.contentMemoStats()).toEqual({ entries: 0, bytes: 0 });
+			const replay = [userMessage("hello")];
+			injectM0M1Pi(baseState(), db, replay as never, undefined, false);
+			expect(JSON.stringify(replay)).toBe(JSON.stringify(first));
+		} finally {
+			__test.clearPiMuralProcessCache(SESSION_ID);
+			closeQuietly(db);
+		}
+	});
 	it("replays a pre-legend baseline unchanged until the next HARD fold", () => {
 		const db = createTestDb();
 		try {

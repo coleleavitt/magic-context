@@ -2,12 +2,22 @@ import { describe, expect, it } from "bun:test";
 import {
   cacheCauseColor,
   cacheCauseLabel,
+  cacheCauseText,
+  cacheCauseTooltip,
+  cacheDropLine,
+  cacheDropText,
   cacheEventColorClass,
   cacheEventLabel,
   cacheReadLabel,
   cacheWriteLabel,
+  ctxBarGeom,
+  latestContextFill,
+  niceTokenCeil,
   normalizeEstimatedContextLimits,
+  PROVIDER_CACHE_MISS_CAUSE,
   selectWorstCacheEvent,
+  sentenceCaseLabel,
+  timelineAxis,
 } from "./cache-format";
 import type { DbCacheEvent } from "./types";
 
@@ -31,6 +41,8 @@ function ev(partial: Partial<DbCacheEvent>): DbCacheEvent {
     context_limit: 0,
     context_limit_estimated: false,
     is_drop: false,
+    context_reduced_by_mc: true,
+    drop_request_size: null,
     aggregate: false,
     cold_start: false,
     cache_write_reported: true,
@@ -44,6 +56,34 @@ describe("cacheCauseLabel", () => {
     expect(cacheCauseColor("mc_transform_failed_open")).toBe("red");
     expect(cacheCauseLabel("mc_transform_missing")).toBe("No attribution recorded");
     expect(cacheCauseColor("mc_transform_missing")).toBe("amber");
+  });
+
+  it("sets provider-side losses apart from Magic Context causes", () => {
+    const idle = "Cache expired after 11 min idle";
+    expect(cacheCauseLabel(idle)).toBe(idle);
+    expect(cacheCauseColor(idle)).toBe("text-secondary");
+    expect(cacheCauseTooltip(idle)).toContain("longer than the cache lifetime");
+    expect(cacheCauseLabel(PROVIDER_CACHE_MISS_CAUSE)).toBe(
+      "Provider cache miss (no change recorded by Magic Context)",
+    );
+    expect(cacheCauseColor(PROVIDER_CACHE_MISS_CAUSE)).toBe("text-secondary");
+    expect(cacheCauseTooltip(PROVIDER_CACHE_MISS_CAUSE)).toContain("did not shrink");
+    // The Turns table and the timeline tooltip share one cause line.
+    expect(cacheCauseText(PROVIDER_CACHE_MISS_CAUSE)).toBe(
+      "Cause: Provider cache miss (no change recorded by Magic Context)",
+    );
+    expect(cacheCauseText("mc_transform_failed_open")).toBe(
+      "Cause: Magic Context transform failed open",
+    );
+    // Magic Context's own causes keep their tone and carry no provider tooltip.
+    for (const cause of [
+      "System prompt change",
+      "Compaction pressure",
+      "Unattributed cache bust",
+    ]) {
+      expect(cacheCauseColor(cause)).toBe("amber");
+      expect(cacheCauseTooltip(cause)).toBeUndefined();
+    }
   });
 });
 
@@ -231,5 +271,106 @@ describe("cacheReadLabel", () => {
     expect(cacheReadLabel(ev({ cache_read: 90 }))).toBe((90).toLocaleString());
     expect(cacheReadLabel(ev({ cache_read: 0 }))).toBe("0");
     expect(cacheReadLabel(ev({ cache_read: 0, cache_reported: false }))).toBe("not reported");
+  });
+});
+
+describe("cache timeline axis", () => {
+  it("rounds axis tops up to readable token counts", () => {
+    expect(niceTokenCeil(252_202)).toBe(300_000);
+    expect(niceTokenCeil(140_000)).toBe(150_000);
+    expect(niceTokenCeil(1_000)).toBe(1_000);
+    expect(niceTokenCeil(0)).toBe(1);
+  });
+
+  it("scales a small prompt in a large window to the session's own range", () => {
+    // A 219k prompt in a 1.05M window: scaled to the window it filled only a
+    // fifth of the chart; on its own range it fills most of it.
+    const step = ev({ cache_read: 219_008, input_tokens: 298, context_limit: 1_050_000 });
+    const axis = timelineAxis([step], 1_050_000);
+    expect(axis).toEqual({ max: 300_000, windowInRange: false });
+    expect(ctxBarGeom(step, axis.max).outerPct).toBeCloseTo(73.1, 1);
+    expect(ctxBarGeom(step).outerPct).toBeCloseTo(20.9, 1);
+  });
+
+  it("uses the whole window once prompts come close to it", () => {
+    const step = ev({ cache_read: 180_000, input_tokens: 20_000, context_limit: 272_000 });
+    expect(timelineAxis([step], 272_000)).toEqual({ max: 272_000, windowInRange: true });
+  });
+
+  it("still flags a prompt that overflowed its window", () => {
+    const step = ev({ cache_read: 300_000, context_limit: 272_000 });
+    const axis = timelineAxis([step], 272_000);
+    const geom = ctxBarGeom(step, axis.max);
+    expect(geom.overflow).toBe(true);
+    expect(geom.outerPct).toBe(100);
+  });
+});
+
+describe("latestContextFill", () => {
+  it("reports the newest step's share of its recorded window", () => {
+    const fill = latestContextFill([
+      ev({ timestamp: 1, cache_read: 100_000, context_limit: 1_000_000 }),
+      ev({ timestamp: 2, cache_read: 210_000, input_tokens: 9_306, context_limit: 1_050_000 }),
+    ]);
+    expect(fill).toEqual({ prompt: 219_306, limit: 1_050_000, ratio: 219_306 / 1_050_000 });
+  });
+
+  it("says nothing when the window was only estimated", () => {
+    expect(
+      latestContextFill([
+        ev({ cache_read: 5_000, context_limit: 5_000, context_limit_estimated: true }),
+      ]),
+    ).toBeNull();
+  });
+});
+
+describe("sentenceCaseLabel", () => {
+  it("turns upper-case row labels into sentence case", () => {
+    expect(sentenceCaseLabel("COLD START · RUN TOTAL")).toBe("Cold start · run total");
+    expect(sentenceCaseLabel("FULL BUST")).toBe("Full bust");
+  });
+});
+
+describe("drop marker wording", () => {
+  const drop = (partial: Partial<DbCacheEvent>) => ev({ is_drop: true, ...partial });
+
+  it("credits Magic Context with a drop only in a session it manages", () => {
+    const managed = drop({ context_reduced_by_mc: true, cause: "mc_transform_failed_open" });
+    expect(cacheDropText(managed)).toEqual({
+      title: "Magic Context reclaimed context",
+      detail: "Cause: Magic Context transform failed open",
+    });
+    expect(cacheDropLine(managed)).toBe(
+      "⬇ MC reclaimed context — Magic Context transform failed open",
+    );
+    const noCause = drop({ context_reduced_by_mc: true });
+    expect(cacheDropText(noCause).detail).toBe("Cause not recorded");
+    expect(cacheDropLine(noCause)).toBe("⬇ MC reclaimed context");
+  });
+
+  it("labels a drop in an unmanaged session without a Magic Context cause", () => {
+    // A cause on the event is ignored: it cannot be Magic Context's here.
+    const unmanaged = drop({ context_reduced_by_mc: false, cause: "mc_transform_failed_open" });
+    expect(cacheDropText(unmanaged)).toEqual({
+      title: "Prompt tokens dropped",
+      detail: "Magic Context does not manage this session.",
+    });
+    expect(cacheDropLine(unmanaged)).toBe(
+      "⬇ Prompt tokens dropped — Magic Context does not manage this session.",
+    );
+  });
+
+  it("says what the request size shows when both sizes were recorded", () => {
+    const grew = drop({ context_reduced_by_mc: false, drop_request_size: "not_smaller" });
+    expect(cacheDropText(grew).detail).toBe(
+      "Magic Context does not manage this session. The request did not get smaller; the provider counted fewer tokens.",
+    );
+    expect(cacheDropLine(grew)).toBe(
+      "⬇ Prompt tokens dropped — Magic Context does not manage this session. The request did not get smaller; the provider counted fewer tokens.",
+    );
+    const shrank = drop({ context_reduced_by_mc: false, drop_request_size: "smaller" });
+    expect(cacheDropText(shrank).detail).toBe(
+      "Magic Context does not manage this session. The request got smaller.",
+    );
   });
 });

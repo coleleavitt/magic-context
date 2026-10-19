@@ -20,8 +20,10 @@ Project config always merges on top of user config. The unified setup wizard (`n
 Keys listed below apply from the next historian or dreamer run (or dream-timer tick); a run in progress keeps its original inputs. All other keys require a host restart. On a malformed edit, the last good config remains active and `/ctx-status` reports the error. The live mark in the [JSON schema](assets/magic-context.schema.json) is authoritative; this list is checked against it.
 
 <!-- LIVE-CONFIG-KEYS-START -->
+- `cache_ttl`
 - `commit_cluster_trigger.enabled`
 - `commit_cluster_trigger.min_clusters`
+- `dreamer.disable`
 - `dreamer.maxTokens`
 - `dreamer.omp.fallback_models`
 - `dreamer.omp.model`
@@ -51,6 +53,7 @@ Keys listed below apply from the next historian or dreamer run (or dream-timer t
 - `dreamer.tasks.review-user-memories.schedule`
 - `dreamer.tasks.verify-broad.schedule`
 - `dreamer.tasks.verify.schedule`
+- `historian.expand_tools`
 - `historian.maxTokens`
 - `historian.omp.fallback_models`
 - `historian.omp.model`
@@ -67,7 +70,6 @@ Keys listed below apply from the next historian or dreamer run (or dream-timer t
 - `memory.git_commit_indexing.enabled`
 - `memory.git_commit_indexing.max_commits`
 - `memory.git_commit_indexing.since_days`
-- `mural.model`
 - `toast_duration_ms`
 <!-- LIVE-CONFIG-KEYS-END -->
 
@@ -301,7 +303,7 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `keep_subagents` | `boolean` | `false` | Debug option: keep every settled Magic Context child session instead of deleting it after success: historian, all Dreamer tasks, smart-note evaluation and compilation, user-memory review, and memory migration. Kept Dreamer children can contain memory-pool text and user messages from other sessions of the same operator; their full transcript stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect. On OpenCode 2.0.22 or newer, every run uses a fresh child, parented when there is a user session. With this option on, settled children and historian children remain inspectable; unsettled Dreamer children are removed. With it off, each run's child is removed through the native session API, whether or not the host runs as a service. |
 | `todowrite` | `object` | See below | **Pi only.** Controls Magic Context's built-in `todowrite` tool and persistent task overlay. OpenCode has its own built-in `todowrite`, so this setting has no effect there. |
 | `sqlite` | `object` | See below | Per-connection SQLite tuning for Magic Context's own `context.db`. |
-| `storage.enforce_private_permissions` | `boolean` | `true` | User-config-only. Keep owner-only `0700` directories and `0600` files. Set `false` only for an externally managed trusted-group deployment; Magic Context will never re-tighten storage permissions. |
+| `storage.enforce_private_permissions` | `boolean` | `true` | User-config-only. By default, TypeScript mode creates/re-tightens 0700 directories and 0600 files. `false` delegates TypeScript-mode permissions to the operator; Rust transform mode always keeps the shared data directory owner-only (0700), regardless of this setting. |
 
 `protected_tags` is deprecated and ignored. Remove it and use `protected_tokens` when an explicit absolute floor is needed.
 
@@ -650,7 +652,7 @@ Dreamer scheduling and agent metadata remain at `dreamer`, while task execution 
 | `dreamer.tasks.review-user-memories`, `dreamer.tasks.promote-primers` | `schedule`, `promotion_threshold` | Task-specific promotion metadata. |
 | `dreamer.temperature`, `top_p`, `prompt`, `tools`, `disable`, `description`, `mode`, `color`, `maxSteps`, `permission`, `maxTokens`, `inject_docs` | metadata | Retained at `dreamer`; these fields never move into a harness block. |
 
-To disable the dreamer entirely, set `dreamer.disable: true`. To disable a single task, set its top-level `dreamer.tasks.<task>.schedule` to `""`; it can still be run on demand via `/ctx-dream <task>`.
+To disable the dreamer entirely, set `dreamer.disable: true`. This also turns off smart notes (`ctx_note` no longer offers `surface_condition`, whatever `smart_notes.enabled` says) and stops the historian from collecting user observations for `review-user-memories`; `dreamer.inject_docs` still applies. Each task follows the setting it serves: memory tasks need `memory.enabled: true`, `evaluate-smart-notes` needs `smart_notes.enabled`, `maintain-docs` and `review-user-memories` need only their schedule. Magic Context logs one `config note` line at startup for each such setting that has no effect. To disable a single task, set its top-level `dreamer.tasks.<task>.schedule` to `""`; it can still be run on demand via `/ctx-dream <task>`.
 
 ### The tasks
 
@@ -735,10 +737,10 @@ Cross-session memory settings. All memories are scoped to the current project (i
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | `boolean` | `true` | Enable cross-session memory. When `false`, the `ctx_memory` tool is hidden, no `<project-memory>` block is injected, and historian/recomp do not promote any session facts to project memories. The `ctx_search` tool stays available but its memory source returns no results, and no memory rows are embedded. Session history is still embedded automatically and silently for semantic `ctx_search` whenever an embedding provider is configured; set `embedding.provider: "off"` to stop all embedding. |
+| `enabled` | `boolean` | `true` | Enable cross-session memory. When `false`, the `ctx_memory` tool is hidden, no `<project-memory>` block is injected, and historian/recomp do not promote any session facts to project memories. The `ctx_search` tool stays available but its memory source returns no results, and no memory rows are embedded. Session history is still embedded automatically and silently for semantic `ctx_search` whenever an embedding provider is configured; set `embedding.provider: "off"` to stop all embedding. While `false`, the dreamer's project-memory tasks (`map-memories`, `verify`, `verify-broad`, `curate`, `compress-cues`, `classify-memories`, `retrospective`, `promote-primers`, `refresh-primers`) run neither on schedule nor through `/ctx-dream`; `maintain-docs`, `evaluate-smart-notes` and `review-user-memories` still run. `memory.auto_search` and `memory.git_commit_indexing` do not depend on it. |
 | `injection_budget_tokens` | `number` (500–20000) | `4000` | Token budget for memory injection into `<session-history>`. |
 | `auto_promote` | `boolean` | `true` | Promote eligible session facts to project memories automatically after historian or `/ctx-recomp` runs. When `false`, historian and recomp do not write any new memories — agents can still create memories explicitly via `ctx_memory write`, and existing memories continue to be injected and searched normally. |
-| `retrieval_count_promotion_threshold` | `number` | `3` | Retrievals needed before a memory is auto-promoted to permanent. |
+| `retrieval_count_promotion_threshold` | `number` | `3` | Currently has no effect: no code reads it, and memories are not promoted to permanent by retrieval count. Kept so existing configs stay valid. |
 
 ---
 
@@ -747,7 +749,7 @@ Cross-session memory settings. All memories are scoped to the current project (i
 
 In Dreamer v2 the former `user_memories` sub-feature block became a first-class scheduled task: **`review-user-memories`** (see the `dreamer.tasks` table above). The `doctor` command migrates a legacy `dreamer.user_memories` config to the equivalent task entry automatically, preserving your enable/disable state and tuning values. (A legacy `dreamer.pin_key_files` block is dropped — key-files pinning has moved out of Magic Context.)
 
-- **`review-user-memories`** (was `user_memories`): set its `schedule` to enable, `""` to disable. Carries `promotion_threshold` (2–20, default 3). When scheduled, the historian extracts behavioral observations and this task promotes recurring patterns to stable user memories injected via `<user-profile>`. Privacy-sensitive — only runs when scheduled.
+- **`review-user-memories`** (was `user_memories`): set its `schedule` to enable, `""` to disable. Carries `promotion_threshold` (2–20, default 3). When scheduled and the dreamer is runnable (`dreamer.disable` not `true`), the historian extracts behavioral observations and this task promotes recurring patterns to stable user memories injected via `<user-profile>`. Privacy-sensitive — only runs when scheduled.
 
 ## History & Recall Features
 
@@ -859,22 +861,24 @@ Tier boundaries are hardcoded to keep behavior predictable and prevent cache-bus
 
 | Key | Type | Default |
 |-----|------|---------|
-| `smart_drops` | `boolean` | `false` |
+| `smart_drops` | deprecated, ignored | — |
 
-**Experimental, opt-in.** Content-aware reclaim of tool output that a later call has made obsolete, layered on top of the normal age-based auto-drop. The age-based drop reclaims the *oldest* tool outputs first; smart-drops additionally reclaims outputs that are dead by *supersession*, regardless of age:
+**Always on.** Content-aware reclaim of tool output that a later call has made obsolete is layered on top of the normal age-based auto-drop. Old configs containing `smart_drops` keep loading, but its value has no effect and doctor reports it as ignored. Supersession reclaims spent results regardless of age:
 
 | Class | Behavior |
 |---|---|
 | `todowrite` | Keep the newest snapshot, drop older ones (the live plan is re-injected every pass; older snapshots are stale). |
-| `ctx_reduce` | Keep the newest 5 calls, drop older ones (preserves the visible reduce rhythm). |
+| `ctx_reduce` | Keep the newest 3 active results by default, drop older ones (preserves the visible reduce rhythm). |
 | Zero-value meta (`bash_status`, `bash_kill`, `ctx_note` read/dismiss) | Drop all (worthless once the call ran; `ctx_note` write/update carry intent and are never dropped). |
 | Superseded edits | When a file is edited more than once, the newest edit stays in full and each older edit is compressed to a marker that keeps its `filePath` and a short region hint of the diff, so the agent still sees which file and region it edited. This is the largest source of reclaimable bytes. |
 
-**Cache safety.** Selection is age-independent, but smart-drops only *acts* during a transform pass that is already rewriting the message array (the same execute-threshold gate the age-based drop uses), so it never causes a prompt-cache miss on its own. Every drop resolves to the same deterministic placeholder as the normal drops, so defer passes replay byte-for-byte identically. **When `smart_drops` is off, the messages sent to the model are byte-identical to the age-based-only behavior** — the entire feature is inert.
+**Cache safety.** Selection is age-independent, but supersession only acts on passes already rebuilding the cache. Sessions that previously set `smart_drops: false` drain their backlog on the first such pass, never on an ordinary defer pass. Drops replay byte-identically afterward.
 
-**Cross-version note.** Once you enable `smart_drops`, all binaries that share your Magic Context database (e.g. multiple OpenCode instances, or OpenCode + Pi) should be on the release that introduced it. If a stale older binary co-runs with the feature on, the worst case is a one-time cache bust (the older binary fully drops what the newer one compressed); it never corrupts data.
+### `protected_tools`
 
-**When to enable.** Turn it on if you run very long, edit-heavy sessions and want to reclaim more context without losing the agent's record of what it did. The default stays off while cache stability is being validated in the wild. Requires a restart to take effect.
+User and project JSON-object maps merge over `{ "todowrite": 1, "ctx_reduce": 3 }`. Each nonnegative whole number keeps that many newest still-active results, ordered by tag number; dropped or historian-summarised results do not count. Project entries override matching user entries. Names ignore case and a leading `mcp_`; 0 disables a default.
+
+Emergency, age, supersession (including edit-marker compression), and duplicate removal honour the map even at ≥95%. There is no byte cap, so large protected outputs can reach refusal sooner. Queued drops, from the agent or historian publication, are held like the protected tail until newer calls displace the result and a later cache-rebuilding pass applies them. The historian's summary is unaffected; the raw result leaves at the next fold. Frozen strips are unaffected. Map changes and N+1 rotation never originate a bust or restore dropped results.
 
 ## Commands
 

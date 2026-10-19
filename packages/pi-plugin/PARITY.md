@@ -835,13 +835,23 @@ security boundary unaffected by the main-session activation behavior.
 
 ---
 
-## 25. Pi clone/fork inherits session state; OpenCode `/fork` does not yet
+## 25. Pi clone/fork and OpenCode 2 fork inherit session state; OpenCode 1 `/fork` cannot
 
 Pi preserves JSONL entry ids when cloning a branch, so the clone-start hook can
 copy compartments, tags, reductions, and deferred Pi marker state while filtering
-them to the copied prefix. OpenCode re-mints message ids during `/fork`, making
-entry-id-keyed migration unsafe there. OpenCode fork inheritance therefore needs
-a separate future design based on a stable cross-fork identity.
+them to the copied prefix.
+
+OpenCode 2 records the link (`session_v2.fork_session_id`, `fork_boundary`) and
+copies each parent row with its `seq`, type and creation time, re-minting the id
+as `<id from the fork event>_<seq>`. On the first pass for a fork with no state,
+`v2/fork-inheritance.ts` pairs the rows by `seq` and copies the parent's state up
+to the boundary with the same `copySessionStateForClone` (TypeScript mode only).
+
+OpenCode 1 re-mints every id during `/fork` and records no link to the source
+session (`session.parent_id` is subagent parentage), so there is nothing to pair
+the copy with and no inheritance. A fork there starts empty; the transform's
+over-window check (`unmanaged-over-window.ts`) keeps its first request from going
+out over the model's window.
 
 ---
 
@@ -950,8 +960,10 @@ lookup. Pi does not warm that cache (see §14); when metadata is absent the gate
 never injects the mural image until vision metadata is available; OpenCode warms
 the cache from its SDK at startup.
 
-**Config:** both honor `mural.enabled` (and `mural.model`
-for the compress-cues dreamer task). No intentional per-provider image-part
+**Config:** both honor `mural.enabled`. The compress-cues dreamer task takes its
+model from each harness's own dreamer settings
+(`dreamer.<harness>.tasks.compress-cues.model`, then `dreamer.<harness>.model`);
+the old shared `mural.model` is deprecated and ignored on both. No intentional per-provider image-part
 blacklist today — every Pi serializer path that accepts user image content takes
 raw base64 the same way.
 
@@ -1151,6 +1163,6 @@ Pi storage-error fallback has no complete held system/tool observation at its ad
 
 Historian admission reads primary/fallback windows from the live Pi/OMP model registry first and uses the cached model metadata when unavailable. A missing window sends unguarded with a once-per-model warning rather than permanently refusing; measured over-limit assembled prompts still refuse before transport. The old 1.02× source-clamping fixture intentionally refuses the assembled calibrated prompt and leaves coverage unchanged; a raw source allowance did not include all instructions/system mass. `/ctx-recomp` forwards its configured historian model to shared admission rather than relying on an unobservable agent default. Pi's actual child tool schemas and later host framing remain outside the observed system/user prompt representation; no exact provider-token claim is made for those components.
 
-The full Pi suite initially reported 1,193 pass / 3 skip / 31 fail. The affected 344-test groups subsequently reported 340 pass / 4 fail, and the four remaining nested-historian cases passed after their mock window observations were supplied. The environment-only OMP/home and smart-note checks passed without product changes. Pi typecheck passed. No second full suite was run, as requested. Exact commands and counts are committed under `docs/reports/tokenizer-calibration-gates/`.
+The full Pi suite initially reported 1,193 pass / 3 skip / 31 fail. The affected 344-test groups subsequently reported 340 pass / 4 fail, and the four remaining nested-historian cases passed after their mock window observations were supplied. The environment-only OMP/home and smart-note checks passed without product changes. Pi typecheck passed. No second full suite was run, as requested.
 
 Tail-hygiene parity is active. Persisted `last_nudge_undropped` and `last_nudge_level.postReduceGraceBaselineU` convert once at the stamped bust; `growthThreshold` is derived from calibrated T. No SQL column, migration, sidecar or fence change was added.

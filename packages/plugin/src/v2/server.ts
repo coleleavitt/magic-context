@@ -1,9 +1,18 @@
+import packageMetadata from "../../package.json";
 import { loadPluginConfigDetailed } from "../config";
+import { bindStaleBuildNotice } from "../plugin/stale-build-notice";
+import {
+    claimStorageBackupWarningCheck,
+    getMagicContextStorageDir,
+    isMagicContextStorageOutsideEngram,
+} from "../shared/data-path";
 import { setHarness } from "../shared/harness";
 import { flushLogger, log } from "../shared/logger";
-import { registerContext } from "./hooks/context";
+import { registerStandalonePluginMarker } from "../standalone-plugin-marker";
 import type { V2Context } from "./hooks/types";
 import { startUpdateChecks } from "./hooks/update-check";
+
+registerStandalonePluginMarker(packageMetadata.version);
 
 /**
  * Only an OpenCode 2 host hands `setup` a context carrying `session.hook`.
@@ -44,7 +53,17 @@ export async function setup(context: V2Context) {
         );
         return async () => {};
     }
+    const storageDir = getMagicContextStorageDir();
+    if (claimStorageBackupWarningCheck() && isMagicContextStorageOutsideEngram(storageDir)) {
+        log(
+            `[magic-context] Magic Context storage is at ${storageDir}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`,
+        );
+    }
+    // The union entry is also imported and probed by OpenCode 1. Load the v2
+    // adapter only after the host-shape check, retaining the same setup callback.
+    const { registerContext } = await import("./hooks/context");
     setHarness("opencode2");
+    bindStaleBuildNotice({}, import.meta.url, "opencode2");
     const duties = await registerContext(context);
     const checks =
         loadPluginConfigDetailed(context.location.directory).config.auto_update === false

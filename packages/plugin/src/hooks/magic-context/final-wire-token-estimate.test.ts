@@ -1,19 +1,282 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import {
     __resetToolDefinitionMeasurements,
     getLargestMeasuredToolDefinitionTokens,
     recordToolDefinition,
 } from "../../features/magic-context/tool-definition-tokens";
+import * as logger from "../../shared/logger";
+import { outgoingContextRefusal } from "./emergency-fail-closed";
 import {
+    createFinalWireUsageTracker,
     describeFinalWireTail,
     estimateFinalWireInputTokens,
+    estimateOutgoingWireForRefusal,
     type FinalWireTokenEstimate,
 } from "./final-wire-token-estimate";
+import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 
 const MODEL = { providerID: "test-provider", modelID: "test-model", agentName: "build" };
 
 afterEach(() => __resetToolDefinitionMeasurements());
+
+it("healthy refusal settles over and under byte bounds without token counts", () => {
+    recordToolDefinition(MODEL.providerID, MODEL.modelID, MODEL.agentName, "read", "Read", {});
+    const huge = estimateOutgoingWireForRefusal(
+        {
+            messages: [toolMessage("x".repeat(12 * 1024 * 1024 + 1000))],
+            systemPromptTokens: 100,
+            ...MODEL,
+        },
+        16000,
+    );
+    expect(huge.refusalBasis).toBe("byte-bound");
+    expect(huge.refusalGrade).toBe(true);
+    expect(huge.messageTokens).toEqual({ conversation: 0, toolCall: 0 });
+    const small = estimateOutgoingWireForRefusal(
+        { messages: [toolMessage("x".repeat(4000))], systemPromptTokens: 100, ...MODEL },
+        16000,
+    );
+    expect(small.refusalBasis).toBe("byte-bound");
+    expect(small.refusalGrade).toBe(false);
+    expect(small.messageTokens).toEqual({ conversation: 0, toolCall: 0 });
+});
+
+it("uncertain refusal bounds pathological text without changing shared tokenization", () => {
+    const ordinary = estimateTokens("ordinary words");
+    recordToolDefinition(MODEL.providerID, MODEL.modelID, MODEL.agentName, "read", "Read", {});
+    const text = "x".repeat(16385);
+    const startedAt = performance.now();
+    const result = estimateOutgoingWireForRefusal(
+        { messages: [toolMessage(text)], systemPromptTokens: 100, ...MODEL },
+        10000,
+    );
+    expect(result.messageTokens.toolCall).toBeGreaterThanOrEqual(Buffer.byteLength(text));
+    expect(result.refusalGrade).toBe(false);
+    expect(performance.now() - startedAt).toBeLessThan(1000);
+    expect(estimateTokens("ordinary words")).toBe(ordinary);
+});
+
+it("borrowed tool definitions and family fallback are admission-only even on complete over-limit envelopes", () => {
+    recordToolDefinition("other", "route", "build", "probe", "word ".repeat(20000), {});
+    const messages = [toolMessage("word ".repeat(20000))];
+    const borrowed = estimateFinalWireInputTokens({
+        messages,
+        systemPromptTokens: 100,
+        providerID: "anthropic",
+        modelID: "claude-fable-5-1",
+        agentName: "build",
+    });
+    expect(borrowed.trusted).toBe(true);
+    expect(borrowed.tokens).toBeGreaterThan(16000);
+    expect(borrowed.toolDefinitionsMeasured).toBe(false);
+    expect(borrowed.refusalGrade).toBe(false);
+    expect(outgoingContextRefusal(borrowed, 16000)).toBeUndefined();
+    recordToolDefinition("anthropic", "claude-fable-5-2", "build", "probe", "A probe", {});
+    const inherited = estimateFinalWireInputTokens({
+        messages,
+        systemPromptTokens: 100,
+        providerID: "anthropic",
+        modelID: "claude-fable-5-2",
+        agentName: "build",
+    });
+    expect(inherited.trusted).toBe(true);
+    expect(inherited.toolDefinitionsMeasured).toBe(true);
+    expect(inherited.refusalGrade).toBe(false);
+    expect(outgoingContextRefusal(inherited, 16000)).toBeUndefined();
+});
+
+it("OpenCode correlated provider usage wins over full-prefix estimates and rejects stale evidence", () => {
+    const route = { providerID: "anthropic", modelID: "claude-fable-5-1", agentName: "build" };
+    recordToolDefinition(route.providerID, route.modelID, route.agentName, "probe", "A probe", {});
+    const tracker = createFinalWireUsageTracker();
+    const prefix = [
+        {
+            info: { id: "input", role: "user" },
+            parts: [{ type: "text", text: "word ".repeat(20000) }],
+        },
+    ] as MessageLike[];
+    const envelope = { systemPromptTokens: 100, systemPromptHash: "system-v1", ...route };
+    tracker.capture("session", { messages: prefix, ...envelope });
+    const reply = {
+        info: {
+            id: "reply",
+            role: "assistant",
+            parentID: "input",
+            ...route,
+            finish: "stop",
+            time: { completed: Date.now() + 1 },
+            tokens: { input: 100, cache: { read: 20, write: 10 } },
+        },
+        parts: [{ type: "text", text: "New reply" }],
+    } as unknown as MessageLike;
+    const messages = [...prefix, reply];
+    const measured = tracker.estimate("session", { messages, ...envelope });
+    expect(measured.tokens).toBeGreaterThan(16000);
+    expect(measured.refusalBasis).toBe("provider-prefix");
+    expect(measured.refusalTokens).toBeGreaterThanOrEqual(130);
+    expect(measured.refusalTokens).toBeLessThan(200);
+    expect(outgoingContextRefusal(measured, 16000)).toBeUndefined();
+    for (const input of [
+        { messages, ...envelope, systemPromptHash: "system-v2" },
+        {
+            messages: [{ ...prefix[0], parts: [{ type: "text", text: "changed prefix" }] }, reply],
+            ...envelope,
+        },
+        {
+            messages: [...prefix, { ...reply, info: { ...reply.info, parentID: "other" } }],
+            ...envelope,
+        },
+        {
+            messages: [...prefix, { ...reply, info: { ...reply.info, providerID: "other" } }],
+            ...envelope,
+        },
+    ])
+        expect(tracker.estimate("session", input).refusalBasis).toBe("calibrated");
+    recordToolDefinition(
+        route.providerID,
+        route.modelID,
+        route.agentName,
+        "probe",
+        "Changed schema",
+        {},
+    );
+    expect(tracker.estimate("session", { messages, ...envelope }).refusalBasis).toBe("calibrated");
+});
+
+it("signed requests use exact provider-prefix fit and emit one estimate drift line", () => {
+    const route = { providerID: "anthropic", modelID: "claude-opus-5-5", agentName: "build" };
+    recordToolDefinition(route.providerID, route.modelID, route.agentName, "probe", "A probe", {});
+    const tracker = createFinalWireUsageTracker();
+    const prefix = [
+        {
+            info: { id: "signed", role: "assistant" },
+            parts: [
+                {
+                    type: "thinking",
+                    thinking: "A kept thought",
+                    signature: "opaque".repeat(50_000),
+                },
+            ],
+        },
+        { info: { id: "input", role: "user" }, parts: [{ type: "text", text: "Continue" }] },
+    ] as unknown as MessageLike[];
+    const envelope = { ...route, systemPromptTokens: 100, systemPromptHash: "stable" };
+    tracker.capture("signed-session", { ...envelope, messages: prefix });
+    const reply = {
+        info: {
+            id: "reply",
+            role: "assistant",
+            parentID: "input",
+            ...route,
+            finish: "tool-calls",
+            time: { completed: Date.now() + 1 },
+            tokens: { input: 657_477, cache: { read: 0, write: 0 } },
+        },
+        parts: [{ type: "thinking", thinking: "Next thought", signature: "opaque".repeat(50_000) }],
+    } as unknown as MessageLike;
+    const log = spyOn(logger, "sessionLog");
+    try {
+        const estimate = tracker.estimate("signed-session", {
+            ...envelope,
+            messages: [...prefix, reply],
+        });
+        expect(estimate.refusalBasis).toBe("provider-prefix");
+        expect(estimate.refusalTokens).toBeGreaterThanOrEqual(657_477);
+        expect(estimate.refusalTokens).toBeLessThan(658_477);
+        const drift = log.mock.calls.filter((call) =>
+            String(call[1]).includes("thinking estimate drift:"),
+        );
+        expect(drift).toHaveLength(1);
+        expect(String(drift[0]?.[1])).toContain("provider=657477 ratio=");
+        tracker.capture("signed-session", { ...envelope, messages: [...prefix, reply] });
+        expect(
+            log.mock.calls.filter((call) => String(call[1]).includes("thinking estimate drift:")),
+        ).toHaveLength(1);
+        log.mockClear();
+        const warm = createFinalWireUsageTracker();
+        warm.capture("warm-session", { ...envelope, messages: prefix });
+        const changed = structuredClone(prefix);
+        (changed[0]!.parts[0] as { thinking: string }).thinking = "Changed head on this request";
+        warm.capture("warm-session", {
+            ...envelope,
+            messages: [
+                ...changed,
+                {
+                    ...reply,
+                    info: { ...reply.info, time: { completed: Date.now() + 1 } },
+                } as unknown as MessageLike,
+            ],
+        });
+        expect(
+            log.mock.calls.filter((call) => String(call[1]).includes("thinking estimate drift:")),
+        ).toHaveLength(1);
+    } finally {
+        log.mockRestore();
+    }
+});
+
+it("opaque fallback telemetry logs once on execute and warm capture", () => {
+    const route = { providerID: "anthropic", modelID: "claude-opus-5-5", agentName: "build" };
+    recordToolDefinition(route.providerID, route.modelID, route.agentName, "probe", "A probe", {});
+    const input = {
+        ...route,
+        systemPromptTokens: 100,
+        systemPromptHash: "stable",
+        messages: [
+            { info: { id: "input", role: "user" }, parts: [{ type: "text", text: "Continue" }] },
+            {
+                info: { id: "hidden", role: "assistant" },
+                parts: [{ type: "thinking", thinking: "", signature: "opaque" }],
+            },
+        ] as unknown as MessageLike[],
+    };
+    const tracker = createFinalWireUsageTracker();
+    const log = spyOn(logger, "sessionLog");
+    try {
+        tracker.estimate("opaque-session", input, 872_000);
+        tracker.capture("opaque-session", input);
+        expect(
+            log.mock.calls.filter((call) => String(call[1]).includes("opaque thinking fallback:")),
+        ).toHaveLength(1);
+        log.mockClear();
+        tracker.capture("opaque-session", input);
+        expect(
+            log.mock.calls.filter((call) => String(call[1]).includes("opaque thinking fallback:")),
+        ).toHaveLength(1);
+        expect(String(log.mock.calls[0]?.[1])).toContain("steps=1 tokensPerStep=1000");
+    } finally {
+        log.mockRestore();
+    }
+});
+
+it("OpenCode measured preceding overflow does not refuse a fitting protected subset", () => {
+    const route = { providerID: "anthropic", modelID: "claude-fable-5-1", agentName: "build" };
+    recordToolDefinition(route.providerID, route.modelID, route.agentName, "probe", "A probe", {});
+    const tracker = createFinalWireUsageTracker();
+    const envelope = { systemPromptTokens: 100, systemPromptHash: "system-v1", ...route };
+    const prefix = [
+        { info: { id: "input", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+    ] as MessageLike[];
+    tracker.capture("session", { messages: prefix, ...envelope });
+    const reply = {
+        info: {
+            id: "reply",
+            role: "assistant",
+            parentID: "input",
+            ...route,
+            finish: "stop",
+            time: { completed: Date.now() + 1 },
+            tokens: { input: 15000, cache: { read: 900, write: 200 } },
+        },
+        parts: [{ type: "text", text: "hello" }],
+    } as unknown as MessageLike;
+    const estimate = tracker.estimate("session", { messages: [...prefix, reply], ...envelope });
+    expect(estimate.tokens).toBeLessThan(1000);
+    expect(estimate.refusalTokens).toBeGreaterThan(16000);
+    expect(outgoingContextRefusal(estimate, 16000, 0)).toBeUndefined();
+    expect(outgoingContextRefusal(estimate, 16000, 10)).toBeUndefined();
+});
 
 function estimate(messages: MessageLike[]): FinalWireTokenEstimate {
     recordToolDefinition(MODEL.providerID, MODEL.modelID, MODEL.agentName, "read", "Read a file", {
@@ -40,6 +303,22 @@ function toolMessage(output: string): MessageLike {
 }
 
 describe("final outgoing-wire token estimate", () => {
+    it("invalidates exact-content counts for in-place historical text and nested tool edits", () => {
+        const row = toolMessage("cache original");
+        const state = (row.parts[0] as { state: { input: { path: string }; output: string } })
+            .state;
+        const first = estimate([row]);
+        expect(estimate(structuredClone([row]))).toEqual(first);
+        state.input.path = "different/new/path.ts";
+        state.output = "edited output with many additional words";
+        expect(estimate([row]).messageTokens.toolCall).toBe(
+            estimateTokens(JSON.stringify(state.input)) + estimateTokens(state.output),
+        );
+        state.output = "cache original";
+        state.input.path = "large.log";
+        expect(estimate([row])).toEqual(first);
+    });
+
     it("counts attachments still sent with a legacy dropped skeleton", () => {
         const row = toolMessage("[dropped §7§]");
         const state = (row.parts[0] as { state: { attachments?: unknown[] } }).state;

@@ -1,5 +1,6 @@
 import { DREAM_TASK_PROMOTION_DEFAULTS } from "../../../config/schema/magic-context";
-import type { Database } from "../../../shared/sqlite";
+import type { Database, Statement } from "../../../shared/sqlite";
+import { isKnownAutocommit } from "../../../shared/sqlite-helpers";
 import { hasMemoryClassifiedAtColumn } from "../memory/storage-memory";
 import { hasMuralCueColumns } from "../mural/storage-mural-cues";
 import {
@@ -106,6 +107,10 @@ export function countProjectSessionsSince(
     projectPath: string,
     since: number | null,
 ): number {
+    // Host events provide precise message timestamps, but SDK bridges may only
+    // maintain the message index. Fall back per session to its indexing time,
+    // not the project binding time (which changes without new messages). Keep
+    // the ledger authoritative so reindexing old Pi history does not reopen work.
     const row =
         since === null
             ? db
@@ -116,9 +121,11 @@ export function countProjectSessionsSince(
             : db
                   .prepare<[string, number], { cnt: number }>(
                       `SELECT COUNT(*) AS cnt FROM session_projects sp
-                        JOIN schema_migrations_meta activity
+                        LEFT JOIN schema_migrations_meta activity
                           ON activity.key = 'retrospective_activity:' || sp.session_id
-                       WHERE sp.project_path = ? AND CAST(activity.value AS INTEGER) > ?`,
+                        LEFT JOIN message_history_index history ON history.session_id = sp.session_id
+                       WHERE sp.project_path = ?
+                         AND COALESCE(CAST(activity.value AS INTEGER), history.updated_at) > ?`,
                   )
                   .get(projectPath, since);
     return row?.cnt ?? 0;
@@ -253,16 +260,17 @@ export function hasActiveMemories(db: Database, projectPath: string): boolean {
 
 /**
  * Sessions count as recent when they were bound or were active after `since`.
- * Both signals are checked because not every host records live activity:
- * OpenCode 2 only backfills activity once at startup, while every host writes
- * the session's project binding (`session_projects.updated_at`) when the
- * session is first seen.
+ * A new binding qualifies before its first message is indexed. Older bindings
+ * need message activity: prefer the host's precise ledger, falling back to the
+ * message index for SDK bridges without host events. This also prevents idle
+ * pruning from removing an actively indexed bridge session's schedule.
  */
 const RECENT_PROJECT_SESSIONS_SQL = `SELECT sp.session_id FROM session_projects sp
-       LEFT JOIN schema_migrations_meta activity
-         ON activity.key = 'retrospective_activity:' || sp.session_id
+        LEFT JOIN schema_migrations_meta activity
+          ON activity.key = 'retrospective_activity:' || sp.session_id
+        LEFT JOIN message_history_index history ON history.session_id = sp.session_id
       WHERE sp.project_path = ?
-        AND (sp.updated_at > ? OR CAST(activity.value AS INTEGER) > ?)`;
+        AND (sp.updated_at > ? OR COALESCE(CAST(activity.value AS INTEGER), history.updated_at) > ?)`;
 
 /** Whether a session of this project was bound or was active after `since`. */
 export function hasRecentProjectSession(db: Database, projectPath: string, since: number): boolean {
@@ -469,6 +477,17 @@ export function getDreamTaskBacklog(
     }
 }
 
+const backlogCaches = new WeakMap<
+    Database,
+    {
+        revisionStatement: Statement;
+        expiryStatement: Statement;
+        revision: string;
+        entries: Map<string, DreamTaskBacklogMap>;
+        eligibleProjects: Map<string, boolean>;
+    }
+>();
+
 /** Read the complete backlog breakdown in the caller's requested registry order. */
 export function getDreamTaskBacklogs(
     db: Database,
@@ -476,8 +495,63 @@ export function getDreamTaskBacklogs(
     tasks: readonly DreamTaskName[] = CANONICAL_DREAM_TASKS,
     options: { lastRunAt?: number | null; retrospectiveWatermarkMs?: number | null } = {},
 ): DreamTaskBacklogMap {
+    if (tasks.length === 0) return {};
+    if (!isKnownAutocommit(db)) {
+        // A rollback leaves every revision counter unchanged, so a backlog read
+        // inside a transaction must never be cached or served from the cache.
+        backlogCaches.delete(db);
+        const result: DreamTaskBacklogMap = {};
+        for (const task of tasks)
+            result[task] = getDreamTaskBacklog(db, projectPath, task, options);
+        return result;
+    }
+    let cache = backlogCaches.get(db);
+    if (!cache) {
+        cache = {
+            revisionStatement: db.prepare(`SELECT total_changes() AS writes,
+                (SELECT data_version FROM pragma_data_version) AS dataVersion,
+                (SELECT schema_version FROM pragma_schema_version) AS schemaVersion`),
+            expiryStatement: db.prepare(`SELECT 1 FROM memories WHERE project_path = ?
+                AND status IN ('active','permanent') AND expires_at IS NOT NULL LIMIT 1`),
+            revision: "",
+            entries: new Map(),
+            eligibleProjects: new Map(),
+        };
+        backlogCaches.set(db, cache);
+    }
+    const revision = JSON.stringify(cache.revisionStatement.get());
+    if (revision !== cache.revision) {
+        cache.entries.clear();
+        cache.eligibleProjects.clear();
+        cache.revision = revision;
+    }
+    let eligible = cache.eligibleProjects.get(projectPath);
+    if (eligible === undefined) {
+        // An expiring pool can change without a write. Never memoize its counts;
+        // all other backlog predicates depend only on rows and caller options.
+        eligible = !cache.expiryStatement.get(projectPath);
+        if (cache.eligibleProjects.size >= 16) cache.eligibleProjects.clear();
+        cache.eligibleProjects.set(projectPath, eligible);
+    }
+    // JSON numbers collapse NaN/Infinity to null; null and omitted watermarks
+    // also have different meanings. Preserve those distinctions in the key.
+    const optionKey = (value: number | null | undefined) =>
+        value === undefined ? "omitted" : value === null ? "null" : `number:${value}`;
+    const key = JSON.stringify([
+        projectPath,
+        tasks,
+        optionKey(options.lastRunAt),
+        optionKey(options.retrospectiveWatermarkMs),
+    ]);
+    const cached = eligible ? cache.entries.get(key) : undefined;
+    if (cached) return structuredClone(cached);
     const result: DreamTaskBacklogMap = {};
     for (const task of tasks) result[task] = getDreamTaskBacklog(db, projectPath, task, options);
+    if (eligible) {
+        if (cache.entries.size >= 16)
+            cache.entries.delete(cache.entries.keys().next().value as string);
+        cache.entries.set(key, structuredClone(result));
+    }
     return result;
 }
 

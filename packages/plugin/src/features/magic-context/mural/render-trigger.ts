@@ -7,7 +7,7 @@ import type { Database } from "../../../shared/sqlite";
 import { DEFAULT_MURAL_MEMORY_BUDGET } from "./mural-selection";
 import { planMuralRender, renderPlannedMural } from "./render-mural";
 import type { MuralWireOptions } from "./resolve-mural";
-import { getMuralCoverage, resolveMural } from "./resolve-mural";
+import { getMuralCoverage, readMuralPool, resolveMural } from "./resolve-mural";
 import { getMural, upsertMural } from "./storage-mural";
 
 /**
@@ -86,7 +86,7 @@ export interface EnsureMuralResult {
     dataUrl?: string;
     /** SHA-256 of the deterministic layout text, used to identify the injected image. */
     contentHash?: string;
-    /** True when this call re-rendered + upserted (the text changed or was new). */
+    /** True when this call encoded a new PNG (persisted unless read-only). */
     rerendered: boolean;
     /** Set when the coverage gate intentionally omitted the mural. */
     skipReason?: string;
@@ -108,14 +108,19 @@ export function muralCoverageGate(cuedMemoryCount: number, activeMemoryCount: nu
  * render. Returns the wire data for the injection path.
  *
  * @param budgetTokens the project memory injection budget, so the overflow set
- *   matches exactly what the m0 path dropped.
+ *   matches exactly the memories the history head left out for lack of room.
+ * @param mode `read-only` reuses a matching stored PNG, or renders the same plan
+ *   without saving it. The history-head fallback that runs when another process
+ *   holds the database write lock uses it: saving would need that lock and fail.
  */
 export function ensureMuralRendered(
     db: Database,
     projectIdentity: string,
     budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
+    mode: "persist" | "read-only" = "persist",
 ): EnsureMuralResult {
-    const coverage = getMuralCoverage(db, projectIdentity);
+    const pool = readMuralPool(db, projectIdentity);
+    const coverage = getMuralCoverage(db, projectIdentity, pool);
     if (
         coverage.activeMemoryCount === 0 ||
         !muralCoverageGate(coverage.cuedMemoryCount, coverage.activeMemoryCount)
@@ -128,7 +133,7 @@ export function ensureMuralRendered(
         return { hasMural: false, rerendered: false, skipReason };
     }
 
-    const entries = resolveMural(db, projectIdentity, budgetTokens);
+    const entries = resolveMural(db, projectIdentity, budgetTokens, pool);
     if (entries.length === 0) {
         // Empty overflow pool → no mural block. Leave any stale stored row alone
         // so the dashboard can still show the last render.
@@ -170,19 +175,20 @@ export function ensureMuralRendered(
     }
 
     const rendered = renderPlannedMural(plan);
-    upsertMural(db, {
-        projectPath: projectIdentity,
-        image: Buffer.from(rendered.png),
-        // content_hash is the TEXT hash (the change-detection key), not a PNG
-        // hash: identical text always yields identical PNG bytes, and hashing the
-        // text is what lets the unchanged-pool fast path above skip re-encoding.
-        contentHash: textHash,
-        renderedAt: Date.now(),
-        model: DETERMINISTIC_MURAL_MODEL,
-        memoryIds: rendered.renderedIds,
-        width: rendered.width,
-        height: rendered.height,
-    });
+    if (mode === "persist")
+        upsertMural(db, {
+            projectPath: projectIdentity,
+            image: Buffer.from(rendered.png),
+            // content_hash is the TEXT hash (the change-detection key), not a PNG
+            // hash: identical text always yields identical PNG bytes, and hashing the
+            // text is what lets the unchanged-pool fast path above skip re-encoding.
+            contentHash: textHash,
+            renderedAt: Date.now(),
+            model: DETERMINISTIC_MURAL_MODEL,
+            memoryIds: rendered.renderedIds,
+            width: rendered.width,
+            height: rendered.height,
+        });
 
     return rememberRender(db, projectIdentity, key, Buffer.from(rendered.png), {
         hasMural: true,
@@ -224,11 +230,12 @@ export function resolveMuralWire(
     modelKey: string | undefined,
     enabled: boolean,
     budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
+    mode: "persist" | "read-only" = "persist",
 ): MuralWireOptions {
     if (!enabled || !projectIdentity || !modelKeyAcceptsImages(modelKey)) {
         return { enabled, supportsVision: false };
     }
-    const result = ensureMuralRendered(db, projectIdentity, budgetTokens);
+    const result = ensureMuralRendered(db, projectIdentity, budgetTokens, mode);
     if (!result.hasMural) return { enabled: true, supportsVision: true };
     return {
         enabled: true,

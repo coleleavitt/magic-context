@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -15,6 +16,7 @@ import {
     assistantAwaitingToolsFromOpenCodeDb,
     closeReadOnlySessionDb,
     findLastAssistantModelFromOpenCodeDb,
+    getMessageTimesFromOpenCodeDb,
     hasNewerRealUserMessage,
     latestPersistedMessageForRecovery,
     observeOpenCodeTurnEvent,
@@ -468,6 +470,49 @@ describe("shouldHoldIgnoredNotificationFromOpenCodeDb", () => {
 });
 
 describe("tracked out-of-pass turn state", () => {
+    it("retains only turn flags for both pending and known parts", () => {
+        useTempDataHome("turn-flag-retention-");
+        const body = "large tool output and image data ".repeat(10_000);
+        for (const messageID of ["known", "pending"]) {
+            if (messageID === "known")
+                observeOpenCodeTurnEvent("message.updated", {
+                    info: {
+                        id: messageID,
+                        sessionID: "flags",
+                        role: "assistant",
+                        finish: "stop",
+                        time: { created: 1 },
+                    },
+                });
+            observeOpenCodeTurnEvent("message.part.updated", {
+                part: {
+                    id: "part",
+                    messageID,
+                    sessionID: "flags",
+                    type: "tool",
+                    state: { output: body },
+                    url: body,
+                    metadata: { diagnostics: body },
+                },
+            });
+        }
+        expect(__openCodeTurnStateTest.retainedPartBytes()).toBeLessThan(1024);
+        expect(assistantAwaitingTools(undefined, "flags")).toBe(true);
+    });
+
+    it("reveals prior turn flags after removal and keeps equal-time insertion order", () => {
+        useTempDataHome("turn-flag-removal-");
+        for (const [id, finish] of [
+            ["old", "tool-calls"],
+            ["new", "stop"],
+        ])
+            observeOpenCodeTurnEvent("message.updated", {
+                info: { id, finish, role: "assistant", sessionID: "flags", time: { created: 5 } },
+            });
+        expect(assistantAwaitingTools(undefined, "flags")).toBe(false);
+        observeOpenCodeTurnEvent("message.removed", { sessionID: "flags", messageID: "new" });
+        expect(assistantAwaitingTools(undefined, "flags")).toBe(true);
+    });
     it("keeps answering after the selected DB disappears and logs the missing path once", () => {
         useTempDataHome("read-session-db-tracked-disappears-");
         const dbPath = join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db");
@@ -654,6 +699,68 @@ function insertV2SessionMessages(
         closeQuietly(db);
     }
 }
+
+describe("getMessageTimesFromOpenCodeDb", () => {
+    afterEach(() => {
+        _resetHarnessForTesting();
+    });
+
+    function v2Times(sessionId: string): Map<string, number> {
+        const db = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"), {
+            readonly: true,
+        });
+        try {
+            const rows = db
+                .prepare("SELECT id, time_created FROM session_message WHERE session_id = ?")
+                .all(sessionId) as Array<{ id: string; time_created: number }>;
+            return new Map(rows.map((row) => [row.id, row.time_created]));
+        } finally {
+            closeQuietly(db);
+        }
+    }
+
+    it("reads session_message in an OpenCode 2 process on a native v2 store", () => {
+        useTempDataHome("read-session-db-times-native-v2-");
+        insertV2SessionMessages(
+            [
+                { id: "sms_user", sessionId: "ses_A", type: "user", seq: 1 },
+                { id: "sms_asst", sessionId: "ses_A", type: "assistant", seq: 2 },
+            ],
+            { v1Part: false },
+        );
+        setHarness("opencode2");
+        const probeFailures: string[] = [];
+        __openCodeTurnStateTest.setLogObserver((message) => probeFailures.push(message));
+        const times = getMessageTimesFromOpenCodeDb("ses_A", ["sms_user", "sms_asst"]);
+        expect(times.size).toBe(2);
+        expect(times).toEqual(v2Times("ses_A"));
+        expect(probeFailures).toEqual([]);
+    });
+
+    it("reads the rows the 2.x host writes on a migrated store", () => {
+        useTempDataHome("read-session-db-times-migrated-v2-");
+        createOpenCodeDb([{ id: "msg_old", sessionId: "ses_A", role: "user", timeCreated: 1000 }]);
+        insertV2SessionMessages([{ id: "sms_new", sessionId: "ses_A", type: "user", seq: 2 }]);
+        setHarness("opencode2");
+        const times = getMessageTimesFromOpenCodeDb("ses_A", ["sms_new"]);
+        expect(times.size).toBe(1);
+        expect(times).toEqual(v2Times("ses_A"));
+    });
+
+    it("reads the message table in an OpenCode 1 process", () => {
+        useTempDataHome("read-session-db-times-v1-");
+        createOpenCodeDb([
+            { id: "msg_a", sessionId: "ses_A", role: "user", timeCreated: 1000 },
+            { id: "msg_b", sessionId: "ses_A", role: "assistant", timeCreated: 2000 },
+        ]);
+        expect(getMessageTimesFromOpenCodeDb("ses_A", ["msg_a", "msg_b"])).toEqual(
+            new Map([
+                ["msg_a", 1000],
+                ["msg_b", 2000],
+            ]),
+        );
+    });
+});
 
 describe("latestPersistedMessageForRecovery", () => {
     it("reports when the latest assistant child has completed", () => {

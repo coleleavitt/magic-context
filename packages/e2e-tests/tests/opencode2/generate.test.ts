@@ -70,6 +70,22 @@ function snapshot(path: string): string {
     }
 }
 
+function assertStoresClosed(paths: string[], root: string, stage: string): void {
+    const inventory = spawnSync("lsof", ["-p", String(process.pid), "-Fn"], {
+        encoding: "utf8",
+        windowsHide: true,
+    });
+    expect(inventory.status).toBe(0);
+    writeFileSync(join(root, `lsof-${stage}.txt`), inventory.stdout);
+    // Bun can report a closed JS handle while cached prepare() statements still
+    // hold native WAL descriptors. Replacing bytes under those handles is unsafe.
+    expect(
+        inventory.stdout.split("\n").filter((line) =>
+            paths.some((path) => line.startsWith(`n${path}`)),
+        ),
+    ).toEqual([]);
+}
+
 test("OpenCode 2 generate serves managed bytes without writes and preserves replay", async () => {
     const f = fixture();
     const version = spawnSync(CLI, ["--version"], {
@@ -170,7 +186,11 @@ test("OpenCode 2 generate serves managed bytes without writes and preserves repl
             .run(session.id);
         expect(drop.changes).toBeGreaterThan(0);
         clearCachedM0M1(db as never, session.id);
-        db.close();
+        // clearCachedM0M1 prepares one-shot statements on this direct handle.
+        // Plain close() would leave the native connection open until the
+        // garbage collector finalizes them; close(true) finalizes them now,
+        // which the descriptor check before the store restore relies on.
+        db.close(true);
         await prompt("SECOND-QUESTION");
         const served = frames()
             .filter((frame) => frame.name === "context")
@@ -270,10 +290,23 @@ test("OpenCode 2 generate serves managed bytes without writes and preserves repl
             "opencode",
             f.env.OPENCODE_DB!,
         );
-        const saved = [dbPath, hostDb].map((path) => ({
-            path,
-            bytes: readFileSync(path),
-        }));
+        assertStoresClosed([dbPath, hostDb], f.root, "before-snapshot");
+        const saved = [dbPath, hostDb].map((path) => {
+            // stop() kills the host, so its last committed frames may still be
+            // in the WAL. Checkpoint before saving only the main database bytes.
+            const checkpoint = new Database(path);
+            try {
+                expect(checkpoint.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual({
+                    busy: 0, log: 0, checkpointed: 0,
+                });
+                expect(checkpoint.query("PRAGMA integrity_check").all()).toEqual([
+                    { integrity_check: "ok" },
+                ]);
+            } finally {
+                checkpoint.close();
+            }
+            return { path, bytes: readFileSync(path) };
+        });
         const unmanaged = await spawnOpencode2({
             existingIsolation: f,
             includeMagicContext: false,
@@ -330,6 +363,7 @@ test("OpenCode 2 generate serves managed bytes without writes and preserves repl
         }
         const mainBodies: string[] = [];
         for (const side of [false, true]) {
+            assertStoresClosed([dbPath, hostDb], f.root, `before-restore-${side}`);
             for (const { path, bytes } of saved) {
                 for (const suffix of ["-wal", "-shm"])
                     if (existsSync(path + suffix)) unlinkSync(path + suffix);

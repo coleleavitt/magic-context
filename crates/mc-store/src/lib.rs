@@ -21,8 +21,13 @@ pub mod context_boundaries;
 pub use context_boundaries::ResolvedContextBoundary;
 pub mod context_writes;
 mod historian_claim;
+mod historian_telemetry;
+pub use historian_telemetry::{HistorianInvocation, HistorianRunTelemetry};
+pub mod move_inventory;
+pub mod private_permissions;
 pub mod single_store_domain;
 pub mod single_store_schema;
+pub mod writer_diagnostics;
 
 pub use single_store_domain::{ContextDomain, SqliteContextDomain};
 
@@ -69,7 +74,9 @@ pub fn canonical_root(path: impl AsRef<Path>) -> PathBuf {
 
 /// Canonical foreign-memory visibility predicate used by module SQL consumers.
 /// The plugin mirrors this literal to keep cache visibility and workspace policy aligned.
-pub const FOREIGN_VISIBLE_SQL: &str = "status IN ('active','permanent') AND (expires_at IS NULL OR expires_at > :now_ms) AND shareable = 1 AND scope IN ('project','ecosystem','universe') AND category IN (SELECT value FROM json_each(:share_categories)) AND project_path IN (SELECT project_path FROM mc_workspace_members WHERE workspace_id = :workspace_id) AND project_path <> :reader_project";
+/// It reads `context.db`, where `memories` and `workspace_members` live; the store.db
+/// mirror `mc_workspace_members` it once named was dropped with the move to one store.
+pub const FOREIGN_VISIBLE_SQL: &str = "status IN ('active','permanent') AND (expires_at IS NULL OR expires_at > :now_ms) AND shareable = 1 AND scope IN ('project','ecosystem','universe') AND category IN (SELECT value FROM json_each(:share_categories)) AND project_path IN (SELECT project_path FROM workspace_members WHERE workspace_id = :workspace_id) AND project_path <> :reader_project";
 
 /// Internal mutation category used to carry foreign-visibility transitions across state sync.
 pub const MEMORY_VISIBILITY_MUTATION_CATEGORY: &str = "__mc_visibility__";
@@ -300,6 +307,61 @@ impl Serialize for CkWireBlock {
 }
 
 impl CkWireBlock {
+    /// Internal projection replay constructor. The receiver is an already-validated typed
+    /// shell together with its own original JSON, not independently supplied parts. Replacing
+    /// scalar text updates both views; all other fields, including unknown JSON, are cloned
+    /// unchanged. This is not a way to bypass deserialization validation of a new block.
+    /// `None` replays the shell unchanged; an unsupported or missing text field returns `None`.
+    #[doc(hidden)]
+    pub fn replay_validated_shell(&self, scalar_text: Option<String>) -> Option<Self> {
+        let Some(text) = scalar_text else {
+            return Some(self.clone());
+        };
+        let path = match &self.kind {
+            CkKind::Text { .. } | CkKind::Reasoning { .. } => "/kind/text",
+            CkKind::RedactedReasoning { .. } => "/kind/data",
+            CkKind::ToolResult { output, .. } => match &output.kind {
+                CkOutputKind::Text { .. } | CkOutputKind::ErrorText { .. } => {
+                    "/kind/output/kind/text"
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let original_text = |value: &Value| {
+            path.split('/')
+                .skip(1)
+                .try_fold(value, |v, key| v.get(key))
+                .is_some_and(Value::is_string)
+        };
+        if self.original.as_ref().is_some_and(|v| !original_text(v)) {
+            return None;
+        }
+        let mut replay = self.clone();
+        if let Some(original) = &mut replay.original {
+            // These fixed schema keys contain no JSON-pointer escaping. Direct key lookup
+            // avoids allocating decoded pointer tokens for every message in a warm delta.
+            let field = path
+                .split('/')
+                .skip(1)
+                .try_fold(original, |v, key| v.get_mut(key))?;
+            *field = Value::String(text.clone());
+        }
+        match &mut replay.kind {
+            CkKind::Text { text: field }
+            | CkKind::Reasoning { text: field, .. }
+            | CkKind::RedactedReasoning { data: field } => *field = text,
+            CkKind::ToolResult { output, .. } => match &mut output.kind {
+                CkOutputKind::Text { text: field } | CkOutputKind::ErrorText { text: field } => {
+                    *field = text
+                }
+                _ => unreachable!("validated scalar output"),
+            },
+            _ => unreachable!("validated scalar kind"),
+        }
+        Some(replay)
+    }
+
     pub fn bare(kind: CkKind) -> Self {
         Self {
             kind,
@@ -4527,6 +4589,10 @@ fn one_f64() -> f64 {
 /// live tail rather than the full history.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TailHygieneBaseline {
+    /// Protected-tool keep counts saved by the last nudge measurement that
+    /// rebuilt the baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_tools_policy: Option<std::collections::BTreeMap<String, usize>>,
     pub baseline_u: i64,
     pub baseline_t: i64,
     pub turn_delta_u: i64,
@@ -4612,9 +4678,21 @@ pub struct FrozenDecisionCalibration {
     pub source: String,
 }
 
+/// Why the host chose this cache lifetime, with the built-in fallback kept for this session and model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCacheTtlPolicy {
+    pub value: String,
+    pub source: String,
+    pub model_key: Option<String>,
+    pub built_in_default: String,
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
+    /// Idle-expiry policy only; it never changes rendered context or cached prompt text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_policy: Option<SessionCacheTtlPolicy>,
     /// Host ordinals and module block IDs used for rendering, only while the shared
     /// row's original IDs, block indices, and ordinals still match.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4867,6 +4945,11 @@ pub struct ModuleMeta {
     /// asynchronous reduction acknowledgements use the same floor as transforms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protected_tokens_effective: Option<u64>,
+    /// Block IDs identified by selection as protected-tool results. Acknowledgements
+    /// use these IDs because tag rows store output text, not tool names. They guide
+    /// decisions but do not identify rendered content or trigger a cache bust.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub protected_tool_block_ids: std::collections::BTreeSet<String>,
     /// Decision calibration frozen at the last authorized bust. Absent legacy state stays
     /// neutral until the next bust so a binary table update cannot alter a defer decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6227,7 +6310,8 @@ enum PublishTxnOutcome {
 }
 
 enum AppendCompartmentsTxnOutcome {
-    Appended,
+    /// The rows landed from `first_sequence` on, as the append transaction assigned them.
+    Appended { first_sequence: i64 },
     Overlap {
         existing_sequence: i64,
         incoming_start_message: i64,
@@ -6295,6 +6379,14 @@ struct ValidatedSeedBoundary {
 fn split_flat_block_id(id: &str) -> Option<(&str, u64)> {
     let (mid, index) = id.rsplit_once('#')?;
     if mid.is_empty() || mid.contains('#') {
+        return None;
+    }
+    // Only the spelling an index formats to: decimal digits with no sign and no leading
+    // zero. `m#05` would otherwise parse as block 5, whose id is rebuilt as `m#5`.
+    let canonical = !index.is_empty()
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+        && (index == "0" || !index.starts_with('0'));
+    if !canonical {
         return None;
     }
     Some((mid, index.parse().ok()?))
@@ -7542,6 +7634,7 @@ pub fn migrate_store_to_pre_single_store(path: &Path) -> Result<u32, McStoreErro
         },
     };
     let inner = open_sqlite(&descriptor)?;
+    inner.with_conn(single_store_domain::set_synchronous_normal_if_wal)?;
     inner.with_conn(register_legacy_trigger_functions)?;
     let end = MIGRATIONS
         .iter()
@@ -7791,7 +7884,43 @@ impl McStore {
     }
 
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, McStoreError> {
+        Self::open_with_private_permissions(descriptor, true)
+    }
+
+    pub fn open_with_private_permissions(
+        descriptor: &StorageDescriptor,
+        enforce_private_permissions: bool,
+    ) -> Result<Self, McStoreError> {
+        let mut storage_root = None;
+        let mut before = private_permissions::TightenReport::default();
+        if let cortexkit_store_types::StorageBackend::Sqlite { path } = &descriptor.backend {
+            let path = Path::new(path);
+            let root = path.parent().unwrap_or_else(|| Path::new("."));
+            private_permissions::ensure_directory(root, true).map_err(|error| {
+                McStoreError::Serde(format!("storage directory unavailable: {error}"))
+            })?;
+            let root_tightening = private_permissions::tighten_directory(root, true);
+            let tree_tightening =
+                private_permissions::tighten_tree(root, enforce_private_permissions);
+            before = private_permissions::TightenReport {
+                tightened: root_tightening.tightened + tree_tightening.tightened,
+                failures: root_tightening.failures + tree_tightening.failures,
+            };
+            if !path.exists() {
+                match private_permissions::create_file(path, true) {
+                    Ok(file) => drop(file),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(McStoreError::Serde(format!(
+                            "storage file unavailable: {error}"
+                        )));
+                    }
+                }
+            }
+            storage_root = Some(root.to_path_buf());
+        }
         let inner = open_sqlite(descriptor)?;
+        inner.with_conn(single_store_domain::set_synchronous_normal_if_wal)?;
         // Registered before migrating: the older migrations of a store below v53 install
         // triggers that call these functions.
         inner.with_conn(register_legacy_trigger_functions)?;
@@ -7882,6 +8011,18 @@ impl McStore {
             route_identities_for_test: Mutex::new(HashMap::new()),
         };
         store.prune_transform_session_roots()?;
+        if let Some(root) = storage_root {
+            let after = if enforce_private_permissions {
+                private_permissions::tighten_tree(&root, true)
+            } else {
+                private_permissions::tighten_directory(&root, true)
+            };
+            tracing::info!(
+                tightened = before.tightened + after.tightened,
+                failures = before.failures + after.failures,
+                "mc-store: storage permission tightening"
+            );
+        }
         Ok(store)
     }
 
@@ -11423,8 +11564,22 @@ impl McStore {
             single_store_schema::apply_compartment_dates(conn, session_id, compartments)
         })?;
         let boundaries = self.cached_context_boundaries(session_id)?;
+        // Index the cached coordinates by sequence once: a long session has thousands of
+        // both, and a boundary can only match the row with its sequence. Each sequence
+        // keeps its boundaries in cache order, so the first match is the same one a scan
+        // of the whole list finds.
+        let mut by_sequence: HashMap<i64, Vec<&ResolvedContextBoundary>> = HashMap::new();
+        for boundary in &boundaries {
+            by_sequence
+                .entry(boundary.sequence)
+                .or_default()
+                .push(boundary);
+        }
         for row in compartments {
-            if let Some(boundary) = boundaries.iter().find(|boundary| boundary.matches(row)) {
+            if let Some(boundary) = by_sequence
+                .get(&row.sequence)
+                .and_then(|candidates| candidates.iter().find(|boundary| boundary.matches(row)))
+            {
                 boundary.apply(row);
             }
         }
@@ -12696,6 +12851,7 @@ impl McStore {
                  WHERE session_id = ?1 AND row_version = ?4",
                 params![session_id, next as i64, meta_json, current],
             )?;
+            advance_row_state_digest_tx(tx, session_id, current, next as i64)?;
 
             Ok(TruncateTxnOutcome::Committed(TruncateOutcome {
                 revert_epoch: next_epoch,
@@ -12727,9 +12883,8 @@ impl McStore {
         compartments: &[StoredCompartment],
     ) -> Result<(), McStoreError> {
         self.resume_pending_context_write(session_id)?;
-        let first_sequence = self.max_compartment_seq(session_id)? + 1;
         match self.append_compartments_now(session_id, compartments)? {
-            AppendCompartmentsTxnOutcome::Appended => {
+            AppendCompartmentsTxnOutcome::Appended { first_sequence } => {
                 self.record_appended_dates(session_id, first_sequence, compartments)
             }
             AppendCompartmentsTxnOutcome::Overlap {
@@ -12798,7 +12953,7 @@ impl McStore {
             }
             Ok(matches!(
                 append_compartments_tx(tx, session_id, std::slice::from_ref(marker))?,
-                AppendCompartmentsTxnOutcome::Appended
+                AppendCompartmentsTxnOutcome::Appended { .. }
             )
             .then_some(max_sequence + 1))
         })?;
@@ -13347,6 +13502,7 @@ impl McStore {
                  WHERE session_id = ?1 AND row_version = ?4",
                 params![session_id, next as i64, meta_json, current],
             )?;
+            advance_row_state_digest_tx(tx, session_id, current, next as i64)?;
             Ok(AbandonHistorianTxnOutcome::Committed(next))
         })?;
 
@@ -13403,6 +13559,7 @@ impl McStore {
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3 WHERE session_id = ?1 AND row_version = ?4",
                 params![session_id, next as i64, meta_json, current],
             )?;
+            advance_row_state_digest_tx(tx, session_id, current, next as i64)?;
             Ok(AbandonHistorianTxnOutcome::Committed(next))
         })?;
         match outcome {
@@ -13501,6 +13658,14 @@ impl McStore {
             },
         };
         let write = context_writes::PendingContextWrite::Fold(fold);
+        // Deflate needs no database state. Prepare the identical payload before taking
+        // store.db's writer lock, but report any preparation error only after the publish
+        // predicates pass, preserving refusal precedence for stale producers.
+        let prepared_transcripts = if request.compartments.is_empty() {
+            Ok(None)
+        } else {
+            prepare_chunk_transcripts(request.chunk_transcript, request.raw_chunk_messages)
+        };
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
@@ -13611,18 +13776,9 @@ impl McStore {
                     compartment.end_message,
                 ));
             }
-            if request.chunk_transcript.is_some() || request.raw_chunk_messages.is_some() {
-                insert_chunk_transcripts_tx(
-                    tx,
-                    session_id,
-                    first_appended_sequence,
-                    request.compartments,
-                    request.chunk_transcript,
-                    request.raw_chunk_messages,
-                )?;
-            }
-            single_store_schema::write_compartment_dates(tx, session_id, &numbered)?;
-            context_writes::record_pending_context_write_tx(tx, session_id, &write)?;
+            // The meta is settled and encoded before the first write: an outcome returned
+            // from this closure commits the transaction, so a refusal after a write would
+            // leave that write (and a pending context.db half) behind.
             meta.publication_floor_ordinal = Some(
                 meta.publication_floor_ordinal
                     .unwrap_or(1)
@@ -13631,15 +13787,27 @@ impl McStore {
             let next = current as u64 + 1;
             meta.historian = idle_historian_after_success(&meta.historian);
             meta.historian.complete_latest_fire(current_time_ms(), next);
-            let meta_json = match serde_json::to_string(&meta) {
+            let meta_json = match encode_published_meta(&meta) {
                 Ok(json) => json,
-                Err(e) => return Ok(PublishTxnOutcome::Serde(e.to_string())),
+                Err(e) => return Ok(PublishTxnOutcome::Serde(e)),
             };
+            if request.chunk_transcript.is_some() || request.raw_chunk_messages.is_some() {
+                insert_prepared_chunk_transcripts_tx(
+                    tx,
+                    session_id,
+                    first_appended_sequence,
+                    request.compartments,
+                    prepared_transcripts?.as_ref(),
+                )?;
+            }
+            single_store_schema::write_compartment_dates(tx, session_id, &numbered)?;
+            context_writes::record_pending_context_write_tx(tx, session_id, &write)?;
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
                  WHERE session_id = ?1 AND row_version = ?4",
                 params![session_id, next as i64, meta_json, current],
             )?;
+            advance_row_state_digest_tx(tx, session_id, current, next as i64)?;
 
             Ok(PublishTxnOutcome::Committed(HistorianPublishResult {
                 row_version: next,
@@ -14443,6 +14611,18 @@ impl McStore {
         project_path: &str,
         query: &str,
     ) -> Result<Vec<StoredMemorySearchRow>, McStoreError> {
+        self.search_visible_memory_contents_in_range(project_path, query, None, None)
+    }
+
+    /// Apply inclusive creation-date bounds before the candidate cap, so newer
+    /// out-of-range matches cannot hide an older matching memory.
+    pub fn search_visible_memory_contents_in_range(
+        &self,
+        project_path: &str,
+        query: &str,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+    ) -> Result<Vec<StoredMemorySearchRow>, McStoreError> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -14453,6 +14633,8 @@ impl McStore {
         };
         let pattern = sql_like_pattern(query);
 
+        let (dates, date_binds) = search_date_filter(from_ms, to_ms);
+
         let rows = self.context_read(|conn| {
             let sql = format!(
                 "SELECT id, project_path, category, content, created_at, updated_at
@@ -14461,12 +14643,14 @@ impl McStore {
                     AND status IN ('active', 'permanent')
                     AND (expires_at IS NULL OR expires_at > CAST(strftime('%s', 'now') AS INTEGER) * 1000)
                     AND LOWER(content) LIKE ? ESCAPE '\\'
+                    {dates}
                   ORDER BY updated_at DESC, id ASC
                   LIMIT 100"
             );
             let mut stmt = conn.prepare(&sql)?;
             let mut all_binds = binds.clone();
             all_binds.push(rusqlite::types::Value::from(pattern));
+            all_binds.extend(date_binds.iter().cloned());
             let mapped = stmt
                 .query_map(rusqlite::params_from_iter(all_binds.iter()), |r| {
                     Ok(StoredMemorySearchRow {
@@ -14492,12 +14676,24 @@ impl McStore {
         session_id: &str,
         query: &str,
     ) -> Result<Vec<StoredCompartmentSearchRow>, McStoreError> {
+        self.search_compartments_like_in_range(session_id, query, None, None)
+    }
+
+    /// Search compartment text with inclusive dates applied before LIMIT 100.
+    pub fn search_compartments_like_in_range(
+        &self,
+        session_id: &str,
+        query: &str,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+    ) -> Result<Vec<StoredCompartmentSearchRow>, McStoreError> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
         let pattern = sql_like_pattern(query);
+        let (dates, date_binds) = search_date_filter(from_ms, to_ms);
         let rows = self.context_read(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT sequence, start_message, end_message, title, content, p1, p2, p3, p4, created_at
                    FROM compartments
                   WHERE session_id = ?1
@@ -14506,12 +14702,15 @@ impl McStore {
                       OR LOWER(COALESCE(p1, '')) LIKE ?2 ESCAPE '\\'
                       OR LOWER(COALESCE(p2, '')) LIKE ?2 ESCAPE '\\'
                       OR LOWER(COALESCE(p3, '')) LIKE ?2 ESCAPE '\\'
-                      OR LOWER(COALESCE(p4, '')) LIKE ?2 ESCAPE '\\')
+                       OR LOWER(COALESCE(p4, '')) LIKE ?2 ESCAPE '\\')
+                    {dates}
                   ORDER BY sequence DESC
                   LIMIT 100",
-            )?;
+            ))?;
+            let mut parameters = vec![SqlValue::Text(session_id.to_string()), SqlValue::Text(pattern.clone())];
+            parameters.extend(date_binds.iter().cloned());
             let mapped = stmt
-                .query_map(params![session_id, pattern], |r| {
+                .query_map(rusqlite::params_from_iter(parameters.iter()), |r| {
                     Ok(StoredCompartmentSearchRow {
                         sequence: r.get(0)?,
                         start_ordinal: r.get(1)?,
@@ -15334,6 +15533,18 @@ impl McStore {
         session_id: &str,
         query: &str,
     ) -> Result<Vec<StoredNoteSearchRow>, McStoreError> {
+        self.search_notes_like_in_range(project_path, session_id, query, None, None)
+    }
+
+    /// Search notes with inclusive dates applied before LIMIT 100.
+    pub fn search_notes_like_in_range(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        query: &str,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+    ) -> Result<Vec<StoredNoteSearchRow>, McStoreError> {
         let terms = keyword_search_terms(query);
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -15350,6 +15561,7 @@ impl McStore {
             })
             .collect::<Vec<_>>()
             .join(" OR ");
+        let (dates, date_binds) = search_date_filter(from_ms, to_ms);
         let sql = format!(
             "SELECT id, content, status, surface_condition, COALESCE(session_id, ''), anchor_ordinal,
                         created_at, updated_at
@@ -15358,6 +15570,7 @@ impl McStore {
                     AND (type = 'smart' OR session_id = ?2)
                     AND status IN ('active', 'pending', 'ready')
                     AND ({predicates})
+                    {dates}
                   ORDER BY updated_at DESC, id DESC
                   LIMIT 100"
         );
@@ -15370,6 +15583,7 @@ impl McStore {
                 .iter()
                 .map(|term| SqlValue::Text(sql_like_pattern(term))),
         );
+        parameters.extend(date_binds);
         let rows = self.context_read(|conn| {
             let mut stmt = conn.prepare(&sql)?;
             let mapped = stmt
@@ -15816,11 +16030,12 @@ fn append_compartments_tx(
     session_id: &str,
     compartments: &[StoredCompartment],
 ) -> rusqlite::Result<AppendCompartmentsTxnOutcome> {
-    if compartments.is_empty() {
-        return Ok(AppendCompartmentsTxnOutcome::Appended);
-    }
-
     let next_sequence = next_compartment_sequence_tx(tx, session_id)?;
+    if compartments.is_empty() {
+        return Ok(AppendCompartmentsTxnOutcome::Appended {
+            first_sequence: next_sequence,
+        });
+    }
     let harness = session_harness_tx(tx, session_id)?;
     let mut statement = tx.prepare(
         "SELECT sequence, start_message, end_message
@@ -15866,7 +16081,9 @@ fn append_compartments_tx(
             &harness,
         )?;
     }
-    Ok(AppendCompartmentsTxnOutcome::Appended)
+    Ok(AppendCompartmentsTxnOutcome::Appended {
+        first_sequence: next_sequence,
+    })
 }
 
 fn next_compartment_sequence_tx(
@@ -15880,17 +16097,15 @@ fn next_compartment_sequence_tx(
     )
 }
 
-fn insert_chunk_transcripts_tx(
-    tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-    first_sequence: i64,
-    compartments: &[StoredCompartment],
+struct PreparedChunkTranscripts {
+    transcript: Vec<u8>,
+    raw_messages: Option<Vec<u8>>,
+}
+
+fn prepare_chunk_transcripts(
     transcript: Option<&str>,
     raw_messages: Option<&str>,
-) -> rusqlite::Result<()> {
-    if compartments.is_empty() {
-        return Ok(());
-    }
+) -> rusqlite::Result<Option<PreparedChunkTranscripts>> {
     let compressed = transcript.and_then(|transcript| {
         compress_transcript(transcript)
             .ok()
@@ -15901,12 +16116,31 @@ fn insert_chunk_transcripts_tx(
         .transpose()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     if compressed.is_none() && raw_messages_compressed.is_none() {
-        return Ok(());
+        return Ok(None);
     }
     // The original schema keeps transcript_deflate NOT NULL. A raw-only row still needs a
     // harmless condensed payload so durable raw recovery is not discarded with an oversized
     // historian transcript.
     let compressed = compressed.unwrap_or_else(|| compress_transcript("").unwrap_or_default());
+    Ok(Some(PreparedChunkTranscripts {
+        transcript: compressed,
+        raw_messages: raw_messages_compressed,
+    }))
+}
+
+fn insert_prepared_chunk_transcripts_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    first_sequence: i64,
+    compartments: &[StoredCompartment],
+    prepared: Option<&PreparedChunkTranscripts>,
+) -> rusqlite::Result<()> {
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    if compartments.is_empty() {
+        return Ok(());
+    }
     for (idx, compartment) in compartments.iter().enumerate() {
         tx.execute(
             "INSERT OR REPLACE INTO mc_chunk_transcripts
@@ -15918,8 +16152,8 @@ fn insert_chunk_transcripts_tx(
                 first_sequence + idx as i64,
                 compartment.start_message,
                 compartment.end_message,
-                &compressed,
-                raw_messages_compressed.as_deref(),
+                &prepared.transcript,
+                prepared.raw_messages.as_deref(),
                 compartment.created_at,
             ],
         )?;
@@ -15932,31 +16166,33 @@ fn evict_chunk_transcripts_tx(
     session_id: &str,
 ) -> rusqlite::Result<()> {
     let empty_transcript = compress_transcript("").unwrap_or_default();
-    loop {
-        let total: i64 = tx.query_row(
-            "SELECT COALESCE(SUM(LENGTH(transcript_deflate)), 0)
+    let mut total: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(LENGTH(transcript_deflate)), 0)
                FROM mc_chunk_transcripts WHERE session_id = ?1",
-            params![session_id],
-            |r| r.get(0),
-        )?;
-        if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
-            return Ok(());
-        }
-        let victim: Option<(i64, bool)> = tx
-            .query_row(
-                "SELECT compartment_seq, raw_messages_deflate IS NOT NULL
+        params![session_id],
+        |r| r.get(0),
+    )?;
+    if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
+        return Ok(());
+    }
+    // Snapshot identities and lengths once, before changing the table. Subtract the
+    // exact reclaimed bytes in the same oldest-first order as the per-victim SUM loop.
+    let victims: Vec<(i64, bool, i64)> = tx
+        .prepare_cached(
+            "SELECT compartment_seq, raw_messages_deflate IS NOT NULL, LENGTH(transcript_deflate)
                    FROM mc_chunk_transcripts
                   WHERE session_id = ?1
                     AND (raw_messages_deflate IS NULL OR transcript_deflate <> ?2)
-                  ORDER BY created_at_ms ASC, compartment_seq ASC
-                  LIMIT 1",
-                params![session_id, &empty_transcript],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((victim, retains_raw_messages)) = victim else {
-            return Ok(());
-        };
+                   ORDER BY created_at_ms ASC, compartment_seq ASC",
+        )?
+        .query_map(params![session_id, &empty_transcript], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (victim, retains_raw_messages, length) in victims {
+        if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
+            break;
+        }
         if retains_raw_messages {
             // Full message recovery is durable by contract. Retain its raw payload and reclaim
             // only the optional condensed transcript when the legacy transcript budget fills.
@@ -15966,13 +16202,16 @@ fn evict_chunk_transcripts_tx(
                   WHERE session_id = ?1 AND compartment_seq = ?2",
                 params![session_id, victim, &empty_transcript],
             )?;
+            total -= length - empty_transcript.len() as i64;
         } else {
             tx.execute(
                 "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1 AND compartment_seq = ?2",
                 params![session_id, victim],
             )?;
+            total -= length;
         }
     }
+    Ok(())
 }
 
 fn compress_transcript(transcript: &str) -> std::io::Result<Vec<u8>> {
@@ -16122,12 +16361,24 @@ fn promote_facts_tx(
     now_ms: i64,
 ) -> rusqlite::Result<Vec<PromotedRef>> {
     let mut active_content = HashSet::new();
-    {
-        let mut stmt = tx.prepare(
-            "SELECT content FROM memories
-             WHERE project_path = ?1 AND status IN ('active', 'permanent')",
-        )?;
-        let rows = stmt.query_map(params![project_path], |r| r.get::<_, String>(0))?;
+    // Probe only this fold's exact contents. Large folds are split below SQLite's
+    // parameter limit; ordinary folds make one scan without copying the project pool.
+    let contents: Vec<&str> = facts
+        .iter()
+        .filter(|fact| !fact.category.trim().is_empty() && !fact.content.trim().is_empty())
+        .map(|fact| fact.content.as_str())
+        .collect();
+    for batch in contents.chunks(128) {
+        let sql = format!(
+            "SELECT content FROM memories WHERE project_path = ?1
+            AND status IN ('active', 'permanent') AND content IN ({})",
+            vec!["?"; batch.len()].join(",")
+        );
+        let mut stmt = tx.prepare_cached(&sql)?;
+        let values = std::iter::once(project_path).chain(batch.iter().copied());
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
+            r.get::<_, String>(0)
+        })?;
         for row in rows {
             active_content.insert(row?);
         }
@@ -16170,13 +16421,16 @@ fn promote_facts_tx(
             ],
         )?;
         let memory_id = tx.last_insert_rowid();
-        raise_embedding_watermark_tx(tx, project_path, memory_id, now_ms)?;
         active_content.insert(fact.content.clone());
         promoted.push(PromotedRef {
             memory_id,
             content: fact.content.clone(),
         });
         next_nonce += 1;
+    }
+
+    if let Some(last) = promoted.last() {
+        raise_embedding_watermark_tx(tx, project_path, last.memory_id, now_ms)?;
     }
 
     Ok(promoted)
@@ -16716,6 +16970,22 @@ fn write_cache_state_tx(
     Ok(written.base_after)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Makes the next historian publish on this thread fail to encode its meta, standing in
+    /// for a serializer error that real meta cannot currently produce.
+    static FAIL_PUBLISH_META_ENCODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The small-row meta JSON a historian publish stores.
+fn encode_published_meta(meta: &ModuleMeta) -> Result<String, String> {
+    #[cfg(test)]
+    if FAIL_PUBLISH_META_ENCODE.with(|flag| flag.replace(false)) {
+        return Err("injected meta encode failure".to_string());
+    }
+    serde_json::to_string(meta).map_err(|error| error.to_string())
+}
+
 /// Carry the row-state digest across a `row_version` step that did not touch the rows it
 /// covers, so the next transform commit can still trust it and skip walking every row.
 /// Only advances a digest that described the version being replaced.
@@ -16891,6 +17161,27 @@ fn set_memory_verification_tx(
                     continue;
                 };
                 let hash = compute_normalized_memory_hash(content);
+                // memories has UNIQUE(project_path, category, normalized_hash). A
+                // rewrite onto another memory's exact content would fail the whole
+                // transaction, so reject that row instead; merging the two is not
+                // the verifier's call.
+                let duplicate: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM memories
+                          WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
+                            AND id <> ?4
+                          LIMIT 1",
+                        params![memory.project_path, memory.category, hash, update.memory_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(duplicate_id) = duplicate {
+                    rejected.push(VerificationRejected {
+                        memory_id: update.memory_id,
+                        reason: format!("duplicate_of:{duplicate_id}"),
+                    });
+                    continue;
+                }
                 tx.execute(
                     "UPDATE memories
                         SET content = ?1, normalized_hash = ?2, updated_at = ?3,
@@ -17237,6 +17528,22 @@ fn keyword_search_terms(query: &str) -> Vec<String> {
     terms
 }
 
+/// Bounds are appended after the query's other placeholders and bound in the same
+/// order. An undated search adds no predicate and retains its existing matching cap.
+fn search_date_filter(from_ms: Option<i64>, to_ms: Option<i64>) -> (String, Vec<SqlValue>) {
+    let mut sql = String::new();
+    let mut binds = Vec::new();
+    if let Some(from) = from_ms {
+        sql.push_str(" AND created_at >= ?");
+        binds.push(SqlValue::Integer(from));
+    }
+    if let Some(to) = to_ms {
+        sql.push_str(" AND created_at <= ?");
+        binds.push(SqlValue::Integer(to));
+    }
+    (sql, binds)
+}
+
 fn sql_like_pattern(query: &str) -> String {
     let mut escaped = String::new();
     for ch in query.trim().to_lowercase().chars() {
@@ -17253,14 +17560,39 @@ fn sql_like_pattern(query: &str) -> String {
 
 /// Compute the ctx_memory normalized hash used for duplicate detection. This mirrors the
 /// plugin path: lowercase, collapse whitespace runs to one space, trim, then MD5 hex.
+/// "Whitespace" is what the plugin's JavaScript `\s` matches, not Rust's definition, so
+/// both runtimes give the same hash and `UNIQUE(project_path, category, normalized_hash)`
+/// dedups across them.
 pub fn compute_normalized_memory_hash(content: &str) -> String {
     let normalized = content
         .to_lowercase()
-        .split_whitespace()
+        .split(is_js_whitespace)
+        .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
     let digest = md5::compute(normalized.as_bytes());
     format!("{digest:032x}")
+}
+
+/// Whether JavaScript's `\s` matches `ch`: ECMAScript WhiteSpace (tab, vertical tab, form
+/// feed, U+FEFF and the Zs space separators) plus LineTerminator (line feed, carriage
+/// return, U+2028, U+2029). It differs from `char::is_whitespace` in two code points:
+/// U+FEFF counts here and U+0085 does not.
+fn is_js_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}'..='\u{000D}'
+            | '\u{0020}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+            | '\u{FEFF}'
+    )
 }
 
 /// The lowercase hex MD5 of `input`'s UTF-8 bytes. The host's `dir:` project identity is
@@ -17342,6 +17674,81 @@ fn capped_trace_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn projection_replay_constructor_matches_serde_for_validated_shells() {
+        let cases = [
+            (
+                serde_json::json!({"kind":{"type":"text","text":"雪\n\"text\"","future":17},"future_block":{"keep":true}}),
+                Some("/kind/text"),
+            ),
+            (
+                serde_json::json!({"kind":{"type":"reasoning","text":"think","signature":"signed","future":"kept"}}),
+                Some("/kind/text"),
+            ),
+            (
+                serde_json::json!({"kind":{"type":"redacted_reasoning","data":"redacted"}}),
+                Some("/kind/data"),
+            ),
+            (
+                serde_json::json!({"kind":{"type":"tool_call","id":"c","name":"work","input":{"x":1.5,"future":[true,"a"]}},"provider_extras":{"future":{"keep":7}}}),
+                None,
+            ),
+            (
+                serde_json::json!({"kind":{"type":"tool_result","id":"c","tool_name":"work","output":{"kind":{"type":"text","text":"done","future":7}},"provider_executed":false}}),
+                Some("/kind/output/kind/text"),
+            ),
+            (
+                serde_json::json!({"kind":{"type":"tool_result","id":"c","tool_name":"work","output":{"kind":{"type":"error_text","text":"failed"}}}}),
+                Some("/kind/output/kind/text"),
+            ),
+            (
+                serde_json::json!({"kind":{"type":"media","kind":"image","media_type":"image/png","source":{"type":"url","url":"https://example.invalid/image.png"},"future":9},"future_block":"kept"}),
+                None,
+            ),
+        ];
+        for (original, path) in cases {
+            let expected: CkWireBlock = serde_json::from_value(original.clone()).unwrap();
+            let mut shell_json = original;
+            let text = path.map(|path| {
+                let text = shell_json
+                    .pointer(path)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                *shell_json.pointer_mut(path).unwrap() = Value::String(String::new());
+                text
+            });
+            // Independently deserialize the empty shell; the constructor does not create its
+            // own oracle. Unknown fields and omitted defaults must survive in the original.
+            let shell: CkWireBlock = serde_json::from_value(shell_json).unwrap();
+            let replay = shell.replay_validated_shell(text).unwrap();
+            assert_eq!(replay, expected);
+            assert_eq!(
+                serde_json::to_vec(&replay).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert_eq!(
+                replay.retained_original_json(),
+                expected.retained_original_json()
+            );
+        }
+    }
+
+    #[test]
+    fn projection_replay_constructor_rejects_non_scalar_replacement() {
+        let shell = CkWireBlock::bare(CkKind::ToolCall {
+            id: "c".into(),
+            name: "work".into(),
+            input: serde_json::json!({"text":"argument"}),
+            provider_executed: false,
+        });
+        assert!(shell
+            .replay_validated_shell(Some("replacement".into()))
+            .is_none());
+        assert_eq!(shell.replay_validated_shell(None).unwrap(), shell);
+    }
+
+    #[test]
     fn attachment_stripped_drop_modes_seed_the_existing_canonical_reductions() {
         let skeleton = super::seeded_drop_unit("m1#0", "skeleton_stripped", None, false).unwrap();
         assert_eq!(skeleton.kind, "skeleton_real");
@@ -17360,10 +17767,67 @@ mod tests {
         assert!(!production.contains(concat!("eprint", "ln!")));
     }
 
+    #[test]
+    fn memory_hash_matches_the_plugin_for_whitespace_the_two_runtimes_classify_differently() {
+        // Expected digests come from the plugin's computeNormalizedHash (lowercase, JS `\s+`
+        // runs to one space, trim, MD5). JS `\s` counts U+FEFF as whitespace and U+0085 as
+        // not; Rust's char::is_whitespace is the reverse for those two.
+        for (content, expected) in [
+            ("Keep\u{0085}THIS", "598888c3f5dcd629ee062d2649d83911"),
+            (
+                "\u{FEFF}Keep\u{FEFF}  this\u{FEFF}",
+                "cdc26c0a460560cc319f09c6fd89172f",
+            ),
+            (
+                " Mixed\t\u{00A0}\u{2028}Case \u{3000} Words\u{000B}\u{000C}",
+                "71975feca6aa4a9408a61e912dc987f1",
+            ),
+            ("plain text", "31bc5c2b8fd4f20cd747347b7504a385"),
+        ] {
+            assert_eq!(
+                compute_normalized_memory_hash(content),
+                expected,
+                "hash of {content:?}"
+            );
+        }
+    }
+
     // Adversarial gate over the claim-lane migration and the single-store marker
     // migration as one merged chain.
     mod gate_a1_b0;
+    mod perf_audit;
     mod tag_cache_migration;
+
+    #[test]
+    fn freshly_opened_cache_store_uses_wal_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .inner
+            .with_conn(|conn| {
+                let journal: String =
+                    conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+                let synchronous: i64 =
+                    conn.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+                assert_eq!(journal, "wal");
+                assert_eq!(synchronous, 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn bundled_sqlite_disables_global_memory_status() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let enabled: i64 = conn
+            .query_row(
+                "SELECT sqlite_compileoption_used('DEFAULT_MEMSTATUS=0')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled, 1);
+    }
 
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         StorageDescriptor {
@@ -19625,6 +20089,78 @@ mod tests {
             .remove("protected_tokens_effective");
         let legacy: ModuleMeta = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.protected_tokens_effective, None);
+    }
+
+    #[test]
+    fn protected_tool_selection_snapshot_round_trips_without_a_schema_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let expected = std::collections::BTreeSet::from(["result#0".to_string()]);
+        {
+            let store = McStore::open_for_test(&descriptor).unwrap();
+            let meta = ModuleMeta {
+                protected_tool_block_ids: expected.clone(),
+                ..ModuleMeta::default()
+            };
+            store
+                .commit("held-tool", None, &CoreState::default(), &meta)
+                .unwrap();
+        }
+        let restarted = McStore::open_for_test(&descriptor).unwrap();
+        assert_eq!(
+            restarted
+                .load("held-tool")
+                .unwrap()
+                .meta
+                .protected_tool_block_ids,
+            expected
+        );
+        let legacy: ModuleMeta =
+            serde_json::from_value(serde_json::to_value(ModuleMeta::default()).unwrap()).unwrap();
+        assert!(legacy.protected_tool_block_ids.is_empty());
+    }
+
+    #[test]
+    fn protected_nudge_policy_round_trips_in_the_existing_baseline_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let policy = std::collections::BTreeMap::from([("probe".to_string(), 2)]);
+        let baseline = TailHygieneBaseline {
+            protected_tools_policy: Some(policy.clone()),
+            ..TailHygieneBaseline::default()
+        };
+        {
+            let store = McStore::open_for_test(&descriptor).unwrap();
+            let meta = ModuleMeta {
+                tail_hygiene_baseline: Some(baseline.clone()),
+                ..ModuleMeta::default()
+            };
+            store
+                .commit("nudge-policy", None, &CoreState::default(), &meta)
+                .unwrap();
+        }
+        let store = McStore::open_for_test(&descriptor).unwrap();
+        assert_eq!(
+            store
+                .load("nudge-policy")
+                .unwrap()
+                .meta
+                .tail_hygiene_baseline
+                .unwrap()
+                .protected_tools_policy,
+            Some(policy)
+        );
+        let mut legacy = serde_json::to_value(baseline).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("protected_tools_policy");
+        assert_eq!(
+            serde_json::from_value::<TailHygieneBaseline>(legacy)
+                .unwrap()
+                .protected_tools_policy,
+            None
+        );
     }
 
     #[test]
@@ -24324,6 +24860,279 @@ mod tests {
             store.load("ses").unwrap().meta.historian.state,
             HistorianPhase::Publishing
         );
+    }
+
+    fn row_state_digest_version(store: &McStore, session_id: &str) -> Option<i64> {
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT row_version FROM mc_cache_state_digest WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .unwrap()
+    }
+
+    fn publish_once(
+        store: &McStore,
+        session_id: &str,
+    ) -> Result<HistorianPublishResult, HistorianPublishError> {
+        let expected = store.load(session_id).unwrap().row_version;
+        store.publish_historian_chunk(HistorianPublishRequest {
+            harness: None,
+            session_id,
+            expected_row_version: expected,
+            expected_revert_epoch: 0,
+            predicate: &publish_predicate(),
+            project_path: "git:proj",
+            compartments: &[publish_compartment()],
+            facts: &[],
+            promote_facts: false,
+            events: &[],
+            primer_candidates: &[],
+            user_memory_candidates: &[],
+            publication_floor_ordinal: 21,
+            chunk_transcript: None,
+            raw_chunk_messages: None,
+        })
+    }
+
+    #[test]
+    fn meta_only_version_steps_carry_the_row_state_digest_forward() {
+        // None of these writers touches the block-identity or served-fingerprint rows, so
+        // the digest that described them before the step still describes them after it.
+        // Left behind, it makes the next transform commit re-read and re-compare every row.
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let at = |store: &McStore| store.load("ses").unwrap().row_version.map(|v| v as i64);
+        store
+            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .unwrap();
+        assert_eq!(row_state_digest_version(&store, "ses"), at(&store));
+
+        store
+            .record_historian_publish_failure_if_matching("ses", &publish_predicate())
+            .unwrap()
+            .expect("the predicate matches");
+        assert_eq!(
+            row_state_digest_version(&store, "ses"),
+            at(&store),
+            "publish-failure count"
+        );
+
+        publish_once(&store, "ses").unwrap();
+        assert_eq!(
+            row_state_digest_version(&store, "ses"),
+            at(&store),
+            "publish"
+        );
+
+        let loaded = store.load("ses").unwrap();
+        store
+            .truncate_compartments_for_revert("ses", 0, loaded.row_version)
+            .unwrap();
+        assert_eq!(
+            row_state_digest_version(&store, "ses"),
+            at(&store),
+            "revert re-cut"
+        );
+
+        let loaded = store.load("ses").unwrap();
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &publishing_meta())
+            .unwrap();
+        store
+            .abandon_historian_run_if_matching_with_publish_failure(
+                "ses",
+                &publish_predicate(),
+                None,
+                Some("abandoned"),
+                true,
+            )
+            .unwrap()
+            .expect("the predicate matches");
+        assert_eq!(
+            row_state_digest_version(&store, "ses"),
+            at(&store),
+            "abandon"
+        );
+    }
+
+    #[test]
+    fn a_publish_whose_meta_fails_to_encode_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .unwrap();
+        let before = store.load("ses").unwrap().row_version;
+
+        FAIL_PUBLISH_META_ENCODE.with(|flag| flag.set(true));
+        assert!(matches!(
+            publish_once(&store, "ses"),
+            Err(HistorianPublishError::Serde(_))
+        ));
+
+        // A publish that reports failure must leave no half behind: no pending context.db
+        // write for a later resume to land, and no compartment dates in store.db.
+        assert!(!store.has_pending_context_write("ses").unwrap());
+        let dates: i64 = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_compartment_dates WHERE session_id = 'ses'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(dates, 0);
+        assert_eq!(store.load("ses").unwrap().row_version, before);
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+    }
+
+    /// A `context.db` that lets another writer append a compartment just before the
+    /// store's next write transaction starts.
+    struct AppendBeforeNextWrite {
+        inner: SqliteContextDomain,
+        writer: std::sync::Mutex<rusqlite::Connection>,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl ContextDomain for AppendBeforeNextWrite {
+        fn read(
+            &self,
+            read: &mut dyn FnMut(&rusqlite::Connection) -> rusqlite::Result<()>,
+        ) -> Result<(), McStoreError> {
+            self.inner.read(read)
+        }
+
+        fn write(
+            &self,
+            tables: &[&str],
+            write: &mut dyn FnMut(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>,
+        ) -> Result<(), McStoreError> {
+            if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.writer
+                    .lock()
+                    .unwrap()
+                    .execute_batch(
+                        "INSERT INTO compartments(session_id, sequence, start_message, end_message,
+                                                  start_message_id, end_message_id, title, content,
+                                                  created_at)
+                         VALUES ('ses', 1, 1, 2, 'm1', 'm2', 'raced', 'raced body', 1)",
+                    )
+                    .unwrap();
+            }
+            self.inner.write(tables, write)
+        }
+    }
+
+    #[test]
+    fn appended_dates_follow_the_sequence_the_append_transaction_assigned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let context_path = dir.path().join("context.db");
+        store.install_context_domain(Arc::new(AppendBeforeNextWrite {
+            inner: SqliteContextDomain::open(&context_path).unwrap(),
+            writer: std::sync::Mutex::new(rusqlite::Connection::open(&context_path).unwrap()),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }));
+
+        let appended = StoredCompartment {
+            sequence: 99,
+            start_message: 5,
+            end_message: 8,
+            start_message_id: "m5".into(),
+            end_message_id: "m8".into(),
+            start_date: Some("2026-01-01".into()),
+            end_date: Some("2026-01-02".into()),
+            title: "appended".into(),
+            content: "appended body".into(),
+            ..Default::default()
+        };
+        store.append_compartments("ses", &[appended]).unwrap();
+
+        // Another writer took sequence 1 between the tail read and the append, so the
+        // append landed at 2. Its dates belong to 2, not to the other writer's row.
+        let rows = store.load_compartments("ses").unwrap();
+        let landed = rows.iter().find(|row| row.title == "appended").unwrap();
+        assert_eq!(landed.sequence, 2);
+        let dates: Vec<(i64, String)> = store
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT sequence, end_message_id FROM mc_compartment_dates
+                      WHERE session_id = 'ses' ORDER BY sequence",
+                )?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(dates, vec![(2, "m8".to_string())]);
+    }
+
+    #[test]
+    fn flat_block_ids_parse_only_in_their_canonical_spelling() {
+        // `{mid}#{index}` is written with a plain decimal index. Any other spelling of the
+        // same index would parse to a block whose rebuilt id is a different string.
+        assert_eq!(split_flat_block_id("m#0"), Some(("m", 0)));
+        assert_eq!(split_flat_block_id("msg_1#12"), Some(("msg_1", 12)));
+        for id in ["m#05", "m#+5", "m#00", "m#", "m# 5", "#5", "m#-1", "a#b#1"] {
+            assert_eq!(split_flat_block_id(id), None, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn foreign_visible_predicate_runs_against_the_context_memories_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let visible = store
+            .with_context_conn_for_test(|conn| {
+                let insert = |project: &str, category: &str, content: &str, shareable: i64| {
+                    conn.execute(
+                        "INSERT INTO memories(project_path, category, content, normalized_hash,
+                                              scope, shareable, first_seen_at, created_at,
+                                              updated_at, last_seen_at)
+                         VALUES (?1, ?2, ?3, ?3, 'project', ?4, 1, 1, 1, 1)",
+                        params![project, category, content, shareable],
+                    )
+                };
+                insert("git:reader", "CONSTRAINTS", "own row", 1)?;
+                insert("git:member", "CONSTRAINTS", "shared row", 1)?;
+                insert("git:member", "CONSTRAINTS", "private row", 0)?;
+                insert("git:member", "WORKFLOW", "unshared category", 1)?;
+                insert("git:outsider", "CONSTRAINTS", "not a member", 1)?;
+                conn.execute_batch(
+                    "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES (7, 'ws', 0, 0);
+                     INSERT INTO workspace_members(workspace_id, project_path, display_name,
+                                                   display_path, added_at)
+                     VALUES (7, 'git:reader', 'reader', 'reader', 0),
+                            (7, 'git:member', 'member', 'member', 0);",
+                )?;
+                let mut statement = conn.prepare(&format!(
+                    "SELECT content FROM memories WHERE {FOREIGN_VISIBLE_SQL} ORDER BY id"
+                ))?;
+                let rows = statement
+                    .query_map(
+                        rusqlite::named_params! {
+                            ":now_ms": 10_i64,
+                            ":share_categories": "[\"CONSTRAINTS\"]",
+                            ":workspace_id": 7_i64,
+                            ":reader_project": "git:reader",
+                        },
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(visible, vec!["shared row".to_string()]);
     }
 }
 

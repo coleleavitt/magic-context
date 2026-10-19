@@ -1,11 +1,15 @@
 #!/usr/bin/env bun
 import { Database } from "bun:sqlite";
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { homedir, loadavg, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { SubcClient } from "@cortexkit/subc-client";
-
+import { loadPluginConfig } from "../src/config";
 import { getDataDir, getMagicContextStorageDir } from "../src/shared/data-path";
+import {
+    setStoragePrivatePermissionEnforcement,
+    writeStorageFileAtomicSync,
+} from "../src/shared/storage-permissions";
 import { parseAgentDeliverReply } from "./cache-bust-sentinel";
 
 const HOUR = 3_600_000;
@@ -36,10 +40,7 @@ function readState(path: string): State {
     return value;
 }
 function saveState(path: string, state: State): void {
-    mkdirSync(dirname(path), { recursive: true });
-    const temporary = `${path}.${process.pid}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(state)}\n`, { mode: 0o600 });
-    renameSync(temporary, path);
+    writeStorageFileAtomicSync(path, `${JSON.stringify(state)}\n`);
 }
 
 // Leave an incomplete final line at the watermark; it can only be parsed after its newline arrives.
@@ -190,9 +191,12 @@ function names(dbPath: string, peerDbPath: string | undefined, alerts: LatencyAl
         try {
             db.exec("PRAGMA busy_timeout = 3000");
             const agent = db.query("SELECT name FROM agent WHERE json_extract(residence_address_json, '$.session') = ? AND terminal_reason IS NULL LIMIT 1");
-            const peer = db.query("SELECT name FROM peers WHERE session_id = ? ORDER BY added_at DESC LIMIT 1");
+            // Prefrontal's store no longer has the legacy `peers` table; preparing a query on it
+            // threw and stopped every run before any alert went out. Use it only where it exists.
+            const hasPeers = db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'peers'").get() !== null;
+            const peer = hasPeers ? db.query("SELECT name FROM peers WHERE session_id = ? ORDER BY added_at DESC LIMIT 1") : null;
             for (const alert of alerts) {
-                const row = (agent.get(alert.sessionId) ?? peer.get(alert.sessionId)) as { name: string } | null;
+                const row = (agent.get(alert.sessionId) ?? peer?.get(alert.sessionId) ?? null) as { name: string } | null;
                 if (row?.name) alert.name = row.name;
             }
         } finally { db.close(false); }
@@ -207,8 +211,8 @@ const seconds = (ms: number | null) => `${((ms ?? 0) / 1000).toFixed(1)} s`;
 const KIND_LABEL: Record<Kind, string> = { p90: "slow p90", single: "slow pass", timeout: "timeout", park: "park", refusal: "refused turn", module_climb: "module time climbing", busy_refusal: "storage-busy refusal", busy_replay: "busy-storage replay", long_lock: "long lock holder" };
 
 /** Only a park or a refused turn needs to interrupt; latency alone is reported at medium urgency. */
-export function alertUrgency(alerts: LatencyAlert[]): "high" | "medium" {
-    return alerts.some((alert) => alert.kind === "park" || alert.kind === "refusal") ? "high" : "medium";
+export function alertUrgency(alerts: LatencyAlert[]): "high" | "normal" {
+    return alerts.some((alert) => alert.kind === "park" || alert.kind === "refusal") ? "high" : "normal";
 }
 
 export function formatAlerts(alerts: LatencyAlert[]): string {
@@ -239,7 +243,7 @@ export function formatAlerts(alerts: LatencyAlert[]): string {
     return `Magic Context transform latency since ${from} (load now ${load}):\n${lines.join("\n")}`;
 }
 
-async function deliver(options: LatencyOptions, content: string, id: string, urgency: "high" | "medium"): Promise<void> {
+async function deliver(options: LatencyOptions, content: string, id: string, urgency: "high" | "normal"): Promise<void> {
     if (options.wake) return options.wake(content, id);
     const client = await SubcClient.connect({ connectionFile: options.connectionFile, handshakeTimeoutMs: 2_000 });
     try {
@@ -313,6 +317,9 @@ export async function runLatencySentinel(options: LatencyOptions): Promise<{ ale
 
 if (import.meta.main) {
     try {
+        setStoragePrivatePermissionEnforcement(
+            loadPluginConfig(process.cwd()).storage.enforce_private_permissions,
+        );
         const args = process.argv.slice(2);
         const values = new Map<string, string>();
         const flags = new Set(["--opencode-log", "--pi-log", "--module-log", "--db", "--peer-db", "--state-file", "--connection-file", "--since", "--until"]);

@@ -1,0 +1,837 @@
+/* biome-ignore-all lint/style/noDescendingSpecificity: Each component's scoped selectors are grouped together; table, default, and field chrome rules style separate elements. */
+.config-editor [hidden] {
+  /* biome-ignore lint/complexity/noImportantStyles: Hidden sections must override grid/flex display rules and stay out of keyboard navigation. */
+  display: none !important;
+}
+
+.config-editor .config-field-key {
+  display: none;
+}
+
+.config-editor.show-config-keys .config-field-key {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+
+.config-keys-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.config-editor .config-action-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 14px 18px;
+  margin-bottom: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+}
+
+.config-file-meta {
+  flex: 1 1 280px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.config-file-meta code {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.config-file-meta span {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.config-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.config-segmented {
+  display: flex;
+  padding: 3px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.config-segmented button {
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+}
+.config-segmented button.active {
+  background: var(--bg-active);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-segment);
+}
+.config-save {
+  min-width: 110px;
+}
+.config-save:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.config-editor :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.config-workspace {
+  display: grid;
+  grid-template-columns: 188px minmax(0, 1fr);
+  align-items: start;
+  gap: 24px;
+}
+
+.config-section-index {
+  position: sticky;
+  top: 72px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 12px 12px 0;
+  border-right: 1px solid var(--border);
+}
+
+.config-index-eyebrow {
+  padding: 0 12px 12px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.config-section-index button {
+  display: flex;
+  gap: 10px;
+  padding: 8px 12px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-md);
+  text-align: left;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.config-section-index button span {
+  font: 10px var(--mono-font);
+  opacity: 0.7;
+}
+
+/* The dimmed index numbers fall below AA on light surfaces; keep them opaque. */
+:root[data-theme="light"] .config-section-index button span {
+  opacity: 1;
+}
+
+.config-section-index button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.config-section-index button.active {
+  background: var(--bg-active);
+  color: var(--accent);
+}
+
+.config-section-index p {
+  margin: 24px 12px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.config-section-panel {
+  container-name: config-section;
+  container-type: inline-size;
+  min-width: 0;
+  padding: 16px 20px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.config-section-panel h2 {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--accent);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.config-section-panel .config-grid {
+  display: block;
+  padding: 0;
+}
+
+.config-section-panel .config-card {
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+.config-section-panel .config-card-header {
+  display: none;
+}
+
+/* Harness tabs that open a section sit directly under its heading, so give them
+   the same top spacing and left edge as the field rows below them. */
+.config-section-panel .config-card > .tab-pills {
+  padding: 14px 0 12px;
+}
+
+.config-section-panel .config-card-two-col {
+  display: contents;
+}
+
+.config-section-panel .config-card-content {
+  display: flex;
+  flex-direction: column;
+}
+
+.config-section-panel .config-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 1.3fr);
+  gap: 4px 24px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+  align-content: start;
+}
+
+.config-section-panel .config-field:nth-last-child(1 of .config-field:not([hidden])) {
+  border-bottom: 0;
+}
+
+.config-section-panel .config-field > input[type="number"],
+.config-section-panel .config-field > .toggle-switch {
+  width: 156px;
+  justify-self: end;
+}
+
+.config-section-panel .config-field > * {
+  grid-column: 2;
+  grid-row: 1 / span 3;
+  align-self: start;
+  min-width: 0;
+}
+
+.config-section-panel .config-field > .config-field-header {
+  grid-column: 1;
+  grid-row: 1;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+}
+
+.config-section-panel .config-field > .config-field-desc {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.config-section-panel .config-field > .config-help {
+  grid-column: 1;
+  grid-row: 3;
+}
+
+.config-section-panel .config-field > .config-field,
+.config-section-panel .config-card-content > .config-field-desc {
+  grid-column: 1 / -1;
+  grid-row: auto;
+}
+
+.config-section-panel .config-card-content > .config-field-desc {
+  padding: 14px 0;
+  line-height: 1.6;
+}
+
+/* Composite editors need independent rows. The generic field placements must
+   not put the fallback list and its add picker into the same grid cell. */
+.config-section-panel .config-field-wide {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.config-section-panel .config-field-wide > *,
+.config-section-panel .config-field-wide > .config-field-header,
+.config-section-panel .config-field-wide > .config-field-desc {
+  grid-column: 1 / -1;
+  grid-row: auto;
+}
+
+.config-section-panel .config-input {
+  max-width: none;
+  min-width: 120px;
+  font-size: 12px;
+}
+
+.config-editor .config-input::placeholder {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.config-editor .toggle-switch {
+  position: relative;
+  gap: 8px;
+  min-height: 31px;
+  font-size: 11px;
+}
+
+.config-editor .toggle-switch input {
+  display: block;
+  position: absolute;
+  width: 32px;
+  height: 20px;
+  opacity: 0;
+}
+
+.config-editor .toggle-switch input:focus-visible + .toggle-slider {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.config-editor .toggle-slider {
+  width: 32px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.config-editor .toggle-slider::before {
+  width: 12px;
+  height: 12px;
+  top: 3px;
+  left: 3px;
+}
+
+.config-editor .toggle-switch input:checked + .toggle-slider::before {
+  transform: translateX(14px);
+}
+
+.config-inherited {
+  display: block;
+  font-size: 10px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.config-restart-badge {
+  border: 1px solid var(--restart-border);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+  color: var(--amber);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.config-defaults {
+  display: block;
+}
+
+.config-defaults .config-field-desc {
+  display: block;
+  margin: 0;
+}
+
+.config-help-button {
+  border: 1px solid var(--border-light);
+  border-radius: 50%;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.config-help-popover {
+  padding: 16px;
+  overflow: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-help);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.config-help-popover p {
+  margin: 8px 0 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+.config-help-popover a {
+  color: var(--accent);
+}
+
+.config-overrides summary {
+  cursor: pointer;
+}
+
+.config-overrides {
+  border-top: 1px solid var(--border);
+  padding: 14px 0;
+}
+
+.config-overrides > summary {
+  font-size: 12px;
+}
+
+.config-overrides > summary .config-field-desc {
+  display: inline;
+  margin-left: 8px;
+}
+
+.config-table-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+}
+
+.config-table-toolbar p,
+.config-table-note {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.config-table-note {
+  padding: 10px 0;
+}
+
+.config-table-wrap {
+  overflow-x: auto;
+}
+
+.config-model-table,
+.config-task-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  table-layout: fixed;
+}
+
+.config-model-table {
+  min-width: 960px;
+}
+
+.config-task-table {
+  min-width: 760px;
+  margin-top: 12px;
+}
+
+.config-model-table th,
+.config-task-table th {
+  padding: 8px;
+  border-bottom: 1px solid var(--border-light);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.config-model-table td,
+.config-task-table td {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.config-model-table th:first-child {
+  width: 36%;
+}
+
+.config-model-table th:last-child {
+  width: 48px;
+}
+
+.config-model-table .config-input {
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+.config-task-table th:first-child {
+  width: 34%;
+}
+
+.config-task-table th:nth-child(2) {
+  width: 22%;
+}
+
+.config-task-table th:last-child {
+  width: 60px;
+}
+
+.config-task-table .config-field-desc {
+  display: block;
+  margin-top: 4px;
+  font-size: 10px;
+}
+
+.config-icon-btn,
+.config-schedule-btn {
+  background: transparent;
+  border: 0;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  padding: 4px 6px;
+}
+
+.config-schedule-btn {
+  text-align: left;
+  color: var(--text-primary);
+  padding: 3px 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.config-schedule-btn::after {
+  content: " ⌄";
+  color: var(--text-secondary);
+}
+
+.config-icon-btn:hover,
+.config-schedule-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.config-task-detail td {
+  background: var(--bg-panel);
+  padding: 12px 16px;
+}
+
+.config-task-edit-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 24px;
+}
+
+.config-task-edit-grid > div,
+.config-task-edit-grid .dreamer-task-param {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.config-task-edit-grid .config-input {
+  max-width: none;
+}
+
+.config-agent-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+  padding: 14px 0;
+}
+
+.config-agent-card {
+  padding: 16px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  min-width: 0;
+}
+
+.config-agent-card h3 {
+  font-size: 12px;
+}
+
+.config-agent-card .config-field {
+  padding: 14px 0;
+}
+
+.config-section-panel .model-chain-list {
+  padding: 0;
+  width: 100%;
+  background: transparent;
+  border: 0;
+}
+.config-section-panel .model-chain-item {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(160px, 200px) 28px;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 0;
+}
+.config-section-panel .model-chain-add {
+  margin: 8px 0 0;
+}
+.config-list-editor,
+.config-tool-descriptions {
+  width: 100%;
+}
+.config-list-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 8px 0;
+}
+.config-list-row .config-input {
+  flex: 1 1 240px;
+}
+.config-tool-row {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+.config-tool-row:last-child {
+  border-bottom: 0;
+}
+.config-tool-row .config-field-header {
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.config-tool-row textarea {
+  resize: vertical;
+  width: 100%;
+  line-height: 1.6;
+  font-family: var(--sans-font);
+}
+.config-route-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 12px;
+  table-layout: fixed;
+}
+.config-route-table th {
+  font-size: 11px;
+  text-align: left;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.config-route-table td {
+  padding: 8px 8px 8px 0;
+}
+.config-route-table th:nth-child(2) {
+  width: 140px;
+}
+.config-route-table th:last-child {
+  width: 32px;
+}
+.config-route-table .config-input {
+  width: 100%;
+}
+.protected-tools-table th:nth-child(2) {
+  width: 200px;
+}
+.protected-tools-default td {
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.protected-tools-default-note {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.protected-tools-error {
+  /* Plain --error-text measures 4.48:1 on the dark panel; blending in the
+     theme's primary text colour lifts it past the 4.5:1 AA minimum in both themes. */
+  color: color-mix(in srgb, var(--error-text) 80%, var(--text-primary));
+  font-size: 11px;
+}
+.protected-tools .config-input[aria-invalid="true"] {
+  border-color: var(--error-text);
+}
+.config-help {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.config-help summary {
+  cursor: pointer;
+  color: var(--text-primary);
+}
+.config-help p,
+.config-help ul {
+  margin: 6px 0 0;
+}
+.config-help ul {
+  padding-left: 18px;
+}
+.model-select-dropdown {
+  overflow-y: auto;
+}
+.search-picker {
+  min-width: 0;
+}
+.model-select {
+  position: relative;
+}
+.model-select:has(> .model-select-clear) .model-select-trigger {
+  padding-right: 44px;
+}
+.model-select > .model-select-clear {
+  position: absolute;
+  right: 24px;
+  top: 8px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.config-editor .model-select-value {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.config-editor .model-select-trigger {
+  min-width: 120px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+.config-task-harness {
+  margin-top: 14px;
+}
+
+.config-section-panel :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+@media (max-width: 800px) {
+  .config-workspace {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .config-section-index {
+    position: static;
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: 0;
+    padding: 0;
+  }
+
+  .config-section-index button {
+    flex-shrink: 0;
+  }
+
+  .config-index-eyebrow,
+  .config-section-index p {
+    display: none;
+  }
+
+  .config-section-panel {
+    padding: 12px;
+  }
+}
+
+/* Use available section width, not the window width: app navigation, the section
+   index and agent-card padding can leave a narrow editor in a wide window. */
+@container config-section (max-width: 640px) {
+  .config-section-panel .config-field {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .config-section-panel .config-field > *,
+  .config-section-panel .config-field > .config-field-header,
+  .config-section-panel .config-field > .config-field-desc {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .config-section-panel .config-field > input[type="number"],
+  .config-section-panel .config-field > .toggle-switch {
+    width: 100%;
+    justify-self: stretch;
+  }
+
+  .config-section-panel .model-chain-item {
+    grid-template-columns: minmax(120px, 1fr) 28px;
+  }
+
+  .model-chain-item > .model-select {
+    grid-column: 1 / -1;
+  }
+
+  .model-chain-item > .search-picker {
+    grid-column: 1;
+  }
+
+  .model-chain-item > .config-icon-btn {
+    grid-column: 2;
+  }
+
+  .config-route-table thead {
+    display: none;
+  }
+
+  .config-route-table tbody {
+    display: grid;
+    gap: 12px;
+  }
+
+  .config-route-table tr {
+    display: grid;
+    grid-template-columns: minmax(120px, 1fr) 28px;
+  }
+
+  .config-route-table td:first-child {
+    grid-column: 1 / -1;
+  }
+
+  .config-route-table td:nth-child(2) {
+    grid-column: 1;
+  }
+
+  .config-route-table td:last-child {
+    grid-column: 2;
+  }
+
+  .config-route-table td:only-child {
+    grid-column: 1 / -1;
+  }
+}
+
+/* Model discovery status: a small toast pinned to the bottom-right corner. Being
+   out of the document flow, it never moves the form when it appears or goes away. */
+.config-catalog-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(420px, calc(100vw - 40px));
+  padding: 10px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 14%);
+  color: var(--text-secondary);
+  font-size: 12px;
+  animation: toast-in 200ms ease-out;
+}
+
+.config-catalog-toast.is-error {
+  background: var(--error-bg);
+  border-color: var(--error-border);
+  color: var(--error-text);
+}

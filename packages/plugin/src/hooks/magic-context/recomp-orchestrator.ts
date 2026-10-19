@@ -45,6 +45,8 @@ export interface ManagedRecompContext {
     client: PluginContext["client"];
     /** Optional executor for hosts that cannot issue hidden completions through the v1 SDK. */
     hiddenCompletionExecutor?: HiddenCompletionExecutor;
+    /** Host-owned checkpoints must not use OpenCode 1's synthetic marker writer. */
+    compactionMarkerStrategy?: CompartmentRunnerDeps["compactionMarkerStrategy"];
     db: Database;
     liveSessionState: LiveSessionState;
     /** Plugin-startup directory — last-resort fallback for session-dir resolution. */
@@ -66,8 +68,11 @@ export interface ManagedRecompContext {
      *  be empty when `/ctx-recomp` runs before the first transform pass). */
     fallbackModelId?: string;
     userMemoriesEnabled: boolean;
+    /** False when the dreamer is not runnable; wrapup's historian then skips user observations. */
+    userObservationsRequested?: boolean;
     /** Two-pass historian (editor cleanup) — config `historian.two_pass`. */
     historianTwoPass?: boolean;
+    historianExpandTools?: Record<string, string | false>;
     getNotificationParams: (sessionId: string) => NotificationParams;
     ensureProjectRegistered?: (directory: string, db: Database) => Promise<void>;
 }
@@ -188,6 +193,7 @@ export function buildRecompDeps(
     return {
         client: ctx.client,
         hiddenCompletionExecutor: ctx.hiddenCompletionExecutor,
+        compactionMarkerStrategy: ctx.compactionMarkerStrategy,
         db: ctx.db,
         sessionId,
         historianChunkTokens: ctx.historianChunkTokens,
@@ -206,11 +212,16 @@ export function buildRecompDeps(
         fallbackModelId:
             ctx.fallbackModelId ?? resolveLiveModelKey(ctx.liveSessionState, sessionId),
         historianTwoPass: ctx.historianTwoPass,
+        historianExpandTools: ctx.historianExpandTools,
         ensureProjectRegistered: ctx.ensureProjectRegistered,
         getNotificationParams: () => ctx.getNotificationParams(sessionId),
         onCompartmentStatePublished: (sid: string) => {
             ctx.liveSessionState.historyRefreshSessions.add(sid);
-            ctx.liveSessionState.pendingMaterializationSessions.add(sid);
+            requestPendingMaterialization(
+                ctx.liveSessionState.pendingMaterializationSessions,
+                sid,
+                "recomp",
+            );
         },
         // Plan v6: recomp is explicit (applies the marker directly) so this is a
         // no-op for recomp, but the runner type is shared and the callback is
@@ -284,3 +295,5 @@ export async function runManagedRecomp(
         return `## Magic Recomp — Failed\n\n${failure}`;
     }
 }
+
+import { requestPendingMaterialization } from "./pending-materialization";

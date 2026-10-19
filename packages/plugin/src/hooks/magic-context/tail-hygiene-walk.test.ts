@@ -8,6 +8,7 @@ import * as formattingModule from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 import {
     assertTailHygieneContentUnchanged,
+    assertTailHygieneContentUnchangedIfEnabled,
     effectiveTailHygiene,
     measureTailHygiene,
     refreshTailHygieneBaseline,
@@ -1049,6 +1050,91 @@ describe("tail hygiene protectedTagNumbers set form (token window)", () => {
 });
 
 describe("tail baseline replay memo", () => {
+    it("reuses unchanged message content on append while detecting historical in-place edits", () => {
+        const messages = [
+            nativeTool(
+                "incremental-owner",
+                "incremental-call",
+                { path: "original-path" },
+                "original output",
+            ),
+            textMessage("incremental-newest", "old newest"),
+        ];
+        const tags = [
+            tag(101, "incremental-call", "tool", { toolOwnerMessageId: "incremental-owner" }),
+        ];
+        const input = { messages, tags, protectedTagNumbers: new Set<number>() };
+        let previous = refreshTailHygieneBaseline({ ...input, cacheBusting: true });
+        const serialize = spyOn(stableJson, "stableStringify");
+        try {
+            messages.push(textMessage("incremental-appended", "appended tail"));
+            previous = refreshTailHygieneBaseline({ ...input, previous, cacheBusting: false });
+            expect(serialize).not.toHaveBeenCalled();
+            expect(previous.contentSignature).toBe(measureTailHygiene(input).contentSignature);
+            (messages[0].parts[0] as { state: { input: { path: string } } }).state.input.path =
+                "ORIGINAL-path";
+            const edited = refreshTailHygieneBaseline({ ...input, previous, cacheBusting: false });
+            expect(edited.lastPrefixMismatch?.messageId).toBe("incremental-owner");
+            expect(edited.contentSignature).toBe(measureTailHygiene(input).contentSignature);
+            expect(effectiveTailHygiene(edited)).toEqual({
+                u: measureTailHygiene(input).u,
+                t: measureTailHygiene(input).t,
+            });
+        } finally {
+            serialize.mockRestore();
+        }
+    });
+
+    it("rechecks cross-message ownership and paired drop sentinels on replay", () => {
+        const messages = [
+            message("arc-owner", "assistant", [
+                { type: "tool_use", id: "arc", input: { command: "read" } },
+            ]),
+            textMessage("arc-middle", "middle"),
+        ];
+        const tags = [tag(102, "arc", "tool", { toolOwnerMessageId: "arc-owner" })];
+        const input = { messages, tags, protectedTagNumbers: new Set<number>() };
+        const previous = refreshTailHygieneBaseline({ ...input, cacheBusting: true });
+        messages.push(
+            message("arc-result", "user", [
+                { type: "tool_result", tool_use_id: "arc", content: "[dropped §102§]" },
+            ]),
+        );
+        const changed = refreshTailHygieneBaseline({ ...input, previous, cacheBusting: false });
+        const fresh = measureTailHygiene(input);
+        expect(changed.contentSignature).toBe(fresh.contentSignature);
+        expect(effectiveTailHygiene(changed)).toEqual({ u: fresh.u, t: fresh.t });
+        expect(changed.lastPrefixMismatch?.messageId).toBe("arc-owner");
+    });
+
+    it("requires the explicit debug flag for content assertions regardless of NODE_ENV", () => {
+        const previousDebug = process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS;
+        const previousNodeEnv = process.env.NODE_ENV;
+        const input = {
+            messages: [textMessage("debug-guard", "content")],
+            tags: [],
+            protectedTagNumbers: new Set<number>(),
+            expectedSignature: "wrong",
+        };
+        try {
+            process.env.NODE_ENV = "test";
+            delete process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS;
+            expect(() => assertTailHygieneContentUnchangedIfEnabled(input)).not.toThrow();
+            process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS = "0";
+            expect(() => assertTailHygieneContentUnchangedIfEnabled(input)).not.toThrow();
+            process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS = "1";
+            process.env.NODE_ENV = "production";
+            expect(() => assertTailHygieneContentUnchangedIfEnabled(input)).toThrow(
+                "tail hygiene walk was not the last byte-affecting operation",
+            );
+        } finally {
+            if (previousDebug === undefined) delete process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS;
+            else process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS = previousDebug;
+            if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+            else process.env.NODE_ENV = previousNodeEnv;
+        }
+    });
+
     it("reuses exact replay measurements without serializing tool input again", () => {
         const input = {
             messages: [

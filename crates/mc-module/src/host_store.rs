@@ -39,8 +39,12 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::time::Instant;
 
+use mc_store::private_permissions::{
+    create_file, ensure_directory, tighten_directory, tighten_tree,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -58,7 +62,7 @@ pub const SINGLE_STORE_CAPABLE: bool = mc_store::SINGLE_STORE_CAPABLE;
 /// this binary was built; whether that migration changed anything these writers depend
 /// on is answered per table by the fingerprints, so a migration that touched only tables
 /// the module never writes does not stop the module writing.
-pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 93;
+pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 95;
 
 /// Versions at or above this number belong to downstream forks and are excluded when
 /// reading the persisted lane, matching the host's own fence arithmetic.
@@ -82,11 +86,13 @@ pub const DOMAIN_TABLES: &[&str] = &[
     "compartment_history_versions",
     "compartment_events",
     "compartments",
+    "historian_runs",
     "memories",
     "memory_embedding_watermarks",
     "notes",
     "primer_candidates",
     "session_facts",
+    "subagent_invocations",
     "user_memories",
     "user_memory_candidates",
 ];
@@ -312,11 +318,15 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
     ),
     (
         "compartments",
-        "b1ced2e8c3bdb5d1872054ff46d170295f40d6babdb27059a51ea172843d7d70",
+        "849679458a3d6f4a495e336221c770066806aba16794f36ee79fbdcd3e32e89c",
     ),
     (
         "context_privilege_state",
         "ffe1e5a4d218c3a16cacc0a4c716eb227fa1bba59f203f035226d73ee0f88751",
+    ),
+    (
+        "historian_runs",
+        "4fdc0eabcd26ec85f2ad536402f2dbcc3d097a29644ab9f95683a40e38fa5643",
     ),
     (
         "memories",
@@ -343,8 +353,12 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
         "db3e60857602228326096491485382054f65432421e673b669b5a91f7dc8c865",
     ),
     (
+        "subagent_invocations",
+        "e99ff3c619f1905c7cd4ef83b6ef82bed73c2fffb5c12ff35d01fb6756718c58",
+    ),
+    (
         "user_memory_candidates",
-        "95439b71b9b3bf11af21a75f092c8978d732e00be1a833b61214e81852dd83cc",
+        "1d918414e8a99614d6fb0b72a55ae40b2006c46dbf7303d4fe5546feff2e182e",
     ),
 ];
 
@@ -849,7 +863,22 @@ pub struct HostStore {
 impl HostStore {
     /// Open `context.db` read/write against this binary's fence.
     pub fn open(path: &Path) -> Result<Self, HostStoreError> {
-        Self::open_with_fence(path, BUILT_CONTEXT_FENCE_VERSION)
+        Self::open_with_private_permissions(
+            path,
+            crate::config::private_storage_permissions_enabled(),
+        )
+    }
+
+    /// Open against the user-tier privacy policy; tests use `open_with_fence` below.
+    pub fn open_with_private_permissions(
+        path: &Path,
+        enforce_private_permissions: bool,
+    ) -> Result<Self, HostStoreError> {
+        Self::open_with_fence_and_private_permissions(
+            path,
+            BUILT_CONTEXT_FENCE_VERSION,
+            enforce_private_permissions,
+        )
     }
 
     /// Open against an explicit built fence.
@@ -857,6 +886,37 @@ impl HostStore {
     /// Tests use this to stand a database one lane ahead of the binary without shipping
     /// a migration; production always goes through [`HostStore::open`].
     pub fn open_with_fence(path: &Path, built_version: i64) -> Result<Self, HostStoreError> {
+        Self::open_with_fence_and_private_permissions(path, built_version, true)
+    }
+
+    fn open_with_fence_and_private_permissions(
+        path: &Path,
+        built_version: i64,
+        enforce_private_permissions: bool,
+    ) -> Result<Self, HostStoreError> {
+        let storage_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        ensure_directory(storage_dir, true).map_err(|error| HostStoreError::OpenFailed {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })?;
+        let root_before = tighten_directory(storage_dir, true);
+        let tree_before = tighten_tree(storage_dir, enforce_private_permissions);
+        let before = mc_store::private_permissions::TightenReport {
+            tightened: root_before.tightened + tree_before.tightened,
+            failures: root_before.failures + tree_before.failures,
+        };
+        if !path.exists() {
+            match create_file(path, true) {
+                Ok(file) => drop(file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(HostStoreError::OpenFailed {
+                        path: path.display().to_string(),
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
         let conn = Connection::open(path).map_err(|error| HostStoreError::OpenFailed {
             path: path.display().to_string(),
             reason: error.to_string(),
@@ -868,6 +928,12 @@ impl HostStore {
                 path: path.display().to_string(),
                 reason: format!("could not confirm WAL journaling: {error}"),
             })?;
+        mc_store::single_store_domain::set_wal_synchronous_normal(&conn).map_err(|error| {
+            HostStoreError::OpenFailed {
+                path: path.display().to_string(),
+                reason: format!("could not configure WAL durability: {error}"),
+            }
+        })?;
         conn.busy_timeout(std::time::Duration::from_millis(u64::from(
             CONTEXT_BUSY_TIMEOUT_MS,
         )))
@@ -885,6 +951,13 @@ impl HostStore {
             })?;
 
         let fence = FenceState::read(&conn, path, built_version)?;
+        let root_after = tighten_directory(storage_dir, true);
+        let tree_after = tighten_tree(storage_dir, enforce_private_permissions);
+        tracing::info!(
+            tightened = before.tightened + root_after.tightened + tree_after.tightened,
+            failures = before.failures + root_after.failures + tree_after.failures,
+            "mc-module: storage permission tightening"
+        );
         Ok(HostStore {
             conn,
             path: path.to_path_buf(),
@@ -949,6 +1022,22 @@ impl HostStore {
         .map(|_| ())
     }
 
+    /// Check telemetry tables against the pinned schema without waiting up to five seconds
+    /// for SQLite's writer lock; that wait budget belongs to compartment publication.
+    pub fn try_domain_transaction(
+        &mut self,
+        tables: &[&str],
+        writes: &mut dyn FnMut(&Transaction<'_>) -> rusqlite::Result<()>,
+    ) -> Result<(), HostStoreError> {
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let outcome = self.with_domain_transaction(tables, writes);
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(u64::from(
+                CONTEXT_BUSY_TIMEOUT_MS,
+            )))?;
+        outcome
+    }
+
     /// The health block the status surface reports.
     pub fn health_value(&self) -> Value {
         let mut tables = serde_json::Map::new();
@@ -997,8 +1086,14 @@ fn with_privileged_transaction<T>(
     tables: &[&str],
     writes: impl FnOnce(&Transaction<'_>) -> Result<T, HostStoreError>,
 ) -> Result<(T, i64), HostStoreError> {
-    let started_at = Instant::now();
-    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let transaction = mc_store::writer_diagnostics::WriterTransaction::immediate(
+        conn,
+        "host_domain",
+        "ck-mc",
+        "domain",
+        |line| tracing::info!("{line}"),
+    )?
+    .with_tables(tables);
 
     // Recheck inside the transaction, not only at open. A host migration can land
     // between opening the file and writing to it, and a stale open-time answer would let
@@ -1039,8 +1134,8 @@ fn with_privileged_transaction<T>(
         "UPDATE context_privilege_state SET enabled = 0 WHERE id = 1",
         [],
     )?;
-    transaction.commit()?;
-    let elapsed_us = i64::try_from(started_at.elapsed().as_micros()).unwrap_or(i64::MAX);
+    let elapsed = transaction.commit_timed()?;
+    let elapsed_us = i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX);
     Ok((result, elapsed_us))
 }
 
@@ -1900,8 +1995,11 @@ pub fn resolve_context_db_path() -> PathBuf {
             .join("cortexkit")
             .join("magic-context")
     } else {
-        let home = non_empty("HOME").unwrap_or_else(|| ".".to_string());
-        Path::new(&home)
+        // The host takes Node's `os.homedir()` here, which also answers on Windows (where
+        // `HOME` is usually unset) and when `HOME` is empty. The current directory is the
+        // last resort only when no home can be found at all.
+        crate::config::user_home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
             .join(".local")
             .join("share")
             .join("cortexkit")
@@ -2076,6 +2174,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn freshly_opened_host_store_uses_wal_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_db(dir.path(), "context.db");
+        let store = HostStore::open(&path).unwrap();
+        let journal: String = store
+            .conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = store
+            .conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+        assert_eq!(synchronous, 1);
+    }
+
     /// The lane alone refuses nothing: a database migrated past this binary whose domain
     /// tables still carry the fingerprints it was built against is written normally, and
     /// the status block says the lane is ahead.
@@ -2120,7 +2235,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fixture_db(dir.path(), "context.db");
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("DROP TRIGGER compartment_history_ai; DROP TRIGGER compartment_history_au; DROP TRIGGER compartment_history_ad; DROP TABLE compartment_history_versions; DELETE FROM schema_migrations WHERE version=93").unwrap();
+        conn.execute_batch("DROP TRIGGER compartment_history_ai; DROP TRIGGER compartment_history_au; DROP TRIGGER compartment_history_ad; DROP TABLE compartment_history_versions; DELETE FROM schema_migrations WHERE version>=93").unwrap();
         let mut store = HostStore::open(&path).unwrap();
         assert_eq!(store.fence().persisted_version, 92);
         assert!(store.writable_tables().contains(&"memories"));

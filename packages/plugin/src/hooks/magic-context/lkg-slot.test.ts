@@ -11,8 +11,12 @@ import {
     incrementalLkgContentDigests,
     type LkgDigestEntry,
     type LkgSlot,
+    lkgContentDigest,
     lkgContentDigestFromFields,
     lkgContentFields,
+    lkgSlotRejection,
+    memoizedLkgContentDigestFromFields,
+    noteEntry,
     registerLkgPersistence,
     resetLkgSlotsForTest,
 } from "./lkg-slot";
@@ -91,7 +95,71 @@ describe("LKG durable hydration pass", () => {
     });
 });
 
+describe("LKG slot size cap", () => {
+    const slotWithPrefixChars = (chars: number): LkgSlot => ({
+        jsonPrefix: `["${"x".repeat(chars)}"]`,
+        inputIdSeq: ["m1"],
+        inputContentDigests: ["digest-m1"],
+        lastInputMessageId: "m1",
+        modelKey: "test/model",
+        providerKey: "test",
+        capturedAt: 1,
+    });
+
+    it("keeps a snapshot of any request size a provider accepts (Anthropic allows 32 MB)", () => {
+        resetLkgSlotsForTest();
+        // A 32 MB request: the old cap refused anything over about 12 MB of JSON.
+        const atLimit = slotWithPrefixChars(32 * 1000 * 1000);
+        expect(lkgSlotRejection("big", atLimit)).toBeNull();
+        expect(captureSlot("big", atLimit)).toBe(true);
+    });
+
+    it("still rejects a single slot beyond any provider's request limit", () => {
+        resetLkgSlotsForTest();
+        expect(lkgSlotRejection("huge", slotWithPrefixChars(40 * 1024 * 1024))).toMatch(
+            /^slot_bytes=/,
+        );
+    });
+});
+
 describe("incremental LKG content digests", () => {
+    it("shares exact digests but rehashes same-id metadata, type and nested content changes", () => {
+        resetLkgSlotsForTest();
+        const message = {
+            info: { id: "same", role: "user" },
+            parts: [{ type: "text", text: "wire", metadata: { counter: 1 as number | string } }],
+        };
+        const initial = lkgContentFields(message)!;
+        const expected = lkgContentDigest(message);
+        expect(memoizedLkgContentDigestFromFields("same", initial)).toBe(expected);
+        // A fresh tree, not reference identity, must prove the cached digest safe.
+        expect(
+            memoizedLkgContentDigestFromFields("same", lkgContentFields(structuredClone(message))!),
+        ).toBe(expected);
+        for (const counter of [2, "2", 1]) {
+            message.parts[0]!.metadata.counter = counter;
+            const fields = lkgContentFields(message)!;
+            expect(memoizedLkgContentDigestFromFields("same", fields)).toBe(
+                lkgContentDigest(message),
+            );
+        }
+        captureSlot("entry", {
+            jsonPrefix: "[]",
+            inputIdSeq: ["same"],
+            inputContentDigests: [expected!],
+            lastInputMessageId: "same",
+            modelKey: null,
+            providerKey: null,
+            capturedAt: 1,
+        });
+        expect(noteEntry("entry", [message])?.entryContentDigests).toEqual([
+            lkgContentDigest(message)!,
+        ]);
+        message.parts[0]!.text = "changed after note";
+        expect(noteEntry("entry", [message])?.entryContentDigests).toEqual([
+            lkgContentDigest(message)!,
+        ]);
+    });
     it("matches a full recompute and reuses an unchanged prefix", () => {
         const prefix = [entry("m1", "one"), entry("m2", "two"), entry("m3", "three")];
         const tail = [entry("m4", "four"), entry("m5", "five")];

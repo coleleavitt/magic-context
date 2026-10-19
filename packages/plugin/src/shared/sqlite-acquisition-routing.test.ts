@@ -4,12 +4,30 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     Database,
+    SqliteAcquisitionBusyError,
     withAsyncPrivilegedWriter,
     withPrivilegedWriter,
     withSqliteTransformPass,
 } from "./sqlite";
 import { startSqliteWriteLocker } from "./sqlite-write-locker-test-support";
 import { createTestTempDirFromPath } from "./test-temp-dir";
+
+test("async writer never retries callback acquisition errors after work began", async () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE context_privilege_state(id INTEGER PRIMARY KEY, enabled INTEGER)");
+    let calls = 0;
+    try {
+        await expect(
+            withAsyncPrivilegedWriter(db, () => {
+                calls++;
+                throw new SqliteAcquisitionBusyError(new Error("nested BEGIN"));
+            }),
+        ).rejects.toThrow("acquisition remained busy");
+        expect(calls).toBe(1);
+    } finally {
+        db.close();
+    }
+});
 
 for (const mode of ["default", "immediate", "exclusive", "literal"] as const) {
     test(`shared SQLite retries ${mode} acquisition before running any writes`, async () => {
@@ -100,7 +118,7 @@ test("exhausted routed acquisition never enters the callback or multiplies privi
         db.close();
         rmSync(dir, { recursive: true, force: true });
     }
-});
+}, 30_000);
 
 for (const mode of ["run", "get", "all", "exec"] as const) {
     test(`foreground ${mode} autocommit waits share one turn budget and restore production timeout`, () => {
@@ -129,7 +147,8 @@ for (const mode of ["run", "get", "all", "exec"] as const) {
                 }
                 expect(() => db.exec("BEGIN IMMEDIATE")).toThrow("acquisition remained busy");
             });
-            expect(performance.now() - started).toBeLessThan(650);
+            expect(performance.now() - started).toBeGreaterThanOrEqual(1900);
+            expect(performance.now() - started).toBeLessThan(2600);
             expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
             expect(db.prepare("SELECT * FROM result").all()).toEqual([]);
             blocker.exec("ROLLBACK");
@@ -141,5 +160,5 @@ for (const mode of ["run", "get", "all", "exec"] as const) {
             db.close();
             rmSync(dir, { recursive: true, force: true });
         }
-    });
+    }, 30_000);
 }

@@ -1,9 +1,15 @@
+import { createHash } from "node:crypto";
+import { statSync } from "node:fs";
+import { hostname } from "node:os";
+import { resolve } from "node:path";
+import type { Statement } from "better-sqlite3";
 import type { RawMessageOrdinalAnchor } from "../hooks/magic-context/read-session-raw";
 import {
     assertOpenCodeStoreGeneration,
     resolveOpenCodeDbPath,
     sourceOpenCodeDatabaseFilename,
 } from "../shared/opencode-db-path";
+import { sameProjectDirectory } from "../shared/project-directory-key";
 import { Database } from "../shared/sqlite";
 
 /** Compatibility export; shared/opencode-db-path.ts is the single filename authority. */
@@ -54,7 +60,7 @@ export const V2_MESSAGE_PAGE_SQL = `WITH bounds AS (
             SELECT seq FROM session_message
             WHERE session_id = ? AND type IN (${RAW_MESSAGE_TYPE_PARAMETERS})
             ORDER BY seq ASC LIMIT 1 OFFSET ?
-        ), -1) END AS after_seq,
+        ), (SELECT MAX(seq) FROM session_message WHERE session_id = ?), -1) END AS after_seq,
         COALESCE((
             SELECT seq FROM session_message
             WHERE session_id = ? AND type IN (${RAW_MESSAGE_TYPE_PARAMETERS})
@@ -137,6 +143,21 @@ export interface V2MessageOrdinalAnchor {
 export interface V2MessageOrdinalEntry extends V2MessageOrdinalAnchor {
     contributesOrdinal: boolean;
     hasValidInfo: boolean;
+}
+
+/** Where an OpenCode 2 fork was cut from its parent (`session_v2.fork_boundary`). */
+export interface V2ForkOrigin {
+    parentSessionID: string;
+    /** `before`: rows strictly before the message were copied; `through`: up to and including it. */
+    boundary: { type: "before" | "through"; messageID: string };
+}
+
+/** The identity columns of one `session_message` row. */
+export interface V2RowStamp {
+    id: string;
+    type: MessageType;
+    seq: number;
+    time_created: number;
 }
 
 const debugSymbol = Symbol.for(V2_STORE_READER_DEBUG_COUNTER_KEY);
@@ -268,33 +289,144 @@ function decode(row: RawRow): StoreRow {
     return { ...row, data: data as MessageData };
 }
 
+interface ReaderConnection {
+    db: Database;
+    statements: Map<string, Statement>;
+    identity: string;
+    leases: number;
+    retired: boolean;
+}
+
+function connect(path: string, identity = ""): ReaderConnection {
+    const stat = statSync(path);
+    const acquiredIdentity = identity || `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+    const db = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+        assertOpenCodeStoreGeneration(db, "v2", path);
+    } catch (error) {
+        db.close();
+        throw error;
+    }
+    const counters = debugCounters();
+    counters.openReaders += 1;
+    counters.readersOpened += 1;
+    counters.maxOpenReaders = Math.max(counters.maxOpenReaders, counters.openReaders);
+    return { db, statements: new Map(), identity: acquiredIdentity, leases: 0, retired: false };
+}
+
+function closeConnection(connection: ReaderConnection): void {
+    connection.statements.clear();
+    try {
+        connection.db.close();
+    } finally {
+        const counters = debugCounters();
+        counters.openReaders = Math.max(0, counters.openReaders - 1);
+        counters.readersClosed += 1;
+    }
+}
+
+/** Boot-scoped read-only handles. Each lease still closes in the caller's finally block.
+ * Statements, not results, are cached: WAL updates are visible on the next query.
+ * A replaced/missing file cannot reuse the old inode, and disposal releases all handles. */
+export class V2StoreReaderPool {
+    private readonly connections = new Map<string, ReaderConnection>();
+    private closed = false;
+
+    constructor(private readonly capacity = 4) {
+        if (!Number.isSafeInteger(capacity) || capacity < 1)
+            throw new Error("Invalid reader capacity");
+    }
+
+    open(path: string): V2StoreReader {
+        return new V2StoreReader(path, this);
+    }
+
+    acquire(path: string): ReaderConnection {
+        if (this.closed) throw new Error("Store reader pool is closed");
+        const key = resolve(path);
+        const stat = statSync(key);
+        const identity = `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+        let connection = this.connections.get(key);
+        if (connection && connection.identity !== identity) {
+            this.connections.delete(key);
+            this.retire(connection);
+            connection = undefined;
+        }
+        if (!connection) connection = connect(key, identity);
+        connection.leases++;
+        this.connections.delete(key);
+        this.connections.set(key, connection);
+        while (this.connections.size > this.capacity) {
+            const oldest = this.connections.entries().next().value;
+            if (!oldest) break;
+            this.connections.delete(oldest[0]);
+            this.retire(oldest[1]);
+        }
+        return connection;
+    }
+
+    release(connection: ReaderConnection): void {
+        connection.leases--;
+        if (connection.retired && connection.leases === 0) closeConnection(connection);
+    }
+
+    private retire(connection: ReaderConnection): void {
+        connection.retired = true;
+        if (connection.leases === 0) closeConnection(connection);
+    }
+
+    close(): void {
+        if (this.closed) return;
+        this.closed = true;
+        for (const connection of this.connections.values()) this.retire(connection);
+        this.connections.clear();
+    }
+}
+
 /** Opens an existing store read-only; missing/corrupt stores propagate errors, never an empty history. */
 export class V2StoreReader {
     private readonly db: Database;
+    private readonly connection: ReaderConnection;
     private closed = false;
-    constructor(path: string) {
-        this.db = new Database(path, { readonly: true, fileMustExist: true });
-        try {
-            assertOpenCodeStoreGeneration(this.db, "v2", path);
-        } catch (error) {
-            this.db.close();
-            throw error;
+    constructor(
+        private readonly path: string,
+        private readonly pool?: V2StoreReaderPool,
+    ) {
+        this.connection = pool ? pool.acquire(path) : connect(path);
+        this.db = this.connection.db;
+    }
+
+    /** Identifies the database file this reader's connection actually opened: the
+     * machine's host name, the resolved path, and the file's device, inode and
+     * creation time recorded when the connection was opened.
+     * If OpenCode's database file is later replaced (for example a new file moved
+     * over the same path), a connection opened earlier keeps reading the old file.
+     * Recording identity at open time, rather than checking the path again, stops
+     * that old connection from reporting the new file's identity, so the fold cache
+     * cannot pair rows read from one file with history cached for the other. */
+    hostIdentity(): string {
+        return createHash("sha256")
+            .update(JSON.stringify([hostname(), resolve(this.path), this.connection.identity]))
+            .digest("hex");
+    }
+
+    private prepare(sql: string): Statement {
+        if (this.closed) throw new Error("Store reader is closed");
+        const statements = this.connection.statements;
+        let statement = statements.get(sql);
+        if (!statement) {
+            statement = this.db.prepare(sql);
+            // Dynamic IN clauses can have many lengths. Bound their retained statements.
+            if (statements.size >= 128) statements.clear();
+            statements.set(sql, statement);
         }
-        const counters = debugCounters();
-        counters.openReaders += 1;
-        counters.readersOpened += 1;
-        counters.maxOpenReaders = Math.max(counters.maxOpenReaders, counters.openReaders);
+        return statement;
     }
     close(): void {
         if (this.closed) return;
         this.closed = true;
-        try {
-            this.db.close();
-        } finally {
-            const counters = debugCounters();
-            counters.openReaders = Math.max(0, counters.openReaders - 1);
-            counters.readersClosed += 1;
-        }
+        if (this.pool) this.pool.release(this.connection);
+        else closeConnection(this.connection);
     }
 
     /** Exclusive cursor, ascending seq. IDs are not chronological in the v2 store. */
@@ -326,11 +458,9 @@ export class V2StoreReader {
                 parameters.push(options.type);
             }
             const rows = (
-                this.db
-                    .prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
+                this.prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
                         WHERE ${predicates.join(" AND ")}
-                        ORDER BY seq ASC LIMIT ?`)
-                    .all(...parameters, limit) as RawRow[]
+                        ORDER BY seq ASC LIMIT ?`).all(...parameters, limit) as RawRow[]
             ).map(decode);
             return { rows, cursor: rows.at(-1)?.seq };
         });
@@ -360,35 +490,39 @@ export class V2StoreReader {
             // A carried row id maps to seq with a point lookup, not another
             // ordinal OFFSET. The remaining ordinal count bounds the watermark.
             if (after) {
-                const anchor = this.db
-                    .prepare("SELECT seq FROM session_message WHERE session_id = ? AND id = ?")
-                    .get(sessionID, after.id) as { seq: number } | undefined;
+                const anchor = this.prepare(
+                    "SELECT seq FROM session_message WHERE session_id = ? AND id = ?",
+                ).get(sessionID, after.id) as { seq: number } | undefined;
                 if (anchor) {
                     return (
-                        this.db
-                            .prepare(`SELECT id, session_id, type, seq, time_created, data
+                        this.prepare(`SELECT id, session_id, type, seq, time_created, data
                         FROM session_message WHERE session_id = ? AND seq > ?
-                        AND type IN (${RAW_MESSAGE_TYPE_PARAMETERS}) ORDER BY seq ASC LIMIT ?`)
-                            .all(sessionID, anchor.seq, ...RAW_MESSAGE_TYPES, pageSize) as RawRow[]
+                        AND type IN (${RAW_MESSAGE_TYPE_PARAMETERS}) ORDER BY seq ASC LIMIT ?`).all(
+                            sessionID,
+                            anchor.seq,
+                            ...RAW_MESSAGE_TYPES,
+                            pageSize,
+                        ) as RawRow[]
                     ).map(decode);
                 }
             }
             const maximumSeq = Number.MAX_SAFE_INTEGER;
-            const rows = this.db
-                .prepare(V2_MESSAGE_PAGE_SQL)
-                .all(
-                    afterOrdinal,
-                    sessionID,
-                    ...RAW_MESSAGE_TYPES,
-                    Math.max(0, afterOrdinal - 1),
-                    sessionID,
-                    ...RAW_MESSAGE_TYPES,
-                    finalWatermark - 1,
-                    maximumSeq,
-                    sessionID,
-                    ...RAW_MESSAGE_TYPES,
-                    pageSize,
-                ) as RawRow[];
+            // A cursor past the last ordinal must stay after the session's rows;
+            // falling back to -1 would replay the first message under that ordinal.
+            const rows = this.prepare(V2_MESSAGE_PAGE_SQL).all(
+                afterOrdinal,
+                sessionID,
+                ...RAW_MESSAGE_TYPES,
+                Math.max(0, afterOrdinal - 1),
+                sessionID,
+                sessionID,
+                ...RAW_MESSAGE_TYPES,
+                finalWatermark - 1,
+                maximumSeq,
+                sessionID,
+                ...RAW_MESSAGE_TYPES,
+                pageSize,
+            ) as RawRow[];
             return rows.map(decode);
         });
     }
@@ -396,12 +530,10 @@ export class V2StoreReader {
     messageCount(sessionID: string): number {
         return trackDecodeOperation("messageCount", () => {
             const rawTypes = RAW_MESSAGE_TYPES.map(() => "?").join(", ");
-            const row = this.db
-                .prepare(
-                    `SELECT COUNT(*) AS count FROM session_message
+            const row = this.prepare(
+                `SELECT COUNT(*) AS count FROM session_message
                      WHERE session_id = ? AND type IN (${rawTypes})`,
-                )
-                .get(sessionID, ...RAW_MESSAGE_TYPES) as { count?: number } | undefined;
+            ).get(sessionID, ...RAW_MESSAGE_TYPES) as { count?: number } | undefined;
             return typeof row?.count === "number" ? row.count : 0;
         });
     }
@@ -415,27 +547,175 @@ export class V2StoreReader {
         afterSessionID: string | null,
         limit: number,
     ): Array<{ sessionId: string; directory: string }> {
-        const rows = this.db
-            .prepare(
-                `SELECT id, COALESCE(directory, '') AS directory FROM session_v2
+        const rows = this.prepare(
+            `SELECT id, COALESCE(directory, '') AS directory FROM session_v2
                  WHERE id > ? ORDER BY id ASC LIMIT ?`,
-            )
-            .all(afterSessionID ?? "", limit) as Array<{ id: string; directory: string }>;
+        ).all(afterSessionID ?? "", limit) as Array<{ id: string; directory: string }>;
         return rows.map((row) => ({ sessionId: row.id, directory: row.directory }));
     }
 
     latestMessageTime(sessionID: string): number | undefined {
-        const row = this.db
-            .prepare("SELECT MAX(time_created) AS time FROM session_message WHERE session_id = ?")
-            .get(sessionID) as { time: number | null } | undefined;
+        const row = this.prepare(
+            "SELECT MAX(time_created) AS time FROM session_message WHERE session_id = ?",
+        ).get(sessionID) as { time: number | null } | undefined;
         return row?.time ?? undefined;
+    }
+
+    /** Parent links are recorded by the host before a child's first context pass. */
+    isSubagent(sessionID: string): boolean | null {
+        const row = this.prepare("SELECT parent_id FROM session_v2 WHERE id = ?").get(sessionID) as
+            | { parent_id: string | null }
+            | undefined;
+        if (!row) return null;
+        return typeof row.parent_id === "string" && row.parent_id.length > 0;
+    }
+
+    /**
+     * The most recently updated top-level user session the host created in
+     * `directory`, or undefined when there is none. Children, Magic Context's
+     * own hidden runs and archived sessions are never returned. The session must
+     * be in this very directory: OpenCode 2 puts a child session in its parent's
+     * location, and only the plugin context of that location recognises the
+     * child, so a parent from a sibling checkout would strand the run.
+     *
+     * The directory is compared by `sameProjectDirectory`, not by SQL equality.
+     * OpenCode 2 on Windows stores `D:/work/app` while the plugin's location is
+     * `D:\work\app`; an exact match found no session there, and every scheduled
+     * task that needs a child session was skipped. Roots are read newest first,
+     * a page at a time, and the first one in this directory wins.
+     */
+    latestRootSessionInDirectory(directory: string): string | undefined {
+        const columns = new Set(
+            (this.prepare("PRAGMA table_info(session_v2)").all() as Array<{ name: string }>).map(
+                (column) => column.name,
+            ),
+        );
+        const archived = columns.has("time_archived") ? " AND time_archived IS NULL" : "";
+        const order = columns.has("time_updated") ? "time_updated DESC, id DESC" : "id DESC";
+        const page = this.prepare(
+            `SELECT id, COALESCE(directory, '') AS directory FROM session_v2
+                 WHERE parent_id IS NULL${archived}
+                   AND COALESCE(json_extract(metadata, '$.magic_context'), '') <> 'hidden-run'
+                 ORDER BY ${order} LIMIT ? OFFSET ?`,
+        );
+        const pageSize = 500;
+        for (let offset = 0; ; offset += pageSize) {
+            const rows = page.all(pageSize, offset) as Array<{ id: string; directory: string }>;
+            const match = rows.find((row) => sameProjectDirectory(row.directory, directory));
+            if (match) return match.id;
+            if (rows.length < pageSize) return undefined;
+        }
+    }
+
+    /** Native user activity on root sessions; internal children must never become
+     * retrospective input. Activity is read from the source, not project-binding
+     * times or optional activity keys in Magic Context's store. */
+    rootSessionActivity(sessionIDs: readonly string[]): Map<string, number> {
+        const roots = new Map<string, number>();
+        for (let offset = 0; offset < sessionIDs.length; offset += 500) {
+            const chunk = sessionIDs.slice(offset, offset + 500);
+            const rows = this.prepare(`SELECT id, (
+                    SELECT MAX(time_created) FROM session_message
+                    WHERE session_id = session_v2.id AND type = 'user'
+                ) AS time FROM session_v2
+                WHERE parent_id IS NULL
+                  AND COALESCE(json_extract(metadata, '$.magic_context'), '') <> 'hidden-run'
+                  AND id IN (${chunk.map(() => "?").join(",")})`).all(...chunk) as Array<{
+                id: string;
+                time: number | null;
+            }>;
+            for (const row of rows) if (row.time !== null) roots.set(row.id, row.time);
+        }
+        return roots;
+    }
+
+    oldestUserMessageTimesSince(
+        sessionIDs: readonly string[],
+        sinceMs: number,
+    ): Map<string, number> {
+        const result = new Map<string, number>();
+        for (let offset = 0; offset < sessionIDs.length; offset += 500) {
+            const chunk = sessionIDs.slice(offset, offset + 500);
+            const rows =
+                this.prepare(`SELECT session_id, MIN(time_created) AS time FROM session_message
+                WHERE type = 'user' AND time_created > ? AND session_id IN (${chunk.map(() => "?").join(",")})
+                GROUP BY session_id`).all(sinceMs, ...chunk) as Array<{
+                    session_id: string;
+                    time: number;
+                }>;
+            for (const row of rows) result.set(row.session_id, row.time);
+        }
+        return result;
+    }
+
+    /** Timestamp-bounded retrospective read. Project only genuine user text in
+     * SQLite, so assistant/tool payloads and unbounded pasted logs never enter JS. */
+    retrospectiveUserPage(
+        sessionID: string,
+        options: {
+            boundaryMs: number;
+            before?: boolean;
+            limit: number;
+            maxChars: number;
+            truncationMarker: string;
+        },
+    ): Array<{ seq: number; time_created: number; text: string }> {
+        const { boundaryMs, before, limit, maxChars, truncationMarker } = options;
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10000)
+            throw new Error("Invalid page limit");
+        if (!Number.isSafeInteger(maxChars) || maxChars <= truncationMarker.length)
+            throw new Error("Invalid text limit");
+        const direction = before ? "DESC" : "ASC";
+        const head = Math.floor((maxChars - truncationMarker.length) / 2);
+        const tail = maxChars - truncationMarker.length - head;
+        return this.prepare(`WITH users AS (
+            SELECT seq, time_created, data FROM session_message
+            WHERE session_id = ? AND type = 'user' AND time_created ${before ? "<=" : ">"} ?
+            ORDER BY time_created ${direction}, seq ${direction} LIMIT ?
+        ), texts AS (
+            SELECT seq, time_created, CASE
+                WHEN json_extract(data, '$.synthetic') = 1 OR json_extract(data, '$.ignored') = 1 THEN ''
+                WHEN json_type(data, '$.text') = 'text' THEN json_extract(data, '$.text')
+                ELSE COALESCE((SELECT group_concat(json_extract(value, '$.text'), char(10))
+                    FROM json_each(users.data, '$.content')
+                    WHERE json_extract(value, '$.type') IN ('text', 'input_text')
+                      AND COALESCE(json_extract(value, '$.synthetic'), 0) <> 1
+                      AND COALESCE(json_extract(value, '$.ignored'), 0) <> 1), '') END AS text
+            FROM users WHERE json_valid(data)
+        ) SELECT seq, time_created, CASE WHEN length(text) > ?
+            THEN substr(text, 1, ?) || ? || substr(text, -?) ELSE text END AS text
+          FROM texts ORDER BY time_created ${direction}, seq ${direction}`).all(
+            sessionID,
+            boundaryMs,
+            limit,
+            maxChars,
+            head,
+            truncationMarker,
+            tail,
+        ) as Array<{
+            seq: number;
+            time_created: number;
+            text: string;
+        }>;
+    }
+
+    /** Count session_message rows after a sequence. This counts stored rows, not
+     * model messages: it includes idle rows (OpenCode's marker that a run finished)
+     * and compaction rows (checkpoints), and one stored assistant row can render as
+     * several model messages, such as the assistant message plus a tool message for
+     * each tool result. */
+    storedRowsAfter(sessionID: string, after: number): number {
+        const row = this.prepare(
+            "SELECT COUNT(*) AS count FROM session_message WHERE session_id = ? AND seq > ?",
+        ).get(sessionID, after) as { count: number };
+        return row.count;
     }
 
     storedMessageCount(sessionID: string): number {
         return trackDecodeOperation("storedMessageCount", () => {
-            const row = this.db
-                .prepare("SELECT COUNT(*) AS count FROM session_message WHERE session_id = ?")
-                .get(sessionID) as { count?: number } | undefined;
+            const row = this.prepare(
+                "SELECT COUNT(*) AS count FROM session_message WHERE session_id = ?",
+            ).get(sessionID) as { count?: number } | undefined;
             return typeof row?.count === "number" ? row.count : 0;
         });
     }
@@ -443,25 +723,48 @@ export class V2StoreReader {
     messageById(sessionID: string, id: string): StoreRow | null {
         return trackDecodeOperation("messageById", () => {
             const rawTypes = RAW_MESSAGE_TYPES.map(() => "?").join(", ");
-            const row = this.db
-                .prepare(
-                    `SELECT id, session_id, type, seq, time_created, data FROM session_message
+            const row = this.prepare(
+                `SELECT id, session_id, type, seq, time_created, data FROM session_message
                      WHERE session_id = ? AND id = ? AND type IN (${rawTypes}) LIMIT 1`,
-                )
-                .get(sessionID, id, ...RAW_MESSAGE_TYPES) as RawRow | undefined;
+            ).get(sessionID, id, ...RAW_MESSAGE_TYPES) as RawRow | undefined;
             return row ? decode(row) : null;
         });
+    }
+
+    messageTimes(
+        sessionID: string,
+        ids: readonly string[],
+    ): Map<string, { created?: number; completed?: number }> {
+        const times = new Map<string, { created?: number; completed?: number }>();
+        // Read only timing metadata for the served draft, not full stored content
+        // or the session's archived history. Bound each query's parameter count.
+        for (let offset = 0; offset < ids.length; offset += 500) {
+            const batch = ids.slice(offset, offset + 500);
+            const rows = this.prepare(
+                `SELECT id, COALESCE(time_created, json_extract(data, '$.time.created')) AS created,
+                        json_extract(data, '$.time.completed') AS completed
+                 FROM session_message WHERE session_id = ? AND id IN (${batch.map(() => "?").join(",")})`,
+            ).all(sessionID, ...batch) as Array<{
+                id: string;
+                created: number | null;
+                completed: number | null;
+            }>;
+            for (const row of rows)
+                times.set(row.id, {
+                    created: typeof row.created === "number" ? row.created : undefined,
+                    completed: typeof row.completed === "number" ? row.completed : undefined,
+                });
+        }
+        return times;
     }
 
     messageExistsById(sessionID: string, id: string): boolean {
         return trackDecodeOperation("messageExistsById", () => {
             const rawTypes = RAW_MESSAGE_TYPES.map(() => "?").join(", ");
-            const row = this.db
-                .prepare(
-                    `SELECT 1 FROM session_message
+            const row = this.prepare(
+                `SELECT 1 FROM session_message
                      WHERE id = ? AND session_id = ? AND type IN (${rawTypes}) LIMIT 1`,
-                )
-                .get(id, sessionID, ...RAW_MESSAGE_TYPES);
+            ).get(id, sessionID, ...RAW_MESSAGE_TYPES);
             return row != null;
         });
     }
@@ -469,9 +772,8 @@ export class V2StoreReader {
     messageOrdinalById(sessionID: string, id: string): number | null {
         return trackDecodeOperation("messageOrdinalById", () => {
             const rawTypes = RAW_MESSAGE_TYPES.map(() => "?").join(", ");
-            const row = this.db
-                .prepare(
-                    `WITH target AS (
+            const row = this.prepare(
+                `WITH target AS (
                         SELECT seq FROM session_message
                         WHERE session_id = ? AND id = ? AND type IN (${rawTypes})
                         LIMIT 1
@@ -483,8 +785,7 @@ export class V2StoreReader {
                           AND seq <= target.seq
                     ) AS ordinal
                     FROM target`,
-                )
-                .get(sessionID, id, ...RAW_MESSAGE_TYPES, sessionID, ...RAW_MESSAGE_TYPES) as
+            ).get(sessionID, id, ...RAW_MESSAGE_TYPES, sessionID, ...RAW_MESSAGE_TYPES) as
                 | { ordinal?: number }
                 | undefined;
             return typeof row?.ordinal === "number" ? row.ordinal : null;
@@ -502,18 +803,16 @@ export class V2StoreReader {
             if (!Number.isSafeInteger(toOrdinal) || toOrdinal < fromOrdinal)
                 throw new Error("Invalid raw-message range end");
             const rawTypes = RAW_MESSAGE_TYPES.map(() => "?").join(", ");
-            const rows = this.db
-                .prepare(
-                    `SELECT id FROM session_message
+            const rows = this.prepare(
+                `SELECT id FROM session_message
                      WHERE session_id = ? AND type IN (${rawTypes})
                      ORDER BY seq ASC LIMIT ? OFFSET ?`,
-                )
-                .all(
-                    sessionID,
-                    ...RAW_MESSAGE_TYPES,
-                    toOrdinal - fromOrdinal + 1,
-                    fromOrdinal - 1,
-                ) as Array<{ id: string }>;
+            ).all(
+                sessionID,
+                ...RAW_MESSAGE_TYPES,
+                toOrdinal - fromOrdinal + 1,
+                fromOrdinal - 1,
+            ) as Array<{ id: string }>;
             return new Map(rows.map((row, index) => [row.id, fromOrdinal + index]));
         });
     }
@@ -528,22 +827,18 @@ export class V2StoreReader {
                 throw new Error("Invalid page limit");
             const rows = (
                 after
-                    ? this.db
-                          .prepare(
-                              `SELECT id, type, seq, json_valid(data) AS valid
+                    ? this.prepare(
+                          `SELECT id, type, seq, json_valid(data) AS valid
                                FROM session_message
                                WHERE session_id = ? AND (seq > ? OR (seq = ? AND id > ?))
                                ORDER BY seq ASC, id ASC LIMIT ?`,
-                          )
-                          .all(sessionID, after.timeCreated, after.timeCreated, after.id, limit)
-                    : this.db
-                          .prepare(
-                              `SELECT id, type, seq, json_valid(data) AS valid
+                      ).all(sessionID, after.timeCreated, after.timeCreated, after.id, limit)
+                    : this.prepare(
+                          `SELECT id, type, seq, json_valid(data) AS valid
                                FROM session_message
                                WHERE session_id = ?
                                ORDER BY seq ASC, id ASC LIMIT ?`,
-                          )
-                          .all(sessionID, limit)
+                      ).all(sessionID, limit)
             ) as Array<{ id: string; type: MessageType; seq: number; valid: number }>;
             const rawTypes = new Set<MessageType>(RAW_MESSAGE_TYPES);
             return rows.map((row) => ({
@@ -571,13 +866,11 @@ export class V2StoreReader {
     spanRowStamps(sessionID: string, after: number, through: number): Map<number, string> {
         if (!Number.isSafeInteger(after) || !Number.isSafeInteger(through))
             throw new Error("Invalid seq span");
-        const rows = this.db
-            .prepare(
-                `SELECT seq, id, time_updated AS updated, length(CAST(data AS BLOB)) AS bytes
+        const rows = this.prepare(
+            `SELECT seq, id, time_updated AS updated, length(CAST(data AS BLOB)) AS bytes
                  FROM session_message WHERE session_id = ? AND seq > ? AND seq <= ?
                  ORDER BY seq ASC`,
-            )
-            .all(sessionID, after, through) as Array<{
+        ).all(sessionID, after, through) as Array<{
             seq: number;
             id: string;
             updated: number | null;
@@ -597,35 +890,94 @@ export class V2StoreReader {
                 throw new Error("Invalid page limit");
             const rawTypes = RAW_MESSAGE_TYPES.map(() => "?").join(", ");
             return (
-                this.db
-                    .prepare(
-                        `SELECT id, session_id, type, seq, time_created, data FROM session_message
+                this.prepare(
+                    `SELECT id, session_id, type, seq, time_created, data FROM session_message
                          WHERE session_id = ? AND type IN (${rawTypes}) AND seq <= ?
                          ORDER BY seq DESC LIMIT ?`,
-                    )
-                    .all(sessionID, ...RAW_MESSAGE_TYPES, throughSeq, limit) as RawRow[]
+                ).all(sessionID, ...RAW_MESSAGE_TYPES, throughSeq, limit) as RawRow[]
             ).map(decode);
         });
     }
 
     sequenceForId(sessionID: string, id: string | null | undefined): number | undefined {
         if (!id) return undefined;
-        const row = this.db
-            .prepare("SELECT seq FROM session_message WHERE session_id = ? AND id = ? LIMIT 1")
-            .get(sessionID, id) as { seq?: number } | undefined;
+        const row = this.prepare(
+            "SELECT seq FROM session_message WHERE session_id = ? AND id = ? LIMIT 1",
+        ).get(sessionID, id) as { seq?: number } | undefined;
         return typeof row?.seq === "number" ? row.seq : undefined;
+    }
+
+    /** Native synthetics are user-shaped on the wire; their store kind is unambiguous. */
+    syntheticMessageIDs(sessionID: string): Set<string> {
+        const rows = this.prepare(
+            "SELECT id FROM session_message WHERE session_id = ? AND type = 'synthetic'",
+        ).all(sessionID) as Array<{ id: string }>;
+        return new Set(rows.map((row) => row.id));
+    }
+
+    /**
+     * The session this one was forked from and where the fork was cut, as the
+     * host recorded them (`session_v2.fork_session_id` and `fork_boundary`).
+     * Null for a session that is not a fork, a store without the columns, or a
+     * boundary that does not parse.
+     */
+    forkOrigin(sessionID: string): V2ForkOrigin | null {
+        const columns = new Set(
+            (this.prepare("PRAGMA table_info(session_v2)").all() as Array<{ name: string }>).map(
+                (column) => column.name,
+            ),
+        );
+        if (!columns.has("fork_session_id") || !columns.has("fork_boundary")) return null;
+        const row = this.prepare(
+            "SELECT fork_session_id, fork_boundary FROM session_v2 WHERE id = ?",
+        ).get(sessionID) as
+            | { fork_session_id: string | null; fork_boundary: string | null }
+            | undefined;
+        if (!row?.fork_session_id || !row.fork_boundary) return null;
+        try {
+            const boundary = JSON.parse(row.fork_boundary) as {
+                type?: unknown;
+                messageID?: unknown;
+            };
+            if (
+                (boundary.type !== "before" && boundary.type !== "through") ||
+                typeof boundary.messageID !== "string" ||
+                boundary.messageID.length === 0
+            )
+                return null;
+            return {
+                parentSessionID: row.fork_session_id,
+                boundary: { type: boundary.type, messageID: boundary.messageID },
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    /** Whether the host still has a session row for this id. */
+    sessionExists(sessionID: string): boolean {
+        return this.prepare("SELECT 1 FROM session_v2 WHERE id = ?").get(sessionID) != null;
+    }
+
+    /**
+     * Identity columns of every row of a session up to and including `throughSeq`,
+     * in seq order, without decoding any message body.
+     */
+    rowStampsThrough(sessionID: string, throughSeq: number): V2RowStamp[] {
+        return this.prepare(
+            `SELECT id, type, seq, time_created FROM session_message
+                 WHERE session_id = ? AND seq <= ? ORDER BY seq ASC`,
+        ).all(sessionID, throughSeq) as V2RowStamp[];
     }
 
     latestSequenceForIds(sessionID: string, ids: readonly string[]): number {
         let latest = -1;
         for (let offset = 0; offset < ids.length; offset += 500) {
             const chunk = ids.slice(offset, offset + 500);
-            const row = this.db
-                .prepare(
-                    `SELECT MAX(seq) AS seq FROM session_message
+            const row = this.prepare(
+                `SELECT MAX(seq) AS seq FROM session_message
                      WHERE session_id = ? AND id IN (${chunk.map(() => "?").join(", ")})`,
-                )
-                .get(sessionID, ...chunk) as { seq?: number | null } | undefined;
+            ).get(sessionID, ...chunk) as { seq?: number | null } | undefined;
             if (typeof row?.seq === "number") latest = Math.max(latest, row.seq);
         }
         return latest;
@@ -635,12 +987,11 @@ export class V2StoreReader {
         sessionID: string,
         status: "completed" | "running",
     ): StoreRow<"compaction"> | undefined {
-        const row = this.db
-            .prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
+        const row =
+            this.prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
                 WHERE session_id = ? AND type = 'compaction'
                   AND json_extract(data, '$.status') = ?
-                ORDER BY seq DESC LIMIT 1`)
-            .get(sessionID, status) as RawRow | undefined;
+                ORDER BY seq DESC LIMIT 1`).get(sessionID, status) as RawRow | undefined;
         return row ? (decode(row) as StoreRow<"compaction">) : undefined;
     }
 
@@ -666,48 +1017,45 @@ export class V2StoreReader {
     }
 
     earliestSequence(sessionID: string): number | undefined {
-        const row = this.db
-            .prepare("SELECT MIN(seq) AS seq FROM session_message WHERE session_id = ?")
-            .get(sessionID) as { seq: number | null } | undefined;
+        const row = this.prepare(
+            "SELECT MIN(seq) AS seq FROM session_message WHERE session_id = ?",
+        ).get(sessionID) as { seq: number | null } | undefined;
         return typeof row?.seq === "number" ? row.seq : undefined;
     }
 
     latestSequence(sessionID: string): number {
-        const row = this.db
-            .prepare("SELECT MAX(seq) AS seq FROM session_message WHERE session_id = ?")
-            .get(sessionID) as { seq: number | null } | undefined;
+        const row = this.prepare(
+            "SELECT MAX(seq) AS seq FROM session_message WHERE session_id = ?",
+        ).get(sessionID) as { seq: number | null } | undefined;
         return typeof row?.seq === "number" ? row.seq : -1;
     }
 
     assistantSince(sessionID: string, afterSeq: number): StoreRow<"assistant">[] {
         return trackDecodeOperation("assistantSince", () => {
-            const rows = this.db
-                .prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
+            const rows =
+                this.prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
                     WHERE session_id = ? AND type = 'assistant' AND seq > ?
-                    ORDER BY seq ASC`)
-                .all(sessionID, afterSeq) as RawRow[];
+                    ORDER BY seq ASC`).all(sessionID, afterSeq) as RawRow[];
             return rows.map((row) => decode(row) as StoreRow<"assistant">);
         });
     }
 
     latestAssistant(sessionID: string): StoreRow<"assistant"> | undefined {
         return trackDecodeOperation("latestAssistant", () => {
-            const row = this.db
-                .prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
+            const row =
+                this.prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
                     WHERE session_id = ? AND type = 'assistant'
-                    ORDER BY seq DESC LIMIT 1`)
-                .get(sessionID) as RawRow | undefined;
+                    ORDER BY seq DESC LIMIT 1`).get(sessionID) as RawRow | undefined;
             return row ? (decode(row) as StoreRow<"assistant">) : undefined;
         });
     }
 
     latestIdle(sessionID: string): StoreRow<"idle"> | undefined {
         return trackDecodeOperation("latestIdle", () => {
-            const row = this.db
-                .prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
+            const row =
+                this.prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
                     WHERE session_id = ? AND type = 'idle'
-                    ORDER BY seq DESC LIMIT 1`)
-                .get(sessionID) as RawRow | undefined;
+                    ORDER BY seq DESC LIMIT 1`).get(sessionID) as RawRow | undefined;
             return row ? (decode(row) as StoreRow<"idle">) : undefined;
         });
     }

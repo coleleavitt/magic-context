@@ -44,6 +44,10 @@ async function setup(
         removeError?: unknown;
         keepSubagents?: boolean;
         stuck?: boolean;
+        /** The directory the host reports for a parented child; it inherits its parent's. */
+        parentLocation?: string;
+        /** This plugin instance's own directory; defaults to `/project`. */
+        directory?: string;
     } = {},
 ) {
     const db = new Database(":memory:");
@@ -72,6 +76,9 @@ async function setup(
             return {
                 model: { providerID: "mock", id: "user" },
                 ...(parentID === undefined ? {} : { parentID }),
+                ...(options.parentLocation === undefined
+                    ? {}
+                    : { location: { directory: options.parentLocation } }),
             };
         },
         async switchModel() {},
@@ -128,7 +135,7 @@ async function setup(
     const executor = await createV2HiddenCompletionExecutor(host, {
         db,
         projectIdentity: "/project",
-        directory: "/project",
+        directory: options.directory ?? "/project",
         hook,
         openReader: () => ({
             latestSequence: (id) => rows.get(id)?.at(-1)?.seq ?? -1,
@@ -140,6 +147,12 @@ async function setup(
         ...(options.keepSubagents ? { keepSubagents: true } : {}),
         log: (message) => logs.push(message),
     });
+    let prompts = 0;
+    const prompt = host.prompt.bind(host);
+    host.prompt = async (input) => {
+        prompts++;
+        return prompt(input);
+    };
     const runOnce = async (identity: HiddenRunIdentity) => {
         const handle = await executor.open(identity);
         let settled = false;
@@ -168,6 +181,8 @@ async function setup(
         legacyRemovals,
         logs,
         runOnce,
+        executor,
+        prompts: () => prompts,
         failNextPrompt: () => {
             failNext = true;
         },
@@ -241,6 +256,80 @@ describe("OpenCode 2 hidden children on a host with session.remove", () => {
             expect(state.logs).toHaveLength(1);
             expect(state.logs[0]).toContain("does not keep the parent of hidden-run sessions");
             expect(state.logs[0]).toContain("asked for user-session, read back none");
+        } finally {
+            state.db.close();
+        }
+    });
+
+    // OpenCode 2 runs a session's hooks in the plugin instance of the session's
+    // location, and a child takes its parent's location. A child placed under a
+    // session of another directory would be shaped by an instance with no record
+    // of the run, so it is refused and removed before anything is prompted.
+    test("a child the host bound to another directory is removed before any prompt", async () => {
+        const state = await setup({ parentLocation: "/somewhere-else" });
+        try {
+            let caught: unknown;
+            try {
+                await state.executor.open(historian);
+            } catch (error) {
+                caught = error;
+            }
+            expect(String(caught)).toContain("hidden_prompt_unrecognized");
+            expect(String(caught)).toContain("bound to /somewhere-else");
+            expect(state.prompts()).toBe(0);
+            expect(state.removed).toEqual(["child-1"]);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    test("a child bound to this instance's own directory runs normally", async () => {
+        const state = await setup({ parentLocation: "/project" });
+        try {
+            const run = await state.runOnce(historian);
+            expect(run.settled).toBe(true);
+            expect(state.prompts()).toBe(1);
+        } finally {
+            state.db.close();
+        }
+    });
+
+    // OpenCode 2 on Windows reports a session's directory with forward slashes
+    // (`D:/coding/app`) while the plugin instance knows its location with
+    // backslashes. Those are the same directory, so the child must run; a
+    // genuinely different directory is still refused before any prompt.
+    for (const [label, parentLocation] of [
+        ["forward slashes against backslashes", "D:/coding/siac/wt/app"],
+        ["drive-letter case", "d:\\coding\\siac\\wt\\app"],
+        ["a trailing separator", "D:/coding/siac/wt/app/"],
+    ] as const) {
+        test(`a child bound to this instance's Windows directory spelled with ${label} runs normally`, async () => {
+            const state = await setup({ parentLocation, directory: "D:\\coding\\siac\\wt\\app" });
+            try {
+                const run = await state.runOnce(historian);
+                expect(run.settled).toBe(true);
+                expect(state.prompts()).toBe(1);
+            } finally {
+                state.db.close();
+            }
+        });
+    }
+
+    test("a child bound to a different Windows directory is still removed before any prompt", async () => {
+        const state = await setup({
+            parentLocation: "D:/coding/siac/wt/other",
+            directory: "D:\\coding\\siac\\wt\\app",
+        });
+        try {
+            let caught: unknown;
+            try {
+                await state.executor.open(historian);
+            } catch (error) {
+                caught = error;
+            }
+            expect(String(caught)).toContain("hidden_prompt_unrecognized");
+            expect(state.prompts()).toBe(0);
+            expect(state.removed).toEqual(["child-1"]);
         } finally {
             state.db.close();
         }

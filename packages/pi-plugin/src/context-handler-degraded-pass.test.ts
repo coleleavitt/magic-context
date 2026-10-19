@@ -131,16 +131,35 @@ describe("Pi context handler never serves a degraded pass", () => {
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
 			expect(result.error).toMatchObject({
-				name: "PiDegradedPassError",
-				site: "raw-messages-over-limit",
+				name: "PiStorageBusyError",
+				cause: { name: "PiDegradedPassError", site: "context-handler-failed" },
 			});
 		}
 	});
 
-	it("still falls through to Pi's messages after an ordinary failure that fits", async () => {
+	it("refuses an ordinary failure even when the raw messages fit", async () => {
 		const { result } = await runFailingPass(
 			"pi-degraded-raw-fits",
 			{
+				resolveForProject: () => {
+					throw new Error("ordinary transform defect");
+				},
+			},
+			[userMessage("hello", 1)],
+		);
+		expect(result.ok).toBe(false);
+		if (!result.ok)
+			expect(result.error).toMatchObject({
+				name: "PiStorageBusyError",
+				cause: { name: "PiDegradedPassError", site: "context-handler-failed" },
+			});
+	});
+
+	it("passes through an ordinary failure when compaction is off", async () => {
+		const { result } = await runFailingPass(
+			"pi-degraded-off",
+			{
+				compactionOff: true,
 				resolveForProject: () => {
 					throw new Error("ordinary transform defect");
 				},

@@ -7,6 +7,7 @@ import { toDatabase } from "./mock-database";
 //#given
 const makeDb = () => {
     const prepare = mock((_sql: string) => ({
+        get: mock((_sessionId: string) => undefined),
         run: mock((_sessionId: string) => {}),
     }));
 

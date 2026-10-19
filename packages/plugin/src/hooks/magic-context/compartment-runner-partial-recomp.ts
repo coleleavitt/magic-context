@@ -372,12 +372,9 @@ export async function executePartialRecompInternal(
             // prior in-flight incremental publish may have left behind — partial
             // recomp now owns the boundary up to lastEnd.
             if (lastEnd > 0) {
-                const markerUpdated = updateCompactionMarkerAfterPublication(
-                    db,
-                    sessionId,
-                    lastEnd,
-                    deps.directory,
-                );
+                const markerUpdated = (
+                    deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication
+                )(db, sessionId, lastEnd, deps.directory);
                 // Only clear the stale pending blob when the boundary actually
                 // advanced — preserve it for the deferred-drain retry on failure.
                 if (markerUpdated) {
@@ -420,6 +417,7 @@ export async function executePartialRecompInternal(
                 promptFit.chunkTokens,
                 offset,
                 snapEnd + 1, // exclusive upper bound — readSessionChunk stops before this ordinal
+                { expandTools: deps.historianExpandTools },
             );
             if (!chunk.text || chunk.messageCount === 0 || chunk.endIndex < offset) {
                 return `## Magic Recomp — Failed\n\nRecomp stopped because raw history ${offset}-${snapEnd} could not be turned into a valid historian chunk. Partial recomp preserved original state (staging kept for retry).`;
@@ -433,7 +431,8 @@ export async function executePartialRecompInternal(
                 return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("recomp_unavailable")}`;
             }
 
-            // v2 bounded reference model: 4 rotating seeds + last-6 recency
+            // Bounded calibration: 3 seeds + 3 diverse older + 4 recent examples.
+            // Recent scores are hidden to prevent anchoring in one-compartment runs
             // (the compartments rebuilt so far in this partial-recomp run provide
             // continuity). Structural rebuild → no <project-memory> dedup block.
             const prompt = buildCompartmentAgentPrompt({
@@ -495,6 +494,7 @@ export async function executePartialRecompInternal(
                         reducedBudget,
                         offset,
                         snapEnd + 1,
+                        { expandTools: deps.historianExpandTools },
                     );
                     if (smallerChunk.messageCount > 0 && smallerChunk.endIndex < chunk.endIndex) {
                         await sendStatusNotification(

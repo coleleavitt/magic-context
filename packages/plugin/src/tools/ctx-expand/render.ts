@@ -25,11 +25,12 @@ import { createHash } from "node:crypto";
 import { type ContextDatabase, getTagById } from "../../features/magic-context/storage";
 import {
     readRawSessionMessageById,
-    readRawSessionMessages,
     visitRawSessionMessages,
 } from "../../hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "../../hooks/magic-context/read-session-formatting";
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
+import { expandToolPart } from "../../shared/historian-tool-expansions";
+import type { ToolExpansionMap } from "../../shared/historian-tool-template";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -154,8 +155,12 @@ function reasoningOf(part: Record<string, unknown>): string | null {
 }
 
 /** One per-part PREVIEW line for the verbose range view (bounded). */
-function renderPartPreview(part: unknown): string | null {
+function renderPartPreview(part: unknown, expandTools?: ToolExpansionMap): string | null {
     if (!isRecord(part)) return null;
+    // Keep verbose ctx_expand's existing templates and length limits because its
+    // tool result goes to the main model. Historian input has no implicit limits.
+    const expansion = expandToolPart(part, expandTools, true);
+    if (expansion !== null) return `    • tool ${part.tool}: ${expansion}`;
     const text = textOf(part);
     if (text !== null) {
         const t = truncate(text, 200);
@@ -269,6 +274,7 @@ export function renderVerboseRange(
     start: number,
     end: number,
     tokenBudget: number,
+    expandTools?: ToolExpansionMap,
 ): VerboseRangeResult {
     const out: string[] = [];
     let usedTokens = 0;
@@ -279,7 +285,9 @@ export function renderVerboseRange(
     // over a long session never loads every message and tool output at once.
     visitRawSessionMessages(sessionId, start, end, (msg: RawMessage) => {
         const header = `[${msg.ordinal}] ${verboseRoleLabel(msg)}`;
-        const partLines = msg.parts.map(renderPartPreview).filter((l): l is string => l !== null);
+        const partLines = msg.parts
+            .map((part) => renderPartPreview(part, expandTools))
+            .filter((l): l is string => l !== null);
         const block = partLines.length > 0 ? `${header}\n${partLines.join("\n")}` : header;
 
         const blockTokens = estimateTokens(block);
@@ -318,16 +326,20 @@ export function renderItemByTag(
             ) ?? [];
         // Pi stores a tool's invocation and result as separate messages.
         if (!parts.some((part) => isRecord(part) && asToolPart(part)?.output !== null)) {
-            const messages = readRawSessionMessages(sessionId);
-            const ownerIndex = messages.findIndex((candidate) => candidate.id === owner);
-            for (const candidate of messages.slice(Math.max(0, ownerIndex + 1))) {
-                const matching = candidate.parts.filter(
-                    (part) => isRecord(part) && asToolPart(part)?.callId === tag.messageId,
-                );
-                if (matching.some((part) => isRecord(part) && part.type === "tool_use")) break;
-                parts.push(...matching);
-                if (matching.length > 0) break;
-            }
+            visitRawSessionMessages(
+                sessionId,
+                message.ordinal + 1,
+                Number.MAX_SAFE_INTEGER,
+                (candidate) => {
+                    const matching = candidate.parts.filter(
+                        (part) => isRecord(part) && asToolPart(part)?.callId === tag.messageId,
+                    );
+                    if (matching.some((part) => isRecord(part) && part.type === "tool_use"))
+                        return false;
+                    parts.push(...matching);
+                    return matching.length === 0;
+                },
+            );
         }
         const rendered = parts.map(renderPartFull).filter((part): part is string => part !== null);
         return rendered.length

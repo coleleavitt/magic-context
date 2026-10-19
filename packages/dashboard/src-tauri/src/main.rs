@@ -34,7 +34,7 @@ fn main() {
     }
 
     tauri::Builder::default()
-        // shell plugin removed — no shell:default capability needed
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
@@ -106,6 +106,7 @@ fn main() {
             commands::get_user_memories,
             commands::get_user_memory_candidates,
             commands::dismiss_user_memory,
+            commands::restore_user_memory,
             commands::delete_user_memory,
             commands::update_user_memory_content,
             commands::delete_user_memory_candidate,

@@ -81,10 +81,12 @@ import { hasUserAnswerMetadata } from "@magic-context/core/shared/user-answer";
 import {
 	canRemoveNativeToolCall,
 	removeNativeToolCall,
+	rewriteNativeAssistantTexts,
 } from "./native-replay-pi";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
 import { resolvePiStableId, SYNTH_USER_ID_PREFIX } from "./read-session-pi";
 import { isPiSystemEntry, type PiSystemEntry } from "./system-entry-pi";
+import { PI_IMAGE_TOKENS } from "./tokenize-pi-messages";
 
 // We re-declare the minimal subset of pi-ai message shapes we need.
 // Importing from @earendil-works/pi-ai directly would couple the plugin
@@ -92,14 +94,23 @@ import { isPiSystemEntry, type PiSystemEntry } from "./system-entry-pi";
 // to construct synthetic messages, and a local type makes that easier.
 // The shape MUST stay structurally compatible with pi-ai's exports.
 
-type PiTextContent = { type: "text"; text: string; textSignature?: string };
+type PiProvenance = { synthetic?: boolean; ignored?: boolean };
+type PiTextContent = PiProvenance & {
+	type: "text";
+	text: string;
+	textSignature?: string;
+};
 type PiThinkingContent = {
 	type: "thinking";
 	thinking: string;
 	thinkingSignature?: string;
 	redacted?: boolean;
 };
-type PiImageContent = { type: "image"; data: string; mimeType: string };
+type PiImageContent = PiProvenance & {
+	type: "image";
+	data: string;
+	mimeType: string;
+};
 type PiToolCall = {
 	type: "toolCall";
 	id: string;
@@ -108,7 +119,7 @@ type PiToolCall = {
 	thoughtSignature?: string;
 };
 
-type PiUserMessage = {
+type PiUserMessage = PiProvenance & {
 	role: "user";
 	content: string | (PiTextContent | PiImageContent)[];
 	timestamp: number;
@@ -165,6 +176,8 @@ export function createPiTranscript(
 		preserveReasoningToolArcs?: boolean;
 		/** Gate first structural application for every arc, including calls without native envelopes. */
 		authorizeToolRemoval?: (callId: string) => boolean | "defer";
+		/** Optional bulk persistence of the same decisions requested during measurement. */
+		authorizeToolRemovals?: (callIds: readonly string[]) => void;
 	} = {},
 ): Transcript & {
 	/**
@@ -198,6 +211,8 @@ export function createPiTranscript(
 	getToolInputChanges(): ReadonlyMap<number, ReadonlySet<string>>;
 	/** Splice emptied tool messages only after the caller captures positional stable IDs. */
 	finalizeToolRemovals(): void;
+	/** Prepare native removal decisions with one message walk, in tag order. */
+	prepareToolRemovalMeasurements(callIds: readonly string[]): void;
 } {
 	const working = source.slice() as unknown as PiAgentMessage[];
 	const dirtyMessages = new Set<number>();
@@ -236,9 +251,34 @@ export function createPiTranscript(
 	return {
 		messages: transcriptMessages,
 		harness: resolvePiHarnessKind(),
+		prepareToolRemovalMeasurements(callIds): void {
+			if (!options.authorizeToolRemovals || callIds.length === 0) return;
+			const requested = new Set(callIds);
+			const eligible = new Set<string>();
+			// Match canRemove() exactly. Do not freeze calls whose native envelope
+			// cannot be structurally edited, even if they are selected for a skeleton.
+			for (const message of working) {
+				if (message.role !== "assistant" || !Array.isArray(message.content))
+					continue;
+				for (const part of message.content) {
+					if (
+						part.type === "toolCall" &&
+						requested.has(part.id) &&
+						canRemoveNativeToolCall(message, part.id)
+					)
+						eligible.add(part.id);
+				}
+			}
+			options.authorizeToolRemovals(
+				callIds.filter((callId) => eligible.has(callId)),
+			);
+		},
 		commit(): void {
 			if (committed) return;
 			committed = true;
+			for (const index of dirtyMessages) {
+				rewriteNativeAssistantTexts(working[index], source[index], sessionId);
+			}
 			for (const [index, parts] of removals) {
 				const message = working[index];
 				if (
@@ -579,6 +619,12 @@ function createPiUserStringPart(
 ): TranscriptPart {
 	return {
 		kind: "text",
+		get synthetic() {
+			return (working[messageIndex] as PiUserMessage).synthetic;
+		},
+		get ignored() {
+			return (working[messageIndex] as PiUserMessage).ignored;
+		},
 		// User text parts do not need per-part ids: tagTranscript keys them by
 		// the stable parent message id plus text ordinal.
 		id: undefined,
@@ -626,6 +672,14 @@ function createPiUserArrayPart(
 	const kind: TranscriptPartKind = classifyContent(part);
 	return {
 		kind,
+		synthetic: msg.synthetic || part?.synthetic,
+		ignored: msg.ignored || part?.ignored,
+		imageTokens() {
+			const current = (working[messageIndex] as PiUserMessage).content;
+			return Array.isArray(current) && current[partIndex]?.type === "image"
+				? PI_IMAGE_TOKENS
+				: 0;
+		},
 		// User array parts are not tool/content units. Text is keyed by parent
 		// message id + ordinal; images remain non-droppable user payloads.
 		id: undefined,
@@ -859,6 +913,8 @@ function createPiAssistantPart(
 					...existing,
 					arguments: { dropped: sentinelText },
 				};
+			} else if (existing?.type === "text") {
+				newContent[partIndex] = { ...existing, text: sentinelText };
 			} else {
 				newContent[partIndex] = { type: "text", text: sentinelText };
 			}
@@ -890,6 +946,12 @@ function createPiToolResultPart(
 	return {
 		kind,
 		id: msg.toolCallId,
+		imageTokens() {
+			return (working[messageIndex] as PiToolResultMessage).content[partIndex]
+				?.type === "image"
+				? PI_IMAGE_TOKENS
+				: 0;
+		},
 		remove(): boolean {
 			return markToolRemoval(working, messageIndex, partIndex);
 		},

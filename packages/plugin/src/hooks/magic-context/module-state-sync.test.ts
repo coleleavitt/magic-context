@@ -31,6 +31,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
+    __moduleStateSyncTest,
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
     loadModuleWatermarks,
@@ -49,6 +50,22 @@ const databases: Database[] = [];
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 const originalLogPath = process.env.MAGIC_CONTEXT_LOG_PATH;
+
+it("sorts canonical seeds byte-identically with one key read per seed", () => {
+    let reads = 0;
+    const seeds = ["strip2", "strip10", "strip1", "strip1"].map((id) => ({
+        get message_id() {
+            reads++;
+            return id;
+        },
+        strip_kind: "placeholder",
+    }));
+    const sorted = __moduleStateSyncTest.sortCanonicalSeeds(seeds);
+    expect(reads).toBe(seeds.length);
+    expect(sorted).toEqual([seeds[2], seeds[3], seeds[1], seeds[0]]);
+    expect(sorted[0]).toBe(seeds[2]);
+    expect(sorted[1]).toBe(seeds[3]);
+});
 
 afterEach(() => {
     for (const db of databases.splice(0)) closeQuietly(db);

@@ -7,7 +7,6 @@ import {
   cacheActivityNote,
   cacheCardCountLabel,
   cacheCardSummary,
-  cacheCardTitle,
   cacheEventPercentage,
   cacheHarnessOptions,
   cachePercentage,
@@ -18,7 +17,7 @@ import {
   cacheSessionVisible,
   sessionModelLabel,
   sessionModelSummary,
-} from "./CacheDiagnostics";
+} from "./cache-diagnostics-model";
 
 const brocaRow: SessionCacheStats = {
   harness: "broca",
@@ -72,6 +71,8 @@ function event(partial: Partial<DbCacheEvent>): DbCacheEvent {
     context_limit: 0,
     context_limit_estimated: false,
     is_drop: false,
+    context_reduced_by_mc: true,
+    drop_request_size: null,
     aggregate: false,
     cold_start: false,
     cache_write_reported: true,
@@ -204,18 +205,6 @@ describe("session cards", () => {
     ]);
     expect(summary.tone).toBe("ratio");
     expect(summary.ratio).toBeCloseTo(900 / 1100);
-  });
-
-  test("long names keep their last meaningful part", () => {
-    const named = (title: string) => ({ ...brocaRow, title });
-    expect(cacheCardTitle(named("alfonso:consult-00000000-1111-2222-3333-4444a1b2c3"))).toBe(
-      "consult-…a1b2c3",
-    );
-    expect(cacheCardTitle(named("alfonso:oneshot-9f8e7d6c5b4a39281706f5e4d3"))).toBe(
-      "oneshot-…f5e4d3",
-    );
-    expect(cacheCardTitle(named("alfonso:bg_b1b7fea62af10d66"))).toBe("bg_b1b7fea62af10d66");
-    expect(cacheCardTitle(named("mc-historian:one"))).toBe("mc-historian:one");
   });
 });
 

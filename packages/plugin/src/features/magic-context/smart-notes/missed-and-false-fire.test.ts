@@ -1,6 +1,8 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import * as dns from "node:dns/promises";
 import { rmSync } from "node:fs";
+import * as https from "node:https";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
@@ -23,9 +25,27 @@ import { SmartNoteNetworkError } from "./types";
 
 const directories: string[] = [];
 const databases: Database[] = [];
+let lookup: ReturnType<typeof spyOn<typeof dns, "lookup">>;
+let request: ReturnType<typeof spyOn<typeof https, "request">>;
+beforeEach(() => {
+    // All HTTP data comes from injected capabilities. Fail closed if a future
+    // compiler change accidentally bypasses those fixtures.
+    lookup = spyOn(dns, "lookup").mockImplementation(() => {
+        throw new Error("fixture must not perform DNS");
+    });
+    request = spyOn(https, "request").mockImplementation(() => {
+        throw new Error("fixture must not open a network connection");
+    });
+});
 afterEach(() => {
+    const dnsCalls = lookup.mock.calls.length;
+    const networkCalls = request.mock.calls.length;
+    lookup.mockRestore();
+    request.mockRestore();
     for (const db of databases.splice(0)) db.close();
     for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
+    expect(dnsCalls).toBe(0);
+    expect(networkCalls).toBe(0);
 });
 function tempDirectory(): string {
     const dir = createTestTempDirFromPath(path.join(tmpdir(), "smart-notes-fixture-"));
@@ -66,6 +86,17 @@ function output(url: string): string {
         manifest: { capabilities: ["httpGet"], hosts: ["api.github.com"], urls: [url] },
         check_cron: "0 * * * *",
     });
+}
+function cronOutput(checkCron: string): string {
+    return JSON.stringify({
+        compiled_check: "function check() { return { met: false }; }",
+        manifest: { capabilities: [] },
+        check_cron: checkCron,
+    });
+}
+function sparseCron(): string {
+    const moreThanOneDayOut = new Date(Date.now() + 48 * 60 * 60 * 1000);
+    return `${moreThanOneDayOut.getMinutes()} ${moreThanOneDayOut.getHours()} ${moreThanOneDayOut.getDate()} ${moreThanOneDayOut.getMonth() + 1} *`;
 }
 function compile(
     condition: string,
@@ -132,15 +163,41 @@ test("oversized repair failure stops after two compiler calls", async () => {
     expect(transport.requests).toHaveLength(2);
 });
 
+test("sparse check_cron recompiles with correction and succeeds with a frequent cron", async () => {
+    const transport = carrier([cronOutput(sparseCron()), cronOutput("0 * * * *")]);
+    const result = await compile("wait until a future date", emptyCapabilities, transport.executor);
+
+    expect(result).toMatchObject({ ok: true, checkCron: "0 * * * *" });
+    expect(transport.requests).toHaveLength(2);
+    expect(transport.requests[1]).toContain(
+        "check_cron must fire at least once every 24 hours; put date conditions inside compiled_check",
+    );
+});
+
+test("sparse check_cron repair fails with the scheduling ceiling error", async () => {
+    const transport = carrier([cronOutput(sparseCron())]);
+    const result = await compile("wait until a future date", emptyCapabilities, transport.executor);
+
+    expect(result).toMatchObject({
+        ok: false,
+        error: "check_cron has no occurrence within the scheduling ceiling",
+    });
+    expect(transport.requests).toHaveLength(2);
+});
+
 const original =
     "a tag on cortexkit/insula that isn't an ancestor of master, or a tag other than v0.1.0/v0.1.1 exists";
 function tagRepository() {
     const dir = tempDirectory();
     const git = (...args: string[]) =>
-        execFileSync("git", ["-C", dir, ...args], {
+        // Fixture commits must not invoke inherited hooks, signing agents or
+        // user configuration: these can contact services or wait for input.
+        execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-C", dir, ...args], {
             encoding: "utf8",
             stdio: ["ignore", "pipe", "pipe"],
             windowsHide: true,
+            timeout: 5_000,
+            env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
         }).trim();
     git("init", "-b", "master");
     git("config", "user.name", "Fixture");

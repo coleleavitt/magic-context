@@ -2471,6 +2471,32 @@ export function getProjectEmbeddingSnapshot(
     return registration ? snapshotFor(registration) : null;
 }
 
+/**
+ * Install a worker-local search runtime backed by the owner's provider bridge.
+ * This does not register a project, load configuration, or write descriptors.
+ * The owner supplies the exact generation and model identities used for ranking;
+ * credentials and provider state remain on the owner thread.
+ */
+export function installProjectEmbeddingSearchBridge(
+    snapshot: ProjectEmbeddingRegistrationSnapshot,
+    provider: EmbeddingProvider,
+): void {
+    projectRegistrations.set(snapshot.projectIdentity, {
+        projectIdentity: snapshot.projectIdentity,
+        sourceDirectory: snapshot.sourceDirectory,
+        providerIdentity: snapshot.providerIdentity,
+        runtimeFingerprint: snapshot.runtimeFingerprint,
+        generation: snapshot.generation,
+        features: { ...snapshot.features },
+        modelId: snapshot.modelId,
+        chunkModelId: snapshot.chunkModelId,
+        // The bridge is already constructed; never instantiate a provider here.
+        config: { provider: "off" },
+        provider,
+        observationMode: !snapshot.historyEnabled,
+    });
+}
+
 export function getProjectChunkEmbeddingModelId(projectIdentity: string): string {
     const registration = projectRegistrations.get(projectIdentity);
     return registration && !registration.observationMode ? registration.chunkModelId : "off";
@@ -2886,13 +2912,15 @@ export async function drainCommitBacklogForProject(
 
     let total = 0;
     let leaseLost = false;
-    const renewal = setInterval(() => {
-        try {
-            if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
-        } catch {
-            // A transient database error leaves the current TTL in force.
-        }
-    }, SESSION_EMBED_LEASE_RENEWAL_MS);
+    const renewal = inRootAsyncContext(() =>
+        setInterval(() => {
+            try {
+                if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
+            } catch {
+                // A transient database error leaves the current TTL in force.
+            }
+        }, SESSION_EMBED_LEASE_RENEWAL_MS),
+    );
     (renewal as { unref?: () => void }).unref?.();
     try {
         while (
@@ -2918,6 +2946,7 @@ async function embedCompartmentChunkBatch(
     db: Database,
     projectIdentity: string,
     batchSize: number,
+    signal?: AbortSignal,
 ): Promise<number> {
     const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
     if (!snapshot?.historyEnabled || snapshot.chunkModelId === "off") return 0;
@@ -2939,6 +2968,7 @@ async function embedCompartmentChunkBatch(
         projectIdentity,
         snapshot.chunkModelId,
         candidates,
+        signal,
     );
     return embedded;
 }
@@ -3183,17 +3213,25 @@ async function drainCompartmentChunkBacklogForProject(
 
     let total = 0;
     let leaseLost = false;
-    const renewal = setInterval(() => {
-        try {
-            if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
-        } catch {
-            // A transient database error leaves the current TTL in force.
-        }
-    }, SESSION_EMBED_LEASE_RENEWAL_MS);
+    const drainAbort = new AbortController();
+    // Leave rate-limited rows for the next sweep instead of holding this lease
+    // beyond its wall-clock budget while waiting for a provider cooldown.
+    const deadlineTimer = setTimeout(() => drainAbort.abort(), Math.max(0, deadline - Date.now()));
+    (deadlineTimer as { unref?: () => void }).unref?.();
+    const renewal = inRootAsyncContext(() =>
+        setInterval(() => {
+            try {
+                if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
+            } catch {
+                // A transient database error leaves the current TTL in force.
+            }
+        }, SESSION_EMBED_LEASE_RENEWAL_MS),
+    );
     (renewal as { unref?: () => void }).unref?.();
     try {
         while (
             !leaseLost &&
+            !drainAbort.signal.aborted &&
             !isEmbeddingHostBusy() &&
             Date.now() < deadline &&
             total < CHUNK_DRAIN_MAX_PER_SWEEP
@@ -3202,6 +3240,7 @@ async function drainCompartmentChunkBacklogForProject(
                 db,
                 projectIdentity,
                 CHUNK_DRAIN_BATCH_SIZE,
+                drainAbort.signal,
             );
             if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
             if (leaseLost || embedded === 0) break;
@@ -3209,6 +3248,7 @@ async function drainCompartmentChunkBacklogForProject(
             if (embedded < CHUNK_DRAIN_BATCH_SIZE) break;
         }
     } finally {
+        clearTimeout(deadlineTimer);
         clearInterval(renewal);
         releaseGitSweepLease(db, projectIdentity, holderId);
     }
@@ -3301,16 +3341,18 @@ export async function embedSessionCompartmentChunks(
     const forwardCallerAbort = (): void => drainAbort.abort();
     if (options?.signal?.aborted) drainAbort.abort();
     else options?.signal?.addEventListener("abort", forwardCallerAbort, { once: true });
-    const renewal = setInterval(() => {
-        try {
-            if (!renewGitSweepLease(db, projectIdentity, holderId)) {
-                leaseLost = true;
-                drainAbort.abort();
+    const renewal = inRootAsyncContext(() =>
+        setInterval(() => {
+            try {
+                if (!renewGitSweepLease(db, projectIdentity, holderId)) {
+                    leaseLost = true;
+                    drainAbort.abort();
+                }
+            } catch {
+                /* best-effort; the current lease remains valid until its TTL */
             }
-        } catch {
-            /* best-effort; the current lease remains valid until its TTL */
-        }
-    }, SESSION_EMBED_LEASE_RENEWAL_MS);
+        }, SESSION_EMBED_LEASE_RENEWAL_MS),
+    );
     (renewal as { unref?: () => void }).unref?.();
 
     const batchSize = Math.max(1, options?.batchSize ?? CHUNK_DRAIN_BATCH_SIZE);
@@ -3647,3 +3689,5 @@ export function _resetProjectEmbeddingRegistryForTests(): void {
     shadowBackfillNow = () => Date.now();
     setBootQuietPeriodForTests(null);
 }
+
+import { inRootAsyncContext } from "../../shared/sqlite";

@@ -402,6 +402,53 @@ describe("message-index-async", () => {
         expect(isSessionReconciled("ses-clear")).toBe(true);
     });
 
+    it("coalesces a removal burst into one authoritative rebuild", async () => {
+        let clears = 0;
+        const prepare = db.prepare.bind(db);
+        db.prepare = ((sql: string) => {
+            const stmt = prepare(sql);
+            if (!sql.startsWith("DELETE FROM message_fts_rowid_map")) return stmt;
+            return new Proxy(stmt, {
+                get(target, property) {
+                    const value = Reflect.get(target, property);
+                    if (property === "run")
+                        return (...args: unknown[]) => {
+                            clears++;
+                            return Reflect.apply(value, target, args);
+                        };
+                    return typeof value === "function" ? value.bind(target) : value;
+                },
+            });
+        }) as typeof db.prepare;
+        const survivors = [message("survivor", 1, "unchanged searchable bytes")];
+        for (let i = 0; i < 8; i++) scheduleClearAndReindex(db, "burst", pagedReader(survivors));
+        await waitForCondition(() => isSessionReconciled("burst"));
+        expect(clears).toBe(1);
+        expect(countMessageRows(db, "burst", "survivor")).toBe(1);
+    });
+
+    it("rebuilds again when a removal lands during paged reconciliation", async () => {
+        let messages = Array.from({ length: 250 }, (_, i) => message(`m-${i}`, i + 1, `text ${i}`));
+        let removed = false;
+        const reader = Object.assign((_session: string) => messages, {
+            getCount: () => messages.length,
+            readPage: (_session: string, cursor: number, limit: number) => {
+                const page = messages.filter((m) => m.ordinal > cursor).slice(0, limit);
+                if (!removed) {
+                    removed = true;
+                    messages = messages.slice(1).map((m, i) => ({ ...m, ordinal: i + 1 }));
+                    scheduleClearAndReindex(db, "during", reader);
+                }
+                return page;
+            },
+        });
+        scheduleClearAndReindex(db, "during", reader);
+        await waitForCondition(
+            () => isSessionReconciled("during") && countMessageRows(db, "during", "m-0") === 0,
+        );
+        expect(countMessageRows(db, "during", "m-249")).toBe(1);
+    });
+
     it("rebuilds when removal overtakes a boot-quiet reconciliation", async () => {
         const sessionId = "ses-boot-clear";
         const surviving = [message("m-survivor", 1, "surviving searchable bytes")];

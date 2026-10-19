@@ -14,7 +14,6 @@ import {
     CATEGORY_PRIORITY,
     clearMemoryVerifications,
     getMemoriesByIds,
-    getMemoriesByProject,
     getMemoryByHash,
     getMemoryById,
     insertMemoryIdempotent,
@@ -36,6 +35,7 @@ import { createMemoryVisibilityPolicy } from "../../features/magic-context/memor
 import { computeNormalizedHash } from "../../features/magic-context/memory/normalize-hash";
 import { describeUnresolvedProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import {
+    getMemoriesForList,
     hasMemoryClassifiedAtColumn,
     hasMemoryShareableColumn,
 } from "../../features/magic-context/memory/storage-memory";
@@ -157,14 +157,6 @@ function formatMemoryList(memories: Memory[]): string {
         ].join("-+-"),
         ...rows.map(formatRow),
     ].join("\n");
-}
-
-function filterByCategory(memories: Memory[], category?: string): Memory[] {
-    if (!category) {
-        return memories;
-    }
-
-    return memories.filter((memory) => memory.category === category);
 }
 
 // Per-id not-found / not-visible wording. Sharing one message between the two
@@ -592,16 +584,15 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
             if (args.action === "list") {
                 const limit = normalizeLimit(args.limit);
                 const category = normalizeCategory(args.category);
-                const allMemories = getMemoriesByProject(deps.db, projectPath);
-                const memories = (
-                    activeCurateCategory
-                        ? allMemories.filter(
-                              (memory) =>
-                                  curateCategoryForMemoryCategory(memory.category) ===
-                                  activeCurateCategory,
-                          )
-                        : filterByCategory(allMemories, category)
-                ).slice(0, limit);
+                const categories = activeCurateCategory
+                    ? CATEGORY_PRIORITY.filter(
+                          (value) =>
+                              curateCategoryForMemoryCategory(value) === activeCurateCategory,
+                      )
+                    : category
+                      ? [category]
+                      : null;
+                const memories = getMemoriesForList(deps.db, projectPath, categories, limit);
 
                 return formatMemoryList(memories);
             }

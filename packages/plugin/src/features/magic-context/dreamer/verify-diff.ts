@@ -35,11 +35,13 @@ export async function buildVerifyDiffEvidence(
     if (!root || !head || memories.some((m) => !m.verifiedAt)) return null;
     try {
         const bases = new Map<number, string>();
+        const basesByTime = new Map<number, string>();
         for (const memory of memories) {
             const at = memory.verifiedAt;
             if (!at) return null;
             const base =
                 memory.verifiedCommit ??
+                basesByTime.get(at) ??
                 (
                     await git(root, [
                         "rev-list",
@@ -49,6 +51,7 @@ export async function buildVerifyDiffEvidence(
                     ])
                 ).trim();
             if (!/^[0-9a-f]{40}$/i.test(base)) return null;
+            if (!memory.verifiedCommit) basesByTime.set(at, base);
             bases.set(memory.id, base);
         }
         // A shared file is presented once, from the oldest verification time.
@@ -77,34 +80,27 @@ export async function buildVerifyDiffEvidence(
             }
         }
         const files: VerifyDiffEvidence["files"] = [];
-        const namesByBase = new Map<string, string>();
+        const namesByBase = new Map<string, string[][]>();
         for (const [file, group] of grouped) {
             // Git's rename detection needs both sides in its candidate set. Reuse
             // name-status across files sharing a base instead of scanning every
             // commit's files once per mapped file.
             let names = namesByBase.get(group.base);
             if (names === undefined) {
-                names = await git(root, ["diff", "-M", "--name-status", group.base, head]);
+                names = (await git(root, ["diff", "-M", "--name-status", group.base, head]))
+                    .split("\n")
+                    .map((line) => line.split("\t"));
                 namesByBase.set(group.base, names);
             }
-            const rename = names
-                .split("\n")
-                .map((line) => line.split("\t"))
-                .find((parts) => parts[0]?.startsWith("R") && parts[1] === file);
+            const rename = names.find((parts) => parts[0]?.startsWith("R") && parts[1] === file);
             const paths = rename ? [file, rename[2]] : [file];
-            const committed = await git(root, [
-                "diff",
-                "-M",
-                "--no-ext-diff",
-                group.base,
-                head,
-                "--",
-                ...paths,
+            const [committed, pending] = await Promise.all([
+                git(root, ["diff", "-M", "--no-ext-diff", group.base, head, "--", ...paths]),
+                git(root, ["diff", "-M", "--no-ext-diff", head, "--", ...paths]),
             ]);
-            const pending = await git(root, ["diff", "-M", "--no-ext-diff", head, "--", ...paths]);
             const status = rename
                 ? `RENAMED ${file} -> ${rename[2]}\n`
-                : names.split("\n").some((line) => line === `D\t${file}`)
+                : names.some((parts) => parts[0] === "D" && parts[1] === file && parts.length === 2)
                   ? `DELETED ${file}\n`
                   : "";
             files.push({

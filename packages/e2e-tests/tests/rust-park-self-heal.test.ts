@@ -30,8 +30,10 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { inspectHostOpenFiles } from "../src/host-open-files";
 import { RUST_REFUSAL_RECOVERY_PROMPT } from "../../plugin/src/hooks/magic-context/rust-refusal-recovery";
-import { RustTestHarness } from "../src/rust-harness";
+import { RustTestHarness, stableSerialize } from "../src/rust-harness";
 import {
     driveToSteadyState,
     rustPrereqs,
@@ -97,11 +99,93 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
         );
     }
 
+    async function requireAuthorizedRecovery(sessionId: string): Promise<void> {
+        // Small park fixtures can sit wholly inside the protected tail. Add real
+        // raw mass first, so the flush has eligible history rather than merely
+        // scheduling a protected-tail no-op. This pressure is not a defer rewrite.
+        const beforePressure = h.readRustPasses().length;
+        h.mock.setDefault({ text: "pressure answer before flush", usage: { input_tokens: 60_000, output_tokens: 20 } });
+        await h.sendPrompt(sessionId, `eligible history for recovery flush: ${h.ballast(10_000)}`);
+        let count = (await h.waitForRustPasses(beforePressure + 1)).length;
+        let rebuilt: ReturnType<typeof h.readRustPasses>[number] | undefined;
+        // A short session may need another eligible chunk, and the historian
+        // publishes asynchronously. Every attempt explicitly requests a flush;
+        // merely seeing a healthy defer is not evidence of representation recovery.
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const command = await fetch(`${h.opencode.url}/session/${sessionId}/command`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ command: "ctx-flush", arguments: "" }),
+            });
+            expect(command.status).toBe(204);
+            h.mock.setDefault({ text: "authorized rebuild answer", usage: { input_tokens: 1_000, output_tokens: 20 } });
+            await h.sendPrompt(sessionId, `authorized rebuild after recovery ${attempt}: ${attempt > 0 ? h.ballast(10_000) : ""}`);
+            const passes = await h.waitForRustPasses(count + 1);
+            count = passes.length;
+            const candidate = passes.at(-1)!;
+            expect(candidate.applied).toBe(true);
+            if (["HARD", "MIGRATE_HARD", "EXECUTE", "SOFT"].includes(candidate.decision) && candidate.servedFrom === "transform") {
+                rebuilt = candidate;
+                break;
+            }
+        }
+        expect(rebuilt).toBeDefined();
+        if (!rebuilt) throw new Error("explicit flush never produced a served rebuild");
+        // Inspect user content, not the system guidance that describes tag syntax.
+        const users = h.lastMainMessages().filter(message => message.role === "user");
+        expect(stableSerialize(users)).toMatch(/§\d+§[^§]*authorized rebuild after recovery/);
+        // A flush can refresh the cached head (SOFT) before any history summary
+        // is published. The first summary must then be folded into the baseline
+        // (HARD) to record which raw messages it covers. Wait for that publication
+        // and require this one fold, rather than allowing arbitrary prefix changes.
+        const firstFoldPending = stableSerialize(h.lastMainMessages()[0]).includes("<session-history></session-history>");
+        if (firstFoldPending) {
+            expect(rebuilt.decision).toBe("SOFT");
+            expect(rebuilt.reason).toBe("explicit_flush");
+            await h.waitFor(async () => {
+                const status = await h.subc.moduleStatus(sessionId, h.env.workdir, "session.status");
+                return Number(status.compartment_count) > 0;
+            }, { label: "first historian compartment published after boundaryless flush" });
+        }
+        // Folding inserts a host compaction marker, so the next request resends
+        // the full message array. The following two requests must send only tail
+        // changes, and all requests after the fold must preserve the cached bytes.
+        const continuations = firstFoldPending ? 4 : 3;
+        for (let i = 0; i < continuations; i++) {
+            const prefix = h.lastMainMessages();
+            h.mock.setDefault({ text: `continued answer ${i}`, usage: { input_tokens: 1_000, output_tokens: 20 } });
+            await h.sendPrompt(sessionId, `delta continuation after recovery ${i}`);
+            const pass = (await h.waitForRustPasses(count + 1 + i)).at(-1)!;
+            expect(pass.applied).toBe(true);
+            expect(pass.servedFrom).toBe("transform");
+            expect(pass.rowVersion).toBeGreaterThan(rebuilt.rowVersion);
+            if (firstFoldPending && i === 0) {
+                expect(pass.decision).toBe("HARD");
+                expect(pass.reason).toBe("coverage_fold");
+                expect(pass.raw).toContain("prefix_bust_permitted=true");
+                expect(stableSerialize(h.lastMainMessages()[0])).toContain("Hermetic Broca chunk");
+                const status = await h.subc.moduleStatus(sessionId, h.env.workdir, "session.status");
+                expect(status.boundary_present).toBe(true);
+                expect(Number(status.coverage_ordinal)).toBeGreaterThan(0);
+            } else {
+                expect(pass.decision).toBe("SOFT+");
+                expect(pass.reason).toBe("none");
+                expect(pass.raw).toContain("prefix_bust_permitted=false");
+                expect(stableSerialize(h.lastMainMessages().slice(0, prefix.length))).toBe(stableSerialize(prefix));
+            }
+            if (i > (firstFoldPending ? 1 : 0)) expect(pass.wireMessages).toBeLessThan(pass.inputCount);
+        }
+        console.log("PARK_AUTHORIZED_RECOVERY", JSON.stringify({ sessionId, passes: h.readRustPasses().slice(count - 1).map(p => p.raw) }));
+    }
+
     beforeEach(async () => {
         h = await RustTestHarness.create({
             modelContextLimit: 100_000,
             magicContextConfig: { execute_threshold_percentage: 40, protected_tags: 1 },
         });
+        const proof = inspectHostOpenFiles(h.opencode.pid, dirname(h.env.dataDir));
+        expect(proof.databases.length).toBeGreaterThan(0);
+        console.log("PARK_HOST_ISOLATION", JSON.stringify({ pid: proof.pid, databases: proof.databases }));
     });
 
     afterEach(async () => {
@@ -145,10 +229,14 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
             const all = await h.waitForRustPasses(beforeCount + 4);
             const after = all.slice(beforeCount);
 
-            // Wedge-free recovery: the module served real transforms again after the
-            // restart, and the session is not left permanently parked.
-            expect(after.some((p) => p.servedFrom === "transform")).toBe(true);
+            // Wedge-free recovery means a healthy module applies and advances its
+            // row version. The host may retain frozen bytes until a genuine rebuild.
+            expect(after.some((p) =>
+                p.applied && p.rowVersion > (before.at(-1)?.rowVersion ?? 0) &&
+                (p.servedFrom === "transform" || p.servedFrom === "lkg_frozen"),
+            )).toBe(true);
             expect(after.at(-1)!.decision).not.toBe("parked");
+            await requireAuthorizedRecovery(sessionId);
         } catch (error) {
             await rethrowWithDiagnostics(sessionId, error);
         }
@@ -454,7 +542,8 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
             const sessionId = await h.createSession();
             try {
                 await driveToSteadyState(h, sessionId, 3);
-                const beforeCount = h.readRustPasses().length;
+                const before = h.readRustPasses();
+                const beforeCount = before.length;
 
                 // Prolonged outage: kill the module and keep it down across several
                 // passes so the adapter crosses its three-failure park threshold.
@@ -487,19 +576,28 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
                             cache_creation_input_tokens: 1_000,
                         },
                     });
+                    const prefix = h.lastMainMessages();
                     await h.sendPrompt(sessionId, `recovery turn ${i}: ${h.ballast(400)}`, {
                         timeoutMs: 30_000,
                     });
-                    await Bun.sleep(300);
+                    const pass = (await h.waitForRustPasses(beforeCount + 5 + i - 8)).at(-1)!;
+                    if (pass.applied && pass.servedFrom === "lkg_frozen") {
+                        expect(stableSerialize(h.lastMainMessages().slice(0, prefix.length))).toBe(stableSerialize(prefix));
+                    }
                 }
 
                 const all = await h.waitForRustPasses(beforeCount + 15);
                 const recovery = all.slice(beforeCount + 5);
 
-                // Outcome: after the module recovers the session un-parks and serves
-                // real transforms again — no permanent park.
-                expect(recovery.some((p) => p.servedFrom === "transform")).toBe(true);
+                // Applied healthy defers prove recovery without demanding a rewrite
+                // of the frozen prompt; parked shortcuts cannot advance the module.
+                expect(recovery.some((p) =>
+                    p.applied && p.rowVersion > (before.at(-1)?.rowVersion ?? 0) &&
+                    (p.servedFrom === "transform" || p.servedFrom === "lkg_frozen"),
+                )).toBe(true);
                 expect(recovery.at(-1)!.decision).not.toBe("parked");
+                expect(recovery.some(p => p.applied && p.servedFrom === "lkg_frozen")).toBe(true);
+                await requireAuthorizedRecovery(sessionId);
             } catch (error) {
                 await rethrowWithDiagnostics(sessionId, error);
             }

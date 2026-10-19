@@ -1,17 +1,18 @@
 import type { Hooks, Plugin, PluginModule } from "@opencode-ai/plugin";
-
+import packageMetadata from "../package.json";
 import {
     buildHiddenAgentConfig,
     buildHiddenAgentRegistrations,
+    buildZenReadAgentRegistrations,
 } from "./agents/hidden-agent-registrations";
 import { withContentLanguageDirective } from "./agents/language-directive";
 import { denyTaskRoutingToCallerAgents } from "./agents/permissions";
 import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
+import { logConfigDependencyNotesOnce } from "./config/dependency-notes";
 import { createDreamerOutputCapSampler } from "./config/live-child-output-cap";
 import { dreamerRunConfig, historianRunConfig, pluginConfigReader } from "./config/live-run-config";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
-import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
 import type {
@@ -32,7 +33,7 @@ import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smar
 import {
     getSchemaFenceRejection,
     isDatabasePersisted,
-    openDatabase,
+    openCurrentDatabase as openDatabase,
     setSqlitePragmaConfig,
 } from "./features/magic-context/storage-db";
 import { recordToolDefinition } from "./features/magic-context/tool-definition-tokens";
@@ -50,6 +51,7 @@ import {
     SubcModuleTransport,
 } from "./hooks/magic-context/module-transport";
 import { preloadTokenizer } from "./hooks/magic-context/read-session-formatting";
+import type { RustLkgReplayParticipant } from "./hooks/magic-context/rust-lkg-freeze-registry";
 import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
 import {
     createBootBudget,
@@ -65,11 +67,15 @@ import { createDreamTimerModuleClient } from "./plugin/dream-timer-module-client
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./plugin/embedding-bootstrap";
 import { createEventHandler } from "./plugin/event";
 import { createSessionHooksAsync } from "./plugin/hooks/create-session-hooks";
+import { startHostStallProfilerSwitch } from "./plugin/host-stall-profiler";
 import { isDisposedInstanceDirectory } from "./plugin/instance-disposal";
 import { createMessagesTransformHandler } from "./plugin/messages-transform";
 import { disableNativeAutoCompaction } from "./plugin/native-compaction-guard";
 import { isDebugRpcEnabled, registerRpcHandlers } from "./plugin/rpc-handlers";
+import { bindStaleBuildNotice } from "./plugin/stale-build-notice";
+import { primaryOnlyToolIds } from "./plugin/subagent-tool-policy";
 import { createToolRegistry } from "./plugin/tool-registry";
+import { getMagicContextBuiltinCommands } from "./shared/builtin-commands";
 import { claimConfigParseFailuresOnce } from "./shared/config-diagnostics";
 import { buildOpenCodeConfigWarningBanner } from "./shared/config-warning-surface";
 import {
@@ -77,9 +83,14 @@ import {
     detectConflicts,
     resolveCompactionForBoot,
 } from "./shared/conflict-detector";
-import { getMagicContextStorageDir } from "./shared/data-path";
+import {
+    claimStorageBackupWarningCheck,
+    getMagicContextStorageDir,
+    isMagicContextStorageOutsideEngram,
+} from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
 import { setHarness } from "./shared/harness";
+import { shapeV1HiddenMessage } from "./shared/hidden-zen-read";
 import { setKeepSubagents } from "./shared/keep-subagents";
 import { flushLogger, log } from "./shared/logger";
 import {
@@ -98,15 +109,30 @@ import { createPromptSurfaceRuntime } from "./shared/prompt-surface-runtime";
 import { assertNoOpenCodeProviderContextEdits } from "./shared/provider-context-edit-guard";
 import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
+import { importPluginModule } from "./shared/stale-plugin-build";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
-import { reloadWindowOverlay } from "./shared/window-geometry";
+import { applyHiddenSubagentTemperature } from "./shared/subagent-temperature";
+import { registerStandalonePluginMarker } from "./standalone-plugin-marker";
 import { CTX_MEMORY_LIST_TOOL_NAME } from "./tools/ctx-memory";
 import { setup } from "./v2/server";
 
 const BOOT_SERVER_DEADLINE_MS = 15_000;
 const RESOLVED_CONFIG_TIMEOUT_MS = 2_000;
 
+function warnStorageBackupOnce(storageDir: string): void {
+    if (!claimStorageBackupWarningCheck()) return;
+    if (isMagicContextStorageOutsideEngram(storageDir)) {
+        log(
+            `[magic-context] Magic Context storage is at ${storageDir}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`,
+        );
+        flushLogger();
+    }
+}
+
+registerStandalonePluginMarker(packageMetadata.version);
+
 const server: Plugin = async (ctx) => {
+    bindStaleBuildNotice(ctx.client, import.meta.url);
     const bootStartedAt = performance.now();
     const bootBudget = createBootBudget(BOOT_SERVER_DEADLINE_MS, bootStartedAt);
     const storageBootTimings = { openMs: 0, guardMs: 0, migrateMs: 0 };
@@ -127,6 +153,9 @@ const server: Plugin = async (ctx) => {
     // host), this throws at boot instead of letting the seat tag every
     // session-scoped row under the wrong harness.
     setHarness("opencode");
+    // Off-by-default diagnostic for multi-second host main-thread stalls. Without
+    // its enable file this is one existsSync every 30 s. Process-wide and idempotent.
+    startHostStallProfilerSwitch();
 
     const configStartedAt = performance.now();
     beginBootQuietPeriod();
@@ -146,7 +175,6 @@ const server: Plugin = async (ctx) => {
         pluginConfig,
         () => liveConfigReader.poll().effective,
     );
-    reloadWindowOverlay(pluginConfig.models?.window_overlay_path);
     const promptSurfaceRuntime = createPromptSurfaceRuntime({
         harness: "opencode",
         directory: ctx.directory,
@@ -197,8 +225,8 @@ const server: Plugin = async (ctx) => {
         if (hasBannerEntries)
             setTimeout(async () => {
                 try {
-                    const { sendStatusNotification } = await import(
-                        "./hooks/magic-context/send-session-notification"
+                    const { sendStatusNotification } = await importPluginModule(
+                        () => import("./hooks/magic-context/send-session-notification"),
                     );
                     // Route the RPC warning to the first active session; never append a chat row.
                     // SDK types don't expose `session.list()`'s actual response shape (the
@@ -225,6 +253,10 @@ const server: Plugin = async (ctx) => {
             }, 3000);
     }
 
+    // Settings that are on but inert because another section turns off what
+    // they rely on (for example smart notes with the dreamer disabled).
+    logConfigDependencyNotesOnce(pluginConfig, log);
+
     const openCodeDbResolution = resolveOpenCodeDbPath();
     if (
         !openCodeDbPathExists(openCodeDbResolution) &&
@@ -236,8 +268,8 @@ const server: Plugin = async (ctx) => {
         );
         setTimeout(async () => {
             try {
-                const { sendStatusNotification } = await import(
-                    "./hooks/magic-context/send-session-notification"
+                const { sendStatusNotification } = await importPluginModule(
+                    () => import("./hooks/magic-context/send-session-notification"),
                 );
                 type SessionListFn = () => Promise<
                     { data?: Array<{ id?: string }> } | Array<{ id?: string }>
@@ -425,6 +457,7 @@ const server: Plugin = async (ctx) => {
         promptSurfaceRuntime,
         registrationPromptSurface: loadedPluginConfig.registrationPromptSurface,
         includeDreamerOnlyTools: true,
+        internalChildSessions: liveSessionState.internalChildSessions,
     });
 
     // v22 deferred legacy-memory identity backfill. createSessionHooks() opens
@@ -516,6 +549,7 @@ const server: Plugin = async (ctx) => {
     // `enabled` block lets the auto-update checker still coordinate even
     // when the rest of the runtime is disabled by config or conflicts.
     const storageDir = getMagicContextStorageDir();
+    warnStorageBackupOnce(storageDir);
 
     // Per-instance process-resident handles, hoisted to function scope so the
     // server.instance.disposed cleanup (wired into the event handler below, which
@@ -578,6 +612,7 @@ const server: Plugin = async (ctx) => {
                 },
                 mural: pluginConfig.mural,
                 retinaHandoff: pluginConfig.smart_notes.retina_handoff,
+                smartNotesEnabled: pluginConfig.smart_notes.enabled,
                 gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled
                     ? {
                           enabled: true,
@@ -704,13 +739,15 @@ const server: Plugin = async (ctx) => {
     {
         const fence = getSchemaFenceRejection();
         if (fence) {
-            void import("./plugin/conflict-warning-hook").then(({ sendSchemaFenceWarning }) =>
-                sendSchemaFenceWarning(
-                    ctx.client as unknown as Record<string, unknown>,
-                    ctx.directory,
-                    fence,
-                ),
-            );
+            void importPluginModule(() => import("./plugin/conflict-warning-hook"))
+                .then(({ sendSchemaFenceWarning }) =>
+                    sendSchemaFenceWarning(
+                        ctx.client as unknown as Record<string, unknown>,
+                        ctx.directory,
+                        fence,
+                    ),
+                )
+                .catch((error) => log("[magic-context] schema-fence warning unavailable:", error));
         }
     }
 
@@ -721,11 +758,11 @@ const server: Plugin = async (ctx) => {
             : typeof serverUrl === "string"
               ? serverUrl.replace(/\/$/, "")
               : undefined;
-    void import("./hooks/magic-context/send-session-notification").then(
-        ({ setNotificationServerUrl }) => {
+    void importPluginModule(() => import("./hooks/magic-context/send-session-notification"))
+        .then(({ setNotificationServerUrl }) => {
             setNotificationServerUrl(serverUrlStr);
-        },
-    );
+        })
+        .catch((error) => log("[magic-context] notification transport unavailable:", error));
 
     // Conflict warning / cleanup for Desktop mode.
     // TUI handles this via a startup dialog; this covers Desktop where we can't show dialogs.
@@ -767,7 +804,7 @@ const server: Plugin = async (ctx) => {
     // so a failure here can never block plugin startup.
     if (pluginConfig.enabled && !conflictResult?.hasConflict) {
         setTimeout(() => {
-            void import("./shared/announcement")
+            void importPluginModule(() => import("./shared/announcement"))
                 .then(
                     ({
                         shouldShowAnnouncement,
@@ -777,16 +814,17 @@ const server: Plugin = async (ctx) => {
                         markAnnouncementSeen,
                     }) => {
                         if (!shouldShowAnnouncement()) return;
-                        return import("./plugin/conflict-warning-hook").then(
-                            ({ sendStartupAnnouncement }) =>
-                                sendStartupAnnouncement(
-                                    ctx.client as unknown as Record<string, unknown>,
-                                    ctx.directory,
-                                    ANNOUNCEMENT_VERSION,
-                                    ANNOUNCEMENT_FEATURES,
-                                    ANNOUNCEMENT_FOOTER,
-                                    markAnnouncementSeen,
-                                ),
+                        return importPluginModule(
+                            () => import("./plugin/conflict-warning-hook"),
+                        ).then(({ sendStartupAnnouncement }) =>
+                            sendStartupAnnouncement(
+                                ctx.client as unknown as Record<string, unknown>,
+                                ctx.directory,
+                                ANNOUNCEMENT_VERSION,
+                                ANNOUNCEMENT_FEATURES,
+                                ANNOUNCEMENT_FOOTER,
+                                markAnnouncementSeen,
+                            ),
                         );
                     },
                 )
@@ -880,8 +918,19 @@ const server: Plugin = async (ctx) => {
                 } catch {
                     // best-effort
                 }
+                try {
+                    // Stop offering this instance's Rust adapter to the last-known-good
+                    // replay registry, which other instances in this process share.
+                    (
+                        magicContextRuntime.magicContext as {
+                            disposeRustAdapter?: () => void;
+                        } | null
+                    )?.disposeRustAdapter?.();
+                } catch {
+                    // best-effort
+                }
                 log(
-                    "[magic-context] instance disposed — stopped RPC server, dream timer, auto-update",
+                    "[magic-context] instance disposed — stopped RPC server, dream timer, auto-update, Rust replay registration",
                 );
             },
         }),
@@ -896,12 +945,20 @@ const server: Plugin = async (ctx) => {
             compactionOff: !isCompactionEnabled(pluginConfig),
             internalChildSessions: liveSessionState.internalChildSessions,
             tryReopenStorage,
+            // This instance's own Rust adapter (null in TypeScript mode), so a replay
+            // this wrapper serves is admitted and frozen by the adapter that runs it.
+            rustReplayParticipant: () =>
+                (
+                    magicContextRuntime.magicContext as {
+                        getRustReplayParticipant?: () => RustLkgReplayParticipant | null;
+                    } | null
+                )?.getRustReplayParticipant?.() ?? null,
             onStorageBusyRefusal: async (sessionId, message) => {
-                const { sendStatusNotification } = await import(
-                    "./hooks/magic-context/send-session-notification"
+                const { sendStatusNotification } = await importPluginModule(
+                    () => import("./hooks/magic-context/send-session-notification"),
                 );
-                const { abortSessionFailClosed } = await import(
-                    "./hooks/magic-context/transform-postprocess-phase"
+                const { abortSessionFailClosed } = await importPluginModule(
+                    () => import("./hooks/magic-context/transform-postprocess-phase"),
                 );
                 await sendStatusNotification(ctx.client, sessionId, message, {
                     toastDurationMs: 15000,
@@ -920,6 +977,7 @@ const server: Plugin = async (ctx) => {
         // loaded after Magic Context can still inject edits after this handler.
         "chat.params": async (input, output) => {
             dreamerCap.apply(input, output);
+            applyHiddenSubagentTemperature(input, output, log);
             assertNoOpenCodeProviderContextEdits(
                 input.model,
                 output.options,
@@ -953,6 +1011,7 @@ const server: Plugin = async (ctx) => {
                 provId && modId
                     ? { providerID: provId, modelID: modId, agentName: agent || "default" }
                     : null;
+            shapeV1HiddenMessage(input.sessionID, output.message);
             await magicContextRuntime.magicContext?.["chat.message"]?.(input, output);
         },
         "tool.definition": async (input, output) => {
@@ -997,6 +1056,16 @@ const server: Plugin = async (ctx) => {
                 if (pluginConfig.enabled !== true) {
                     return;
                 }
+                // The host applies these only when task creates a child session.
+                // Unlike agent permissions, this leaves the same agent's primary
+                // tool list unchanged and does not touch hidden maintenance runs.
+                const experimental = config.experimental as typeof config.experimental & {
+                    primary_tools?: string[];
+                };
+                config.experimental = {
+                    ...experimental,
+                    primary_tools: primaryOnlyToolIds(experimental?.primary_tools),
+                } as typeof config.experimental;
                 // In compaction-off mode native compaction is the user's chosen
                 // window manager, so it is left alone.
                 if (isCompactionEnabled(pluginConfig)) {
@@ -1077,6 +1146,7 @@ const server: Plugin = async (ctx) => {
                     historianOverrides: historianAgentOverrides,
                     historianDisallowed: pluginConfig.historian?.disallowed_tools ?? [],
                 });
+                registrations.push(...buildZenReadAgentRegistrations(registrations));
 
                 const agentConfig = { ...(config.agent ?? {}) } as NonNullable<typeof config.agent>;
                 const agentConfigRecord = agentConfig as Record<string, Record<string, unknown>>;

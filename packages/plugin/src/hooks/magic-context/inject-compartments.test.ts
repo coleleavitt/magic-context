@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,7 +24,10 @@ import type { Memory } from "../../features/magic-context/memory/types";
 import { __projectDocsHashTest } from "../../features/magic-context/project-docs-hash";
 import { unifiedSearch } from "../../features/magic-context/search";
 import {
+    appendAutoSearchHintDecision,
     bumpSessionFactsVersion,
+    flushAutoSearchHintDecisionRetirement,
+    getAutoSearchHintDecisions,
     getOrCreateSessionMeta,
     queueM0Mutation,
     queueMemoryMutation,
@@ -32,6 +35,7 @@ import {
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
+import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -39,6 +43,7 @@ import {
     COMPARTMENT_RENDER_EPOCH,
     encodeCachedM0UpgradeIdentity,
     MEMORY_RENDER_FORMAT_EPOCH,
+    withCachedM0MemoryIds,
 } from "./compartment-render-epoch";
 import {
     capturePrefixTrimSourceOrder,
@@ -59,7 +64,7 @@ import {
     trimMemoriesToBudgetV2,
 } from "./inject-compartments";
 import { withRawMessageProvider } from "./read-session-chunk";
-import { closeReadOnlySessionDb } from "./read-session-db";
+import { closeReadOnlySessionDb, withReadOnlySessionDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 
@@ -70,6 +75,155 @@ let db: Database;
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 const originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+
+for (const host of ["opencode", "opencode2"] as const) {
+    it(`${host} cached prefix defer writes nothing and defers decision retirement`, () => {
+        _resetHarnessForTesting();
+        setHarness(host);
+        db = makeDb();
+        const hint = { messageId: "covered", decision: "hint" as const, text: "cached hint" };
+        appendAutoSearchHintDecision(db, SESSION_ID, hint);
+        appendCompartments(db, SESSION_ID, [
+            {
+                sequence: 0,
+                startMessage: 0,
+                endMessage: 0,
+                startMessageId: "covered",
+                endMessageId: "covered",
+                title: "Covered",
+                content: "Earlier question was answered.",
+            },
+        ]);
+        const options = {
+            db,
+            sessionId: SESSION_ID,
+            state: getOrCreateSessionMeta(db, SESSION_ID),
+            injectDocs: false,
+        };
+        const cached = materializeM0(options);
+        const live = ["covered", "live"].map(
+            (id) =>
+                ({
+                    info: { id, role: "user" },
+                    parts: [{ type: "text", text: id }],
+                }) as MessageLike,
+        );
+        try {
+            db.exec("PRAGMA query_only=ON");
+            const before = db.prepare("SELECT total_changes() AS count").get() as { count: number };
+            const result = injectM0M1({
+                ...options,
+                state: getOrCreateSessionMeta(db, SESSION_ID),
+                messages: live,
+                isCacheBustingPass: false,
+            });
+            expect(result.prefixTrimStatus).toBe("applied");
+            expect(result.m0Bytes).toEqual(cached.m0Bytes);
+            expect(result.m1Text).toBe(cached.m1Text);
+            expect(db.prepare("SELECT total_changes() AS count").get()).toEqual(before);
+            expect(getAutoSearchHintDecisions(db, SESSION_ID)).toEqual([hint]);
+            db.exec("PRAGMA query_only=OFF");
+            expect(flushAutoSearchHintDecisionRetirement(db, SESSION_ID, new Set(["live"]))).toBe(
+                1,
+            );
+            expect(getAutoSearchHintDecisions(db, SESSION_ID)).toEqual([]);
+        } finally {
+            db.exec("PRAGMA query_only=OFF");
+            clearInjectionCache(SESSION_ID);
+            _resetHarnessForTesting();
+        }
+    });
+    it(`${host} applied compaction bounds auto-search blob across 20000 user messages`, () => {
+        _resetHarnessForTesting();
+        setHarness(host);
+        db = makeDb();
+        let live: MessageLike[] = [];
+        const window = 100;
+        const total = 20000;
+        const id = (number: number) => `user-${number}`;
+        let maxEntries = 0;
+        let maxBytes = 0;
+        const readBlob = db.prepare(
+            "SELECT auto_search_hint_decisions AS blob FROM session_meta WHERE session_id = ?",
+        );
+        try {
+            for (let number = 1; number <= total; number++) {
+                live.push({
+                    info: { id: id(number), role: "user" },
+                    parts: [{ type: "text", text: `Question ${number}` }],
+                } as MessageLike);
+                expect(
+                    appendAutoSearchHintDecision(
+                        db,
+                        SESSION_ID,
+                        number % 3 === 0
+                            ? { messageId: id(number), decision: "hint", text: "h".repeat(512) }
+                            : {
+                                  messageId: id(number),
+                                  decision: "no-hint",
+                                  reason: number % 2 ? "error" : "timeout",
+                              },
+                    ),
+                ).toMatchObject({ ok: true, kind: "appended" });
+                if (number % window !== 0) continue;
+                const before = (readBlob.get(SESSION_ID) as { blob: string }).blob;
+                const count = JSON.parse(before).length;
+                expect(count).toBe(live.length);
+                expect(count).toBeLessThanOrEqual(window * 2);
+                maxEntries = Math.max(maxEntries, count);
+                maxBytes = Math.max(maxBytes, Buffer.byteLength(before));
+                if (number === window) continue;
+                const cutoff = number - window;
+                appendCompartments(db, SESSION_ID, [
+                    {
+                        sequence: number / window - 2,
+                        startMessage: cutoff - window,
+                        endMessage: cutoff - 1,
+                        startMessageId: id(cutoff - window + 1),
+                        endMessageId: id(cutoff),
+                        title: "Compacted questions",
+                        content: "Earlier questions were answered.",
+                    },
+                ]);
+                const options = {
+                    db,
+                    sessionId: SESSION_ID,
+                    state: getOrCreateSessionMeta(db, SESSION_ID),
+                    injectDocs: false,
+                };
+                materializeM0(options);
+                const result = injectM0M1({
+                    ...options,
+                    state: getOrCreateSessionMeta(db, SESSION_ID),
+                    messages: live,
+                    prefixTrimSourceOrder:
+                        host === "opencode2" ? capturePrefixTrimSourceOrder(live) : undefined,
+                });
+                expect(result.prefixTrimStatus).toBe("applied");
+                live = live.filter((message) => typeof message.info.id === "string");
+                // Match postprocessing when the host permits rebuilding the request prefix.
+                flushAutoSearchHintDecisionRetirement(
+                    db,
+                    SESSION_ID,
+                    new Set(live.map((message) => message.info.id as string)),
+                );
+                expect(live).toHaveLength(window);
+                const after = (readBlob.get(SESSION_ID) as { blob: string }).blob;
+                expect(
+                    JSON.parse(after).map((decision: { messageId: string }) => decision.messageId),
+                ).toEqual(Array.from({ length: window }, (_, index) => id(cutoff + index + 1)));
+                expect(Buffer.byteLength(after)).toBeLessThanOrEqual(window * 800);
+            }
+            expect(getAutoSearchHintDecisions(db, SESSION_ID)).toHaveLength(window);
+            console.log(
+                `AUTO_SEARCH_BOUNDED ${host} users=${total} live=${window} maxEntries=${maxEntries} maxBytes=${maxBytes}`,
+            );
+        } finally {
+            clearInjectionCache(SESSION_ID);
+            _resetHarnessForTesting();
+        }
+    }, 30000);
+}
 
 function makeDb(): Database {
     const d = new Database(":memory:");
@@ -665,6 +819,50 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
     });
 });
 
+describe("user-profile baseline and delta rendering", () => {
+    it("normalizes subject prefixes in both m[0] and the new-profile delta", () => {
+        db = makeDb();
+        createUserMemoryTable();
+        const projectDirectory = makeProjectDir();
+        insertUserMemory(db, "User strongly pushes back on untested changes.", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
+        const options = {
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            injectDocs: false,
+            userProfileBudgetTokens: 10_000,
+        };
+
+        const baseline = materializeM0(options);
+        expect(baseline.m0Text).toContain(
+            "<user-profile>\n- Strongly pushes back on untested changes.\n</user-profile>",
+        );
+
+        insertUserMemory(db, "User expects changes to be tested.", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 2 });
+        expect(
+            mustMaterialize({
+                db,
+                sessionId: SESSION_ID,
+                state: readStateFromMeta(),
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+            }),
+        ).toEqual({ value: false, reason: null });
+        const delta = renderM1(
+            { ...options, state: readStateFromMeta() },
+            baseline.snapshotMarkers,
+            baseline.renderedMemoryIds,
+        );
+        expect(delta).toContain("<new-user-profile>");
+        expect(delta).toContain("- Strongly pushes back on untested changes.");
+        expect(delta).toContain("- Expects changes to be tested.");
+    });
+});
+
 describe("prepared prefix source-order trimming", () => {
     const message = (id: string, role: "user" | "assistant"): MessageLike => ({
         info: { id, role, sessionID: SESSION_ID },
@@ -689,6 +887,75 @@ describe("prepared prefix source-order trimming", () => {
             } as MessageLike,
         ],
         preparedTrimBoundaryId: boundary,
+    });
+
+    it("applied prefix pruning preserves the decision on a partially covered user boundary", () => {
+        db = makeDb();
+        appendCompartments(db, SESSION_ID, [
+            {
+                sequence: 0,
+                startMessage: 0,
+                endMessage: 1,
+                startMessageId: "before",
+                endMessageId: "partial",
+                endBlockIndex: 0,
+                title: "Partial turn",
+                content: "Only the first block was summarized.",
+            },
+        ]);
+        for (const messageId of ["before", "partial", "after", "hidden-branch"]) {
+            appendAutoSearchHintDecision(db, SESSION_ID, {
+                messageId,
+                decision: "no-hint",
+                reason: "error",
+            });
+        }
+        const live = [
+            message("before", "user"),
+            message("partial", "user"),
+            message("after", "user"),
+        ];
+        const result = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state: getOrCreateSessionMeta(db, SESSION_ID),
+            messages: live,
+            preparedPrefix: preparedPrefix("partial"),
+            prefixTrimSourceOrder: capturePrefixTrimSourceOrder(live),
+        });
+        expect(result.prefixTrimStatus).toBe("applied");
+        expect(live.map((entry) => entry.info.id)).toEqual([undefined, "partial", "after"]);
+        flushAutoSearchHintDecisionRetirement(db, SESSION_ID, new Set(["partial", "after"]));
+        expect(getAutoSearchHintDecisions(db, SESSION_ID).map((entry) => entry.messageId)).toEqual([
+            "partial",
+            "after",
+            "hidden-branch",
+        ]);
+    });
+
+    it("refused prefix trim does not prune auto-search decisions", () => {
+        db = makeDb();
+        for (const messageId of ["before", "missing-boundary", "after"]) {
+            appendAutoSearchHintDecision(db, SESSION_ID, {
+                messageId,
+                decision: "no-hint",
+                reason: "error",
+            });
+        }
+        const source = [message("before", "user"), message("after", "user")];
+        const before = getAutoSearchHintDecisions(db, SESSION_ID);
+        const result = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state: getOrCreateSessionMeta(db, SESSION_ID),
+            messages: source,
+            preparedPrefix: preparedPrefix("missing-boundary"),
+            prefixTrimSourceOrder: capturePrefixTrimSourceOrder(source),
+        });
+        expect(result.prefixTrimStatus).toBe("refused");
+        // A later branch switch must not delete these records: the failed trim proved nothing.
+        flushAutoSearchHintDecisionRetirement(db, SESSION_ID, new Set(["later-branch"]));
+        expect(getAutoSearchHintDecisions(db, SESSION_ID)).toEqual(before);
     });
 
     it("trims surviving rows through a deleted assistant boundary without resurrecting it", () => {
@@ -773,12 +1040,43 @@ describe("prepared prefix source-order trimming", () => {
         expect(result.prefixTrimStatus).toBe("applied");
         expect(live.map((entry) => entry.parts[0]?.text)).toEqual([
             "new prefix",
+            "covered instruction",
             "instruction row",
             "after",
         ]);
     });
 
-    it("orders id-less host system messages by their persisted neighbours", () => {
+    it("render review: shipped trim retains instruction bytes before a visible boundary", () => {
+        db = makeDb();
+        const source = [
+            message("covered", "user"),
+            hostSystem("covered instruction"),
+            message("served-boundary", "assistant"),
+            hostSystem("instruction row"),
+            message("after", "user"),
+        ];
+        const evidence = capturePrefixTrimSourceOrder(source);
+        const live = [...source];
+        const result = withServedBoundary({ "instruction-row": "served-boundary" }, () =>
+            injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                state: getOrCreateSessionMeta(db, SESSION_ID),
+                messages: live,
+                preparedPrefix: preparedPrefix("instruction-row"),
+                prefixTrimSourceOrder: evidence,
+            }),
+        );
+        expect(result.prefixTrimStatus).toBe("applied");
+        expect(live.map((entry) => entry.parts[0]?.text)).toEqual([
+            "new prefix",
+            "covered instruction",
+            "instruction row",
+            "after",
+        ]);
+    });
+
+    it("retains id-less host instructions even before a visible boundary", () => {
         db = makeDb();
         const source = [
             message("covered", "user"),
@@ -805,6 +1103,7 @@ describe("prepared prefix source-order trimming", () => {
         expect(result.prefixTrimStatus).toBe("applied");
         expect(live.map((entry) => entry.parts[0]?.text)).toEqual([
             "new prefix",
+            "covered instruction",
             "instruction row",
             "after",
         ]);
@@ -922,6 +1221,95 @@ describe("prepareCompartmentInjection — SQLITE_BUSY handling (issue #23)", () 
 });
 
 describe("m[0]/m[1] materialization", () => {
+    it("fallback compartment dates seek message primary keys instead of the session index", () => {
+        db = makeDb();
+        storeDatedCompartment();
+        createOpenCodeMessageTimes([
+            { id: "m1", timestamp: new Date(2026, 0, 2, 12).getTime() },
+            { id: "m2", timestamp: new Date(2026, 0, 3, 12).getTime() },
+        ]);
+        const path = join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db");
+        const writer = new Database(path);
+        writer.exec(
+            "CREATE INDEX message_session_time_created_id_idx ON message(session_id,time_created,id)",
+        );
+        const insert = writer.prepare("INSERT INTO message VALUES (?, ?, ?)");
+        writer.transaction(() => {
+            for (let i = 3; i <= 150_000; i++) insert.run(`m${i}`, SESSION_ID, i);
+        })();
+        writer.close();
+        withReadOnlySessionDb((source) => {
+            const prepare = source.prepare.bind(source);
+            let timeReads = 0;
+            let details = "";
+            const intercept = spyOn(source, "prepare").mockImplementation((sql: string) => {
+                if (sql.startsWith("SELECT id, time_created FROM message WHERE")) {
+                    timeReads++;
+                    const plan = prepare(`EXPLAIN QUERY PLAN ${sql}`).all(
+                        SESSION_ID,
+                        "m1",
+                        "m2",
+                    ) as Array<{ detail: string }>;
+                    details = plan.map((r) => r.detail).join(" | ");
+                }
+                return prepare(sql);
+            });
+            try {
+                const rendered = materializeM0({
+                    db,
+                    sessionId: SESSION_ID,
+                    state: readStateFromMeta(),
+                    temporalAwareness: true,
+                });
+                expect(timeReads).toBe(1);
+                expect(details).toContain("(id=?)");
+                expect(details).not.toContain("message_session_time_created_id_idx");
+                expect(rendered.m0Text).toContain("## 1-2 · 2026-01-02→03 · dated compartment");
+            } finally {
+                intercept.mockRestore();
+            }
+        });
+    });
+
+    it("compartment dates seek boundary ordinals instead of all non-null session times", () => {
+        db = makeDb();
+        storeDatedCompartment();
+        const insert = db.prepare(
+            "INSERT INTO message_fts_rowid_map(session_id,message_ordinal,fts_rowid,message_time_ms) VALUES (?,?,?,?)",
+        );
+        db.transaction(() => {
+            for (let i = 1; i <= 150_000; i++)
+                insert.run(SESSION_ID, i, i, new Date(2026, 0, i === 2 ? 3 : 2, 12).getTime());
+        })();
+        const prepare = db.prepare.bind(db);
+        let dateReads = 0;
+        const intercept = spyOn(db, "prepare").mockImplementation((sql: string) => {
+            if (sql.includes("SELECT message_ordinal AS ordinal, message_time_ms AS time")) {
+                dateReads++;
+                const plan = prepare(`EXPLAIN QUERY PLAN ${sql}`).all(
+                    SESSION_ID,
+                    "[1,2]",
+                ) as Array<{ detail: string }>;
+                expect(plan.map((r) => r.detail).join(" | ")).toContain(
+                    "session_id=? AND message_ordinal=?",
+                );
+            }
+            return prepare(sql);
+        });
+        try {
+            const rendered = materializeM0({
+                db,
+                sessionId: SESSION_ID,
+                state: readStateFromMeta(),
+                temporalAwareness: true,
+            });
+            expect(dateReads).toBe(1);
+            expect(rendered.m0Text).toContain("## 1-2 · 2026-01-02→03 · dated compartment");
+        } finally {
+            intercept.mockRestore();
+        }
+    });
+
     it("renders complete date ranges into m[0] only when temporal awareness is enabled", () => {
         db = makeDb();
         storeDatedCompartment();
@@ -2420,13 +2808,16 @@ describe("m[0]/m[1] materialization", () => {
         expect(typeof row.cached_m0_materialized_at).toBe("number");
         expect(row.cached_m0_session_facts_version).toBe(0);
         expect(row.cached_m0_upgrade_state).toBe(
-            encodeCachedM0UpgradeIdentity(
-                "ready",
-                COMPARTMENT_RENDER_EPOCH,
-                false,
-                "m8000-h60000",
-                MEMORY_RENDER_FORMAT_EPOCH,
-                "m8000-h60000",
+            withCachedM0MemoryIds(
+                encodeCachedM0UpgradeIdentity(
+                    "ready",
+                    COMPARTMENT_RENDER_EPOCH,
+                    false,
+                    "m8000-h60000",
+                    MEMORY_RENDER_FORMAT_EPOCH,
+                    "m8000-h60000",
+                ),
+                [],
             ),
         );
     });
@@ -2626,6 +3017,143 @@ describe("m[0]/m[1] materialization", () => {
         expect(attempts).toBe(3);
     });
 
+    for (const change of ["memory", "compartment"] as const) {
+        it(`two connections ${change === "memory" ? "include an additive memory in the locked delta" : "retry a fold for a new compartment"} before admission`, () => {
+            const projectDirectory = makeProjectDir();
+            const path = join(projectDirectory, "context.db");
+            db = new Database(path);
+            initializeDatabase(db);
+            db.exec("PRAGMA journal_mode=WAL");
+            getOrCreateSessionMeta(db, SESSION_ID);
+            const sibling = new Database(path);
+            try {
+                let attempts = 0;
+                let commits = 0;
+                const result = materializeWithRetry({
+                    db,
+                    sessionId: SESSION_ID,
+                    state: readStateFromMeta(),
+                    projectPath: PROJECT_PATH,
+                    projectDirectory,
+                    beforeCacheCommitForTest: () => {
+                        attempts++;
+                        if (attempts !== 1) return;
+                        if (change === "memory") {
+                            insertMemory(sibling, {
+                                projectPath: PROJECT_PATH,
+                                category: "ARCHITECTURE",
+                                content: "Concurrent published memory",
+                            });
+                        } else {
+                            appendCompartments(sibling, SESSION_ID, [
+                                {
+                                    sequence: 0,
+                                    startMessage: 0,
+                                    endMessage: 1,
+                                    startMessageId: "concurrent-start",
+                                    endMessageId: "concurrent-end",
+                                    title: "Concurrent compartment",
+                                    content: "Concurrent published history",
+                                    p1: "Concurrent published history",
+                                    p2: "summary",
+                                    p3: "outcome",
+                                    p4: "anchor",
+                                    importance: 70,
+                                    legacy: 0,
+                                },
+                            ]);
+                        }
+                    },
+                    onFoldPrepare: () => () => {
+                        commits++;
+                    },
+                });
+                expect(attempts).toBe(change === "memory" ? 1 : 2);
+                expect(commits).toBe(1);
+                expect(change === "memory" ? result.m1Text : result.m0Text).toContain(
+                    change === "memory"
+                        ? "Concurrent published memory"
+                        : "Concurrent published history",
+                );
+                const meta = getOrCreateSessionMeta(db, SESSION_ID);
+                expect(meta.cachedM0Bytes).toEqual(result.m0Bytes);
+                expect(meta.cachedM1Bytes).toEqual(result.m1Bytes);
+            } finally {
+                sibling.close();
+            }
+        });
+
+        it(`two connections include a ${change} published before soft-refresh admission`, () => {
+            const projectDirectory = makeProjectDir();
+            const path = join(projectDirectory, "context.db");
+            db = new Database(path);
+            initializeDatabase(db);
+            db.exec("PRAGMA journal_mode=WAL");
+            getOrCreateSessionMeta(db, SESSION_ID);
+            const state = readStateFromMeta();
+            injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+            });
+            const before = db
+                .prepare("SELECT * FROM session_meta WHERE session_id = ?")
+                .get(SESSION_ID);
+            const sibling = new Database(path);
+            try {
+                const m0Before = state.cachedM0Bytes;
+                const refreshed = injectM0M1({
+                    db,
+                    sessionId: SESSION_ID,
+                    state,
+                    projectPath: PROJECT_PATH,
+                    projectDirectory,
+                    isCacheBustingPass: true,
+                    beforeCacheCommitForTest: () => {
+                        if (change === "memory")
+                            insertMemory(sibling, {
+                                projectPath: PROJECT_PATH,
+                                category: "ARCHITECTURE",
+                                content: "Concurrent refresh memory",
+                            });
+                        else
+                            appendCompartments(sibling, SESSION_ID, [
+                                {
+                                    sequence: 0,
+                                    startMessage: 0,
+                                    endMessage: 1,
+                                    endMessageId: "refresh-end",
+                                    title: "Refresh compartment",
+                                    content: "Concurrent refresh history",
+                                    p1: "Concurrent refresh history",
+                                    p2: "summary",
+                                    p3: "outcome",
+                                    p4: "anchor",
+                                    importance: 70,
+                                    legacy: 0,
+                                },
+                            ]);
+                    },
+                });
+                const after = getOrCreateSessionMeta(db, SESSION_ID);
+                expect(after.cachedM0Bytes).toEqual(m0Before);
+                expect(after.cachedM1Bytes?.toString("utf8")).toContain(
+                    change === "memory"
+                        ? "Concurrent refresh memory"
+                        : "Concurrent refresh history",
+                );
+                expect(after.cachedM1Bytes?.toString("utf8")).toBe(refreshed.m1Text);
+                expect(
+                    db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(SESSION_ID),
+                ).not.toEqual(before);
+            } finally {
+                sibling.close();
+            }
+        });
+    }
+
     it("injectM0M1 updates root cached state after successful materialization", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
@@ -2654,13 +3182,16 @@ describe("m[0]/m[1] materialization", () => {
         expect(typeof state.cachedM0MaterializedAt).toBe("number");
         expect(state.cachedM0SessionFactsVersion).toBe(0);
         expect(state.cachedM0UpgradeState).toBe(
-            encodeCachedM0UpgradeIdentity(
-                "ready",
-                COMPARTMENT_RENDER_EPOCH,
-                false,
-                "m8000-h60000",
-                MEMORY_RENDER_FORMAT_EPOCH,
-                "m8000-h60000",
+            withCachedM0MemoryIds(
+                encodeCachedM0UpgradeIdentity(
+                    "ready",
+                    COMPARTMENT_RENDER_EPOCH,
+                    false,
+                    "m8000-h60000",
+                    MEMORY_RENDER_FORMAT_EPOCH,
+                    "m8000-h60000",
+                ),
+                [],
             ),
         );
         expect(state.snapshotMarkers?.maxMemoryId).toBe(0);

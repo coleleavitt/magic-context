@@ -1,4 +1,8 @@
 import { Buffer } from "node:buffer";
+import {
+    cancelAutoSearchWork,
+    clearUnpublishedAutoSearchNoHints,
+} from "../../shared/auto-search-lifecycle";
 import { getHarness } from "../../shared/harness";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import {
@@ -7,7 +11,15 @@ import {
     withSqliteBackgroundWriter,
 } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
-import { resolveIsSubagentFromOpenCodeDb } from "./resolve-subagent-fallback";
+import {
+    resolveIsSubagentFromOpenCode2Db,
+    resolveIsSubagentFromOpenCodeDb,
+} from "./resolve-subagent-fallback";
+import {
+    getPendingPiCompactionMarkerState,
+    logPiCompactionMarkerClear,
+    type PendingPiCompactionMarker,
+} from "./storage-meta-persisted";
 import {
     BOOLEAN_META_KEYS,
     ensureSessionMetaRow,
@@ -80,35 +92,54 @@ function getSessionMetaSelectColumns(db: Database): string {
     return projection;
 }
 
-export function getOrCreateSessionMeta(db: Database, sessionId: string): SessionMeta {
+function findSessionMeta(db: Database, sessionId: string): SessionMeta | undefined {
     const result = db
         .prepare(`SELECT ${getSessionMetaSelectColumns(db)} FROM session_meta WHERE session_id = ?`)
         .get(sessionId);
 
-    if (isSessionMetaRow(result)) {
-        return toSessionMeta(result);
-    }
+    return isSessionMetaRow(result) ? toSessionMeta(result) : undefined;
+}
+
+/**
+ * Read session metadata, returning defaults instead of inserting a row. The
+ * history-head fallback that runs when another process holds the database write
+ * lock uses this: inserting would need that same lock, fail, and refuse the turn.
+ */
+export function readSessionMeta(db: Database, sessionId: string): SessionMeta {
+    return findSessionMeta(db, sessionId) ?? getDefaultSessionMeta(sessionId);
+}
+
+export function getOrCreateSessionMeta(db: Database, sessionId: string): SessionMeta {
+    const existing = findSessionMeta(db, sessionId);
+    if (existing) return existing;
 
     // Fresh row creation: bridge the race between OpenCode creating the
     // session (which writes `parent_id` synchronously) and the async
     // `session.created` event reaching our handler. Without this, child
     // sessions default to `isSubagent: false` on their first transform pass,
-    // triggering primary-mode behavior (§N§ prefixes, system adjuncts, etc.)
+    // triggering primary guidance, system adjuncts and historian eligibility
     // that then has to be corrected on the next pass — busting prompt-cache.
     //
-    // Harness gate: this fallback opens OpenCode's opencode.db read-only to
-    // probe `session.parent_id`. Pi has no opencode.db and no concept of
-    // OpenCode-style subagents — calling the fallback there throws "unable
-    // to open database file" and floods the shared log. Skip on non-opencode
-    // harnesses; Pi sessions always default to isSubagent=false.
+    // Read the host's own parent link only at row creation. OC2 has no v1
+    // session.created handler and stores this link in session_v2 instead.
+    // Existing rows (including OC2 children seen by an older plugin) retain
+    // their served mode above: correcting them now would flip prompt bytes
+    // mid-session. Pi-compatible hosts must never open an OpenCode store.
     const defaults = getDefaultSessionMeta(sessionId);
+    const harness = getHarness();
     const fallbackSubagent =
-        getHarness() === "opencode" ? resolveIsSubagentFromOpenCodeDb(sessionId) : null;
+        harness === "opencode"
+            ? resolveIsSubagentFromOpenCodeDb(sessionId)
+            : harness === "opencode2"
+              ? resolveIsSubagentFromOpenCode2Db(sessionId)
+              : null;
     if (fallbackSubagent === true) {
         defaults.isSubagent = true;
     }
-    ensureSessionMetaRow(db, sessionId);
-    if (fallbackSubagent === true) {
+    // OC2's flag is part of the INSERT, so even a concurrent reader cannot
+    // observe a provisional primary row. Leave the v1 event/fallback path alone.
+    ensureSessionMetaRow(db, sessionId, harness === "opencode2" && fallbackSubagent === true);
+    if (harness === "opencode" && fallbackSubagent === true) {
         db.prepare("UPDATE session_meta SET is_subagent = 1 WHERE session_id = ?").run(sessionId);
     }
     return defaults;
@@ -236,7 +267,7 @@ export function retryPendingSessionCleanups(
                     db.prepare(
                         "UPDATE pending_session_cleanup SET last_attempt_at = ? WHERE session_id = ?",
                     ).run(Date.now(), row.session_id);
-                    clearSession(db, row.session_id);
+                    clearSession(db, row.session_id, false, true);
                 }),
             );
             cleared += 1;
@@ -283,7 +314,7 @@ export async function retryPendingRustSessionCleanupsForProject(
                 ),
             );
             await deleteSession(row.session_id);
-            clearSession(db, row.session_id, true);
+            clearSession(db, row.session_id, true, true);
             cleared += 1;
         } catch {
             failedSessionIds.push(row.session_id);
@@ -296,19 +327,28 @@ export function clearSession(
     db: Database,
     sessionId: string,
     rustModuleCleanupAcknowledged = false,
+    // A deleted host session cannot resume; its retained tag-change counters can
+    // be removed. Administrative reset/reimport keeps them to invalidate live caches.
+    permanentlyDeleted = false,
 ): void {
+    cancelAutoSearchWork(sessionId);
     let transactionStartedAt = 0;
+    let clearedMarker: PendingPiCompactionMarker | null = null;
     withoutSqliteTransformPass(() =>
         withSqliteBackgroundWriter(() =>
             db
                 .transaction(() => {
                     transactionStartedAt = performance.now();
+                    clearedMarker = getPendingPiCompactionMarkerState(db, sessionId);
                     deleteSessionScopedRows(db, [sessionId], undefined, {
                         rustModuleCleanupAcknowledged,
+                        preserveTagRevisionTombstones: !permanentlyDeleted,
                     });
                 })
                 .immediate(),
         ),
     );
+    if (clearedMarker) logPiCompactionMarkerClear(sessionId, clearedMarker, "session-reset");
+    clearUnpublishedAutoSearchNoHints(sessionId);
     logSlowWriteTransaction("clear-session", transactionStartedAt);
 }

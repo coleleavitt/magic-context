@@ -2,6 +2,7 @@ import type { createCompactionHandler } from "../../features/magic-context/compa
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { scheduleClearAndReindex } from "../../features/magic-context/message-index-async";
 import {
+    detectLatestTurnThinkingMismatch,
     detectOverflow,
     detectThinkingBindingMismatch,
     isPrefixBoundThinkingModel,
@@ -10,7 +11,6 @@ import { observeSessionActivity } from "../../features/magic-context/session-act
 import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
-    armThinkingBindingRecovery,
     clearDetectedContextLimit,
     clearHistorianFailureState,
     clearPendingCompactionMarkerStateIf,
@@ -38,12 +38,14 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { clearSession } from "../../features/magic-context/storage-meta-session";
 import type { Tagger } from "../../features/magic-context/tagger";
+import { deleteTemporalDecision } from "../../features/magic-context/temporal-decisions";
 import {
     clearTransformDecisionSession,
     scheduleOpenCodeTransformDecisionWrite,
 } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage, SessionMeta } from "../../features/magic-context/types";
 import { captureWindowReport } from "../../features/magic-context/window-report-ledger";
+import { forgetUnpublishedAutoSearchNoHint } from "../../shared/auto-search-lifecycle";
 import { log, sessionLog } from "../../shared/logger";
 import {
     getSdkContextLimit,
@@ -51,10 +53,14 @@ import {
     refreshModelLimitsFromApi,
 } from "../../shared/models-dev-cache";
 import { recordPromptSessionError } from "../../shared/prompt-async-transport";
+import {
+    isSuccessfulProviderCompletion,
+    providerResponseFailed,
+} from "../../shared/provider-response-completion";
 import { hasTrustedAbsoluteWall } from "../../shared/window-geometry";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
 import { removeCompactionMarkerForSession } from "./compaction-marker-manager";
-import { noteContextLimitResolution, provenFloorForModel } from "./context-limit-resolution";
+import { noteContextLimitResolution } from "./context-limit-resolution";
 import {
     getMessageRemovedInfo,
     getMessageUpdatedAssistantInfo,
@@ -69,16 +75,28 @@ import {
     resolveModelKey,
     resolveSessionId,
 } from "./event-resolvers";
+import { armBindingRecoverySafely, armLatestThinkingRecovery } from "./latest-thinking-recovery";
+import {
+    clearLkgMeasuredRequest,
+    lkgProviderInputTotal,
+    noteLkgProviderResponse,
+} from "./lkg-measured-request";
 import { dropSlot } from "./lkg-slot";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
+import {
+    recordOpenCodeProvenInputFloor,
+    resolveOpenCodeProvenInputFloor,
+} from "./opencode-proven-floor";
 import { readRawSessionMessages } from "./read-session-chunk";
 import {
     clearTrackedOpenCodeSession,
     findLastAssistantModelFromOpenCodeDb,
     observeOpenCodeTurnEvent,
 } from "./read-session-db";
+import { forgetRawSessionOrdinalWatermark } from "./read-session-raw";
 import { invalidateTrueRawTokenCache } from "./read-session-true-raw-tokens";
 import { type NotificationParams, sendStatusNotification } from "./send-session-notification";
+import { isAnthropicFamilyRoute } from "./sentinel";
 import { clearMessageTokensCache } from "./transform";
 import { resetDegradedCacheCount } from "./transform-postprocess-phase";
 
@@ -117,12 +135,14 @@ export interface EventHandlerDeps {
     rustSessionCleanup?: boolean;
     allowHomeProject?: boolean;
     config: {
-        clear_reasoning_age?: number;
+        clear_reasoning_age?: unknown;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
         execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
         cache_ttl: CacheTtlConfig;
+        cacheTtlConfigured?: boolean;
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
     };
+    sampleCacheTtlConfig?: () => { cache_ttl: CacheTtlConfig; cacheTtlConfigured?: boolean };
     tagger: Tagger;
     // openDatabase() returns Database | null, but the hook only constructs these
     // deps after it has already null-checked and disabled MC on storage failure,
@@ -175,9 +195,9 @@ async function deliverChannel2IfPending(deps: EventHandlerDeps, sessionId: strin
         // `pending` intent exists, a client is wired, and a subagent run is still
         // active.
         const baseline = deps.channel1StateBySession?.get(sessionId);
-        // A reduce after the persisted generation invalidates its U/T values.
-        // Hold the pending intent until a cache-busting pass rewalks the final
-        // rendered tail; delivery must never burn the cap from stale mass.
+        // Context reduction makes the last measured token counts stale. Wait for
+        // a successful refresh rather than using the pre-reduction estimate to
+        // consume a reminder delivery opportunity.
         if (baseline?.reducedSinceRefresh) return;
         const delivered = await maybeDeliverChannel2(sessionId, {
             db: deps.db,
@@ -199,9 +219,10 @@ function cleanupRemovedMessageState(
     sessionId: string,
     messageId: string,
 ): MessageRemovedCleanupResult {
-    return deps.db
+    const result = deps.db
         .transaction(() => {
             const removedTagNumbers = deleteTagsByMessageId(deps.db, sessionId, messageId);
+            deleteTemporalDecision(deps.db, sessionId, messageId);
             sessionLog(
                 sessionId,
                 `event message.removed: deleted ${removedTagNumbers.length} tag(s) for message ${messageId}`,
@@ -274,6 +295,8 @@ function cleanupRemovedMessageState(
             };
         })
         .immediate();
+    forgetUnpublishedAutoSearchNoHint(sessionId, messageId);
+    return result;
 }
 
 export function createEventHandler(deps: EventHandlerDeps) {
@@ -323,13 +346,15 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     );
                 }
                 const modelKey = resolveModelKey(info.providerID, info.modelID);
+                const ttlConfig = deps.sampleCacheTtlConfig?.() ?? deps.config;
                 updateSessionMeta(deps.db, info.id, {
                     isSubagent: info.parentID.length > 0,
                     cacheTtl: resolveSessionCacheTtl(
                         deps.db,
                         info.id,
-                        deps.config.cache_ttl,
+                        ttlConfig.cache_ttl,
                         modelKey,
+                        ttlConfig.cacheTtlConfigured,
                     ).value,
                 });
             } catch (error) {
@@ -345,6 +370,18 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
             recordPromptSessionError(errInfo.sessionID, errInfo.error);
             try {
+                if (detectLatestTurnThinkingMismatch(errInfo.error)) {
+                    const model = findLastAssistantModelFromOpenCodeDb(errInfo.sessionID);
+                    if (
+                        !deps.compactionOff &&
+                        isAnthropicFamilyRoute(model?.providerID, model?.modelID)
+                    ) {
+                        armLatestThinkingRecovery(deps.db, errInfo.sessionID);
+                        dropSlot(errInfo.sessionID, "latest-thinking-recovery-arm");
+                        deps.onSessionCacheInvalidated?.(errInfo.sessionID);
+                    }
+                    return;
+                }
                 const bindingMismatch = detectThinkingBindingMismatch(errInfo.error);
                 if (bindingMismatch.isBindingMismatch) {
                     const model = findLastAssistantModelFromOpenCodeDb(errInfo.sessionID);
@@ -353,7 +390,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         !deps.compactionOff &&
                         isPrefixBoundThinkingModel(model?.providerID, model?.modelID)
                     ) {
-                        armThinkingBindingRecovery(deps.db, errInfo.sessionID);
+                        armBindingRecoverySafely(deps.db, errInfo.sessionID);
                         sessionLog(
                             errInfo.sessionID,
                             `thinking binding recovery armed from session.error (provider paths: failing=${bindingMismatch.failingBlockPath ?? "?"} firstChanged=${bindingMismatch.firstChangedPath ?? "?"})`,
@@ -520,6 +557,19 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
 
+            noteLkgProviderResponse({
+                sessionId: info.sessionID,
+                responseId: info.messageID,
+                modelKey:
+                    info.providerID && info.modelID
+                        ? `${info.providerID}/${info.modelID}`
+                        : undefined,
+                inputTokens: lkgProviderInputTotal(info.tokens),
+                completedAt: info.completedAt,
+                finish: info.finish,
+                error: info.error,
+            });
+
             // Invalidate this message's cached token contribution. The message
             // content is finalized at this event — if a prior transform pass
             // happened to cache partial/streaming content (or the message is
@@ -543,6 +593,16 @@ export function createEventHandler(deps: EventHandlerDeps) {
             let messageHadOverflowError = false;
 
             if (info.error !== undefined && info.error !== null) {
+                if (
+                    detectLatestTurnThinkingMismatch(info.error) &&
+                    !deps.compactionOff &&
+                    isAnthropicFamilyRoute(info.providerID, info.modelID)
+                ) {
+                    armLatestThinkingRecovery(deps.db, info.sessionID);
+                    dropSlot(info.sessionID, "latest-thinking-recovery-arm");
+                    deps.onSessionCacheInvalidated?.(info.sessionID);
+                    return;
+                }
                 const bindingMismatch = detectThinkingBindingMismatch(info.error);
                 if (
                     bindingMismatch.isBindingMismatch &&
@@ -551,7 +611,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     isPrefixBoundThinkingModel(info.providerID, info.modelID)
                 ) {
                     try {
-                        armThinkingBindingRecovery(deps.db, info.sessionID);
+                        armBindingRecoverySafely(deps.db, info.sessionID);
                         sessionLog(
                             info.sessionID,
                             `thinking binding recovery armed from message.updated (provider paths: failing=${bindingMismatch.failingBlockPath ?? "?"} firstChanged=${bindingMismatch.firstChangedPath ?? "?"})`,
@@ -689,10 +749,22 @@ export function createEventHandler(deps: EventHandlerDeps) {
             const hasUsageTokens = usageTokens.some(
                 (value) => typeof value === "number" && value > 0,
             );
-            const terminalAssistantUpdate =
-                info.messageID !== undefined &&
-                hasUsageTokens &&
-                (typeof info.finish === "string" || typeof info.completedAt === "number");
+            const successfulCompletion = isSuccessfulProviderCompletion({
+                completedAt: info.completedAt,
+                finish: info.finish,
+                error: info.error,
+            });
+            const responseFailed = providerResponseFailed({
+                finish: info.finish,
+                error: info.error,
+            });
+            const responseTime =
+                typeof info.completedAt === "number" &&
+                Number.isFinite(info.completedAt) &&
+                info.completedAt > 0
+                    ? info.completedAt
+                    : now;
+            const terminalAssistantUpdate = info.messageID !== undefined && successfulCompletion;
             if (terminalAssistantUpdate && info.messageID) {
                 scheduleOpenCodeTransformDecisionWrite({
                     db: deps.db,
@@ -711,6 +783,22 @@ export function createEventHandler(deps: EventHandlerDeps) {
             );
 
             const hasKnownUsage = hasUsageTokens || deps.contextUsageMap.has(info.sessionID);
+            // Completion and pressure are independent. Some providers omit usage
+            // entirely; their successful replies still refresh the idle clock.
+            // A shell, error or abort cannot spend an expiry, even with time.completed.
+            if (successfulCompletion && !hasUsageTokens) {
+                try {
+                    const meta = getOrCreateSessionMeta(deps.db, info.sessionID);
+                    const completedAt = responseTime;
+                    if (completedAt > meta.lastResponseTime) {
+                        updateSessionMeta(deps.db, info.sessionID, {
+                            lastResponseTime: completedAt,
+                        });
+                    }
+                } catch (error) {
+                    sessionLog(info.sessionID, "event completion clock persistence failed:", error);
+                }
+            }
             if (!hasKnownUsage) {
                 sessionLog(
                     info.sessionID,
@@ -724,31 +812,34 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 const updates: Partial<SessionMeta> = {};
                 // last_response_time is the idle clock for the provider cache:
                 // the scheduler's TTL execute and the ttl_idle HARD fold both
-                // measure from it. Only a request the provider served refreshes
-                // that cache, and only such a request reports tokens. OpenCode
+                // measure from it. Usage proves the provider served a request;
+                // successful completion above also proves it when usage is absent. OpenCode
                 // creates the assistant message for a new request with zero
                 // tokens before it runs that request's transform, and a request
                 // the provider refuses (a spent quota) ends with zero tokens.
                 // Stamping on those made the first pass after a long idle look
                 // like it followed a fresh response, so it deferred and queued
                 // drops never applied.
-                if (hasUsageTokens) {
-                    updates.lastResponseTime = now;
+                if (hasUsageTokens && !responseFailed) {
+                    updates.lastResponseTime = responseTime;
                 }
 
-                if (typeof deps.config.cache_ttl === "string") {
+                const ttlConfig = deps.sampleCacheTtlConfig?.() ?? deps.config;
+                if (typeof ttlConfig.cache_ttl === "string") {
                     updates.cacheTtl = resolveSessionCacheTtl(
                         deps.db,
                         info.sessionID,
-                        deps.config.cache_ttl,
+                        ttlConfig.cache_ttl,
                         modelKey,
+                        ttlConfig.cacheTtlConfigured,
                     ).value;
                 } else if (modelKey) {
                     updates.cacheTtl = resolveSessionCacheTtl(
                         deps.db,
                         info.sessionID,
-                        deps.config.cache_ttl,
+                        ttlConfig.cache_ttl,
                         modelKey,
+                        ttlConfig.cacheTtlConfigured,
                     ).value;
                 }
 
@@ -790,7 +881,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 let refreshLimitsAfterRecording: (() => Promise<void>) | undefined;
                 if (hasUsageTokens) {
                     const pressureInputTokens = totalInputTokens;
-                    const requestSucceeded = !messageHadOverflowError;
+                    const requestSucceeded = !messageHadOverflowError && !responseFailed;
                     const successfulUsageProof = requestSucceeded && !aboveTrustedWall;
                     // A limit learned from an earlier overflow error is stale
                     // once the provider accepts a larger request, whatever the
@@ -816,13 +907,21 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     }
 
                     const sessionMeta = getOrCreateSessionMeta(deps.db, info.sessionID);
+                    // A delayed usage update may follow a newer usage-less reply.
+                    // It must not move the independently tracked response clock back.
+                    if (!responseFailed) {
+                        updates.lastResponseTime = Math.max(
+                            sessionMeta.lastResponseTime,
+                            responseTime,
+                        );
+                    }
                     // A proven floor belongs to the model whose accepted request
                     // proved it, the same rule resolveContextLimit applies. Carrying
                     // another model's floor over would give this model a limit none
                     // of its own requests supports.
-                    const observedSafeInputTokens = provenFloorForModel(
-                        sessionMeta.observedSafeInputTokens,
-                        sessionMeta.lastObservedModelKey,
+                    const observedSafeInputTokens = resolveOpenCodeProvenInputFloor(
+                        deps.db,
+                        info.sessionID,
                         modelKey,
                     );
                     const provenSafeInputTokens = successfulUsageProof
@@ -1018,6 +1117,14 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 }
 
                 updateSessionMeta(deps.db, info.sessionID, updates);
+                if (modelKey && updates.observedSafeInputTokens !== undefined) {
+                    recordOpenCodeProvenInputFloor(
+                        deps.db,
+                        info.sessionID,
+                        modelKey,
+                        updates.observedSafeInputTokens,
+                    );
+                }
                 if (refreshLimitsAfterRecording) {
                     await refreshLimitsAfterRecording();
                 }
@@ -1069,6 +1176,8 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             dropSlot(info.sessionID, "message.removed");
+            // A removal can shift the canonical ordinal of every later message.
+            forgetRawSessionOrdinalWatermark(info.sessionID);
             deps.onRustWireInvalidated?.(info.sessionID);
             sessionLog(
                 info.sessionID,
@@ -1171,6 +1280,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             dropSlot(sessionId, "session.deleted");
+            clearLkgMeasuredRequest(sessionId);
             clearTrackedOpenCodeSession(sessionId);
             try {
                 // Commit the retry marker before any deletion work. clearSession removes
@@ -1193,7 +1303,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     // clearSession's session_meta DELETE wipes it automatically — no
                     // separate CAS-clear needed here.
                     removeCompactionMarkerForSession(deps.db, sessionId);
-                    clearSession(deps.db, sessionId, deps.rustSessionCleanup === true);
+                    clearSession(deps.db, sessionId, deps.rustSessionCleanup === true, true);
                 }
             } catch (error) {
                 sessionLog(sessionId, "event session.deleted persistence failed:", error);

@@ -17,6 +17,7 @@ import type { DreamerTickFailure } from "../features/magic-context/dreamer/tick-
 import { formatCacheTtlDisplay } from "./cache-ttl-display";
 import { type ConfigParseFailure, formatConfigParseStatusLine } from "./config-diagnostics";
 import { formatThresholdPercent } from "./format-threshold";
+import { primaryQuotaDiagnostic } from "./quota-diagnostic";
 import type { TailHygieneStatus } from "./rpc-types";
 import {
     type StatusCheck,
@@ -30,7 +31,11 @@ import {
     type UserFacingFailureKey,
     userFacingFailureCode,
 } from "./user-facing-codes";
-import { formatWindowDerivationLine, type WindowGeometryResult } from "./window-geometry";
+import {
+    formatWindowDerivationLine,
+    formatWindowSource,
+    type WindowGeometryResult,
+} from "./window-geometry";
 
 /** Theme-independent colour role; each host maps these onto its own palette. */
 export type StatusTone = "accent" | "text" | "muted" | "warning" | "error";
@@ -146,12 +151,14 @@ export interface StatusViewSource {
      * backlog that silently never falls.
      */
     readonly dreamerUnsupportedTasks?: readonly string[];
+    readonly dreamerSkipped?: readonly string[];
     /**
      * Set when the last background maintenance pass stopped before finishing.
      * Shown so "the dreamer has nothing to do" and "the dreamer never got to
      * its work" are not the same blank space in this view.
      */
     readonly dreamerTickFailure?: DreamerTickFailure | null;
+    readonly dreamerFailures?: readonly { task: string; error: string }[];
     readonly memoryCount: number;
     readonly sessionNoteCount?: number;
     readonly readySmartNoteCount?: number;
@@ -503,11 +510,17 @@ function historyRows(source: StatusViewSource, now: number): StatusRow[] {
     return rows;
 }
 
-/** One row naming every Dreamer task this host cannot run, or nothing when it runs them all. */
+/** Availability rows for unsupported tasks and explicitly disabled/unavailable runs. */
 function dreamerUnsupportedRows(source: StatusViewSource): StatusRow[] {
     const unsupported = source.dreamerUnsupportedTasks ?? [];
-    if (unsupported.length === 0) return [];
+    const skipped: StatusRow[] = (source.dreamerSkipped ?? []).map((value) => ({
+        label: "Dreamer skipped",
+        value,
+        tone: "muted",
+    }));
+    if (unsupported.length === 0) return skipped;
     return [
+        ...skipped,
         {
             label: "Dreamer unavailable",
             value: `${unsupported.join(", ")} (${userFacingFailureCode("dream_task_needs_tool_loop")})`,
@@ -518,9 +531,18 @@ function dreamerUnsupportedRows(source: StatusViewSource): StatusRow[] {
 
 /** One row naming the stage that stopped the last maintenance pass, if one did. */
 function dreamerTickFailureRows(source: StatusViewSource, now: number): StatusRow[] {
+    const quotas = [
+        ...new Set(
+            (source.dreamerFailures ?? []).flatMap((failure) => {
+                const quota = primaryQuotaDiagnostic(failure.error);
+                return quota ? [quota] : [];
+            }),
+        ),
+    ].map((value): StatusRow => ({ label: "Dreamer quota", value, tone: "warning" }));
     const failure = source.dreamerTickFailure;
-    if (!failure) return [];
+    if (!failure) return quotas;
     return [
+        ...quotas,
         {
             label: "Dreamer blocked",
             value: `${failure.stage} failed ${formatRelativeTime(failure.at, now)} (${userFacingFailureCode(
@@ -638,6 +660,16 @@ function statusSections(source: StatusViewSource, now: number): StatusSection[] 
                     tone: "muted",
                 },
                 { label: "Subagent", value: source.isSubagent ? "yes" : "no", tone: "muted" },
+                {
+                    label: "Denominator",
+                    value: `${Math.round(source.contextLimit)} tokens`,
+                    tone: "muted",
+                },
+                {
+                    label: "Window source",
+                    value: formatWindowSource(source.windowGeometry),
+                    tone: "muted",
+                },
             ],
         },
         { title: "Cache TTL", labelWidth: 14, rows: cacheRows(source, now) },

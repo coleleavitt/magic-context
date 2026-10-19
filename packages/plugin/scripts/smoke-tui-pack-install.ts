@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { checkPackedTuiGraph } from "./tui-pack-graph";
 
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const packageName = "@cortexkit/opencode-magic-context";
@@ -77,11 +78,17 @@ const tempRoot = await mkdtemp(join(tmpdir(), "magic-context-tui-pack-"));
 const installRoot = join(tempRoot, "install");
 
 try {
-    run("bun", ["run", "build:tui"], pluginRoot);
+    // CI already built and checked drift; pack exactly that output. Standalone
+    // smoke runs still generate their own compiled TUI before packing.
+    if (!process.argv.includes("--skip-build")) run("bun", ["run", "build:tui"], pluginRoot);
 
     const packStdout = run("npm", ["pack", "--json", "--pack-destination", tempRoot], pluginRoot);
     const tarball = join(tempRoot, parsePackedFilename(packStdout));
     check("npm pack produced a tarball", existsSync(tarball), tarball);
+
+    const packed = JSON.parse(packStdout.trim()) as Array<{ files: Array<{ path: string }> }>;
+    const graphSize = checkPackedTuiGraph(pluginRoot, new Set(packed[0]?.files.map(({ path }) => path)));
+    check(`all ${graphSize} TUI-reachable runtime files ship in the tarball`, true);
 
     await mkdir(installRoot, { recursive: true });
     await writeFile(
@@ -99,6 +106,27 @@ try {
         ),
     );
     run("bun", ["install", "--production"], installRoot);
+
+    for (const dependency of ["@opentui/core", "@opentui/solid", "solid-js"]) {
+        check(
+            `standalone consumer does not install ${dependency}`,
+            !existsSync(join(installRoot, "node_modules", dependency)),
+        );
+    }
+
+    // These probes emulate a host and bare-Bun development, respectively. The
+    // published package must not install a second Solid/OpenTUI runtime; provide
+    // the development runtimes explicitly only after checking the consumer graph.
+    const manifest = JSON.parse(await readFile(join(pluginRoot, "package.json"), "utf8")) as {
+        devDependencies: Record<string, string>;
+    };
+    run(
+        "bun",
+        ["add", "--dev", ...["@opentui/core", "@opentui/solid", "solid-js"].map(
+            (name) => `${name}@${manifest.devDependencies[name]}`,
+        )],
+        installRoot,
+    );
 
     const installedPackageRoot = join(
         installRoot,

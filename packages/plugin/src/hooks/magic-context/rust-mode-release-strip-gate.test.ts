@@ -159,7 +159,8 @@ function tagging(tags: Record<string, number>) {
         });
 }
 
-type Step = "throw" | string;
+/** A decision string, "throw" for a module failure, or a decision with extra response fields. */
+type Step = "throw" | string | { decision: string; response: Record<string, unknown> };
 
 /**
  * A prefix-bound Rust session whose module answers each pass from `script`
@@ -184,7 +185,11 @@ function scriptedSession(label: string) {
             const step = script.shift() ?? fallbackDecision;
             if (step === "throw") throw new Error("daemon unavailable");
             return {
-                decision: step,
+                ...(typeof step === "string" ? { decision: step } : step.response),
+                ...(typeof step === "string" ? {} : { decision: step.decision }),
+                prefix_bust_permitted: ["HARD", "SOFT"].includes(
+                    typeof step === "string" ? step : step.decision,
+                ),
                 served_from: "transform",
                 row_version: pass,
                 native_messages: moduleOutput(lastInput),
@@ -254,11 +259,11 @@ function releaseLines(logSpy: ReturnType<typeof spyOn>, sessionId: string): stri
 describe("release strip: the stored snapshot is not always what was served last", () => {
     // Shared shape: a HARD pass captures [m1]; the module then fails, and the
     // host serves the LKG replay with the raw tail [a1, m2]. That replay is not
-    // captured, so the slot still holds [m1]. On release the module tags m2, so
-    // the bytes change at index 2 and a2 (generated on the raw m2) must lose its
-    // thinking.
+    // captured, so the slot still holds [m1]. A module SOFT/HARD with
+    // prefix_bust_permitted=true may tag m2. Its changed bytes invalidate the
+    // signature on a2, which the provider generated against the raw m2.
 
-    it("strips thinking after a tail the error replay served when the release follows it directly", async () => {
+    it("an authorized rebuild strips thinking after a tail the error replay served directly before it", async () => {
         const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
         try {
             const s = scriptedSession("error-then-release");
@@ -274,15 +279,13 @@ describe("release strip: the stored snapshot is not always what was served last"
             expect(textOf(errorServed, "m2")).toBe("follow-up");
 
             s.setModuleOutput(tagging({ m2: 2 }));
-            // a2 and a3 open one Anthropic reasoning run, which the frozen
-            // replay refuses, so this very pass releases the freeze.
+            // SOFT grants prefix_bust_permitted here; a failed replay alone does not.
             const served = await s.run(
                 [...errorInput, thinkingAssistant(sid, "a2"), thinkingAssistant(sid, "a3")],
-                "SOFT+",
+                "SOFT",
             );
-            expect(releaseLines(logSpy, sid)).toEqual([
-                "lkg_frozen_replay_released reason=lkg_anthropic_reasoning_run_invalid",
-            ]);
+            expect(releaseLines(logSpy, sid)).toEqual([]);
+            expect(s.frozen()).toBe(false);
             // The served bytes did change at m2 ...
             expect(textOf(served, "m2")).toBe("§2§ follow-up");
             // ... so the thinking after it is invalid and must be removed.
@@ -292,7 +295,7 @@ describe("release strip: the stored snapshot is not always what was served last"
         }
     });
 
-    it("strips thinking after the raw tail an outage served when the first healthy pass releases on tail growth", async () => {
+    it("keeps outage-tail thinking on growth and strips it on the next genuine rebuild", async () => {
         const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
         try {
             const s = scriptedSession("outage-growth");
@@ -312,13 +315,16 @@ describe("release strip: the stored snapshot is not always what was served last"
             expect(s.frozen()).toBe(true);
             expect(textOf(outageServed, "m2")).toBe("turn 2");
 
-            // The module is back; the raw tail has grown past the freeze limit.
+            // Raw growth is debt, not permission to retag the outage tail or strip thinking.
             for (let index = 7; index <= 10; index += 1) turn(index);
             s.setModuleOutput(tagging({ m2: 2, m3: 3, m4: 4, m5: 5, m6: 6, m7: 7 }));
-            const served = await s.run([...conversation], "SOFT+");
-            expect(releaseLines(logSpy, sid)).toEqual([
-                "lkg_frozen_replay_released reason=raw_tail_growth_limit",
-            ]);
+            const deferred = await s.run([...conversation], "SOFT+");
+            expect(s.frozen()).toBe(true);
+            expect(textOf(deferred, "m2")).toBe("turn 2");
+            expect(hasReasoning(deferred, "a2")).toBe(true);
+            expect(releaseLines(logSpy, sid)).toEqual([]);
+            const served = await s.run([...conversation], "HARD");
+            expect(s.frozen()).toBe(false);
             expect(textOf(served, "m2")).toBe("§2§ turn 2");
             // a2 sits after the first changed message (m2) and was served with
             // its thinking by the outage replay.
@@ -328,7 +334,7 @@ describe("release strip: the stored snapshot is not always what was served last"
         }
     });
 
-    it("control: with one captured frozen pass between the error and the release, the same shape strips a2", async () => {
+    it("control: an authorized rebuild after one captured frozen pass strips a2", async () => {
         const s = scriptedSession("error-frozen-release");
         const sid = s.sessionId;
         await s.run([user(sid, "m1", "question")], "HARD");
@@ -343,7 +349,7 @@ describe("release strip: the stored snapshot is not always what was served last"
         s.setModuleOutput(tagging({ m2: 2 }));
         const served = await s.run(
             [...errorInput, thinkingAssistant(sid, "a2"), thinkingAssistant(sid, "a3")],
-            "SOFT+",
+            "SOFT",
         );
         expect(textOf(served, "m2")).toBe("§2§ follow-up");
         expect(hasReasoning(served, "a1")).toBe(true);
@@ -352,8 +358,73 @@ describe("release strip: the stored snapshot is not always what was served last"
     });
 });
 
+describe("release strip: a module bust while frozen", () => {
+    it("a frozen trim-only SOFT strips outage-tail thinking", async () => {
+        const s = scriptedSession("frozen-trim-only");
+        const sid = s.sessionId;
+        await s.run([user(sid, "m1", "question")], "HARD");
+        const conversation: MessageLike[] = [
+            user(sid, "m1", "question"),
+            thinkingAssistant(sid, "a1"),
+            user(sid, "m2", "turn 2"),
+        ];
+        // The module fails: the last-known-good replay serves the captured [m1] plus
+        // a1 and m2 exactly as the host sent them (untagged).
+        await s.run([...conversation], "throw");
+        expect(s.frozen()).toBe(true);
+        // Two healthy defers each append a thinking assistant and keep serving the
+        // frozen bytes; each one captures exactly what it served.
+        conversation.push(thinkingAssistant(sid, "a2"), user(sid, "m3", "turn 3"));
+        await s.run([...conversation], "SOFT+");
+        conversation.push(thinkingAssistant(sid, "a3"), user(sid, "m4", "turn 4"));
+        const lastFrozen = await s.run([...conversation], "SOFT+");
+        expect(s.frozen()).toBe(true);
+        expect(hasReasoning(lastFrozen, "a2")).toBe(true);
+        expect(hasReasoning(lastFrozen, "a3")).toBe(true);
+
+        // The module's bust removes the oldest reasoning (a1) and tags m2..m4, which
+        // the freeze served untagged. A signed thinking block is valid only while
+        // every byte before it is unchanged, so a2 and a3 become invalid even though
+        // the module reports its own edit as a reasoning trim.
+        const tag = tagging({ m2: 2, m3: 3, m4: 4 });
+        s.setModuleOutput((input) =>
+            tag(input).map((message) => {
+                const record = message as MessageLike;
+                return record.info.id === "a1"
+                    ? {
+                          ...record,
+                          parts: record.parts.filter(
+                              (part) => (part as { type?: string }).type !== "reasoning",
+                          ),
+                      }
+                    : message;
+            }),
+        );
+        const busted = await s.run([...conversation], {
+            decision: "SOFT",
+            response: { reasoning_trim_only: true },
+        });
+        expect(s.frozen()).toBe(false);
+        const divergence = firstServedDivergenceIndex(busted, lastFrozen, {
+            providerID: MODEL.providerID,
+        });
+        expect(divergence).toBe(1);
+        for (const message of busted.slice(divergence ?? 0) as MessageLike[]) {
+            expect(
+                message.parts.some((part) => (part as { type?: string }).type === "reasoning"),
+            ).toBe(false);
+        }
+        expect(s.strippedIds()).toEqual(["a2", "a3"]);
+
+        // The stripped ids were saved, so the next defer removes the same thinking
+        // and serves the same bytes.
+        const defer = await s.run([...conversation], "SOFT+");
+        expect(sha(defer)).toBe(sha(busted));
+    });
+});
+
 describe("release strip: replay after the strip", () => {
-    it("release -> defer -> defer, then error -> frozen -> second release, serve stable prefixes", async () => {
+    it("authorized rebuilds separated by defers and another freeze serve stable prefixes", async () => {
         const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
         try {
             const s = scriptedSession("replay-chain");
@@ -374,7 +445,7 @@ describe("release strip: replay after the strip", () => {
                 thinkingAssistant(sid, "a2"),
                 thinkingAssistant(sid, "a3"),
             ];
-            const release1 = await s.run(releaseInput, "SOFT+");
+            const release1 = await s.run(releaseInput, "SOFT");
             expect(sha(release1.slice(0, 2))).toBe(sha(frozenServed.slice(0, 2)));
             expect(hasReasoning(release1, "a1")).toBe(true);
             expect(hasReasoning(release1, "a2")).toBe(false);
@@ -415,7 +486,7 @@ describe("release strip: replay after the strip", () => {
                 thinkingAssistant(sid, "a6"),
                 thinkingAssistant(sid, "a7"),
             ];
-            const release2 = await s.run(release2Input, "SOFT+");
+            const release2 = await s.run(release2Input, "SOFT");
             const m4Index = withM4.length - 1;
             expect(sha(release2.slice(0, m4Index))).toBe(sha(frozen2.slice(0, m4Index)));
             expect(textOf(release2, "m4")).toBe("§4§ fourth");
@@ -423,15 +494,12 @@ describe("release strip: replay after the strip", () => {
             expect(hasReasoning(release2, "a4")).toBe(true);
             expect(hasReasoning(release2, "a5")).toBe(false);
             expect(s.strippedIds()).toEqual(["a2", "a3", "a5", "a6", "a7"]);
-            expect(releaseLines(logSpy, sid)).toEqual([
-                "lkg_frozen_replay_released reason=lkg_anthropic_reasoning_run_invalid",
-                "lkg_frozen_replay_released reason=lkg_anthropic_reasoning_run_invalid",
-            ]);
+            expect(releaseLines(logSpy, sid)).toEqual([]);
 
             // And the defers after it replay it exactly.
             const defer3 = await s.run(release2Input, "SOFT+");
             expect(sha(defer3)).toBe(sha(release2));
-            const defer4 = await s.run([...release2Input, user(sid, "m4", "fourth")], "SOFT+");
+            const defer4 = await s.run([...release2Input, user(sid, "m5", "fourth")], "SOFT+");
             expect(sha(defer4.slice(0, release2.length))).toBe(sha(release2));
         } finally {
             logSpy.mockRestore();

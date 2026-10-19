@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
+import { isReclaimUserTurn } from "@magic-context/core/shared/reclaim-distance";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
 import {
@@ -43,6 +44,76 @@ class LegacyAggregateToolTokenCache extends CountingToolTokenCache {
 }
 
 describe("createPiTranscript", () => {
+	it("retains notice provenance on string, array and mixed authored user content", () => {
+		for (const provenance of [{ synthetic: true }, { ignored: true }]) {
+			for (const content of [
+				"Host notice",
+				[{ type: "image", data: "", mimeType: "image/png" }],
+			]) {
+				const transcript = createPiTranscript(
+					[{ role: "user", timestamp: 1, content, ...provenance }],
+					"provenance",
+				);
+				const message = transcript.messages[0];
+				if (!message) throw new Error("missing user transcript");
+				expect(
+					isReclaimUserTurn({ ...message.info, parts: message.parts }),
+				).toBe(false);
+			}
+			const transcript = createPiTranscript(
+				[
+					{
+						role: "user",
+						timestamp: 1,
+						content: [
+							{ type: "text", text: "Host notice", ...provenance },
+							{ type: "image", data: "", mimeType: "image/png" },
+						],
+					},
+				],
+				"provenance",
+			);
+			const message = transcript.messages[0];
+			if (!message) throw new Error("missing user transcript");
+			expect(isReclaimUserTurn({ ...message.info, parts: message.parts })).toBe(
+				true,
+			);
+			expect(message.parts[1]?.imageTokens?.()).toBe(1200);
+		}
+	});
+
+	it("tags only tool result text and replays image children byte-identically", () => {
+		const db = createTestDb();
+		try {
+			const image = { type: "image", data: "aW1n", mimeType: "image/jpeg" };
+			const result = {
+				...toolResultMessage("attachment-call", "Read result"),
+				content: [{ type: "text", text: "Read result" }, image],
+			};
+			const messages = [
+				assistantToolCall("attachment-call", "read", {}),
+				result,
+			];
+			const tagger = createTagger();
+			tagger.initFromDb("ses-attachment", db);
+			const transcript = createPiTranscript(messages, "ses-attachment");
+			tagTranscript("ses-attachment", transcript, tagger, db);
+			transcript.commit();
+			const output = messages[1] as typeof result;
+			expect(output.content[0]).toEqual({
+				type: "text",
+				text: "§1§ Read result",
+			});
+			expect(output.content[1]).toBe(image);
+			const bytes = JSON.stringify(output);
+			const replay = createPiTranscript(messages, "ses-attachment");
+			tagTranscript("ses-attachment", replay, tagger, db);
+			replay.commit();
+			expect(JSON.stringify(messages[1])).toBe(bytes);
+		} finally {
+			closeQuietly(db);
+		}
+	});
 	it("scoped gate Pi finalization preserves unrelated reasoning-only assistant", () => {
 		const db = createTestDb();
 		try {

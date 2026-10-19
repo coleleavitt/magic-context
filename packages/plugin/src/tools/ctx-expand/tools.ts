@@ -1,17 +1,23 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { getLastCompartmentEndMessage } from "../../features/magic-context/compartment-storage";
 import type { ContextDatabase } from "../../features/magic-context/storage";
-import { readSessionChunk } from "../../hooks/magic-context/read-session-chunk";
+import {
+    prepareRawSessionOrdinals,
+    readSessionChunk,
+} from "../../hooks/magic-context/read-session-chunk";
+import type { ToolExpansionMap } from "../../shared/historian-tool-template";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_EXPAND_DESCRIPTION, CTX_EXPAND_TOKEN_BUDGET } from "./constants";
 import { resolveCtxExpandMode } from "./mode";
 import { renderItemByTag, renderMessageByOrdinal, renderVerboseRange } from "./render";
+import { renderSearchArchive } from "./search-archive";
 import type { CtxExpandArgs } from "./types";
 
 export { CTX_EXPAND_LIGHT_DESCRIPTION } from "../light-descriptions";
 
 export interface CtxExpandToolDeps {
     db: ContextDatabase;
+    expandTools?: ToolExpansionMap;
 }
 
 const ctxExpandArgsShape = {
@@ -63,6 +69,8 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 message: "number",
             });
             const sessionId = toolContext.sessionID;
+            if (!(await prepareRawSessionOrdinals(sessionId)))
+                return "Session ordinals are warming in the background. Retry ctx_expand shortly; no approximate ordinal was served.";
             const mode = resolveCtxExpandMode(args, "positive");
             if (mode.kind === "error") {
                 return mode.message;
@@ -71,7 +79,15 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 return renderItemByTag(deps.db, sessionId, mode.tag);
             }
             if (mode.kind === "message") {
-                return renderMessageByOrdinal(sessionId, mode.message);
+                return (
+                    renderSearchArchive(
+                        deps.db,
+                        sessionId,
+                        mode.message,
+                        mode.message,
+                        CTX_EXPAND_TOKEN_BUDGET,
+                    ) ?? renderMessageByOrdinal(sessionId, mode.message)
+                );
             }
             const { start, end, verbose } = mode;
 
@@ -85,6 +101,14 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 return `Range ${start}-${end} is entirely within the live tail (after the last compacted message ${lastCompartmentEnd}); those messages are already visible in context.`;
             }
             const effectiveEnd = lastCompartmentEnd >= 0 ? Math.min(end, lastCompartmentEnd) : end;
+            const archived = renderSearchArchive(
+                deps.db,
+                sessionId,
+                start,
+                effectiveEnd,
+                CTX_EXPAND_TOKEN_BUDGET,
+            );
+            if (archived) return archived;
 
             // Verbose mode: each message separate, with ids + per-part previews.
             if (verbose) {
@@ -93,6 +117,7 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                     start,
                     effectiveEnd,
                     CTX_EXPAND_TOKEN_BUDGET,
+                    deps.expandTools,
                 );
                 if (!v.text) {
                     return `No messages found in range ${start}-${effectiveEnd}. The range may be outside this session's history.`;
@@ -116,6 +141,7 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 CTX_EXPAND_TOKEN_BUDGET,
                 start,
                 effectiveEnd + 1, // readSessionChunk uses exclusive end
+                { expand: false },
             );
 
             if (!chunk.text || chunk.messageCount === 0) {
