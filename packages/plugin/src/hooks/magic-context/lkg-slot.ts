@@ -39,6 +39,22 @@ export interface LkgEntryNote {
     anchorIndex: number;
 }
 
+const POSITIONAL_SYSTEM_KEY = "\0mc-system:";
+
+/**
+ * Identity used only to match a last-good replay against the current input.
+ * Never assign it to a host message's `info.id`, and never tag a message by
+ * it: tags are the `§N§` numbers the model passes to `ctx_reduce`, and they
+ * must stay keyed by real host message ids so a drop survives restarts.
+ */
+export function lkgInputIdentity(id: unknown, role: unknown, index: number): string | null {
+    if (typeof id === "string" && id.length > 0)
+        return id.startsWith(POSITIONAL_SYSTEM_KEY) ? null : id;
+    // Content is checked separately by the aligned pristine digest. Position
+    // distinguishes repeated announcements without inventing a host message id.
+    return role === "system" ? `${POSITIONAL_SYSTEM_KEY}${index}` : null;
+}
+
 // One slot must hold any request a provider will accept. Anthropic's limit is
 // 32 MB of request JSON, and screenshot-heavy sessions reach it long before the
 // token window. Slot size is counted as two heap bytes per JSON character, so a
@@ -777,13 +793,16 @@ export function dropSlot(sessionId: string, _reason?: string): void {
     if (pass !== undefined) hydrationAttemptBySession.set(sessionId, pass);
 }
 
-export function noteEntry(sessionId: string, messages: MessageLike[]): LkgEntryNote | null {
+export function noteEntry(sessionId: string, input: MessageLike[]): LkgEntryNote | null {
     const slot = getSlot(sessionId);
     if (!slot) return null;
-    const entryInputIds = messages.map((message) => {
-        const id = (message.info as { id?: unknown } | undefined)?.id;
-        return typeof id === "string" ? id : "";
-    });
+    // Covered instructions can still be served from the saved prefix. Their
+    // positions and bytes must be proved too, even while transform stages set
+    // them aside to keep them out of tagging and ordinary history trimming.
+    const messages = input;
+    const entryInputIds = messages.map(
+        (message, index) => lkgInputIdentity(message.info?.id, message.info?.role, index) ?? "",
+    );
     const anchorIndex = entryInputIds.indexOf(slot.lastInputMessageId);
     if (anchorIndex < 0) return null;
     // Digest the whole input, not only the prefix the slot needs: the entry

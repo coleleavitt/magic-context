@@ -5,14 +5,9 @@ import {
     hasMeaningfulUserText,
 } from "../../hooks/magic-context/read-session-chunk";
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
-import { getHarness, type HarnessId } from "../../shared/harness";
-import {
-    type Database,
-    type Statement as PreparedStatement,
-    withoutSqliteTransformPass,
-    withSqliteBackgroundWriter,
-} from "../../shared/sqlite";
-import { closeQuietly } from "../../shared/sqlite-helpers";
+import { getHarness } from "../../shared/harness";
+import { removeTaskNotifications } from "../../shared/search-text";
+import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { removeSystemReminders } from "../../shared/system-directive";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { clearCompressionDepth } from "./compression-depth-storage";
@@ -22,8 +17,6 @@ import {
     recordIndexedMessageTime,
     recordMessageFtsRowid,
 } from "./message-fts-rowid-map";
-import { deleteSessionScopedRows, SESSION_SCOPED_TABLES } from "./storage-session-tables";
-import { TAG_TOMBSTONE_OWNER_PREFIX } from "./storage-tag-identity-revision";
 
 interface MessageHistoryIndexRow {
     last_indexed_ordinal?: number;
@@ -36,33 +29,6 @@ interface MessageHistorySourceRow {
     normalized_content_hash?: string;
     role?: string;
 }
-
-interface MessageHistoryOrphanSweepRow {
-    cursor_session_id?: string;
-    last_swept_at?: number | null;
-}
-
-export interface MessageHistoryOrphanSweepResult {
-    status: "swept" | "cooldown" | "source_unavailable" | "unavailable";
-    scanned: number;
-    deleted: number;
-    cursor: string;
-    /** Why a parked sweep did not run, when that is not simply a host without an OpenCode store. */
-    reason?: string;
-}
-
-export interface MessageHistoryOrphanSweepOptions {
-    batchSize?: number;
-    now?: number;
-    safetyAgeMs?: number;
-    cooldownMs?: number;
-    unavailableReprobeMs?: number;
-}
-
-export const MESSAGE_HISTORY_ORPHAN_SWEEP_BATCH_SIZE = 200;
-export const MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS = 24 * 60 * 60 * 1000;
-export const MESSAGE_HISTORY_ORPHAN_SWEEP_COOLDOWN_MS = 10 * 60 * 1000;
-export const MESSAGE_HISTORY_ORPHAN_UNAVAILABLE_REPROBE_MS = 24 * 60 * 60 * 1000;
 
 const lastIndexedStatements = new WeakMap<Database, PreparedStatement>();
 const insertMessageStatements = new WeakMap<Database, PreparedStatement>();
@@ -588,6 +554,7 @@ export function getIndexableContent(role: string, parts: unknown[]): string {
         }
 
         return extractTexts(parts)
+            .map(removeTaskNotifications)
             .map(cleanUserText)
             .map(normalizeIndexText)
             .filter((text) => text.length > 0)
@@ -596,6 +563,7 @@ export function getIndexableContent(role: string, parts: unknown[]): string {
 
     if (role === "assistant") {
         return extractTexts(parts)
+            .map(removeTaskNotifications)
             .map(removeSystemReminders)
             .map(normalizeIndexText)
             .filter((text) => text.length > 0)
@@ -913,238 +881,4 @@ export function ensureMessagesIndexed(
     }
 
     indexMessagesAfterOrdinal(db, sessionId, messages, lastIndexedOrdinal, messages.length);
-}
-
-/**
- * True when the running host keeps its sessions in the OpenCode store this
- * sweep reads. Pi and OMP keep theirs elsewhere, so there is nothing here for
- * the sweep to compare against — that is an absent source, not an error, and
- * the caller parks the sweep instead of failing the maintenance pass.
- *
- * OpenCode 2 is parked too. This sweep judges a session orphaned when OpenCode
- * 1's `session` table has no row for it, but OpenCode 2 keeps its sessions in
- * `session_v2`. A store OpenCode 2 migrated from OpenCode 1 still carries the
- * old `session` table, so the OpenCode 1 store opens cleanly and every
- * OpenCode 2 session looks orphaned: sweeping there would delete live session
- * state. Sweeping OpenCode 2 needs a check against `session_v2` instead.
- */
-function harnessSupportsOpenCodeOrphanSweep(harness: HarnessId): harness is "opencode" {
-    return harness === "opencode";
-}
-
-function getMessageHistoryOrphanSweepState(
-    db: Database,
-    harness: HarnessId,
-): MessageHistoryOrphanSweepRow {
-    return (
-        (db
-            .prepare(
-                "SELECT cursor_session_id, last_swept_at FROM message_history_orphan_sweep WHERE harness = ?",
-            )
-            .get(harness) as MessageHistoryOrphanSweepRow | null) ?? {}
-    );
-}
-
-function persistMessageHistoryOrphanSweepState(
-    db: Database,
-    cursor: string,
-    lastSweptAt: number | null,
-    harness: HarnessId,
-): void {
-    db.prepare(
-        `INSERT INTO message_history_orphan_sweep (harness, cursor_session_id, last_swept_at)
-          VALUES (?, ?, ?)
-         ON CONFLICT(harness) DO UPDATE SET
-             cursor_session_id = excluded.cursor_session_id,
-             last_swept_at = excluded.last_swept_at`,
-    ).run(harness, cursor, lastSweptAt);
-}
-
-function getOpenCodeSessionScopedCandidateSourceSql(harness: "opencode" | "opencode2"): string {
-    // A table without harness provenance cannot safely nominate a session for an
-    // OpenCode sweep: the same shared row could belong to Pi. Once an
-    // OpenCode-scoped table is listed for deletion, it automatically becomes a
-    // discovery source too; storage-db.test.ts fences that list to the schema.
-    const sources = SESSION_SCOPED_TABLES.filter(
-        (definition) => definition.harnessScoped === true,
-    ).map((definition) => {
-        const predicates = ["session_id IS NOT NULL", `harness = '${harness}'`];
-        if (definition.extraPredicate) predicates.push(definition.extraPredicate);
-        return `SELECT session_id FROM ${definition.table} WHERE ${predicates.join(" AND ")}`;
-    });
-    // A context reset can leave only its retained tag-change counters. The
-    // marker records the session ID and producing harness, so this sweep checks
-    // OpenCode's session table only for OpenCode-owned counters, not resumable Pi sessions.
-    const jsonId = `SUBSTR(key, ${TAG_TOMBSTONE_OWNER_PREFIX.length + 1}, LENGTH(key) - ${TAG_TOMBSTONE_OWNER_PREFIX.length + harness.length + 1})`;
-    sources.push(`SELECT CASE WHEN json_valid(${jsonId}) THEN
-        CASE WHEN json_type(${jsonId}) = 'text' THEN json_extract(${jsonId}, '$') END END AS session_id
-        FROM schema_migrations_meta WHERE value = '${harness}'
-        AND key >= '${TAG_TOMBSTONE_OWNER_PREFIX}' AND key < '${TAG_TOMBSTONE_OWNER_PREFIX.slice(0, -1)};'
-        AND SUBSTR(key, -${harness.length + 1}) = ':${harness}'`);
-    return sources.join("\nUNION\n");
-}
-
-/**
- * Delete old OpenCode session state that no longer exists in OpenCode's
- * authoritative session table. One bounded keyset page is processed per call;
- * the cursor survives restarts and only resets after a complete pass. Pi rows
- * need a separate sweep against Pi's session files and are excluded here.
- */
-function sweepOrphanedOpenCodeMessageIndexesInBackground(
-    db: Database,
-    openReadableOpenCodeDb: () => Database | null,
-    options: MessageHistoryOrphanSweepOptions = {},
-): MessageHistoryOrphanSweepResult {
-    const now = options.now ?? Date.now();
-    const batchSize = Math.max(
-        1,
-        Math.floor(options.batchSize ?? MESSAGE_HISTORY_ORPHAN_SWEEP_BATCH_SIZE),
-    );
-    const safetyAgeMs = Math.max(0, options.safetyAgeMs ?? MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS);
-    const cooldownMs = Math.max(0, options.cooldownMs ?? MESSAGE_HISTORY_ORPHAN_SWEEP_COOLDOWN_MS);
-    const unavailableReprobeMs = Math.max(
-        cooldownMs,
-        options.unavailableReprobeMs ?? MESSAGE_HISTORY_ORPHAN_UNAVAILABLE_REPROBE_MS,
-    );
-    const harness = getHarness();
-    const state = getMessageHistoryOrphanSweepState(db, harness);
-    const cursor = typeof state.cursor_session_id === "string" ? state.cursor_session_id : "";
-    if (typeof state.last_swept_at === "number" && state.last_swept_at + cooldownMs > now) {
-        return { status: "cooldown", scanned: 0, deleted: 0, cursor };
-    }
-
-    if (!harnessSupportsOpenCodeOrphanSweep(harness)) {
-        // Same class of problem as the unreadable store below: the source this
-        // sweep needs is not here. Park it future-dated so the normal cooldown
-        // arithmetic re-probes after one day, and report it to the caller
-        // instead of throwing — a throw here aborted the whole maintenance tick
-        // on Pi and OMP, which stopped every scheduled task from running
-        // (issue 496).
-        persistMessageHistoryOrphanSweepState(
-            db,
-            cursor,
-            now + unavailableReprobeMs - cooldownMs,
-            harness,
-        );
-        if (harness === "opencode2") {
-            return {
-                status: "unavailable",
-                scanned: 0,
-                deleted: 0,
-                cursor,
-                reason: "OpenCode 2 keeps its sessions in session_v2, which this sweep does not read",
-            };
-        }
-        return { status: "unavailable", scanned: 0, deleted: 0, cursor };
-    }
-
-    let openCodeDb: Database | null = null;
-    try {
-        openCodeDb = openReadableOpenCodeDb();
-    } catch {
-        openCodeDb = null;
-    }
-    if (!openCodeDb) {
-        // Mirror the git sweep's non-indexable parking: future-date the last
-        // sweep so the normal cooldown arithmetic re-probes after one day.
-        persistMessageHistoryOrphanSweepState(
-            db,
-            cursor,
-            now + unavailableReprobeMs - cooldownMs,
-            harness,
-        );
-        return { status: "source_unavailable", scanned: 0, deleted: 0, cursor };
-    }
-
-    try {
-        const cutoff = now - safetyAgeMs;
-        const candidateSourceSql = getOpenCodeSessionScopedCandidateSourceSql(harness);
-        const candidates = db
-            .prepare(
-                `SELECT session_id
-                 FROM (${candidateSourceSql}) AS session_candidates
-                 WHERE session_id > ?
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM message_history_index
-                       WHERE message_history_index.session_id = session_candidates.session_id
-                          AND message_history_index.harness = '${harness}'
-                         AND message_history_index.updated_at > ?
-                   )
-                 ORDER BY session_id ASC
-                 LIMIT ?`,
-            )
-            .all(cursor, cutoff, batchSize) as Array<{ session_id: string }>;
-        const sessionExists = openCodeDb.prepare("SELECT 1 FROM session WHERE id = ? LIMIT 1");
-        const missingSessionIds = candidates
-            .filter((candidate) => !sessionExists.get(candidate.session_id))
-            .map((candidate) => candidate.session_id);
-        const nextCursor =
-            candidates.length < batchSize
-                ? ""
-                : (candidates[candidates.length - 1]?.session_id ?? cursor);
-        const completedAt = candidates.length < batchSize ? now : null;
-
-        db.exec("BEGIN IMMEDIATE");
-        const transactionStartedAt = performance.now();
-        let committed = false;
-        let deleted = 0;
-        try {
-            const stillEligible = db.prepare(
-                `SELECT 1
-                 FROM (${candidateSourceSql}) AS session_candidates
-                 WHERE session_id = ?
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM message_history_index
-                       WHERE message_history_index.session_id = session_candidates.session_id
-                          AND message_history_index.harness = '${harness}'
-                         AND message_history_index.updated_at > ?
-                   )
-                 LIMIT 1`,
-            );
-            // A session absent from OpenCode's first probe may have been imported
-            // while this worker waited for the context writer lock. Recheck just
-            // those IDs in OpenCode's session table before deleting their context
-            // rows, including any tags written since the initial probe.
-            const eligibleSessionIds = missingSessionIds.filter(
-                (sessionId) =>
-                    !sessionExists.get(sessionId) && stillEligible.get(sessionId, cutoff),
-            );
-            deleted = deleteSessionScopedRows(db, eligibleSessionIds, harness);
-            persistMessageHistoryOrphanSweepState(db, nextCursor, completedAt, harness);
-            db.exec("COMMIT");
-            committed = true;
-            logSlowWriteTransaction("message_index_orphan_sweep", transactionStartedAt);
-        } finally {
-            if (!committed) {
-                try {
-                    db.exec("ROLLBACK");
-                } catch {
-                    // already rolled back / no active transaction
-                }
-            }
-        }
-
-        return {
-            status: "swept",
-            scanned: candidates.length,
-            deleted,
-            cursor: nextCursor,
-        };
-    } finally {
-        closeQuietly(openCodeDb);
-    }
-}
-
-export function sweepOrphanedOpenCodeMessageIndexes(
-    db: Database,
-    openReadableOpenCodeDb: () => Database | null,
-    options: MessageHistoryOrphanSweepOptions = {},
-): MessageHistoryOrphanSweepResult {
-    return withoutSqliteTransformPass(() =>
-        withSqliteBackgroundWriter(() =>
-            sweepOrphanedOpenCodeMessageIndexesInBackground(db, openReadableOpenCodeDb, options),
-        ),
-    );
 }

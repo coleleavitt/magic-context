@@ -16,15 +16,34 @@ const DAY = 24 * HOUR;
 const MAX_NEW = 500;
 const MAX_HISTORY = 5_000;
 const AGENT_ID = "agent_b613e5cf2ee55b8c";
+// A primary attempt that fails is followed by its fallback attempt, which ends
+// later. Rows are judged only once they are this old, which gives the fallback
+// time to finish before its outcome is checked.
+const DEFAULT_SETTLE_MS = 5 * 60_000;
+// Some fallback rows carry no parent link. Such a row still counts as a
+// primary's fallback when it has task `fallback`, the same subagent and session,
+// and starts between 5 seconds before and this long after the primary ends.
+const FALLBACK_START_WINDOW_MS = 120_000;
+// Failures a working fallback makes routine: an exhausted or rate-limited
+// provider; the summarizer refusing before sending because the prompt is
+// larger than that model's window (no model call was made); and a primary that
+// never answered before the prompt deadline (a model that is down). A timeout
+// counts only when a fallback then completed the same work, so a prompt too slow
+// for every model in the chain still alerts. Any other failure stays eligible for
+// the alert rules even when a fallback recovered it.
+const RECOVERABLE_ERROR =
+    /account pool has no account|quota|rate[ _-]?limit|too many requests|\b429\b|resource_exhausted|usage limit|producer_prompt_exceeds_window|prompt timed out after/i;
 
 type Row = {
     id: number;
     session_id: string;
     subagent: string;
     task: string | null;
+    started_at: number;
     ended_at: number;
     status: string;
     error: string | null;
+    parent_invocation_id: number | null;
 };
 type Cursor = { ended_at: number; id: number };
 type Sent = { at: number; count: number };
@@ -46,6 +65,8 @@ export type FailureSentinelOptions = {
     stateFile: string;
     connectionFile: string;
     send: boolean;
+    /** How long a row must have ended before it is judged; see DEFAULT_SETTLE_MS. */
+    settleMs?: number;
     now?: () => number;
     wake?: (content: string, deliveryId: string) => Promise<void>;
     stdout?: (line: string) => void;
@@ -96,7 +117,55 @@ function key(alert: Alert): string {
     return JSON.stringify([alert.rule, alert.subagent, alert.task, klass]);
 }
 
-export function evaluateFailures(rows: Row[], newRows: Row[], now: number, completeSince: number): Alert[] {
+/**
+ * Ids of routine failures (see RECOVERABLE_ERROR) that a completed fallback attempt
+ * recovered. The run produced its result on a fallback model, so the earlier
+ * failures are expected and not worth a wake. A chain can fail on several models
+ * before one completes, for example when two models share one exhausted account
+ * pool, so recovery follows the chain to the completed attempt. Only routine
+ * failures are excused. A non-routine step on the way, such as a fallback that
+ * returned an empty reply, still lets the chain reach its completion, but that step
+ * itself stays eligible for the alert rules. A chain that ends without a completed
+ * attempt leaves all its failures eligible.
+ */
+export function recoveredByFallback(rows: Row[]): Set<number> {
+    const isRoutineFailure = (row: Row) =>
+        (row.status === "failed" || row.status === "timed_out") && RECOVERABLE_ERROR.test(row.error ?? "");
+    const nextAttempts = (row: Row) =>
+        rows.filter(
+            (candidate) =>
+                candidate.parent_invocation_id === row.id ||
+                (candidate.parent_invocation_id === null &&
+                    candidate.task === "fallback" &&
+                    candidate.subagent === row.subagent &&
+                    candidate.session_id === row.session_id &&
+                    candidate.started_at >= row.ended_at - 5_000 &&
+                    candidate.started_at <= row.ended_at + FALLBACK_START_WINDOW_MS),
+        );
+    // True when a completed attempt follows this failure further down its chain.
+    // `seen` guards against a malformed chain that loops.
+    const reachesCompletion = (row: Row, seen: Set<number>): boolean => {
+        for (const next of nextAttempts(row)) {
+            if (seen.has(next.id)) continue;
+            if (next.status === "completed") return true;
+            seen.add(next.id);
+            if (reachesCompletion(next, seen)) return true;
+        }
+        return false;
+    };
+    const recovered = new Set<number>();
+    for (const row of rows) {
+        if (isRoutineFailure(row) && reachesCompletion(row, new Set([row.id]))) recovered.add(row.id);
+    }
+    return recovered;
+}
+
+export function evaluateFailures(allRows: Row[], allNewRows: Row[], now: number, completeSince: number): Alert[] {
+    // A recovered attempt is neither a failure nor a success of its task, so it is
+    // left out of every rule, including the share denominator.
+    const recovered = recoveredByFallback(allRows);
+    const rows = allRows.filter((row) => !recovered.has(row.id));
+    const newRows = allNewRows.filter((row) => !recovered.has(row.id));
     const failures = (row: Row) => row.status === "failed" || row.status === "timed_out";
     const taskName = (row: Row) => row.task ?? "(untitled)";
     const alerts: Alert[] = [];
@@ -174,9 +243,10 @@ export async function runFailureSentinel(options: FailureSentinelOptions): Promi
         if (!existsSync(options.db)) throw new Error(`context database missing: ${options.db}`);
         db = new Database(options.db, { readonly: true });
         db.exec("PRAGMA busy_timeout = 3000");
-        const fields = "id, session_id, subagent, task, ended_at, status, error";
+        const fields = "id, session_id, subagent, task, started_at, ended_at, status, error, parent_invocation_id";
+        const settledBefore = now - (options.settleMs ?? DEFAULT_SETTLE_MS);
         const next = db.query(`SELECT ${fields} FROM subagent_invocations WHERE ended_at IS NOT NULL AND ended_at <= ? AND (ended_at > ? OR (ended_at = ? AND id > ?)) ORDER BY ended_at, id LIMIT ?`)
-            .all(now, state.cursor.ended_at, state.cursor.ended_at, state.cursor.id, MAX_NEW + 1) as Row[];
+            .all(settledBefore, state.cursor.ended_at, state.cursor.ended_at, state.cursor.id, MAX_NEW + 1) as Row[];
         bounded = next.length > MAX_NEW;
         const fresh = next.slice(0, MAX_NEW);
         examined += next.length;

@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import { markWhitespaceAssistantTagInert } from "../../features/magic-context/storage-tags";
+import {
+    clearLegacyForeignTextTagsForTest,
+    rememberLegacyForeignTextTags,
+} from "../../hooks/magic-context/foreign-text-parts";
 import { Database } from "../../shared/sqlite";
 import { createCtxReduceTools } from "./tools";
 
@@ -122,7 +126,9 @@ describe("createCtxReduceTools", () => {
             const result = await tools.ctx_reduce.execute({}, toolContext());
 
             expect(result).toContain("Error");
-            expect(result).toContain("'drop' must be provided");
+            expect(result).toBe(
+                `Error: 'drop' must be provided as a string of tag numbers, for example {"drop": "3-5,8"}.`,
+            );
         });
 
         it("refuses empty drop filler without queuing a phantom command", async () => {
@@ -130,7 +136,9 @@ describe("createCtxReduceTools", () => {
             const omitted = await tools.ctx_reduce.execute({}, toolContext());
             const empty = await tools.ctx_reduce.execute({ drop: "" }, toolContext());
             expect(empty).toBe(omitted);
-            expect(empty).toContain("'drop' must be provided");
+            expect(empty).toBe(
+                `Error: 'drop' must be provided as a string of tag numbers, for example {"drop": "3-5,8"}.`,
+            );
             expect(getPendingOps(db, "ses-1")).toHaveLength(0);
         });
 
@@ -339,6 +347,27 @@ describe("createCtxReduceTools", () => {
                 "2 tags stamped. Skipped: §7§ is provider framing, nothing to reclaim.",
             );
             expect(getPendingOps(db, "ses-1").map((op) => op.tag_id)).toEqual([6, 8]);
+        });
+
+        it("skips another plugin's legacy text tag per id while queueing every live tag", async () => {
+            seedTags(db, [
+                { id: 6, sessionId: "ses-1" },
+                { id: 7, sessionId: "ses-1" },
+                { id: 8, sessionId: "ses-1" },
+            ]);
+            // The transform records a tag an older release put on another
+            // plugin's appended text part when it serves that part.
+            rememberLegacyForeignTextTags("ses-1", [7]);
+            try {
+                const result = await tools.ctx_reduce.execute({ drop: "6-8" }, toolContext());
+
+                expect(result).toBe(
+                    "2 tags stamped. Skipped: §7§ is another plugin's text, nothing to reclaim.",
+                );
+                expect(getPendingOps(db, "ses-1").map((op) => op.tag_id)).toEqual([6, 8]);
+            } finally {
+                clearLegacyForeignTextTagsForTest();
+            }
         });
 
         it("reads inert whitespace state only for the requested tags", async () => {

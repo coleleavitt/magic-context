@@ -1,7 +1,78 @@
 import { describe, expect, it } from "bun:test";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 
-import { calibrateHistorianProviderPayload } from "./historian-calibration-extension";
+import {
+	calibrateHistorianProviderPayload,
+	ceilProviderOutputTokens,
+} from "./historian-calibration-extension";
+
+describe("hidden child output ceiling", () => {
+	it("lowers every provider output field to the ceiling but never raises one", () => {
+		for (const key of [
+			"max_tokens",
+			"max_completion_tokens",
+			"max_output_tokens",
+			"maxTokens",
+		]) {
+			expect(ceilProviderOutputTokens({ [key]: 936_066 }, 32_000)).toEqual({
+				[key]: 32_000,
+			});
+			expect(ceilProviderOutputTokens({ [key]: 8_192 }, 32_000)).toEqual({
+				[key]: 8_192,
+			});
+		}
+		expect(
+			ceilProviderOutputTokens(
+				{ generationConfig: { maxOutputTokens: 65_536, temperature: 1 } },
+				32_000,
+			),
+		).toEqual({
+			generationConfig: { maxOutputTokens: 32_000, temperature: 1 },
+		});
+		expect(
+			ceilProviderOutputTokens(
+				{ inferenceConfig: { maxTokens: 65_536 } },
+				32_000,
+			),
+		).toEqual({ inferenceConfig: { maxTokens: 32_000 } });
+		// No cap field: the field name is unknown, so the request is left alone.
+		expect(ceilProviderOutputTokens({ model: "m" }, 32_000)).toEqual({
+			model: "m",
+		});
+		expect(
+			ceilProviderOutputTokens({ max_tokens: 936_066 }, undefined),
+		).toEqual({
+			max_tokens: 936_066,
+		});
+	});
+
+	it("keeps an Anthropic thinking budget below the lowered max_tokens", () => {
+		expect(
+			ceilProviderOutputTokens(
+				{
+					max_tokens: 64_000,
+					thinking: { type: "enabled", budget_tokens: 40_000 },
+				},
+				32_000,
+			),
+		).toEqual({
+			max_tokens: 32_000,
+			thinking: { type: "enabled", budget_tokens: 30_976 },
+		});
+		expect(
+			ceilProviderOutputTokens(
+				{
+					max_tokens: 64_000,
+					thinking: { type: "enabled", budget_tokens: 16_384 },
+				},
+				32_000,
+			),
+		).toEqual({
+			max_tokens: 32_000,
+			thinking: { type: "enabled", budget_tokens: 16_384 },
+		});
+	});
+});
 
 describe("historian provider calibration", () => {
 	it("sets the calibration triple on every supported output-budget shape", () => {
@@ -135,6 +206,7 @@ it("observes the effective context prompt rather than before-agent input", async
 			(event: unknown, ctx: { getSystemPrompt(): unknown }) => unknown
 		>();
 		extension({
+			registerFlag: () => {},
 			on: (
 				name: string,
 				handler: (
@@ -183,7 +255,10 @@ it("does not apply historian sampling calibration to provenance-only dreamer chi
 		process.env.MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY = "1";
 		process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE = "0.1";
 		const events: string[] = [];
-		extension({ on: (name: string) => events.push(name) } as never);
+		extension({
+			registerFlag: () => {},
+			on: (name: string) => events.push(name),
+		} as never);
 		expect(events).not.toContain("before_provider_request");
 	} finally {
 		if (previous === undefined)
@@ -250,6 +325,7 @@ async function withCalibrationHook(
 			| ((event: { payload: unknown }, ctx: { model?: unknown }) => unknown)
 			| undefined;
 		extension({
+			registerFlag: () => {},
 			on(name: string, handler: typeof hook) {
 				if (name === "before_provider_request") hook = handler;
 			},

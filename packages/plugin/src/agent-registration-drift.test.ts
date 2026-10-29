@@ -34,6 +34,7 @@ import {
 import { SMART_NOTE_COMPILER_AGENT } from "./agents/smart-note-compiler";
 import { permissionDisabled } from "./hooks/magic-context/ctx-reduce-availability";
 import { resolveHistorianAgentOverrides } from "./shared/model-resolution";
+import { hiddenAgentAllowedTools, hiddenChildPermissions } from "./v2/hooks/hidden-child";
 
 function taskRules(task: Record<string, string>) {
     return Object.entries(task).map(([pattern, action]) => ({
@@ -64,6 +65,23 @@ describe("hidden-agent registration drift guard", () => {
         historianDisallowed: [],
     });
     const byId = (id: string) => regs.find((r) => r.id === id);
+
+    for (const [id, tools] of [
+        [DREAMER_MEMORY_MAPPER_AGENT, DREAMER_MEMORY_MAPPER_ALLOWED_TOOLS],
+        [DREAMER_PRIMER_INVESTIGATOR_AGENT, DREAMER_PRIMER_INVESTIGATOR_ALLOWED_TOOLS],
+    ] as const) {
+        test(`OpenCode 2 ${id} navigation tools match the canonical registration`, () => {
+            expect(hiddenAgentAllowedTools(id)).toEqual([...tools]);
+            expect(hiddenAgentAllowedTools(id)).toEqual(byId(id)?.allowedTools);
+            expect(
+                hiddenChildPermissions(id)
+                    .filter((rule) => rule.effect === "allow")
+                    .map((rule) => rule.action),
+            ).toEqual([...tools]);
+            for (const tool of ["aft_outline", "aft_zoom", "aft_search"])
+                expect(hiddenAgentAllowedTools(id)).toContain(tool);
+        });
+    }
 
     test("registers hidden agents with canonical ids", () => {
         expect(regs.map((r) => r.id).sort()).toEqual(
@@ -255,6 +273,48 @@ describe("hidden-agent registration drift guard", () => {
             "*": "deny",
         });
         expect(permissionDisabled("task", taskRules(merged.task))).toBe(true);
+    });
+
+    test("named task allows survive an ambient wildcard deny (#777)", () => {
+        const internalAgentIds = [DREAMER_REVIEWER_AGENT, HISTORIAN_AGENT];
+        const merged = denyTaskRoutingToAgents(
+            { task: { "*": "deny", "my-scout": "allow" } },
+            internalAgentIds,
+        ) as { task: Record<string, string> };
+
+        // The agent's own ordering is kept: the wildcard stays where the user
+        // put it, so the named allow after it still wins under OpenCode's
+        // last-matching-rule evaluation instead of being overridden by a
+        // re-appended wildcard.
+        expect(merged.task).toEqual({
+            "*": "deny",
+            "my-scout": "allow",
+            [DREAMER_REVIEWER_AGENT]: "deny",
+            [HISTORIAN_AGENT]: "deny",
+        });
+
+        const rules = taskRules(merged.task);
+        const lastMatching = (target: string) =>
+            [...rules].reverse().find((rule) => rule.pattern === target || rule.pattern === "*");
+        expect(lastMatching("my-scout")?.action).toBe("allow");
+        expect(lastMatching("other-agent")?.action).toBe("deny");
+
+        // A mixed map must not hide the whole Task tool: the last rule is a
+        // named deny, not the wildcard.
+        expect(permissionDisabled("task", rules)).toBe(false);
+    });
+
+    test("mixed wildcard-deny task maps re-merge idempotently (#777)", () => {
+        const internalAgentIds = [DREAMER_REVIEWER_AGENT, HISTORIAN_AGENT];
+        const first = denyTaskRoutingToAgents(
+            { task: { "*": "deny", "my-scout": "allow" } },
+            internalAgentIds,
+        );
+        const second = denyTaskRoutingToAgents(first, internalAgentIds);
+
+        expect(second).toEqual(first);
+        const task = (second as { task: Record<string, string> }).task;
+        expect(Object.keys(task).filter((pattern) => pattern === "*")).toHaveLength(1);
     });
 
     test("Task wildcard re-emission is idempotent across repeated registration", () => {

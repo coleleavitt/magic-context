@@ -77,6 +77,8 @@ When and how aggressively Magic Context manages the session's context window. Pe
 | `keep_reasoning_tokens` | integer (0–1000000) \| map<string, integer (0–1000000)> | — | Reasoning tokens to keep on rebuilding passes. Number or per-model object; exact, shorter model keys, provider/\*, then default. Omitted: fixed 10,000. 0 removes all eligible historical reasoning; newest and exempt steps always stay. |
 | `history_budget_percentage` | number (0.05–0.5) | `0.15` | Fraction of usable context (context_limit × execute_threshold) reserved for the session history block (default: 0.15) |
 
+If `cache_ttl` is shorter than the provider's real cache lifetime (for example, a locally hosted model whose prefix cache doesn't expire), idle expiry rebuilds the prompt onto a cache that is still warm and pays for the rewrite for nothing. Set `cache_ttl` to match the provider, or to `"never"` for a cache that doesn't expire.
+
 ## Model profiles
 
 Named user-owned model-selection overlays. A project may select a profile name but cannot define or alter profile contents.
@@ -111,16 +113,16 @@ The background agent that condenses old conversation into compact history.
 | `historian.maxTokens` **Live** | number | — | Maximum output tokens |
 | `historian.expand_tools` **Live** | map<string, string \| boolean> | — | Readable historian tool expansions, keyed by exact host tool name. Templates override built-in defaults; false disables an expansion. Supports ${input.path}, ${output.path}, bare ${output}, array [N], [\*].field, .each("${field}"), .join("separator"), .count and final .truncate(N). Missing fields are empty. Historian text and lists have no implicit caps; explicit .truncate(N) keeps complete sentences and marks omitted characters, or emits only the marker if no sentence fits. When the ctx_expand history-recovery tool is called in verbose mode, its tool-call previews retain their original built-in templates and limits (300 characters per placeholder, 10 list elements, 1000 characters per expansion). Valid in user and project config; never changes the wire or default ctx_expand transcript. |
 | `historian.opencode` | object | — | Strict OpenCode model-resolution block. It accepts no Pi vocabulary. |
-| `historian.opencode.model` **Live** | string \| object | — | Primary OpenCode model entry. |
-| `historian.opencode.fallback_models` **Live** | string \| object[] | — | Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
+| `historian.opencode.model` **Live** | string \| object | — | Primary historian OpenCode model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. When absent, OpenCode inherits the session model. |
+| `historian.opencode.fallback_models` **Live** | string \| object[] | — | Ordered historian fallback OpenCode entries. A configured primary never adds the session model after this list. Requires an array; legacy singleton values migrate to a one-element array. |
 | `historian.opencode.variant` **Live** | string | — | OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry. |
 | `historian.pi` | object | — | Strict Pi model-resolution block. It accepts no OpenCode vocabulary. |
-| `historian.pi.model` **Live** | string \| object | — | Primary Pi model entry. |
-| `historian.pi.fallback_models` **Live** | string \| object[] | — | Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
+| `historian.pi.model` **Live** | string \| object | — | Primary historian Pi model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. When absent, Pi does not run the historian. |
+| `historian.pi.fallback_models` **Live** | string \| object[] | — | Ordered historian fallback Pi entries. The session model is never appended. Requires an array; legacy singleton values migrate to a one-element array. |
 | `historian.pi.thinking_level` **Live** | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"` | — | Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
 | `historian.omp` | object | — | Strict OMP model-resolution block. It accepts no OpenCode vocabulary. |
-| `historian.omp.model` **Live** | string \| object | — | Primary OMP model entry. |
-| `historian.omp.fallback_models` **Live** | string \| object[] | — | Ordered fallback OMP entries. |
+| `historian.omp.model` **Live** | string \| object | — | Primary historian OMP model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. An absent OMP block inherits the Pi block; a selected block without a model does not run the historian. |
+| `historian.omp.fallback_models` **Live** | string \| object[] | — | Ordered historian fallback OMP entries. The session model is never appended. |
 | `historian.omp.thinking_level` **Live** | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"` \| `"inherit"` \| `"auto"` | — | OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
 | `historian.runner` | `"broca"` \| `"host"` | — | Which side runs the historian completion in Rust transform mode: "host" queues it for this process to run on the configured historian model, "broca" routes it to the Broca module. When unset the harness decides: OpenCode 1 and OpenCode 2 use "host", Claude Code (through the Thalamus gateway, which has no host to run a completion) uses "broca". User-level config only — it decides whose provider account pays for the call. |
 | `historian.host_runner` | object | — | Controls for this process's historian pull loop, which answers runs the Rust module queues for the host runner (`historian.runner: "host"`, or unset on OpenCode 1 and OpenCode 2). User-level config only — it decides whether this machine's provider account is spent on folds. |
@@ -165,6 +167,39 @@ Durable project memory, semantic search, and recall features. OpenAI-compatible 
 | `embedding.max_input_tokens` | integer (–9007199254740991) | — | Optional maximum input tokens for chunk embeddings. Defaults conservatively to 512 when omitted. |
 | `embedding.local_runtime` | `"auto"` \| `"native"` \| `"wasm"` | `"auto"` | Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Inference runs in a dedicated worker after disabling POSIX telemetry in the native process environment. Compiled Bun hosts and hosts without a verified in-process opt-out use a subprocess instead. Windows native ONNX emits OS-controlled ETW diagnostics, not direct uploads. On Bun before 1.4.0, even explicit 'native' uses WASM because native worker teardown can crash the process. Set 'wasm' to avoid loading the native addon on newer hosts too. |
 | `embedding.local_dtype` | `"auto"` \| `"fp32"` \| `"fp16"` \| `"q8"` \| `"int8"` \| `"uint8"` \| `"q4"` \| `"bnb4"` \| `"q4f16"` \| `"q2"` \| `"q2f16"` \| `"q1"` \| `"q1f16"` | — | Local provider only: ONNX model dtype passed to the transformers.js feature-extraction pipeline. Accepts the @huggingface/transformers DataType strings (auto, fp32, fp16, q8, int8, uint8, q4, bnb4, q4f16, q2, q2f16, q1, q1f16). Omitted keeps today's behavior (fp32). A non-default value changes the produced vectors and folds into the embedding model identity, so switching dtype re-embeds rather than mixing vector spaces. Useful for selecting a quantized variant (e.g. q8) of a larger multilingual model to cut memory and CPU cost; see issue #259. |
+
+## Explicit search reranking
+
+Reranking reuses the existing prose-query gate, candidate preparation and stable score sorting for explicit `ctx_search` on OpenCode and Pi. Automatic per-turn search hints never call a reranker. With no block configured, local Synapse remains the default.
+
+Hosted reranking sends retrieved text to a user-chosen service. Put this block in user config beside `embedding` (it is independent of the embedding provider):
+
+```jsonc
+"rerank": {
+  "provider": "remote",
+  "endpoint": "https://api.cohere.com/v2",
+  "model": "rerank-v3.5",
+  "api_key": "{env:RERANK_API_KEY}",
+  "timeout_ms": 1500,
+  "top_n": 20
+}
+```
+
+The client posts to `<endpoint>/rerank` with `{model, query, documents, top_n}` and reads `results: [{index, relevance_score}]` (Cohere, Voyage, OpenRouter and Jina-compatible). Prefix the base URL with `tei+` for Hugging Face TEI: `{query, texts}` in and `[{index, score}]` out. API keys are sent as Bearer tokens; user-level `{env:NAME}` and `{file:path}` expansion follows the embedding configuration rules.
+
+Each document uses the existing location/title/body recipe, truncated at a UTF-8 character boundary to 1024 bytes. At most 20 documents are allowed per request; larger batches are refused, never split. `top_n` caps the fused candidate pool, and the wire request asks for all submitted scores. Scores must cover each document index exactly once and be finite; ties retain candidate order. Any failure preserves the original unreranked order, adds one short skip reason to the tool result, and never falls back to Synapse while remote is configured.
+
+Project config may only set `"rerank": {"provider": "off"}`. Project routing, credentials and limits are stripped with a warning, and project `{env:}` / `{file:}` tokens never expand. Changes require a host restart. The dashboard currently requires its raw JSONC editor for this block.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `rerank` | object | — | Explicit ctx_search reranking only. Defaults to local Synapse. Hosted settings are user-level only; projects may only select off. |
+| `rerank.provider` | `"synapse"` \| `"remote"` \| `"off"` | `"synapse"` | Explicit ctx_search reranker: local Synapse by default, remote for hosted scoring, or off. Projects may only select off. |
+| `rerank.endpoint` | string | — | User-level rerank API base URL; prefix with tei+ for Hugging Face TEI. |
+| `rerank.model` | string | — | Hosted reranker model name. |
+| `rerank.api_key` | string | — | Bearer API key; supports {env:NAME} in user config, like embedding.api_key. |
+| `rerank.timeout_ms` | integer (-9007199254740991–9007199254740991) | — | Hosted request timeout in milliseconds, clamped to 50–15000; also cancelled by ctx_search's abort signal. |
+| `rerank.top_n` | integer (1–20) | `20` | Maximum fused candidates sent to the hosted reranker (1–20). Requests ask for a score for every submitted document; partial replies are rejected. |
 
 ## Background agents
 

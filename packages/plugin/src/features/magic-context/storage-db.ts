@@ -8,7 +8,7 @@ import {
     unlinkSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import { bootQuietRemainingMs, scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
+import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import {
     getLegacyOpenCodeMagicContextStorageDir,
     getMagicContextStorageDir,
@@ -30,8 +30,10 @@ import {
     readProcessProbeEvidence,
 } from "../../shared/rpc-utils";
 import {
+    createSqliteTurnDatabase,
     Database,
     detectSqliteRuntime,
+    hasSqliteTurnDeadlineRouting,
     isTransientSqliteError,
     registerSlowWriteReporter,
     registerSqliteDiagnosticSink,
@@ -94,6 +96,13 @@ export { ensureColumn, FORK_MIGRATION_VERSION_FLOOR, healAllNullColumns };
 
 const databases = new Map<string, Database>();
 const pendingAsyncOpens = new Map<string, Promise<Database | null>>();
+const pendingDatabaseCloses = new Set<Promise<void>>();
+interface StartupBackfills {
+    controller: AbortController;
+    timer?: ReturnType<typeof setTimeout>;
+    running?: Promise<void>;
+}
+const startupBackfills = new WeakMap<Database, StartupBackfills>();
 const persistenceByDatabase = new WeakMap<Database, boolean>();
 const persistenceErrorByDatabase = new WeakMap<Database, string>();
 const pathByDatabase = new WeakMap<Database, string>();
@@ -193,6 +202,8 @@ export interface OpenDatabaseOptions {
     latestSupportedVersion?: number;
     /** Test/diagnostic override; production uses BOOT_SQLITE_BUSY_TIMEOUT_MS. */
     busyTimeoutMs?: number;
+    /** Pi's serving handle opts in before initialization creates cached statements. */
+    nativeTurnDeadlines?: boolean;
     /** Boot-only timing sink; omitted by ordinary storage callers. */
     onBootTimings?: (timings: DatabaseBootTimings) => void;
     /** Receives the exact busy-timeout diagnostic emitted during a fresh database open. */
@@ -1048,10 +1059,15 @@ function finishDatabaseOpen(
     // only context.db and runs in every harness.
     if (!explicitDbPath) {
         const readsOpenCodeStore = harnessOwnsOpenCodeStore();
+        const state: StartupBackfills = { controller: new AbortController() };
+        startupBackfills.set(db, state);
+        const { signal } = state.controller;
         let busyRetryMs = 100;
         const runBackfills = () =>
             withoutSqliteTransformPass(() =>
                 withSqliteBackgroundWriter(() => {
+                    state.timer = undefined;
+                    if (signal.aborted) return;
                     if (readsOpenCodeStore) {
                         try {
                             runToolOwnerBackfill(db);
@@ -1061,9 +1077,9 @@ function finishDatabaseOpen(
                             );
                         }
                     }
-                    void startMessageFtsRowidMapBackfill(db)
+                    state.running = startMessageFtsRowidMapBackfill(db, signal)
                         .then(async () => {
-                            if (!readsOpenCodeStore) return;
+                            if (signal.aborted || !readsOpenCodeStore) return;
                             const { readRawSessionMessagePage, readRawSessionMessages } =
                                 await importPluginModule(
                                     () => import("../../hooks/magic-context/read-session-chunk"),
@@ -1071,20 +1087,24 @@ function finishDatabaseOpen(
                             const { startMessageTimeBackfill } = await importPluginModule(
                                 () => import("./message-time-backfill"),
                             );
+                            if (signal.aborted) return;
                             await startMessageTimeBackfill(
                                 db,
                                 Object.assign(readRawSessionMessages, {
                                     readPage: readRawSessionMessagePage,
                                 }),
+                                signal,
                             );
                         })
                         .catch((error) => {
+                            if (signal.aborted) return;
                             if (isTransientSqliteError(error)) {
                                 // Durable cursors advance only with their data. Retry the complete
                                 // chain after yielding, without sharing an interactive turn's lock-wait limit.
                                 withoutSqliteTransformPass(() => {
-                                    const timer = setTimeout(runBackfills, busyRetryMs);
-                                    timer.unref();
+                                    state.timer = setTimeout(runBackfills, busyRetryMs);
+                                    // Hosts and test doubles may hand back a timer id without unref.
+                                    state.timer.unref?.();
                                 });
                                 busyRetryMs = Math.min(30000, busyRetryMs * 2);
                                 return;
@@ -1095,8 +1115,10 @@ function finishDatabaseOpen(
                         });
                 }),
             );
-        if (bootQuietRemainingMs() > 0) scheduleAfterBootQuiet(runBackfills);
-        else runBackfills();
+        // The database handle owns these backfills. Always schedule them
+        // asynchronously, even without a startup delay, so an immediate close
+        // can cancel them before a worker opens the file.
+        state.timer = scheduleAfterBootQuiet(runBackfills);
     }
     // Wire the persistence-backed tool-definition measurement store and
     // rehydrate the in-memory map from any prior writes. Doing this here
@@ -2643,6 +2665,12 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         return null;
     }
     if (existing) {
+        if (options?.nativeTurnDeadlines && !hasSqliteTurnDeadlineRouting(existing)) {
+            log(
+                "[magic-context] storage unavailable: native turn deadlines must be selected on the first open; restart the host",
+            );
+            return null;
+        }
         if (!enforceSchemaFence(existing, dbPath, latestSupportedVersion)) {
             return null;
         }
@@ -2672,7 +2700,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             }
         }
 
-        db = new Database(dbPath);
+        db = options?.nativeTurnDeadlines ? createSqliteTurnDatabase(dbPath) : new Database(dbPath);
         installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
         if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
             closeQuietly(db);
@@ -2738,6 +2766,12 @@ export async function openDatabaseAsync(
     lastMigrationOnOpenRefusal = null;
     const existing = databases.get(dbPath);
     if (existing) {
+        if (options?.nativeTurnDeadlines && !hasSqliteTurnDeadlineRouting(existing)) {
+            log(
+                "[magic-context] storage unavailable: native turn deadlines must be selected on the first open; restart the host",
+            );
+            return null;
+        }
         const startedAt = performance.now();
         const accepted = enforceSchemaFence(existing, dbPath, latestSupportedVersion);
         if (accepted) {
@@ -2753,7 +2787,11 @@ export async function openDatabaseAsync(
     }
 
     const pending = pendingAsyncOpens.get(dbPath);
-    if (pending) return pending;
+    if (pending) {
+        if (!options?.nativeTurnDeadlines) return pending;
+        const opened = await pending;
+        return opened && hasSqliteTurnDeadlineRouting(opened) ? opened : null;
+    }
 
     // A worker cannot share an in-memory connection. Reject before file creation
     // or permission hardening can mistake a SQLite pseudo-path for a real file.
@@ -2784,7 +2822,9 @@ export async function openDatabaseAsync(
                 }
             }
 
-            db = new Database(dbPath);
+            db = options?.nativeTurnDeadlines
+                ? createSqliteTurnDatabase(dbPath)
+                : new Database(dbPath);
             installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
             openMs = performance.now() - openStartedAt;
             guardStartedAt = performance.now();
@@ -2878,9 +2918,24 @@ export function getDatabasePersistenceError(db: Database | null): string | null 
     return persistenceErrorByDatabase.get(db) ?? null;
 }
 
-export function closeDatabase(): void {
+/** Close serving handles immediately; the result joins canceled startup work before file removal. */
+export function closeDatabase(): Promise<void> {
     pendingAsyncOpens.clear();
     for (const [key, db] of databases) {
+        const state = startupBackfills.get(db);
+        if (state) {
+            clearTimeout(state.timer);
+            state.controller.abort();
+            startupBackfills.delete(db);
+            if (state.running) {
+                const closing = state.running.finally(() => {
+                    pendingDatabaseCloses.delete(closing);
+                });
+                // A new generation may open while this worker releases its own connection.
+                // Track each shutdown separately so awaiting close still joins older generations.
+                pendingDatabaseCloses.add(closing);
+            }
+        }
         try {
             closeQuietly(db);
         } catch (error) {
@@ -2889,6 +2944,7 @@ export function closeDatabase(): void {
             databases.delete(key);
         }
     }
+    return Promise.all(pendingDatabaseCloses).then(() => {});
 }
 
 export type ContextDatabase = Database;

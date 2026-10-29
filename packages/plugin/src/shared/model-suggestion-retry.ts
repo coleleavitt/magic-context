@@ -41,6 +41,8 @@ export type PromptBody = {
 export type PromptArgs = {
     path: { id: string };
     body: PromptBody;
+    /** Controls hidden historian message-block cache markers; never serialized in the prompt body. */
+    cacheTail?: import("./historian-cache").HistorianCacheTail;
     signal?: AbortSignal;
     [key: string]: unknown;
 };
@@ -72,6 +74,8 @@ export interface PromptAttemptInfo {
 export interface PromptRetryOptions {
     transport?: PromptTransport;
     timeoutMs?: number;
+    /** False for callers whose configured model chain must not accept provider suggestions. Defaults to true. */
+    allowModelSuggestions?: boolean;
     /** External abort signal — cancels the in-flight LLM prompt immediately when aborted */
     signal?: AbortSignal;
     /**
@@ -85,11 +89,26 @@ export interface PromptRetryOptions {
      *     still self-heal at the primary AND at each fallback).
      *   - Iteration stops immediately on abort/timeout/context-overflow errors —
      *     fallbacks won't help and the caller's emergency-recovery path needs
-     *     to handle these.
+     *     to handle these. The exception is an attempt cut by
+     *     `firstOutputTimeoutMs` (see there), which moves on to the next model.
      *   - On all-failed, the LAST error is thrown (matches legacy behavior when
      *     `fallbackModels` is empty).
      */
     fallbackModels?: readonly ModelInput[];
+    /**
+     * How long an attempt may go without the model producing anything (no
+     * streamed text, reasoning, tool call, or token usage) before the model is
+     * treated as hung. The attempt is then stopped and the next configured model
+     * runs with whatever is left of `timeoutMs`, so a dead model costs this
+     * bound instead of the whole timeout. An attempt that has produced output
+     * keeps its full timeout and, if that expires, still ends the chain.
+     *
+     * Applies only to an attempt that has a later model to move to, is capped at
+     * half that attempt's timeout so the next model keeps a usable share, and
+     * only works with transports that watch the child for output (OpenCode's
+     * `prompt_async` wait). Undefined = no first-output deadline.
+     */
+    firstOutputTimeoutMs?: number;
     /**
      * Identifier for structured logging (e.g. "dreamer:consolidate",
      * "historian", "compressor", "dreamer"). Helps correlate fallback
@@ -164,9 +183,53 @@ export function isHostTimeoutError(error: unknown): boolean {
     );
 }
 
+/**
+ * The model chain cut this attempt short because the model had produced nothing
+ * (no streamed text, reasoning, tool call, or token usage) by the first-output
+ * deadline. A model that has not answered at all is treated like a provider
+ * failure, so the next configured model gets the rest of the time.
+ */
+export class ModelProducedNoOutputError extends Error {
+    constructor(readonly waitedMs: number) {
+        // Keeps "timed out after Nms" so ledgers record the attempt as timed out.
+        super(`prompt timed out after ${waitedMs}ms with no model output`);
+        this.name = "ModelProducedNoOutputError";
+    }
+}
+
+/**
+ * What a transport has seen of the model during one attempt. `monitored` means
+ * the transport watches the child's messages and will set `received` as soon as
+ * the model streams anything. Transports that cannot see progress never set
+ * `monitored`, and the first-output deadline then never fires for them.
+ */
+interface ModelActivity {
+    monitored: boolean;
+    received: boolean;
+}
+
+/** Keyed by the per-attempt abort signal that `promptWithTimeout` hands the transport. */
+const modelActivityBySignal = new WeakMap<AbortSignal, ModelActivity>();
+
+/** A transport calls this once it is watching the child for model output. */
+export function noteModelActivityMonitored(signal: AbortSignal | undefined): void {
+    const activity = signal ? modelActivityBySignal.get(signal) : undefined;
+    if (activity) activity.monitored = true;
+}
+
+/** A transport calls this when it sees the model produce anything for this attempt. */
+export function noteModelOutputReceived(signal: AbortSignal | undefined): void {
+    const activity = signal ? modelActivityBySignal.get(signal) : undefined;
+    if (activity) {
+        activity.monitored = true;
+        activity.received = true;
+    }
+}
+
 /** Our own slice expiry (see `promptWithTimeout`) or a host request timer. */
 export function isPromptTimeoutError(error: unknown): boolean {
     if (isHostTimeoutError(error)) return true;
+    if (error instanceof ModelProducedNoOutputError) return true;
     return error instanceof Error && /^prompt timed out after \d+ms$/.test(error.message);
 }
 
@@ -248,12 +311,30 @@ function externalAbortMessage(signal: AbortSignal): string {
     return `prompt aborted by external signal${reason instanceof Error && /^lease_(?:lost|expired):/.test(reason.message) ? `: ${reason.message}` : ""}`;
 }
 
+/** A carrier may ignore cancellation; stop waiting without trusting it to reject. */
+export function raceWithSignal<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+    // Match await's handling of synchronous completion as well as promises.
+    work = Promise.resolve(work);
+    if (!signal) return work;
+    return new Promise<T>((resolve, reject) => {
+        const abort = () => reject(new Error(externalAbortMessage(signal)));
+        if (signal.aborted) {
+            work.catch(() => {});
+            abort();
+            return;
+        }
+        signal.addEventListener("abort", abort, { once: true });
+        work.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    });
+}
+
 async function promptWithTimeout(
     client: Client,
     args: PromptArgs,
     timeoutMs: number,
     signal?: AbortSignal,
     transport?: PromptTransport,
+    firstOutputTimeoutMs?: number,
 ): Promise<void> {
     // Bail immediately if the caller's signal is already aborted (e.g.
     // lease loss before this attempt was scheduled). Per spec
@@ -266,6 +347,23 @@ async function promptWithTimeout(
     }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const activity: ModelActivity = { monitored: false, received: false };
+    modelActivityBySignal.set(controller.signal, activity);
+    // Set when the first-output deadline, not the attempt timeout, ended the attempt.
+    let silent = false;
+    const firstOutputTimer =
+        firstOutputTimeoutMs !== undefined && firstOutputTimeoutMs < timeoutMs
+            ? setTimeout(() => {
+                  // Only a transport that watches the child can say the model is silent.
+                  if (!activity.monitored || activity.received) return;
+                  silent = true;
+                  controller.abort(new ModelProducedNoOutputError(firstOutputTimeoutMs));
+              }, firstOutputTimeoutMs)
+            : undefined;
+    const timeoutError = () =>
+        silent && firstOutputTimeoutMs !== undefined
+            ? new ModelProducedNoOutputError(firstOutputTimeoutMs)
+            : new Error(`prompt timed out after ${timeoutMs}ms`);
 
     // Link external signal to internal controller so external abort cancels the fetch
     const onExternalAbort = () => controller.abort();
@@ -273,10 +371,13 @@ async function promptWithTimeout(
 
     try {
         const request = { ...args, signal: controller.signal };
-        if (transport) await transport(request);
+        if (transport) await raceWithSignal(transport(request), controller.signal);
         else {
             if (!client) throw new Error("Hidden completion transport is unavailable");
-            await client.session.prompt(request as Parameters<typeof client.session.prompt>[0]);
+            await raceWithSignal<unknown>(
+                client.session.prompt(request as Parameters<typeof client.session.prompt>[0]),
+                controller.signal,
+            );
         }
     } catch (error) {
         if (signal?.aborted) {
@@ -295,7 +396,7 @@ async function promptWithTimeout(
             if (!transport || transport.childSessionId) {
                 await abortChildRun(client, transport?.childSessionId ?? args.path.id);
             }
-            throw new Error(`prompt timed out after ${timeoutMs}ms`);
+            throw timeoutError();
         }
         if (isHostTimeoutError(error)) {
             // The host client's own request timer fired. Only our side of the
@@ -309,6 +410,7 @@ async function promptWithTimeout(
         throw error;
     } finally {
         clearTimeout(timeout);
+        if (firstOutputTimer) clearTimeout(firstOutputTimer);
         signal?.removeEventListener("abort", onExternalAbort);
     }
     // Some transports resolve with an error result when their fetch is aborted.
@@ -317,11 +419,7 @@ async function promptWithTimeout(
         if (!transport || transport.childSessionId) {
             await abortChildRun(client, transport?.childSessionId ?? args.path.id);
         }
-        throw new Error(
-            signal?.aborted
-                ? externalAbortMessage(signal)
-                : `prompt timed out after ${timeoutMs}ms`,
-        );
+        throw signal?.aborted ? new Error(externalAbortMessage(signal)) : timeoutError();
     }
 }
 
@@ -358,7 +456,12 @@ async function abortChildRun(client: Client, sessionId: string): Promise<void> {
  *     model. Caller has its own emergency-recovery path for this.
  *   - Timeout — same wall-clock budget on the same prompt is unlikely to
  *     succeed on another model. Caller decides whether to retry at a higher
- *     level (e.g. historian's MAX_HISTORIAN_RETRIES loop).
+ *     level (e.g. historian's MAX_HISTORIAN_RETRIES loop). This covers an
+ *     attempt that ran out its whole time, whether or not the model answered.
+ *
+ * A `ModelProducedNoOutputError` is the exception: no output was observed
+ * before the first-output deadline, which points at the model rather than the
+ * prompt, so the chain gives the next model the time that is left.
  *
  * Everything else (auth errors, ProviderModelNotFoundError without suggestion,
  * rate limits, transient network failures, etc.) is considered retryable on a
@@ -372,6 +475,8 @@ function isNonRetryable(error: unknown, externalSignal?: AbortSignal): boolean {
         error instanceof DreamTokenBudgetExceeded
     )
         return true;
+
+    if (error instanceof ModelProducedNoOutputError) return false;
 
     if (error instanceof Error) {
         if (error.name === "AbortError") return true;
@@ -418,7 +523,11 @@ function classifyPromptFailure(
     if (externalSignal?.aborted || message === "prompt aborted by external signal") {
         return "child_aborted";
     }
-    if (/^prompt timed out after \d+ms$/.test(message) || isHostTimeoutError(error)) {
+    if (
+        error instanceof ModelProducedNoOutputError ||
+        /^prompt timed out after \d+ms$/.test(message) ||
+        isHostTimeoutError(error)
+    ) {
         return "provider_timeout";
     }
     if (phase === "validation") {
@@ -488,6 +597,8 @@ async function attemptOnce(
     callContext: string,
     label: string,
     transport?: PromptTransport,
+    allowModelSuggestions = true,
+    firstOutputTimeoutMs?: number,
 ): Promise<void> {
     // Keep this snapshot separate from the object passed to the client. A
     // failed prompt facade may rewrite its request body before rejecting; the
@@ -495,12 +606,19 @@ async function attemptOnce(
     const originalBody = { ...args.body };
     const attemptArgs = copyPromptArgs(args, originalBody);
     try {
-        await promptWithTimeout(client, attemptArgs, timeoutMs, signal, transport);
+        await promptWithTimeout(
+            client,
+            attemptArgs,
+            timeoutMs,
+            signal,
+            transport,
+            firstOutputTimeoutMs,
+        );
         return;
     } catch (error) {
-        // If non-retryable (abort, overflow, timeout), bubble up immediately.
-        // Don't even try suggestion retry — caller needs the original error.
-        if (isNonRetryable(error, signal)) throw error;
+        // Non-retryable failures and callers with model suggestions disabled
+        // must surface the original error without accepting a provider suggestion.
+        if (isNonRetryable(error, signal) || !allowModelSuggestions) throw error;
 
         const suggestion = parseModelSuggestion(error);
         if (!suggestion || !originalBody.model) {
@@ -526,8 +644,46 @@ async function attemptOnce(
             timeoutMs,
             signal,
             transport,
+            firstOutputTimeoutMs,
         );
     }
+}
+
+/**
+ * Per-attempt timing across one model chain. An attempt cut by the first-output
+ * deadline has the time it used taken out of every later attempt's timeout, so
+ * a silent model never stretches the caller's overall wait past `timeoutMs`.
+ * Attempts that fail for other reasons keep the existing full per-attempt budget.
+ */
+function createChainClock(options: PromptRetryOptions, timeoutMs: number) {
+    const fallbacks = options.fallbackModels ?? [];
+    const hasValidFallbackFrom = (index: number) =>
+        fallbacks.slice(index).some((fallback) => {
+            const entry = toModelEntry(fallback);
+            return entry ? parseProviderModel(entry.model) !== null : false;
+        });
+    let silentSpentMs = 0;
+    return {
+        /** Budget for an attempt whose next candidate is `fallbacks[nextFallbackIndex]`. */
+        budget(nextFallbackIndex: number): { timeoutMs: number; firstOutputTimeoutMs?: number } {
+            const attemptTimeoutMs = Math.max(1, timeoutMs - silentSpentMs);
+            // The last model in the chain has nothing to move to, so it keeps the
+            // plain timeout rather than being cut short for no benefit.
+            if (
+                options.firstOutputTimeoutMs === undefined ||
+                !hasValidFallbackFrom(nextFallbackIndex)
+            )
+                return { timeoutMs: attemptTimeoutMs };
+            const bound = Math.min(options.firstOutputTimeoutMs, Math.floor(attemptTimeoutMs / 2));
+            return bound > 0
+                ? { timeoutMs: attemptTimeoutMs, firstOutputTimeoutMs: bound }
+                : { timeoutMs: attemptTimeoutMs };
+        },
+        settle(error: unknown, startedAt: number): void {
+            if (error instanceof ModelProducedNoOutputError)
+                silentSpentMs += Date.now() - startedAt;
+        },
+    };
 }
 
 /**
@@ -566,20 +722,26 @@ export async function promptSyncWithModelSuggestionRetry(
             : "primary";
 
     let lastError: unknown = null;
+    const clock = createChainClock(options, timeoutMs);
 
+    const primaryStartedAt = Date.now();
     try {
+        const budget = clock.budget(0);
         await attemptOnce(
             client,
             baseArgs,
-            timeoutMs,
+            budget.timeoutMs,
             options.signal,
             callContext,
             explicitPrimaryLabel,
             options.transport,
+            options.allowModelSuggestions,
+            budget.firstOutputTimeoutMs,
         );
         return;
     } catch (error) {
         lastError = error;
+        clock.settle(error, primaryStartedAt);
         if (isNonRetryable(error, options.signal)) throw error;
 
         if (fallbacks.length === 0) {
@@ -611,15 +773,19 @@ export async function promptSyncWithModelSuggestionRetry(
             ...(fallback?.qualifier ? { variant: fallback.qualifier } : {}),
         });
 
+        const attemptStartedAt = Date.now();
         try {
+            const budget = clock.budget(i + 1);
             await attemptOnce(
                 client,
                 attemptArgs,
-                timeoutMs,
+                budget.timeoutMs,
                 options.signal,
                 callContext,
                 label,
                 options.transport,
+                options.allowModelSuggestions,
+                budget.firstOutputTimeoutMs,
             );
             log(
                 `[${callContext}] fallback succeeded with ${label} (attempt ${i + 2}/${fallbacks.length + 1})`,
@@ -627,6 +793,7 @@ export async function promptSyncWithModelSuggestionRetry(
             return;
         } catch (error) {
             lastError = error;
+            clock.settle(error, attemptStartedAt);
             if (isNonRetryable(error, options.signal)) throw error;
 
             const remaining = fallbacks.length - i - 1;
@@ -655,6 +822,7 @@ async function attemptAndValidate<TOutput, TValidated>(
     callContext: string,
     attempt: PromptAttemptInfo,
     options: ValidatedPromptRetryOptions<TOutput, TValidated>,
+    firstOutputTimeoutMs?: number,
 ): Promise<ValidatedPromptRetryResult<TOutput, TValidated>> {
     try {
         await attemptOnce(
@@ -665,6 +833,8 @@ async function attemptAndValidate<TOutput, TValidated>(
             callContext,
             attempt.label,
             options.transport,
+            options.allowModelSuggestions,
+            firstOutputTimeoutMs,
         );
     } catch (error) {
         throw {
@@ -676,7 +846,7 @@ async function attemptAndValidate<TOutput, TValidated>(
 
     let output: TOutput;
     try {
-        output = await options.fetchOutput(args, attempt);
+        output = await raceWithSignal(options.fetchOutput(args, attempt), options.signal);
     } catch (error) {
         throw {
             error,
@@ -751,7 +921,9 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
     let firstError: unknown = null;
     let lastError: unknown = null;
     const cooledPrimary = primaryQuotaFailure(explicitPrimaryLabel);
+    const clock = createChainClock(options, timeoutMs);
 
+    const primaryStartedAt = Date.now();
     try {
         if (cooledPrimary)
             throw {
@@ -766,10 +938,11 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
                     skipped: true,
                 },
             } satisfies FailedAttempt;
+        const budget = clock.budget(0);
         return await attemptAndValidate(
             client,
             baseArgs,
-            timeoutMs,
+            budget.timeoutMs,
             options.signal,
             callContext,
             {
@@ -780,10 +953,12 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
                 model: baseBody.model,
             },
             options,
+            budget.firstOutputTimeoutMs,
         );
     } catch (caught) {
         const failure = caught as FailedAttempt;
         failedAttempts.push(failure);
+        clock.settle(failure.error, primaryStartedAt);
         firstError = failure.error;
         lastError = failure.error;
         if (
@@ -821,7 +996,7 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
 
         if (!cooledPrimary && !quota)
             log(
-                `[${callContext}] primary (${explicitPrimaryLabel}) failed validation/prompt: ${shortErr(failure.error)}; trying ${fallbacks.length} fallback(s)`,
+                `[${callContext}] primary (${explicitPrimaryLabel}) failed validation/prompt: ${shortErr(failure.error)}; ${fallbacks.length} fallback(s) configured, subject to remaining budget`,
             );
     }
 
@@ -848,15 +1023,18 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
             model: parsed,
         };
 
+        const attemptStartedAt = Date.now();
         try {
+            const budget = clock.budget(i + 1);
             const result = await attemptAndValidate(
                 client,
                 attemptArgs,
-                timeoutMs,
+                budget.timeoutMs,
                 options.signal,
                 callContext,
                 attempt,
                 options,
+                budget.firstOutputTimeoutMs,
             );
             log(
                 `[${callContext}] fallback succeeded with ${label} (attempt ${i + 2}/${fallbacks.length + 1})`,
@@ -865,6 +1043,7 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
         } catch (caught) {
             const failure = caught as FailedAttempt;
             failedAttempts.push(failure);
+            clock.settle(failure.error, attemptStartedAt);
             lastError = failure.error;
             if (isNonRetryable(failure.error, options.signal)) {
                 throwWithPromptFailure(

@@ -1,3 +1,4 @@
+import { startMessageFtsRowidMapBackfill } from "../../features/magic-context/message-fts-rowid-map";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 /// <reference types="bun-types" />
@@ -5,11 +6,12 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 // to prevent the TUI toast path from intercepting sendIgnoredMessage calls.
 process.env.OPENCODE_CLIENT = "desktop";
 
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { inspect } from "node:util";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { writeTaskScheduleState } from "../../features/magic-context/dreamer/storage-task-schedule";
 import { ensureContextStoreUuid } from "../../features/magic-context/legacy-authority-fixture.test-support";
@@ -23,7 +25,12 @@ import {
     __setProjectIdentityTestHooks,
     resolveProjectIdentity,
 } from "../../features/magic-context/memory/project-identity";
-import { __resetMessageIndexAsyncForTests } from "../../features/magic-context/message-index-async";
+import {
+    __resetMessageIndexAsyncForTests,
+    getMessageIndexQueueHeapStats,
+    isSessionReconciled,
+    scheduleReconciliation,
+} from "../../features/magic-context/message-index-async";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
@@ -39,10 +46,17 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import type { Tagger } from "../../features/magic-context/tagger";
+import * as logger from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
-import { autoEmbedAttemptedBySession, clearEmbedSessionState } from "./embed-session-state";
+import {
+    autoEmbedAttemptedBySession,
+    autoEmbedRetryAfterBySession,
+    clearEmbedSessionState,
+    embedRunStateBySession,
+} from "./embed-session-state";
 import { createMagicContextHook, type MagicContextDeps } from "./hook";
 import { createLiveSessionState } from "./live-session-state";
+import { prepareRawSessionOrdinals, readRawSessionMessages } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import { __ignoredNotificationTest } from "./send-session-notification";
 
@@ -255,6 +269,73 @@ function countIndexedHookMessage(sessionId: string, messageId: string): number {
     return typeof row?.count === "number" ? row.count : 0;
 }
 
+/**
+ * Waits until no incremental index job is scheduled or running. A job is
+ * tracked first as a debounce timer and then as a pending key until its
+ * session-locked write settles. An empty queue does not prove a message was
+ * indexed: a database-locked write retries after 1 second, and a failed ordinal
+ * preparation retries after 60 seconds, and this queue tracks neither timer.
+ * Positive checks therefore wait for the rows themselves; this wait is for
+ * proving no incremental job is left to run.
+ */
+async function waitForIncrementalIndexDrain(timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        const stats = getMessageIndexQueueHeapStats();
+        if (
+            stats.incrementalTimers === 0 &&
+            stats.pendingIncremental === 0 &&
+            stats.activeSessionLocks === 0
+        )
+            return;
+        if (Date.now() >= deadline)
+            throw new Error(
+                `incremental message indexing did not finish within ${timeoutMs} ms: ${JSON.stringify(stats)}`,
+            );
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
+
+/**
+ * Polls background state until `predicate` holds. The bound only stops a hung
+ * background job from stalling the suite; on timeout the error names what was
+ * being waited for and the last observed state.
+ */
+async function waitFor(
+    description: string,
+    predicate: () => boolean,
+    describeState: () => unknown = () => undefined,
+    timeoutMs = 10_000,
+): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+        if (Date.now() >= deadline)
+            throw new Error(
+                `timed out after ${timeoutMs} ms waiting for ${description}: ${JSON.stringify(describeState())}`,
+            );
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
+
+/**
+ * Incremental indexing first checks that the session's canonical ordinals are
+ * prepared. That check starts a worker and gives it only 250 ms; when it
+ * misses, the indexer defers the message by a full minute. On a loaded machine
+ * the first worker start can miss that window, so prepare the session up front
+ * the way a context pass would, letting the worker finish however long it
+ * takes. The indexing itself still runs through the real asynchronous path.
+ */
+async function prepareOpenCodeSession(sessionId: string, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!(await prepareRawSessionOrdinals(sessionId))) {
+        if (Date.now() >= deadline)
+            throw new Error(
+                `canonical ordinals for ${sessionId} were not prepared within ${timeoutMs} ms`,
+            );
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
+
 describe("magic-context hook", () => {
     it("passes the selected OpenCode 1 model to per-model scheduling before any usage event", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-model-threshold-");
@@ -379,11 +460,21 @@ describe("magic-context hook", () => {
 
     it("indexes terminal message.updated events asynchronously", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-message-index-");
+        createOpenCodeDbForHook("ses-index", []);
+        const hook = requireHook(createMagicContextHook(createMockDeps()));
+        await prepareOpenCodeSession("ses-index");
+        // Every session event also schedules a one-time catch-up pass that
+        // indexes the whole stored session. Finish that pass while the session
+        // is still empty, so the rows checked below can only come from the
+        // incremental indexer that message.updated schedules.
+        scheduleReconciliation(openDatabase(), "ses-index", readRawSessionMessages);
+        await waitFor("the empty session's catch-up pass to finish", () =>
+            isSessionReconciled("ses-index"),
+        );
         createOpenCodeDbForHook("ses-index", [
             { id: "u-1", role: "user", text: "index user text" },
             { id: "a-1", role: "assistant", text: "index assistant text" },
         ]);
-        const hook = requireHook(createMagicContextHook(createMockDeps()));
 
         await hook.event!({
             event: {
@@ -391,6 +482,9 @@ describe("magic-context hook", () => {
                 properties: { info: { id: "u-1", role: "user", sessionID: "ses-index" } },
             },
         });
+        // The handler only schedules the work: nothing is indexed when it returns.
+        expect(countIndexedHookMessage("ses-index", "u-1")).toBe(0);
+        expect(getMessageIndexQueueHeapStats().incrementalTimers).toBe(1);
         await hook.event!({
             event: {
                 type: "message.updated",
@@ -404,7 +498,19 @@ describe("magic-context hook", () => {
                 },
             },
         });
-        await new Promise((resolve) => setTimeout(resolve, 140));
+        expect(countIndexedHookMessage("ses-index", "a-1")).toBe(0);
+        await waitFor(
+            "u-1 and a-1 to be indexed",
+            () =>
+                countIndexedHookMessage("ses-index", "u-1") === 1 &&
+                countIndexedHookMessage("ses-index", "a-1") === 1,
+            () => ({
+                "u-1": countIndexedHookMessage("ses-index", "u-1"),
+                "a-1": countIndexedHookMessage("ses-index", "a-1"),
+                queue: getMessageIndexQueueHeapStats(),
+            }),
+        );
+        await waitForIncrementalIndexDrain();
 
         expect(countIndexedHookMessage("ses-index", "u-1")).toBe(1);
         expect(countIndexedHookMessage("ses-index", "a-1")).toBe(1);
@@ -420,8 +526,9 @@ describe("magic-context hook", () => {
                 },
             },
         });
-
-        await new Promise((resolve) => setTimeout(resolve, 140));
+        // A non-terminal assistant update schedules no incremental index timer.
+        expect(getMessageIndexQueueHeapStats().incrementalTimers).toBe(0);
+        await waitForIncrementalIndexDrain();
 
         expect(countIndexedHookMessage("ses-index", "a-streaming")).toBe(0);
     });
@@ -550,17 +657,57 @@ describe("magic-context hook", () => {
             ];
             await hook["experimental.chat.messages.transform"]!({}, { messages });
         };
-        const waitUntil = async (predicate: () => boolean): Promise<void> => {
-            const deadline = Date.now() + 3_000;
-            while (!predicate() && Date.now() < deadline) {
-                await new Promise((resolve) => setTimeout(resolve, 10));
+        // Each transform starts a background drain (registration, a database
+        // worker, the provider batches) that outlives the transform. Its finally
+        // block releases the session's run claim and, unless the drain was
+        // aborted or the embedding identity changed, records the completion
+        // latch or a retry. Wait for that outcome instead of a fixed deadline,
+        // which a loaded CI runner can overrun while the drain is still working;
+        // a drain that never settles fails on the test timeout.
+        //
+        // A drain can also stop short and record a short retry (lease
+        // contention or a busy interruption sets it one second ahead). In
+        // production the session's next context pass after that delay starts
+        // the drain again, so the test drives the same extra idle pass, a
+        // bounded number of times. A long retry delay is a real failure (an
+        // error or deferred work) and is not waited out.
+        const maxRetryPasses = 3;
+        const maxWaitedRetryDelayMs = 2_000;
+        // The logger is silent under bun test. Capture its calls so a failed
+        // drain reports the original error or deferral, not just its retry time.
+        const drainLogs: string[] = [];
+        const logSpy = spyOn(logger, "log").mockImplementation((message, data) => {
+            if (/^\[magic-context\] (?:auto-embed|session backfill)/.test(message)) {
+                drainLogs.push(data === undefined ? message : `${message} ${inspect(data)}`);
             }
-            expect(predicate()).toBe(true);
+        });
+        const waitForDrainOutcome = async (): Promise<void> => {
+            const settled = () =>
+                !embedRunStateBySession.has(sessionId) &&
+                (autoEmbedAttemptedBySession.has(sessionId) ||
+                    autoEmbedRetryAfterBySession.has(sessionId));
+            let retryPasses = 0;
+            let retryDelayMs = 0;
+            for (;;) {
+                while (!settled()) {
+                    await new Promise((resolve) => setTimeout(resolve, 10));
+                }
+                if (autoEmbedAttemptedBySession.has(sessionId)) break;
+                retryDelayMs = (autoEmbedRetryAfterBySession.get(sessionId) ?? 0) - Date.now();
+                if (retryPasses >= maxRetryPasses || retryDelayMs > maxWaitedRetryDelayMs) break;
+                retryPasses++;
+                await new Promise((resolve) => setTimeout(resolve, Math.max(0, retryDelayMs) + 10));
+                await runTransform();
+            }
+            // A retry instead of the latch means the drain stopped short.
+            const failure = `auto-embed drain never latched: ${retryPasses} retry pass(es), next retry in ${retryDelayMs} ms\n${drainLogs.join("\n")}`;
+            if (!autoEmbedAttemptedBySession.has(sessionId)) console.error(failure);
+            expect(autoEmbedAttemptedBySession.has(sessionId), failure).toBe(true);
         };
 
         try {
             await runTransform();
-            await waitUntil(() => autoEmbedAttemptedBySession.has(sessionId));
+            await waitForDrainOutcome();
 
             for (let i = 1; i <= 7; i++) {
                 appendCompartments(db, sessionId, [
@@ -580,14 +727,15 @@ describe("magic-context hook", () => {
                 ).run(sessionId, i, `u${i}`, "user", `Source text ${i}`);
             }
 
+            // These direct FTS inserts bypass the indexer's source and rowid-map
+            // entries. Canonical chunk text defers such legacy-shaped spans until
+            // the startup rowid-map backfill completes, so join it before draining.
+            await startMessageFtsRowidMapBackfill(db);
             await runTransform();
-            await waitUntil(() => {
-                const coverage = getEmbeddingCoverageStatus(db, projectIdentity, sessionId);
-                return (
-                    coverage.session.total === 7 &&
-                    coverage.session.embedded === 7 &&
-                    autoEmbedAttemptedBySession.has(sessionId)
-                );
+            await waitForDrainOutcome();
+            expect(getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session).toEqual({
+                total: 7,
+                embedded: 7,
             });
             await new Promise((resolve) => setTimeout(resolve, 30));
             expect(userRows()).toEqual([]);
@@ -613,11 +761,10 @@ describe("magic-context hook", () => {
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
             ).run(sessionId, 8, "u8", "user", "Later source text");
             await runTransform();
-            await waitUntil(
-                () =>
-                    getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session.embedded ===
-                    8,
-            );
+            await waitForDrainOutcome();
+            expect(
+                getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session.embedded,
+            ).toBe(8);
             expect(embedBatch.mock.calls.length).toBeGreaterThan(calls);
             expect(getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session).toEqual({
                 total: 8,
@@ -625,6 +772,7 @@ describe("magic-context hook", () => {
             });
             expect(userRows()).toEqual([]);
         } finally {
+            logSpy.mockRestore();
             clearEmbedSessionState(sessionId);
             hostDb.close();
         }
@@ -681,6 +829,12 @@ describe("magic-context hook", () => {
             category: "CONSTRAINTS",
             content: "A memory that must stay unembedded while memory is off.",
         });
+        // History chunk text is read from message_history_fts only for ordinals
+        // the FTS rowid map covers, or after the one-time rowid-map backfill has
+        // finished. The rows above are inserted directly, without map entries,
+        // so until that backfill (started on a worker by the default-path open)
+        // completes, the drain finds nothing to embed and defers its retry.
+        await startMessageFtsRowidMapBackfill(db);
 
         try {
             await hook["experimental.chat.messages.transform"]!(
@@ -694,12 +848,20 @@ describe("magic-context hook", () => {
                     ] as never,
                 },
             );
-            const deadline = Date.now() + 3_000;
-            const embedded = () =>
-                getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session.embedded;
-            while (embedded() < 3 && Date.now() < deadline) {
+            // The drain runs in the background after the transform returns. Its
+            // finally block removes the session's in-flight marker and, unless
+            // the drain was aborted or the embedding identity changed, records
+            // completion or a retry. Wait for that outcome rather than a fixed
+            // deadline, which a loaded machine can overrun.
+            const drainSettled = () =>
+                !embedRunStateBySession.has(sessionId) &&
+                (autoEmbedAttemptedBySession.has(sessionId) ||
+                    autoEmbedRetryAfterBySession.has(sessionId));
+            while (!drainSettled()) {
                 await new Promise((resolve) => setTimeout(resolve, 10));
             }
+            // A retry instead of a latch means the drain stopped short.
+            expect(autoEmbedAttemptedBySession.has(sessionId)).toBe(true);
             await new Promise((resolve) => setTimeout(resolve, 30));
 
             expect(getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session).toEqual({

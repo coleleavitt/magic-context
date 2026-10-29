@@ -63,6 +63,7 @@ import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import {
     byteSize,
     prependTag,
+    stripPersistedAssistantText,
     stripTagPrefix,
     stripWellFormedLeadingTagPrefix,
 } from "../hooks/magic-context/tag-content-primitives";
@@ -75,6 +76,8 @@ import type { Transcript, TranscriptMessage, TranscriptPart } from "./transcript
 export { TEXT_TAG_IDENTITY_MARKER };
 
 export interface TagTranscriptOptions {
+    /** Keep tag-only assistant slots inert when their original text must survive stripping. */
+    preserveTagOnlyAssistantText?: boolean;
     /**
      * When true, skip injecting `§N§` prefix into visible text. Tags
      * still get assigned in the DB so historian/drops can reference
@@ -416,6 +419,7 @@ export function tagTranscript(
                     db,
                     targets,
                     skipPrefixInjection,
+                    preserveTagOnlyAssistantText: options.preserveTagOnlyAssistantText,
                     entryFingerprint: options.entryFingerprintByMessageId?.get(messageId) ?? null,
                     reuseIdentity: reuseIdentity || contentDerivedTextIds !== undefined,
                     timing,
@@ -835,12 +839,17 @@ class ConversationEndGuard {
         }
     }
 
-    wouldStrand(occurrences: readonly ToolOccurrence[]): boolean {
+    wouldStrand(
+        occurrences: readonly ToolOccurrence[],
+        plannedRemovals?: ReadonlySet<unknown>,
+    ): boolean {
         const end = this.end;
         if (!end || !occurrences.some((occ) => occ.message === end)) return false;
         const leaving = new Set(occurrences.map((occ) => partKey(occ.part)));
         const survives = (part: TranscriptPart) =>
-            !leaving.has(partKey(part)) && !this.removed.has(partKey(part));
+            !leaving.has(partKey(part)) &&
+            !this.removed.has(partKey(part)) &&
+            !plannedRemovals?.has(partKey(part));
         return end.info.role === "assistant"
             ? !end.parts.some((part) => part.kind === "tool_result" && survives(part))
             : !end.parts.some((part) => partHasContent(part) && survives(part));
@@ -991,6 +1000,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 interface TagTextPartArgs {
+    preserveTagOnlyAssistantText?: boolean;
     sessionId: string;
     message: { info: { id?: string; role: string } };
     messageId: string;
@@ -1017,7 +1027,10 @@ function tagTextPart(args: TagTextPartArgs): void {
     // into a tag-bearing part that later strip logic could mistake for content.
     if (
         args.message.info.role === "assistant" &&
-        stripWellFormedLeadingTagPrefix(text).trim().length === 0
+        (stripWellFormedLeadingTagPrefix(text).trim().length === 0 ||
+            (args.preserveTagOnlyAssistantText &&
+                text.includes("§") &&
+                stripPersistedAssistantText(text).length === 0))
     ) {
         if (args.timing) args.timing.identity += performance.now() - identityStart;
         return;
@@ -1380,8 +1393,11 @@ function buildAggregateTarget(
             }
             return null;
         },
-        wouldStrandConversationEnd(): boolean {
-            return conversationEnd?.wouldStrand(occurrences) ?? false;
+        wouldStrandConversationEnd(plannedRemovals): boolean {
+            return conversationEnd?.wouldStrand(occurrences, plannedRemovals) ?? false;
+        },
+        notePlannedRemoval(plannedRemovals): void {
+            for (const occ of occurrences) plannedRemovals.add(partKey(occ.part));
         },
         editMarker(): "truncated" | "absent" {
             // Edit-marker: preserve the tool_use input's filePath + a region

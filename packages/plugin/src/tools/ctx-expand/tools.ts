@@ -10,7 +10,7 @@ import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_EXPAND_DESCRIPTION, CTX_EXPAND_TOKEN_BUDGET } from "./constants";
 import { resolveCtxExpandMode } from "./mode";
 import { renderItemByTag, renderMessageByOrdinal, renderVerboseRange } from "./render";
-import { renderSearchArchive } from "./search-archive";
+import { renderSearchArchiveOffThread } from "./search-archive";
 import type { CtxExpandArgs } from "./types";
 
 export { CTX_EXPAND_LIGHT_DESCRIPTION } from "../light-descriptions";
@@ -18,7 +18,20 @@ export { CTX_EXPAND_LIGHT_DESCRIPTION } from "../light-descriptions";
 export interface CtxExpandToolDeps {
     db: ContextDatabase;
     expandTools?: ToolExpansionMap;
+    /**
+     * The resolved transform mode of this plugin process. In Rust mode the ck-mc
+     * module numbers the §N§ tags the agent sees, in its own store (`store.db`),
+     * and the TypeScript tagger never runs. The `tags` table in `context.db` then
+     * holds only rows from before the session moved to Rust mode, whose numbers
+     * overlap the module's, so a tag lookup there would return an unrelated old
+     * item. Tag lookup is refused in Rust mode for that reason.
+     */
+    transformMode?: "ts" | "rust";
 }
+
+/** Reply for `ctx_expand(tag=N)` when the tag numbers belong to the Rust module. */
+export const CTX_EXPAND_RUST_TAG_REFUSAL =
+    "Tag lookup isn't available on this session: its §N§ tags are numbered by the Rust transform engine and ctx_expand cannot resolve those numbers, so no content was returned. Expand by message instead: ctx_expand(message=<ordinal>) or ctx_expand(start=<ordinal>, end=<ordinal>), using ordinals from a <session-history> heading or a ctx_search hit.";
 
 const ctxExpandArgsShape = {
     tag: tool.schema
@@ -69,9 +82,14 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 message: "number",
             });
             const sessionId = toolContext.sessionID;
+            const mode = resolveCtxExpandMode(args, "positive");
+            // Refuse before touching history: no host read can make a module-numbered
+            // tag resolvable, so warming ordinals for it would only delay the refusal.
+            if (mode.kind === "tag" && deps.transformMode === "rust") {
+                return CTX_EXPAND_RUST_TAG_REFUSAL;
+            }
             if (!(await prepareRawSessionOrdinals(sessionId)))
                 return "Session ordinals are warming in the background. Retry ctx_expand shortly; no approximate ordinal was served.";
-            const mode = resolveCtxExpandMode(args, "positive");
             if (mode.kind === "error") {
                 return mode.message;
             }
@@ -80,13 +98,13 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
             }
             if (mode.kind === "message") {
                 return (
-                    renderSearchArchive(
+                    (await renderSearchArchiveOffThread(
                         deps.db,
                         sessionId,
                         mode.message,
                         mode.message,
                         CTX_EXPAND_TOKEN_BUDGET,
-                    ) ?? renderMessageByOrdinal(sessionId, mode.message)
+                    )) ?? renderMessageByOrdinal(sessionId, mode.message)
                 );
             }
             const { start, end, verbose } = mode;
@@ -101,7 +119,7 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 return `Range ${start}-${end} is entirely within the live tail (after the last compacted message ${lastCompartmentEnd}); those messages are already visible in context.`;
             }
             const effectiveEnd = lastCompartmentEnd >= 0 ? Math.min(end, lastCompartmentEnd) : end;
-            const archived = renderSearchArchive(
+            const archived = await renderSearchArchiveOffThread(
                 deps.db,
                 sessionId,
                 start,

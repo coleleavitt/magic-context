@@ -2,6 +2,9 @@
  * History-only equivalences for Oh My Pi (OMP) 18.10.4's Chat serializer.
  * Source citations below are in @oh-my-pi/pi-ai/src/providers/.
  */
+import { piOmitsTruncatedAssistant } from "./pi-dispatch-assistant-history";
+import { piToolCallPairing } from "./pi-dispatch-tool-pairing";
+
 export interface PiChatHistoryModel {
 	api?: string;
 	id?: string;
@@ -31,27 +34,18 @@ function omitsAssistant(
 	compat: Record<string, unknown>,
 ): boolean {
 	if (!Array.isArray(message.content)) return false;
+	if (piOmitsTruncatedAssistant(message)) return true;
 	let thinking = false;
-	let hasTextBlock = false;
 	for (const value of message.content) {
 		const block = object(value);
 		if (!block) return false;
 		if (block.type === "text") {
-			hasTextBlock = true;
 			if (typeof block.text !== "string" || block.text.trim()) return false;
 		} else if (block.type === "thinking") {
 			if (typeof block.thinking !== "string") return false;
 			thinking ||= block.thinking.trim().length > 0;
 		} else return false;
 	}
-	// Interrupted reasoning without an answer or tool call is not replayed by
-	// Oh My Pi, so it cannot contribute an outgoing assistant row.
-	// transform-messages.ts:1340-1354.
-	if (
-		!hasTextBlock &&
-		["length", "error", "aborted"].includes(String(message.stopReason))
-	)
-		return true;
 	if (compat.requiresReasoningContentForAllAssistantTurns === true)
 		return false;
 	if (!thinking) return true;
@@ -78,6 +72,12 @@ export function piChatHistoryPlan(
 ): readonly PiChatHistoryStep[] | undefined {
 	if (model?.api !== "openai-completions") return undefined;
 	const compat = object(model.compat) ?? {};
+	// The input is the shared host-window projection, so every result already
+	// sits in its call's window: Oh My Pi moved it there when another message
+	// interrupted the window. Results pair with calls by the host's pairing key,
+	// so a Responses composite whose item half differs from its call's is still
+	// that call's result, never a <stale-tool-result> note.
+	const pairingId = piToolCallPairing(messages);
 	const calls = new Set<string>();
 	for (const value of messages) {
 		const message = object(value);
@@ -86,7 +86,7 @@ export function piChatHistoryPlan(
 		for (const value of message.content) {
 			const block = object(value);
 			if (block?.type === "toolCall" && typeof block.id === "string")
-				calls.add(block.id);
+				calls.add(pairingId(block.id));
 		}
 	}
 	const transformed: PiChatHistoryStep[] = [];
@@ -113,15 +113,15 @@ export function piChatHistoryPlan(
 				for (const value of message.content) {
 					const block = object(value);
 					if (block?.type === "toolCall" && typeof block.id === "string")
-						pending.add(block.id);
+						pending.add(pairingId(block.id));
 				}
 		}
 		if (
 			message.role === "toolResult" &&
 			typeof message.toolCallId === "string"
 		) {
-			pending.delete(message.toolCallId);
-			if (!calls.has(message.toolCallId)) {
+			pending.delete(pairingId(message.toolCallId));
+			if (!calls.has(pairingId(message.toolCallId))) {
 				// Unpaired results become <stale-tool-result> user messages only when no
 				// earlier tool call is still awaiting a result. Freeze the note from this
 				// managed pass. Later redaction/obfuscation changes its bytes and must

@@ -1,7 +1,21 @@
+import { piOmpUserHistory } from "./pi-dispatch-omp-user";
+
 function object(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value)
 		? (value as Record<string, unknown>)
 		: undefined;
+}
+
+const DEVELOPER_ORIGIN = Symbol("custom developer history");
+
+/** Preserve custom messages' developer origin even when their wire role is user. */
+export function piIsDeveloperHistory(
+	message: Record<string, unknown>,
+): boolean {
+	return (
+		message.role === "developer" ||
+		Reflect.get(message, DEVELOPER_ORIGIN) === true
+	);
 }
 
 /** Map Oh My Pi custom messages and compaction summaries to their outgoing row shapes. */
@@ -12,6 +26,7 @@ export function piAgentHistory(
 	return messages.flatMap((value): unknown[] => {
 		const message = object(value);
 		if (!message) return [value];
+		if (message.role === "user") return [piOmpUserHistory(message)];
 		if (message.role === "compactionSummary") {
 			// With blocks, OMP sends the summary literally; without blocks it renders a
 			// nonempty context envelope even for an empty summary. Only row shape is
@@ -76,11 +91,21 @@ export function piAgentHistory(
 			api === "ollama-chat" && message.attribution !== "user"
 				? "developer"
 				: "user";
-		if (!images.length) return [{ ...message, role: developerRole, content }];
+		if (!images.length)
+			return [
+				{ ...message, role: developerRole, content, [DEVELOPER_ORIGIN]: true },
+			];
 		const texts = content.filter((part) => object(part)?.type === "text");
 		return [
 			...(texts.length
-				? [{ ...message, role: developerRole, content: texts }]
+				? [
+						{
+							...message,
+							role: developerRole,
+							content: texts,
+							[DEVELOPER_ORIGIN]: true,
+						},
+					]
 				: []),
 			{
 				...message,

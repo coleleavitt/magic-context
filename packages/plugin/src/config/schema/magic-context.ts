@@ -211,12 +211,14 @@ export type OmpEntry = z.infer<typeof OmpEntrySchema>;
 /** Strict model-resolution block used by historian.opencode. */
 export const OpenCodeHarnessBlockSchema = z
     .object({
-        model: OcEntrySchema.optional().describe("Primary OpenCode model entry."),
+        model: OcEntrySchema.optional().describe(
+            "Primary historian OpenCode model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. When absent, OpenCode inherits the session model.",
+        ),
         fallback_models: z
             .array(OcEntrySchema)
             .optional()
             .describe(
-                "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+                "Ordered historian fallback OpenCode entries. A configured primary never adds the session model after this list. Requires an array; legacy singleton values migrate to a one-element array.",
             ),
         variant: z
             .string()
@@ -232,12 +234,14 @@ export type OpenCodeHarnessBlock = z.infer<typeof OpenCodeHarnessBlockSchema>;
 /** Strict model-resolution block used by historian.pi. */
 export const PiHarnessBlockSchema = z
     .object({
-        model: PiEntrySchema.optional().describe("Primary Pi model entry."),
+        model: PiEntrySchema.optional().describe(
+            "Primary historian Pi model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. When absent, Pi does not run the historian.",
+        ),
         fallback_models: z
             .array(PiEntrySchema)
             .optional()
             .describe(
-                "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+                "Ordered historian fallback Pi entries. The session model is never appended. Requires an array; legacy singleton values migrate to a one-element array.",
             ),
         thinking_level: PiThinkingLevelSchema.describe(
             "Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
@@ -250,11 +254,15 @@ export type PiHarnessBlock = z.infer<typeof PiHarnessBlockSchema>;
 /** Strict model-resolution block used by historian.omp. */
 export const OmpHarnessBlockSchema = z
     .object({
-        model: OmpEntrySchema.optional().describe("Primary OMP model entry."),
+        model: OmpEntrySchema.optional().describe(
+            "Primary historian OMP model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. An absent OMP block inherits the Pi block; a selected block without a model does not run the historian.",
+        ),
         fallback_models: z
             .array(OmpEntrySchema)
             .optional()
-            .describe("Ordered fallback OMP entries."),
+            .describe(
+                "Ordered historian fallback OMP entries. The session model is never appended.",
+            ),
         thinking_level: OmpThinkingLevelSchema.describe(
             "OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
         ),
@@ -920,6 +928,61 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
 export type EmbeddingConfig = z.infer<typeof EmbeddingConfigSchema>;
 export type EmbeddingFallbackProvider = z.infer<typeof EmbeddingFallbackProviderSchema>;
 
+export const RerankConfigSchema = z
+    .object({
+        provider: z
+            .enum(["synapse", "remote", "off"])
+            .default("synapse")
+            .describe(
+                "Explicit ctx_search reranker: local Synapse by default, remote for hosted scoring, or off. Projects may only select off.",
+            ),
+        endpoint: z
+            .string()
+            .trim()
+            .optional()
+            .describe("User-level rerank API base URL; prefix with tei+ for Hugging Face TEI."),
+        model: z.string().trim().optional().describe("Hosted reranker model name."),
+        api_key: z
+            .string()
+            .optional()
+            .describe(
+                "Bearer API key; supports {env:NAME} in user config, like embedding.api_key.",
+            ),
+        timeout_ms: z
+            .number()
+            .int()
+            .transform((n) => Math.max(50, Math.min(15000, n)))
+            .default(1500)
+            .describe(
+                "Hosted request timeout in milliseconds, clamped to 50–15000; also cancelled by ctx_search's abort signal.",
+            ),
+        top_n: z
+            .number()
+            .int()
+            .min(1)
+            .max(20)
+            .default(20)
+            .describe(
+                "Maximum fused candidates sent to the hosted reranker (1–20). Requests ask for a score for every submitted document; partial replies are rejected.",
+            ),
+    })
+    .superRefine((data, ctx) => {
+        if (data.provider !== "remote") return;
+        for (const field of ["endpoint", "model"] as const) {
+            if (!data[field])
+                ctx.addIssue({
+                    code: "custom",
+                    path: [field],
+                    message: `${field} is required when rerank.provider is remote`,
+                });
+        }
+    })
+    .describe(
+        "Explicit ctx_search reranking only. Defaults to local Synapse. Hosted settings are user-level only; projects may only select off.",
+    );
+
+export type RerankConfig = z.infer<typeof RerankConfigSchema>;
+
 export interface SubcConfig {
     connection_file: string;
 }
@@ -1085,6 +1148,7 @@ export interface MagicContextConfig {
         min_chars: number;
     };
     embedding: EmbeddingConfig;
+    rerank?: RerankConfig;
     /** User-only connection settings for the Synapse daemon. */
     subc?: SubcConfig;
     /** Developer-only Synapse shadow lane switch. */
@@ -1398,6 +1462,7 @@ export const MagicContextConfigSchema = z
             .describe(
                 "Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; TypeScript mode follows that policy, but Rust transform mode always keeps its shared data directory owner-only because ck-mc's store library enforces it.",
             ),
+        rerank: RerankConfigSchema.optional(),
         embedding: EmbeddingConfigSchema.default({
             provider: "local",
             model: DEFAULT_LOCAL_EMBEDDING_MODEL,

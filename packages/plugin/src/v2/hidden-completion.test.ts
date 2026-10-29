@@ -1,19 +1,40 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { parsePluginConfig } from "../config";
+import { withLiveDreamerOutputCap } from "../config/live-child-output-cap";
+import { acquireLease } from "../features/magic-context/dreamer/lease";
+import {
+    mapMemories,
+    parseMapMemoriesCompletion,
+} from "../features/magic-context/dreamer/map-memories";
 import { inspectCurateMemoryOperations } from "../features/magic-context/dreamer/task-executor";
+import { getMemoryVerifications, insertMemory } from "../features/magic-context/memory";
+import { runMigrations } from "../features/magic-context/migrations";
+import { closeDatabase, openDatabase } from "../features/magic-context/storage";
+import { initializeDatabase } from "../features/magic-context/storage-db";
+import { getSubagentInvocations } from "../features/magic-context/storage-subagent-invocations";
+import { runValidatedHistorianPass } from "../hooks/magic-context/compartment-runner-historian";
 import {
     HiddenCompletionRefusal,
     type HiddenRunIdentity,
 } from "../hooks/magic-context/compartment-runner-types";
 import {
+    clearProducerModelObservations,
+    observeProducerModelsForTest,
+} from "../hooks/magic-context/producer-window-test-support";
+import * as logger from "../shared/logger";
+import { resolveHistorianModel } from "../shared/model-resolution";
+import {
     getPromptFailureDetail,
     promptSyncWithValidatedOutputRetry,
 } from "../shared/model-suggestion-retry";
 import { Database } from "../shared/sqlite";
+import { createTestTempDir } from "../shared/test-temp-dir";
 import {
     createV2HiddenCompletionExecutor,
     type HiddenChildHost,
     toolLoopMessages,
 } from "./hidden-completion";
+import { HiddenModelActivity } from "./hidden-model-activity";
 import {
     HIDDEN_CURATE_AGENT,
     HIDDEN_DREAMER_AGENT,
@@ -234,6 +255,7 @@ async function setup(
     const db = new Database(":memory:");
     db.exec("CREATE TABLE schema_migrations_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     const rows = new Rows();
+    const activity = new HiddenModelActivity();
     const hook = new HiddenChildHook();
     const children = new Map<
         string,
@@ -264,6 +286,7 @@ async function setup(
     let reasoningOnly = false;
 
     const host: HiddenChildHost = {
+        watchModelActivity: (sessionID, onOutput) => activity.watch(sessionID, onOutput),
         async create(input) {
             creates.push(structuredClone(input));
             const id = `child-${++nextID}`;
@@ -370,6 +393,7 @@ async function setup(
     return {
         db,
         rows,
+        activity,
         hook,
         host,
         executor,
@@ -443,6 +467,279 @@ async function close(
 }
 
 describe("OpenCode 2 hidden child completion", () => {
+    test("records the dispatched model and terminal host error when no assistant row exists", async () => {
+        const { dir: dataHome, cleanup } = createTestTempDir("v2-model-refusal-");
+        const previous = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = dataHome;
+        const state = await setup();
+        try {
+            const db = openDatabase();
+            if (!db) throw new Error("invocation test database did not open");
+            const model = "mock/missing";
+            const suggestion = "mock/available";
+            state.setTerminalOutcome("failed");
+            state.setTerminalRowType("idle");
+            state.setEventSessionError({
+                type: "provider.error",
+                name: "ProviderModelNotFoundError",
+                data: {
+                    providerID: "mock",
+                    modelID: "missing",
+                    message: `Model not found: ${model}. Did you mean: ${suggestion}?`,
+                    suggestions: [suggestion],
+                },
+            });
+
+            await runValidatedHistorianPass({
+                client: undefined,
+                hiddenCompletionExecutor: state.executor,
+                db: state.db,
+                parentSessionId: "v2-model-refusal-parent",
+                sessionDirectory: "/project",
+                prompt: "Summarize history",
+                chunk: {
+                    startIndex: 1,
+                    endIndex: 1,
+                    lines: [{ ordinal: 1, messageId: "m1" }],
+                },
+                priorCompartments: [],
+                sequenceOffset: 0,
+                dumpLabelBase: "v2-model-refusal",
+                model: { model, sourceConfigKey: "historian.opencode.model" },
+            });
+
+            const [row] = getSubagentInvocations(db, "v2-model-refusal-parent");
+            expect(row).toMatchObject({
+                providerId: "mock",
+                modelId: "missing",
+                status: "failed",
+            });
+            expect(row?.error).toContain("No reply: OpenCode 2 refused the model");
+            expect(row?.error).toContain(suggestion);
+        } finally {
+            state.db.close();
+            closeDatabase();
+            if (previous === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = previous;
+            cleanup();
+        }
+    });
+
+    for (const streaming of [false, true]) {
+        test(`OpenCode 2 dreamer ${streaming ? "streamed primary keeps its full timeout" : "silent primary is cut and fallback completes with a timed_out attempt row"}`, async () => {
+            const f = await setup();
+            initializeDatabase(f.db);
+            runMigrations(f.db);
+            const handle = await f.executor.open({
+                ...dreamerRun,
+                title: "magic-context-dream-classify-memories",
+            });
+            const prompt = f.host.prompt;
+            const sent: string[] = [];
+            f.host.prompt = async (input) => {
+                const model = f.creates.find((_, i) => `child-${i + 1}` === input.sessionID)?.model
+                    .id;
+                sent.push(model ?? "unknown");
+                if (model !== "cheap") return prompt(input);
+                f.rows.append(input.sessionID, "", { omitFinish: true, usage: false });
+                f.activity.observe({
+                    type: "session.execution.started",
+                    data: { sessionID: input.sessionID },
+                });
+                // A different child's output cannot protect this attempt from its deadline.
+                f.activity.observe({
+                    type: "session.text.delta",
+                    data: { sessionID: "foreign", delta: "x" },
+                });
+                if (streaming)
+                    f.activity.observe({
+                        type: "session.reasoning.delta",
+                        data: { sessionID: input.sessionID, delta: "thinking" },
+                    });
+            };
+            f.host.wait = async ({ sessionID }) => {
+                if (sessionID === "child-1") await new Promise(() => {});
+            };
+            const startedAt = Date.now();
+            try {
+                const result = promptSyncWithValidatedOutputRetry(undefined, request(), {
+                    transport: (args) => f.executor.attempt(handle, args),
+                    timeoutMs: 500,
+                    firstOutputTimeoutMs: 60,
+                    fallbackModels: ["mock/fallback"],
+                    fetchOutput: () => f.executor.collect(handle),
+                    validateOutput: (completion) => completion.text,
+                });
+                if (streaming) {
+                    await expect(result).rejects.toThrow("prompt timed out after 500ms");
+                    expect(sent).toEqual(["cheap"]);
+                    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(450);
+                    expect(getSubagentInvocations(f.db, "user-session")).toHaveLength(0);
+                } else {
+                    expect((await result).validated).toBe("editor completion");
+                    expect(sent).toEqual(["cheap", "fallback"]);
+                    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(55);
+                    expect(Date.now() - startedAt).toBeLessThan(400);
+                    expect(f.interrupts).toContain("child-1");
+                    expect(getSubagentInvocations(f.db, "user-session")).toMatchObject([
+                        {
+                            modelId: "cheap",
+                            harness: "opencode2",
+                            status: "timed_out",
+                            error: expect.stringContaining(
+                                "prompt timed out after 60ms with no model output",
+                            ),
+                        },
+                    ]);
+                }
+            } finally {
+                await close(f.executor, handle, !streaming);
+                f.db.close();
+            }
+        });
+    }
+    for (const stage of ["initial", "repair", "fallback", "editor"] as const) {
+        test(`OpenCode 2 historian rejects unconfigured model suggestions during ${stage}`, async () => {
+            const { dir: dataHome, cleanup } = createTestTempDir("v2-historian-suggestion-");
+            const previous = process.env.XDG_DATA_HOME;
+            process.env.XDG_DATA_HOME = dataHome;
+            const state = await setup();
+            try {
+                await observeProducerModelsForTest(["mock/cheap", "mock/fallback", "mock/user"]);
+                const valid =
+                    '<compartment start="1" end="2" title="Allowed"><p1>Summary</p1></compartment>';
+                const prompt = state.host.prompt.bind(state.host);
+                let calls = 0;
+                state.host.prompt = async (input) => {
+                    calls += 1;
+                    const shouldSuggest = calls === (stage === "initial" ? 1 : 2);
+                    state.setCompletion(stage === "repair" && calls === 1 ? "not XML" : valid);
+                    state.setPromptError(
+                        shouldSuggest
+                            ? new Error(
+                                  `model not found: mock/${stage === "fallback" ? "fallback" : "cheap"}. Did you mean: user?`,
+                              )
+                            : stage === "fallback" && calls === 1
+                              ? new Error("invalid credentials for configured primary")
+                              : undefined,
+                    );
+                    await prompt(input);
+                };
+                const result = await runValidatedHistorianPass({
+                    client: undefined,
+                    hiddenCompletionExecutor: state.executor,
+                    db: state.db,
+                    parentSessionId: "user-session",
+                    sessionDirectory: "/project",
+                    prompt: "Summarize history",
+                    chunk: {
+                        startIndex: 1,
+                        endIndex: 2,
+                        lines: [
+                            { ordinal: 1, messageId: "m1" },
+                            { ordinal: 2, messageId: "m2" },
+                        ],
+                    },
+                    priorCompartments: [],
+                    sequenceOffset: 0,
+                    dumpLabelBase: `v2-suggestion-${stage}`,
+                    model: { model: "mock/cheap", qualifier: "high" },
+                    fallbackModels: stage === "fallback" ? ["mock/fallback"] : [],
+                    fallbackModelId: "mock/user",
+                    twoPass: stage === "editor",
+                });
+                expect(
+                    state.requests.map(
+                        (request) => `${request.model.providerID}/${request.model.id}`,
+                    ),
+                ).toEqual(
+                    stage === "initial"
+                        ? ["mock/cheap"]
+                        : ["mock/cheap", stage === "fallback" ? "mock/fallback" : "mock/cheap"],
+                );
+                expect(state.switches.some((input) => input.model.id === "user")).toBe(false);
+                expect(result.ok).toBe(stage === "editor");
+                if (result.ok) expect(result.compartments[0]?.title).toBe("Allowed");
+            } finally {
+                state.db.close();
+                closeDatabase();
+                clearProducerModelObservations();
+                if (previous === undefined) delete process.env.XDG_DATA_HOME;
+                else process.env.XDG_DATA_HOME = previous;
+                cleanup();
+            }
+        });
+    }
+    for (const scenario of ["exhausted", "success", "unconfigured"] as const) {
+        test(`OpenCode 2 historian ${scenario} respects configured model ownership`, async () => {
+            const { dir: dataHome, cleanup } = createTestTempDir("v2-historian-chain-");
+            const previous = process.env.XDG_DATA_HOME;
+            process.env.XDG_DATA_HOME = dataHome;
+            const state = await setup();
+            try {
+                await observeProducerModelsForTest(["mock/cheap", "mock/fallback", "mock/user"]);
+                const config = parsePluginConfig(
+                    scenario === "unconfigured"
+                        ? {}
+                        : {
+                              historian: {
+                                  opencode: {
+                                      model: "mock/cheap",
+                                      fallback_models: ["mock/fallback"],
+                                  },
+                              },
+                          },
+                );
+                const models = resolveHistorianModel(config, "opencode");
+                if (scenario === "unconfigured") expect(models.primary).toBeUndefined();
+                state.setCompletion(
+                    scenario === "exhausted"
+                        ? ""
+                        : '<compartment start="1" end="2" title="Allowed"><p1>Summary</p1></compartment>',
+                );
+                const result = await runValidatedHistorianPass({
+                    client: undefined,
+                    hiddenCompletionExecutor: state.executor,
+                    db: state.db,
+                    parentSessionId: "user-session",
+                    sessionDirectory: "/project",
+                    prompt: "Summarize history",
+                    chunk: {
+                        startIndex: 1,
+                        endIndex: 2,
+                        lines: [
+                            { ordinal: 1, messageId: "m1" },
+                            { ordinal: 2, messageId: "m2" },
+                        ],
+                    },
+                    priorCompartments: [],
+                    sequenceOffset: 0,
+                    dumpLabelBase: "v2-chain-policy",
+                    model: models.primary,
+                    fallbackModels: models.fallbacks,
+                    fallbackModelId: "mock/user",
+                });
+                expect(
+                    state.requests.map(
+                        (request) => `${request.model.providerID}/${request.model.id}`,
+                    ),
+                ).toEqual(
+                    scenario === "exhausted"
+                        ? ["mock/cheap", "mock/fallback"]
+                        : [scenario === "unconfigured" ? "mock/user" : "mock/cheap"],
+                );
+                expect(result.ok).toBe(scenario !== "exhausted");
+                if (!result.ok) expect(result.error).toBeTruthy();
+            } finally {
+                state.db.close();
+                closeDatabase();
+                clearProducerModelObservations();
+                if (previous === undefined) delete process.env.XDG_DATA_HOME;
+                else process.env.XDG_DATA_HOME = previous;
+                cleanup();
+            }
+        });
+    }
     test("names retrospective and curate at the missed context-shaping stage without model fallback", async () => {
         for (const [task, agent] of [
             ["retrospective", "dreamer-retrospective"],
@@ -552,7 +849,7 @@ describe("OpenCode 2 hidden child completion", () => {
             expect(state.requests[0]?.options).toEqual({ temperature: 0.25 });
             expect(completion).toMatchObject({
                 text: "editor completion",
-                usage: { input: 101, output: 11, cacheRead: 7, cacheWrite: 5 },
+                usage: { input: 101, output: 11, cacheRead: 7, cacheWrite: 5, reasoning: 3 },
                 tokenLog: {
                     input: 101,
                     output: 11,
@@ -904,6 +1201,7 @@ describe("OpenCode 2 hidden child completion", () => {
                 output: 11,
                 cacheRead: 0,
                 cacheWrite: 0,
+                reasoning: 3,
             });
             await close(state.executor, handle, true);
         } finally {
@@ -985,8 +1283,23 @@ describe("OpenCode 2 hidden child completion", () => {
                 [HIDDEN_HISTORIAN_AGENT]: ["read"],
                 [HIDDEN_DREAMER_AGENT]: ["read"],
                 [HIDDEN_CURATE_AGENT]: ["ctx_memory"],
-                "dreamer-memory-mapper": ["read", "grep", "glob"],
-                "dreamer-primer-investigator": ["read", "grep", "glob", "ctx_search"],
+                "dreamer-memory-mapper": [
+                    "read",
+                    "grep",
+                    "glob",
+                    "aft_outline",
+                    "aft_zoom",
+                    "aft_search",
+                ],
+                "dreamer-primer-investigator": [
+                    "read",
+                    "grep",
+                    "glob",
+                    "aft_outline",
+                    "aft_zoom",
+                    "aft_search",
+                    "ctx_search",
+                ],
                 "dreamer-retrospective": ["ctx_search"],
             };
             expect(agent.permissions).toEqual([
@@ -1064,7 +1377,169 @@ describe("OpenCode 2 hidden child completion", () => {
             state.db.close();
         }
     });
+
+    test.each([
+        "bare array",
+        "data envelope",
+    ])("uses catalog variant ids from a %s at creation and model switch", async (shape) => {
+        const logs: string[] = [];
+        const state = await setup("array-variants", {
+            logs,
+            modelCatalog: async () => {
+                const data = [
+                    {
+                        id: "cheap",
+                        providerID: "mock",
+                        variants: [
+                            { id: "high", settings: {} },
+                            { id: "medium", settings: {} },
+                        ],
+                    },
+                ];
+                return shape === "bare array" ? data : { data };
+            },
+        });
+        try {
+            const handle = await state.executor.open({
+                ...dreamerRun,
+                model: { model: "mock/cheap", qualifier: "high" },
+            });
+            expect(state.creates[0]?.model.variant).toBe("high");
+            await state.executor.attempt(handle, request("cheap", { variant: "medium" }));
+            expect(state.switches.at(-1)?.model.variant).toBe("medium");
+            await state.executor.attempt(handle, request("cheap", { variant: "not-offered" }));
+            expect(state.switches.at(-1)?.model.variant).toBeUndefined();
+            expect(logs.filter((line) => line.includes("variant '"))).toEqual([
+                expect.stringContaining("variant 'not-offered' not offered"),
+            ]);
+            await close(state.executor, handle, true);
+        } finally {
+            state.db.close();
+        }
+    });
 });
+
+test("OC2 mapper retains the persisted incremental transcript and final reply without reasoning", async () => {
+    const state = await setup();
+    const final = '<memory id="1" files="src/fact.ts"/>\n</mappings>';
+    const prefix = '<mappings>\n<memory id="2" independent="true"/>\n';
+    state.host.prompt = async ({ sessionID, text }) => {
+        state.hook.apply({
+            sessionID,
+            agent: "dreamer-memory-mapper",
+            model: { providerID: "mock", id: "cheap" },
+            system: [],
+            tools: {},
+            options: {},
+            messages: [{ role: "user", content: [{ type: "text", text }] }],
+        });
+        const first = state.rows.append(sessionID, prefix, { finish: "tool-calls" });
+        first.data.content?.push({
+            type: "reasoning",
+            text: "private <mappings>reasoning</mappings>",
+        });
+        state.rows.append(sessionID, final);
+    };
+    try {
+        const handle = await state.executor.open({ ...dreamerRun, agent: "dreamer-memory-mapper" });
+        await state.executor.attempt(handle, request());
+        const completion = await state.executor.collect(handle, 50);
+        expect(completion.text).toBe(final);
+        expect(completion.usage).toEqual({
+            input: 202,
+            output: 22,
+            cacheRead: 14,
+            cacheWrite: 10,
+            reasoning: 6,
+        });
+        expect(completion.tokenLog?.reasoning).toBe(6);
+        expect(completion.messages).toEqual([
+            { info: { role: "assistant" }, parts: [{ type: "text", text: prefix }] },
+            { info: { role: "assistant" }, parts: [{ type: "text", text: final }] },
+        ]);
+        expect(parseMapMemoriesCompletion(final, completion, new Set([1, 2]))).toEqual([
+            { id: 2, files: [], independent: true },
+            { id: 1, files: ["src/fact.ts"], independent: false },
+        ]);
+        await close(state.executor, handle, true);
+    } finally {
+        state.db.close();
+    }
+});
+
+for (const failure of ["prompt timed out after 30000ms", "provider unavailable"]) {
+    test(`OpenCode 2 map-memories keeps partial mappings after ${failure}`, async () => {
+        const state = await setup();
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        runMigrations(db);
+        const { dir: directory, cleanup } = createTestTempDir("mc-v2-map-partial-");
+        const log = spyOn(logger, "log").mockImplementation(() => {});
+        try {
+            const memory = insertMemory(db, {
+                projectPath: directory,
+                category: "ARCHITECTURE",
+                content: "Prefer explicit error handling.",
+            });
+            expect(acquireLease(db, "holder", "mapping")).toBe(true);
+            state.host.prompt = async ({ sessionID, text }) => {
+                state.hook.apply({
+                    sessionID,
+                    agent: "dreamer-memory-mapper",
+                    model: { providerID: "mock", id: "cheap" },
+                    system: [],
+                    tools: {},
+                    options: {},
+                    messages: [{ role: "user", content: [{ type: "text", text }] }],
+                });
+                state.rows.append(
+                    sessionID,
+                    `<mappings><memory id="${memory.id}" independent="true"/>`,
+                    { omitFinish: true },
+                );
+                throw new Error(failure);
+            };
+            state.host.removeSession = async ({ sessionID }) => {
+                state.removed.push(sessionID);
+                state.rows.assistantSince = () => [];
+                state.rows.latestAssistant = () => undefined;
+            };
+            const result = await mapMemories({
+                db,
+                projectIdentity: directory,
+                sessionDirectory: directory,
+                parentSessionId: "parent",
+                holderId: "holder",
+                leaseKey: "mapping",
+                deadline: Date.now() + 600_000,
+                model: "mock/cheap",
+                hiddenCompletionExecutor: withLiveDreamerOutputCap(state.executor, {}, () => ({})),
+            });
+            expect(result.independent).toBe(1);
+            expect(result.remaining).toBe(0);
+            expect(getMemoryVerifications(db, [memory.id]).get(memory.id)?.mappingOrigin).toBe(
+                "mapper",
+            );
+            expect(getSubagentInvocations(db, "parent")[0]).toMatchObject({
+                inputTokens: 101,
+                outputTokens: 11,
+                cacheReadTokens: 7,
+                cacheWriteTokens: 5,
+            });
+            expect(state.removed).toHaveLength(1);
+            expect(
+                log.mock.calls.some(([message]) =>
+                    message.includes("map-memories batch: steps=1 committed=1"),
+                ),
+            ).toBe(true);
+        } finally {
+            log.mockRestore();
+            db.close();
+            state.db.close();
+            cleanup();
+        }
+    });
+}
 
 test("hidden tool-loop hard-stops at soft prompt budget when the host has no pre-tool hook", async () => {
     const fixture = await setup();
@@ -1099,14 +1574,38 @@ test("hidden tool-loop hard-stops at soft prompt budget when the host has no pre
 });
 
 describe("curate validation over the OpenCode 2 tool-loop transcript", () => {
-    // These tool results use the shapes `v2/fold/restore.ts` builds when it restores a
-    // child's transcript into provider messages, which is what toolLoopMessages reads.
+    // The wire fallback uses the shapes `v2/fold/restore.ts` builds when it restores
+    // a child's transcript into provider messages. Persisted tool parts differ.
     const call = (id: string, action: string) => ({
         role: "assistant",
         content: [{ type: "tool-call", id, name: "ctx_memory", input: { action, ids: [1] } }],
     });
     const transcript = (results: unknown[]) =>
         toolLoopMessages({ observedMessages: results } as never);
+
+    test.each([
+        "completed",
+        "error",
+    ])("preserves a persisted %s tool result for curate validation", (status) => {
+        const rows = new Rows();
+        const row = rows.append("child", "");
+        row.data.content = [
+            {
+                type: "tool",
+                id: "c1",
+                name: "ctx_memory",
+                state: {
+                    status,
+                    input: { action: "archive", ids: [1] },
+                    content: [{ type: "text", text: "Archived memory [ID: 1]." }],
+                },
+            },
+        ];
+        expect(inspectCurateMemoryOperations(toolLoopMessages({} as never, [row]))).toEqual({
+            totalCalls: 1,
+            completedActions: status === "completed" ? ["archive"] : [],
+        });
+    });
 
     test("counts an applied operation from a single text result", () => {
         const messages = transcript([
@@ -1475,7 +1974,13 @@ test("v2 historian sums all blocked-call steps and excludes previous attempts", 
         expect(refusal).toContain("tool use is disabled for this task");
         expect(filesystemOpens).toBe(0);
         expect(completion.text).toBe("editor completion");
-        expect(completion.usage).toEqual({ input: 114, output: 16, cacheRead: 10, cacheWrite: 7 });
+        expect(completion.usage).toEqual({
+            input: 114,
+            output: 16,
+            cacheRead: 10,
+            cacheWrite: 7,
+            reasoning: 3,
+        });
         expect(Object.keys(f.requests[0]!.tools)).toEqual(["read"]);
         expect(f.requests[0]!.system).toEqual([
             {

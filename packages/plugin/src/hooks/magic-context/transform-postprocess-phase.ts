@@ -39,9 +39,16 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import {
+    hostInstructionRetentionEnabled,
+    isHostInstructionRetentionOn,
+    markHostInstructionRetention,
+} from "../../features/magic-context/storage-host-instruction-retention";
+import {
     addMergedReasoningStrippedIds,
     addTrailingBlankDecisions,
     clearEmergencyDropSample,
+    compactionOffFrozenThinkingIds,
+    compactionOffThinkingFrozenId,
     demoteTrailingBlankKeepDecisions,
     getDeferredClearedCompactionMarkerState,
     getEmergencyInputSample,
@@ -87,11 +94,12 @@ import {
     applyFlushedStatuses,
     type ConvertedToolDropMode,
     foldBustsServedPrefix,
+    foldChangesServedPrefix,
     prepareLegacyToolSkeletonConversions,
     renderConvertedToolSkeletons,
 } from "./apply-operations";
 import { runAutoSearchHint } from "./auto-search-runner";
-import { hasReclaimRide, reclaimRideLabel } from "./cache-busting-signals";
+import { reclaimRideLabel, reclaimRidePermitted } from "./cache-busting-signals";
 import type { CavemanWordRules } from "./caveman";
 import {
     rearmChannel2AfterCoverageAdvancingHardFold,
@@ -115,6 +123,7 @@ import {
 } from "./ctx-reduce-availability";
 import type { Channel1State } from "./ctx-reduce-nudge";
 import { degradedPassError } from "./degraded-pass-refusal";
+import { diagnosticStateChanged } from "./diagnostic-log-state";
 import { dropStaleReduceCalls } from "./drop-stale-reduce-calls";
 import {
     type DroppedTokenReduction,
@@ -125,6 +134,12 @@ import {
     EmergencyFailClosedError,
     outgoingContextRefusal,
 } from "./emergency-fail-closed";
+import {
+    clearExecuteReclaimState,
+    estimateExecuteReclaimTokens,
+    originateExecuteReclaim,
+    readExecuteReclaimState,
+} from "./execute-reclaim";
 import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
@@ -145,7 +160,11 @@ import {
     prepareCachedM0M1Replay,
     renderCompartmentInjection,
 } from "./inject-compartments";
-import { protectNewTagMutations, retainedActiveThinkingParts } from "./latest-assistant-turn";
+import {
+    isAnthropicThinkingPart,
+    protectNewTagMutations,
+    retainedActiveThinkingParts,
+} from "./latest-assistant-turn";
 import { markNoteNudgeDelivered, observeNoteNudgeServe, peekNoteNudgeText } from "./note-nudger";
 import { hasVisibleNoteReadCall } from "./note-visibility";
 import type { PassDegradationKind, PassDegradationSite, PassOutcome } from "./pass-outcome";
@@ -165,13 +184,16 @@ import {
     settleDroppedReasoningParts,
 } from "./reasoning-removal";
 import {
+    isAnthropicFamilyRoute,
     isNeutralizedReasoningPart,
     modelAcceptsEmptyContent,
     replaySentinelByMessageIds,
 } from "./sentinel";
+import { prepareServedShapeRepair } from "./served-shape-repair";
 import { servedPrefixMatches } from "./strict-thinking-prefix";
 import {
     applyFrozenTrailingBlankDecisions,
+    captureInlineThinkingRepairs,
     clearOldReasoning,
     findLatestAssistantReasoningMutationExemptMessage,
     findMergedReasoningStripDecisions,
@@ -566,6 +588,8 @@ export function freezeReasoningOnBustingPass(args: {
     messages: MessageLike[];
     protectedMessages?: ReadonlySet<MessageLike>;
     alreadyFrozen: ReadonlySet<string>;
+    /** Also record the strip for compaction-off, which replays only its own strips. */
+    compactionOff?: boolean;
 }): { strip: ProactiveThinkingStrip | null; persistenceFailed: boolean } {
     const protectedMessages = args.protectedMessages ?? new Set<MessageLike>();
     const messageIds = findReasoningBearingAssistantIds(
@@ -574,11 +598,10 @@ export function freezeReasoningOnBustingPass(args: {
     if (messageIds.length === 0) return { strip: null, persistenceFailed: false };
     let persisted = false;
     try {
-        persisted = addMergedReasoningStrippedIds(
-            args.db,
-            args.sessionId,
-            messageIds.map(thinkingBindingRecoveryFrozenId),
-        );
+        persisted = addMergedReasoningStrippedIds(args.db, args.sessionId, [
+            ...messageIds.map(thinkingBindingRecoveryFrozenId),
+            ...(args.compactionOff ? messageIds.map(compactionOffThinkingFrozenId) : []),
+        ]);
     } catch (error) {
         sessionLog(args.sessionId, "proactive thinking strip: persistence threw:", error);
     }
@@ -637,6 +660,39 @@ function proactiveStripStartIndex(args: {
     });
     if (lastServed.proven) return divergence;
     return divergence ?? lastServed.messages.length;
+}
+
+/**
+ * True when the array about to be served still carries a thinking part that
+ * may be signed (its signature is not inspected). A part counts by the same route rule that finds an open signed turn
+ * (`isAnthropicThinkingPart`): on an Anthropic-family route (Anthropic,
+ * Bedrock, Vertex, Copilot) every thinking part counts, whichever metadata key
+ * holds its signature. Parts that never reach the provider do not count: an
+ * ignored part, or an empty one that carries no redacted payload. On a
+ * prefix-bound model such a block is bound to every byte in front of it, the
+ * system prompt included, so this is the fact that decides whether the system
+ * date may move. It reads the outcome of every strip the pass made instead of
+ * predicting it, so it also covers blocks of a turn whose opening user message
+ * was trimmed away.
+ */
+export function servesThinkingBlock(
+    messages: readonly MessageLike[],
+    providerID: string | undefined,
+    modelID: string | undefined,
+): boolean {
+    const familyRoute = isAnthropicFamilyRoute(providerID, modelID);
+    for (const message of messages) {
+        if (message.info.role !== "assistant") continue;
+        for (const part of message.parts) {
+            if (!isAnthropicThinkingPart(part, familyRoute) || part.ignored === true) continue;
+            if (part.type === "redacted_thinking") return true;
+            if (typeof part.text === "string" && part.text !== "") return true;
+            const records = isRecord(part.metadata) ? Object.values(part.metadata) : [];
+            if (records.some((record) => isRecord(record) && record.redactedData !== undefined))
+                return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -1593,6 +1649,13 @@ interface RunPostTransformPhaseArgs {
     activeAgent?: string;
     batch: { finalize: () => void } | null;
     contextUsage: { percentage: number; inputTokens: number };
+    /**
+     * True when `contextUsage` was raised by a local count of the request, not
+     * by a provider measurement or an overflow latch (the first pass after a
+     * restart, or after a model switch). Such a reading below 95% may not by
+     * itself grant the force ride.
+     */
+    contextUsageFromEstimate?: boolean;
     /** Usable tokens available for soft scheduling thresholds and usage-ratio calculation. */
     usableWindow: number;
     schedulerDecision: "execute" | "defer";
@@ -1622,6 +1685,13 @@ interface RunPostTransformPhaseArgs {
     activeThinkingPrefixHold?: boolean;
     directoryPrefixHold?: boolean;
     forceSignedRebuildForFit?: boolean;
+    /**
+     * The session's compaction mode changed (managed <-> compaction-off) and no
+     * pass has completed in the new mode yet. The new mode serves the message
+     * bytes differently (compaction-off writes no tags), so every signed
+     * thinking block on the wire sits behind changed bytes.
+     */
+    compactionModeTransition?: boolean;
     readLastServedMessages?: () => readonly unknown[] | null;
     deferredHistoryWasPendingAtPassStart: boolean;
     compartmentInjectionRebuiltFromDb: boolean;
@@ -1646,6 +1716,7 @@ interface RunPostTransformPhaseArgs {
     clearReasoningAge?: number;
     /** Canonical token-window membership consumed by pending-operation application. */
     protectedTagIds: ReadonlySet<number>;
+    onPendingDropEligibility?: (eligible: ReadonlySet<number>) => void;
     /** Canonical token-window membership in tag-number space. */
     protectedTagNumbers: ReadonlySet<number>;
     /** Canonical token-window cutoff in tag-number space. */
@@ -1661,6 +1732,12 @@ interface RunPostTransformPhaseArgs {
     pendingCompartmentInjection: PreparedCompartmentInjection | null;
     /** Save host-order IDs before tag replay or tool pruning can remove the message that marks the prefix-trimming boundary. */
     prefixTrimSourceOrder?: PrefixTrimSourceOrder;
+    /**
+     * OpenCode 2 id-less instruction rows the history boundary covers, set aside
+     * by the history trim (and by the OpenCode 2 restore after a host checkpoint)
+     * until this phase decides whether the session serves them.
+     */
+    coveredHostInstructions?: MessageLike[];
     /**
      * Messages trimmed while this transform rebuilds history. OpenCode rebuilds
      * the next request from the boundary written later in this pass, so some rows
@@ -1926,14 +2003,14 @@ export function finalizeMessageRepresentation(
             );
         }
     }
-    const bindingRecoveryParts = options?.skipMergedReasoningStrip
-        ? 0
-        : stripReasoningFromAssistantIds(
-              messages,
-              resolvedProviderID,
-              options?.frozenThinkingBindingMessageIds ?? new Set(),
-              restoredMessages,
-          );
+    // Compaction-off skips the merged-reasoning strip but still replays the
+    // binding strips it is given (its own, see COMPACTION_OFF_THINKING_FROZEN_PREFIX).
+    const bindingRecoveryParts = stripReasoningFromAssistantIds(
+        messages,
+        resolvedProviderID,
+        options?.frozenThinkingBindingMessageIds ?? new Set(),
+        restoredMessages,
+    );
     const mergedReasoningParts =
         bindingRecoveryParts +
         (options?.skipMergedReasoningStrip
@@ -2011,6 +2088,19 @@ export async function runPostTransformPhase(
     };
     const trailingBlankSourceDecisions =
         args.trailingBlankSourceDecisions ?? snapshotTrailingBlankSourceDecisions(args.messages);
+    if (!modelAcceptsEmptyContent(args.resolvedProviderID) && !compactionOff)
+        captureInlineThinkingRepairs(
+            args.messages,
+            args.messageTagNumbers,
+            args.sessionMeta?.clearedReasoningThroughTag ?? 0,
+        );
+    const servedShapeRepair = prepareServedShapeRepair(
+        args.db,
+        args.sessionId,
+        args.messages,
+        args.readLastServedMessages,
+        compactionOff ? undefined : postprocessReplaySnapshot(args.db, args.sessionId),
+    );
     // Capture before todo/history synthesis can add assistant messages. Reasoning replay skips a
     // metadata-only OpenCode request shell, while trailing-blank freezing still tracks that newest
     // host message because its shape can change before the next pass.
@@ -2068,8 +2158,12 @@ export async function runPostTransformPhase(
         executePressureEligible &&
         routinePressureAppliedBySession.get(args.sessionId) === true;
     // Require five points below the force band so a batch-induced dip cannot
-    // immediately rearm another cache rewrite as the tail regrows.
+    // immediately rearm another cache rewrite as the tail regrows. Only a
+    // provider-measured reading may end the episode: a local count can read
+    // low (a provider tokenizer denser than the local one), and clearing on it
+    // would let the next real reading rearm a second rewrite.
     if (
+        args.contextUsageFromEstimate !== true &&
         args.contextUsage.percentage > 0 &&
         args.contextUsage.percentage < args.forceMaterializationPercentage - 5 &&
         getEmergencyInputSample(args.db, args.sessionId) > 0
@@ -2083,8 +2177,11 @@ export async function runPostTransformPhase(
         args.canRunCompartments &&
         !args.awaitedCompartmentRun &&
         activeCompartmentRun !== undefined;
-    let deferredMaterialize = args.canConsumeDeferredLate && deferredMaterializationWasPending;
-    let materializationRequested = isExplicitFlush || deferredMaterialize;
+    let deferredMaterialize =
+        (args.canConsumeDeferredLate || servedShapeRepair.needsRebuild) &&
+        deferredMaterializationWasPending;
+    let materializationRequested =
+        isExplicitFlush || deferredMaterialize || servedShapeRepair.needsRebuild;
     // Persist eligible prefix work off-wire before authorizing automatic cleanup.
     // Execute may refresh m[1] without changing it: only changed bytes supply a ride.
     // A failed or contended advisory alone must never open the reduction lanes.
@@ -2098,13 +2195,23 @@ export async function runPostTransformPhase(
         (!!args.m0M1.projectPath || !!args.m0M1.projectDirectory) &&
         (args.fullFeatureMode || compactionOff);
     const frozenThinking = new Set(
-        args.activeThinkingTurn ? getMergedReasoningStrippedIds(args.db, args.sessionId) : [],
+        args.activeThinkingTurn || compactionOff
+            ? getMergedReasoningStrippedIds(args.db, args.sessionId)
+            : [],
     );
-    const bindingThinking = new Set(
-        [...frozenThinking]
-            .filter((id) => id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX))
-            .map((id) => id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length)),
-    );
+    // Compaction-off replays only the thinking strips it chose itself (see
+    // COMPACTION_OFF_THINKING_FROZEN_PREFIX): it never applied the managed
+    // mode's binding-mismatch entries, so the blocks they name stay on its wire.
+    const compactionOffFrozenThinking = compactionOff
+        ? compactionOffFrozenThinkingIds(frozenThinking)
+        : new Set<string>();
+    const bindingThinking = compactionOff
+        ? new Set(compactionOffFrozenThinking)
+        : new Set(
+              [...frozenThinking]
+                  .filter((id) => id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX))
+                  .map((id) => id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length)),
+          );
     const retainedThinking = args.activeThinkingTurn
         ? retainedActiveThinkingParts({
               messages: args.messages,
@@ -2133,21 +2240,32 @@ export async function runPostTransformPhase(
         const tag = args.messageTagNumbers.get(message);
         if (tag && tag > 0) safeReasoningCutoff = Math.min(safeReasoningCutoff, tag - 1);
     }
-    let activeThinkingPrefixHold =
-        args.activeThinkingPrefixHold === true ||
-        (activeThinkingTurn && args.thinkingBindingRecoveryEnabledForModel === true);
+    // The caller decides the hold (decideSignedThinkingHold): on a prefix-bound
+    // model it holds only right after heavy reasoning and below the cap. Any
+    // other pass of a signed turn busts like a pass of any other model, and
+    // strips the turn's signed thinking when it does (see below).
+    let activeThinkingPrefixHold = args.activeThinkingPrefixHold === true;
     let freezeM0M1 = args.freezeM0M1 === true || activeThinkingPrefixHold;
     let rewritingSignedPrefix = false;
     let thinkingReleasedForFit = false;
-    const releaseThinkingForRewrite = (forFit = false) => {
+    // `stripInCompactionOff` makes a compaction-off pass remove the frozen
+    // blocks from its own wire too (it otherwise only records them), for a
+    // release whose head change compaction-off cannot avoid.
+    const releaseThinkingForRewrite = (forFit = false, stripInCompactionOff = false) => {
+        const stripOffWire = compactionOff && stripInCompactionOff;
         const stripped = freezeReasoningOnBustingPass({
             db: args.db,
             sessionId: args.sessionId,
             messages: args.messages,
             alreadyFrozen: bindingThinking,
+            compactionOff: stripOffWire,
         });
         if (stripped.persistenceFailed)
             throw new Error("Cannot persist signed thinking omission before prefix rewrite");
+        if (stripOffWire)
+            for (const id of stripped.strip?.messageIds ?? []) compactionOffFrozenThinking.add(id);
+        // A later release on the same pass then has nothing left to record.
+        for (const id of stripped.strip?.messageIds ?? []) bindingThinking.add(id);
         retainedThinking.clear();
         protectedThinkingMessages.clear();
         activeThinkingTurn = false;
@@ -2157,6 +2275,32 @@ export async function runPostTransformPhase(
         rewritingSignedPrefix = true;
         thinkingReleasedForFit ||= forFit;
     };
+    // Replacing a previously served empty text slot cannot wait for the signed-prefix hold. Reuse
+    // the normal rewrite release so no signature remains bound to old bytes.
+    if (servedShapeRepair.needsRebuild && activeThinkingTurn)
+        releaseThinkingForRewrite(false, true);
+    // Fit proof authorizes rebuilding the signed prefix, independently of
+    // pressure. Release before prefix preparation so it can refresh history
+    // without pretending the protected tool window has reached 95% usage.
+    if (
+        args.forceSignedRebuildForFit &&
+        (activeThinkingPrefixHold ||
+            (activeThinkingTurn && args.thinkingBindingRecoveryEnabledForModel === true))
+    ) {
+        releaseThinkingForRewrite(true);
+    }
+    // A compaction mode switch adds or removes the tags in front of every
+    // signed block, whatever the head does, and the switch pass rebuilds the
+    // head anyway (the switch clears the cached m[0]/m[1]). Strip every signed
+    // block on that pass, before the head is prepared, so the rebuild carries
+    // no thinking bound to the other mode's bytes.
+    if (
+        args.compactionModeTransition === true &&
+        args.thinkingBindingRecoveryEnabledForModel === true
+    ) {
+        sessionLog(args.sessionId, "compaction mode switch: stripping signed thinking");
+        releaseThinkingForRewrite(false, true);
+    }
     const foldDueDecision =
         m0M1EnabledForFold && args.m0M1 && !freezeM0M1
             ? mustMaterialize({
@@ -2200,7 +2344,10 @@ export async function runPostTransformPhase(
     let publishedM1RefreshedThisPass = false;
     let prefixPreflightFailed = false;
     const softRefreshOpportunity =
-        !freezeM0M1 && (args.schedulerDecision === "execute" || deferredMaterialize);
+        !freezeM0M1 &&
+        (args.schedulerDecision === "execute" ||
+            deferredMaterialize ||
+            servedShapeRepair.needsRebuild);
     let m0RematerializedThisPass = false;
     const m0CoverageBeforeFold =
         args.sessionMeta.cachedM0Bytes === null ? -1 : args.sessionMeta.cachedM0MaxCompartmentSeq;
@@ -2234,6 +2381,11 @@ export async function runPostTransformPhase(
         args.m0M1
     ) {
         let committedFoldBustsServedPrefix: boolean | undefined;
+        // Whether the committed fold serves m[0]/m[1]/mural bytes that differ
+        // from the head the session last served. Unlike the bust permission it
+        // ignores reasons that only lose the provider cache: signed thinking is
+        // bound to bytes, so only a byte change invalidates it.
+        let committedFoldChangesHead: boolean | undefined;
         try {
             const previousM1 = args.sessionMeta.cachedM1Bytes?.toString("utf8");
             // Omitting messages keeps prefix preparation off-wire. The final
@@ -2275,6 +2427,14 @@ export async function runPostTransformPhase(
                                   servedPrefixBeforeFold,
                                   rendered,
                               );
+                        committedFoldChangesHead = firstRenderBust
+                            ? !servedPrefixMatches({
+                                  messages: servedBeforeFirstRender,
+                                  m0Text: rendered.m0Bytes.toString(),
+                                  m1Text: rendered.m1Bytes.toString(),
+                                  muralDataUrl: rendered.muralDataUrl,
+                              })
+                            : foldChangesServedPrefix(servedPrefixBeforeFold, rendered);
                         if (bustsPrefix) {
                             if (!conversions.isCurrent(db)) {
                                 throw new MaterializeContentionError({
@@ -2292,7 +2452,28 @@ export async function runPostTransformPhase(
             });
             preparedPrefix = foldResult;
             if (activeThinkingPrefixHold && firstRenderBust && committedFoldBustsServedPrefix) {
-                releaseThinkingForRewrite();
+                // Compaction-off holds every open signed turn, but a first render
+                // has no cached head to replay: the new head goes out, so the
+                // turn's thinking must leave the wire with it.
+                releaseThinkingForRewrite(false, true);
+            } else if (
+                compactionOff &&
+                !activeThinkingPrefixHold &&
+                args.thinkingBindingRecoveryEnabledForModel === true &&
+                committedFoldChangesHead
+            ) {
+                // Compaction-off holds the head only while the open turn has
+                // signed thinking. A fold on any other pass (the first request of
+                // a new turn after a memory edit, for example) re-renders the
+                // head in front of the earlier turns' signed thinking, which a
+                // prefix-bound model invalidates as well. That fold is the
+                // rewrite, so the blocks leave the wire on the same pass and
+                // stay stripped on every later one.
+                sessionLog(
+                    args.sessionId,
+                    "compaction-off fold changed the head: stripping signed thinking",
+                );
+                releaseThinkingForRewrite(false, true);
             }
             prefixPreflightFailed = foldResult.materializationContentionRetryExhausted === true;
             foldExecutedThisPass = foldExecutesThisPass(
@@ -2353,16 +2534,6 @@ export async function runPostTransformPhase(
             `m[0] HARD fold decision: reason=${m0MaterializeReason ?? foldDueDecision.reason ?? (foldExecutedThisPass ? "drift" : "soft_refresh")} executed=${foldExecutedThisPass} bustsServedPrefix=${foldBustsServedPrefixThisPass}`,
         );
     }
-    if (args.normalizeRecoveryTail && (foldBustsServedPrefixThisPass || firstRenderBust)) {
-        args.normalizeRecoveryTail();
-        args.tags = getTagsBySession(args.db, args.sessionId);
-        newTargets = protectNewTagMutations(
-            args.messages,
-            args.targets,
-            retainedThinking,
-            args.thinkingBindingRecoveryEnabledForModel === true,
-        );
-    }
     // Fold decision, cached-prefix capture and the m[1] soft refresh run above;
     // time precomputation and commit together so setup has no untimed stretch.
     logTransformTiming(
@@ -2408,8 +2579,12 @@ export async function runPostTransformPhase(
     const hasPendingUserOps = pendingOps.length > 0;
     // Preserve the requested application opportunity when thinking safety, not
     // cache policy, prevents this batch. The next real user releases the veto.
+    // Prefix-bound models request nothing: their queued drops ride the next
+    // bust of the turn, which strips the signed thinking that protected them,
+    // so a request here would originate a bust no other model takes.
     if (
         args.schedulerDecision === "execute" &&
+        args.thinkingBindingRecoveryEnabledForModel !== true &&
         pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
     )
         requestPendingMaterialization(
@@ -2433,12 +2608,24 @@ export async function runPostTransformPhase(
     const idleExpiryRebuild =
         (!freezeM0M1 || activeThinkingPrefixHold) && args.m0M1?.hardSignals?.cacheExpired === true;
     const rideSignals = {
+        servedShapeRepair: servedShapeRepair.needsRebuild,
+        executeReclaim: false,
         subagentExecute: !args.fullFeatureMode && args.schedulerDecision === "execute",
-        hardFold: foldBustsServedPrefixThisPass || firstRenderBust || idleExpiryRebuild,
+        hardFold:
+            rewritingSignedPrefix ||
+            foldBustsServedPrefixThisPass ||
+            firstRenderBust ||
+            idleExpiryRebuild,
+        // A reading that only a local count put in the force band is not
+        // evidence the session is there: the count can overstate the provider.
+        // Below 95% it waits for the provider's next measurement instead of
+        // rewriting the cache on its own. At 95% or more it still rides, since
+        // waiting there risks the next request not fitting.
         force:
             emergencyDropEligible &&
             (args.contextUsage.percentage >= 95 ||
-                getEmergencyInputSample(args.db, args.sessionId) === 0),
+                (args.contextUsageFromEstimate !== true &&
+                    getEmergencyInputSample(args.db, args.sessionId) === 0)),
         explicitFlush:
             isExplicitFlush &&
             hasPendingMaterializationOrigin(
@@ -2453,21 +2640,55 @@ export async function runPostTransformPhase(
                     (args.pendingCompartmentInjection?.compartmentCount ?? 0) > 0 &&
                     legacyPublishedHeadChanged(args))),
     };
+    const protectedToolTags = protectedToolTagNumbers(args.tags, args.protectedTools);
+    rideSignals.executeReclaim =
+        !compactionOff &&
+        originateExecuteReclaim({
+            db: args.db,
+            sessionId: args.sessionId,
+            primaryExecute:
+                args.fullFeatureMode &&
+                args.schedulerDecision === "execute" &&
+                args.contextUsage.percentage < args.forceMaterializationPercentage,
+            alreadyBusting: Object.values(rideSignals).some(Boolean) || args.historyRebuiltThisPass,
+            summaryCanCome:
+                compartmentRunning ||
+                args.sessionMeta.compartmentInProgress ||
+                ((prefixPreflightFailed || freezeM0M1 || activeThinkingPrefixHold) &&
+                    (args.deferredHistoryRefreshSessions.has(args.sessionId) ||
+                        args.deferredMaterializationSessions.has(args.sessionId) ||
+                        args.historyRefreshSessions?.has(args.sessionId) === true)) ||
+                readExecuteReclaimState(args.db, args.sessionId).floorOrdinal !== null,
+            reclaimableTokens: estimateExecuteReclaimTokens({
+                db: args.db,
+                sessionId: args.sessionId,
+                pendingOps,
+                tags: args.tags,
+                targets: newTargets,
+                protectedTagIds: new Set([...args.protectedTagIds, ...protectedToolTags]),
+            }),
+            usableWindow: args.usableWindow,
+        });
     // Warm-cache thinking holds defer every new prefix edit. First render, idle
     // expiry and pressure relief can admit work, but the target guards still
     // forbid changes before any retained signature. A genuine prefix rewrite
     // first omits every signed block. The directory veto freezes injection only.
+    // The historian's redundancy skip applies the same predicate.
     const publishedWorkDrainAllowed =
-        !compactionOff &&
-        (!activeThinkingPrefixHold ||
-            firstRenderBust ||
-            idleExpiryRebuild ||
-            emergencyDropEligible) &&
-        hasReclaimRide(rideSignals);
-    const shouldApplyPendingOps = publishedWorkDrainAllowed;
+        (!compactionOff || servedShapeRepair.needsRebuild) &&
+        reclaimRidePermitted(rideSignals, {
+            signedThinkingHold: activeThinkingPrefixHold,
+            firstRender: firstRenderBust,
+            idleExpiry: idleExpiryRebuild,
+            emergency: emergencyDropEligible,
+        });
+    const shouldApplyPendingOps = !compactionOff && publishedWorkDrainAllowed;
     const shouldRunHeuristics =
+        !compactionOff &&
         publishedWorkDrainAllowed &&
         (rideSignals.publishedHistory ||
+            rideSignals.executeReclaim ||
+            rideSignals.servedShapeRepair ||
             materializationRequested ||
             forceMaterialization ||
             // The off-wire fold changed the served prefix, so the prefix already
@@ -2486,6 +2707,58 @@ export async function runPostTransformPhase(
     // Every first-application lane and m[1] refresh uses this same permission.
     // It authorizes mutation; individual lanes may still find no eligible work.
     const isCacheBustingPass = publishedWorkDrainAllowed;
+    if (servedShapeRepair.needsRebuild && !isCacheBustingPass)
+        throw new Error("Served-shape repair requires a rebuilding pass");
+    servedShapeRepair.apply(isCacheBustingPass);
+    // An unheld bust of a prefix-bound model whose turn still keeps signed
+    // thinking lands like a bust on any other model: latest-turn protection is
+    // lifted so queued drops and cleanup in the turn apply on it. A bust that
+    // changes anything before the kept thinking must then strip every signed
+    // block, because those blocks no longer match their prefix:
+    // - a pass whose head changed (fold, first render, m[1] refresh) strips
+    //   now, before any lane edits, through the same persisted freeze a held
+    //   pass's release uses;
+    // - any other bust (flush, pressure, idle expiry, subagent execute) strips
+    //   at the end of the pass through the proactive strip, only if one of its
+    //   edits lies before newer thinking, so a bust with nothing to apply keeps
+    //   the turn's thinking.
+    let unheldSignedTurnBust = false;
+    if (
+        isCacheBustingPass &&
+        !activeThinkingPrefixHold &&
+        activeThinkingTurn &&
+        args.thinkingBindingRecoveryEnabledForModel === true
+    ) {
+        if (foldBustsServedPrefixThisPass || firstRenderBust || publishedM1RefreshedThisPass)
+            releaseThinkingForRewrite();
+        else {
+            unheldSignedTurnBust = true;
+            retainedThinking.clear();
+            protectedThinkingMessages.clear();
+            newTargets = args.targets;
+        }
+    }
+    // Keep recovery bytes until the shared permission allows a cache rewrite
+    // (for example, a user flush or pressure relief). Normalize before applying
+    // drops so the saved drop state and the request sent to the provider agree.
+    // Normalizing tags the messages appended after a last-good replay, which
+    // lie in front of thinking signed after it. A held pass keeps that thinking
+    // (idle expiry or a first render can admit it without stripping), so it
+    // keeps replaying the recovered prefix instead; the next pass that strips
+    // the turn or ends the hold normalizes. Until then the replay serves the
+    // recorded prefix byte for byte.
+    let recoveryTailNormalizedThisPass = false;
+    if (args.normalizeRecoveryTail && isCacheBustingPass && !activeThinkingPrefixHold) {
+        args.normalizeRecoveryTail();
+        recoveryTailNormalizedThisPass = true;
+        args.tags = getTagsBySession(args.db, args.sessionId);
+        newTargets = protectNewTagMutations(
+            args.messages,
+            args.targets,
+            retainedThinking,
+            args.thinkingBindingRecoveryEnabledForModel === true,
+        );
+    }
     const reclaimDistance = isCacheBustingPass
         ? toolReclaimDistanceEntries(args.messages, args.targets)
         : [];
@@ -2642,6 +2915,25 @@ export async function runPostTransformPhase(
             );
         }
     }
+    const heuristicsLogChanged = diagnosticStateChanged(
+        args.sessionId,
+        "heuristics",
+        JSON.stringify([
+            args.currentTurnId,
+            shouldRunHeuristics,
+            shouldRunHeuristics ? null : args.schedulerDeferReason,
+        ]),
+    );
+    const pendingLogChanged = diagnosticStateChanged(
+        args.sessionId,
+        "pending-ops",
+        JSON.stringify([
+            args.currentTurnId,
+            shouldApplyPendingOps,
+            shouldApplyPendingOps ? null : args.schedulerDeferReason,
+            shouldApplyPendingOps ? null : (getPendingOpsCount(args.db, args.sessionId) ?? 0) > 0,
+        ]),
+    );
     if (shouldRunHeuristics) {
         const subagentRerun =
             !args.fullFeatureMode &&
@@ -2664,7 +2956,11 @@ export async function runPostTransformPhase(
             args.sessionId,
             `heuristics WILL RUN — reason=${reason}, context=${args.contextUsage.percentage.toFixed(1)}%, turn=${args.currentTurnId}`,
         );
-    } else if (args.schedulerDeferReason !== undefined && args.schedulerDeferReason !== null) {
+    } else if (
+        heuristicsLogChanged &&
+        args.schedulerDeferReason !== undefined &&
+        args.schedulerDeferReason !== null
+    ) {
         sessionLog(args.sessionId, `heuristics WILL NOT RUN — reason=${args.schedulerDeferReason}`);
     }
     // Only show "skipping" log for primary sessions — subagents bypass the
@@ -2682,6 +2978,7 @@ export async function runPostTransformPhase(
     }
     if (
         !shouldApplyPendingOps &&
+        pendingLogChanged &&
         args.schedulerDeferReason !== undefined &&
         args.schedulerDeferReason !== null
     ) {
@@ -2699,7 +2996,6 @@ export async function runPostTransformPhase(
     let explicitMaterializedSuccessfully = false;
     let deferredMaterializedSuccessfully = false;
     let pendingOpsDidMutate = false;
-    const protectedToolTags = protectedToolTagNumbers(args.tags, args.protectedTools);
     // First application is an edit; restoring the same frozen choice from raw
     // history is replay. Telemetry and signed-thinking invalidation consume the
     // same edit record so a strip cannot silently escape either accounting lane.
@@ -2709,6 +3005,7 @@ export async function runPostTransformPhase(
         firstApplicationEdits.beforeNewerThinking ||= beforeNewerThinking;
     };
     if (temporalFirstApplication) recordFirstApplicationWireEdit(true);
+    if (servedShapeRepair.needsRebuild) recordFirstApplicationWireEdit(true);
     const firstApplicationLocations = new Map<MessageLike, number>();
     const recordFirstApplicationAt = (message: MessageLike, partIndex: number): void => {
         recordFirstApplicationWireEdit(false);
@@ -2787,6 +3084,8 @@ export async function runPostTransformPhase(
                 [],
                 new Set(),
                 (reduction) => droppedTokenReductions.push(reduction),
+                undefined,
+                args.onPendingDropEligibility,
             );
             if (pendingOpsDidMutate) {
                 droppedCount += pendingOps.length;
@@ -3013,7 +3312,12 @@ export async function runPostTransformPhase(
             // models it stays off too (Pi caps both lanes with one cutoff).
             const strippedInline =
                 routineCleanupApplied && ageLaneAllowed
-                    ? stripInlineThinking(args.messages, args.messageTagNumbers, budgetCutoff)
+                    ? stripInlineThinking(
+                          args.messages,
+                          args.messageTagNumbers,
+                          budgetCutoff,
+                          !canUseEmptySentinels,
+                      )
                     : 0;
             // Fresh caveman compression above rebuilds text from its original source,
             // which brings back inline thinking that the replay at the start of this
@@ -3028,8 +3332,13 @@ export async function runPostTransformPhase(
                     args.messages,
                     args.messageTagNumbers,
                     persistedInlineWatermark,
+                    !canUseEmptySentinels,
                 );
             }
+            // Inline stripping records its source slot before emptying it. Persist
+            // new served-shape decisions only on a cache-busting pass; deferred
+            // passes replay those decisions without discovering new replacements.
+            servedShapeRepair.apply(isCacheBustingPass);
             // Every other provider removes whole reasoning parts instead. New ids
             // are chosen only here, on the same rebuilding pass as the lane above,
             // and persisted before final representation applies them; a failed
@@ -3398,6 +3707,32 @@ export async function runPostTransformPhase(
 
     // Same gate computed once at the top for the known-bust fold decision.
     const m0M1Enabled = m0M1EnabledForFold;
+    if (m0M1Enabled && args.m0M1 && !compactionOff && args.opencode2) {
+        // OpenCode 2 instruction rows are served even once the history summary
+        // covers them; the delivery trim below already keeps every one still in
+        // the array. The switch that extends this to the earlier trims is set on
+        // the first pass allowed to rewrite the whole prefix, so a session served
+        // before it never changes bytes on a defer pass. Every pass after that
+        // serves the same rows, whichever pass moved the history boundary.
+        const covered = args.coveredHostInstructions ?? [];
+        if (covered.length > 0 || canEditWholePrefix) {
+            let retain = false;
+            if (hostInstructionRetentionEnabled()) {
+                try {
+                    retain = isHostInstructionRetentionOn(args.db, args.sessionId);
+                } catch (error) {
+                    failPass("host-instruction-retention-read-failure", error);
+                }
+                if (!retain && canEditWholePrefix) {
+                    if (!markHostInstructionRetention(args.db, args.sessionId))
+                        failPass("host-instruction-retention-persistence-failure");
+                    retain = true;
+                }
+            }
+            // The covered rows are older than everything left in the array.
+            if (retain && covered.length > 0) args.messages.unshift(...covered);
+        }
+    }
     if (m0M1Enabled && args.m0M1) {
         // Serve the persisted pair and its trim boundary as they are. Marking
         // the replay contention-exhausted keeps this pass from counting as
@@ -3594,7 +3929,9 @@ export async function runPostTransformPhase(
         // and persist their IDs so future defer passes can replay.
         if (isCacheBustingPass) {
             const droppedResult = stripDroppedPlaceholderMessages(
-                args.messages,
+                args.messages.filter(
+                    (message) => !servedShapeRepair.messageIDs.has(message.info.id ?? ""),
+                ),
                 args.resolvedProviderID,
                 recordFirstApplicationAt,
             );
@@ -4139,7 +4476,9 @@ export async function runPostTransformPhase(
     // Keep them separate from merged-part choices and anchored recovery ids.
     const frozenThinkingBindingMessageIds = new Set<string>();
     let thinkingBindingRecovery: ThinkingBindingRecoveryApplication | null = null;
-    if (!compactionOff) {
+    if (compactionOff) {
+        for (const id of compactionOffFrozenThinking) frozenThinkingBindingMessageIds.add(id);
+    } else {
         try {
             for (const id of mergedReasoningStrippedIds) {
                 if (id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) {
@@ -4488,6 +4827,8 @@ export async function runPostTransformPhase(
         todoAnchorMovedThisPass ||
         autoSearchHintAppendedThisPass ||
         dropModeSwitchesThisPass ||
+        // Re-tagging a replayed tail is an edit in front of newer thinking.
+        recoveryTailNormalizedThisPass ||
         firstApplicationEdits.beforeNewerThinking;
     let proactiveThinkingStrip: ProactiveThinkingStrip | null = null;
     if (
@@ -4510,7 +4851,14 @@ export async function runPostTransformPhase(
                 mergedReasoningStrippedIds.add(thinkingBindingRecoveryFrozenId(messageId));
             }
             bustedThisPass = true;
+            // The open turn's thinking went with it: its pre-rejection originals
+            // must not be restored over the strip.
+            if (unheldSignedTurnBust) rewritingSignedPrefix = true;
         } else if (outcome.persistenceFailed) {
+            // The open turn's edits are already applied in front of its kept
+            // thinking; serving them without the strip would be rejected.
+            if (unheldSignedTurnBust)
+                throw new Error("Cannot persist signed thinking omission after a mid-turn edit");
             failPass("proactive-thinking-strip-persistence-failure");
         }
     }
@@ -4765,6 +5113,7 @@ export async function runPostTransformPhase(
     }
 
     logTransformTiming(args.sessionId, "pp.tailGuard", tTailGuard);
+    if (bustedThisPass) clearExecuteReclaimState(args.db, args.sessionId);
     return {
         explicitMaterializedSuccessfully,
         deferredMaterializedSuccessfully,

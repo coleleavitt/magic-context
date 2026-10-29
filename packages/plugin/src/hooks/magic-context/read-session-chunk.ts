@@ -7,7 +7,8 @@ import type { ToolExpansionMap } from "../../shared/historian-tool-template";
 import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { isSystemDirective } from "../../shared/system-directive";
+import { isSystemDirective, removeSystemReminders } from "../../shared/system-directive";
+import { askAnswerLines } from "./ask-answer-notice";
 import { isHostUnservedRow, markHostUnservedRow } from "./host-served-rows";
 import { prewarmRawSessionOrdinalsForDb } from "./raw-ordinal-warmup";
 import {
@@ -299,8 +300,6 @@ export function withRawMessageProvider<T>(
     return result;
 }
 
-const SYSTEM_REMINDER_BLOCK_REGEX = /<system-reminder>[\s\S]*?<\/system-reminder>/gi;
-
 /**
  * Strip system-reminder blocks and OMO markers from user text for chunk
  * compaction. OpenCode 1.17.8 and older wrapped a user message sent mid-run in a
@@ -309,8 +308,18 @@ const SYSTEM_REMINDER_BLOCK_REGEX = /<system-reminder>[\s\S]*?<\/system-reminder
  */
 export function cleanUserText(text: string): string {
     return stripOutsideSteeringWrappers(text, (segment) =>
-        segment.replace(SYSTEM_REMINDER_BLOCK_REGEX, "").replace(OMO_INTERNAL_INITIATOR_MARKER, ""),
+        removeSystemReminders(segment).replace(OMO_INTERNAL_INITIATOR_MARKER, ""),
     ).trim();
+}
+
+/**
+ * The answer lines the chunk reader appends to a user message, one per answer
+ * notice in its raw text, normalized like every other user text.
+ */
+function answerLineParts(rawText: string): string[] {
+    return askAnswerLines(rawText)
+        .map(normalizeText)
+        .filter((value) => value.length > 0);
 }
 
 /**
@@ -330,7 +339,17 @@ function hasMeaningfulChunkUserText(parts: unknown[]): boolean {
         if (isSystemDirective(cleaned)) continue;
         return true;
     }
-    return false;
+    // A message that held only an answer notice cleans to nothing, but it carries
+    // a decision the user made, so it is not noise.
+    return parts.some(
+        (part) =>
+            part !== null &&
+            typeof part === "object" &&
+            (part as Record<string, unknown>).type === "text" &&
+            typeof (part as Record<string, unknown>).text === "string" &&
+            (part as Record<string, unknown>).ignored !== true &&
+            askAnswerLines((part as Record<string, unknown>).text as string).length > 0,
+    );
 }
 
 export interface SessionChunk {
@@ -935,6 +954,45 @@ export function readRawSessionMessageOrdinalById(
     );
 }
 
+/** The newest stored compartment boundary a historian chunk continues from. */
+export interface HistorianChunkStartBoundary {
+    endMessage: number;
+    endMessageId?: string | null;
+    endBlockIndex?: number | null;
+}
+
+/**
+ * Where the next historian chunk starts. On OpenCode 1, read straight from
+ * its store file, it is the message after the newest compartment's end id,
+ * resolved through the canonical read, so a stored `endMessage` that drifted
+ * below its id can neither skip nor repeat a message. Every other case keeps
+ * the stored number: provider sessions (see below), and an end id no longer
+ * in the history (a revert retired or rewrote it), where there is no position
+ * to resolve and the host's boundary repair decides what survives. A compartment whose end
+ * carries a block index (written by the Rust historian) also continues at
+ * the next message, as the stored-number start always did: a TypeScript
+ * summary starting inside that message would carry no block index, and the
+ * uncovered-end rule (`getUncoveredCompartmentEndsThrough`) would then treat
+ * the earlier end as uncovered for good and stop history trimming there.
+ */
+export function resolveHistorianChunkStart(
+    sessionId: string,
+    newest: HistorianChunkStartBoundary | null | undefined,
+): number {
+    if (!newest) return 1;
+    const fallback = newest.endMessage + 1;
+    // Only OpenCode 1's store-file count can drift behind a late-saved row.
+    // Provider sessions (OpenCode 2, Pi) number messages in their own
+    // coordinates, and Pi's carry a persisted alignment offset that an id
+    // lookup would ignore, so they keep the stored-number start.
+    if (hasRawMessageProvider(sessionId)) return fallback;
+    const endId = newest.endMessageId;
+    if (typeof endId !== "string" || endId.length === 0) return fallback;
+    const ordinal = readRawSessionMessageOrdinalById(sessionId, endId);
+    if (typeof ordinal !== "number" || !Number.isFinite(ordinal) || ordinal < 1) return fallback;
+    return ordinal + 1;
+}
+
 /** Store positions order persisted rows; raw ordinals number only messages selected for compression. */
 function readRawSessionMessageOrderPosition(sessionId: string, messageId: string): number | null {
     const provider = sessionProviders.get(sessionId)?.provider;
@@ -1400,6 +1458,13 @@ export function readSessionChunk(
         const meta = { ordinal: msg.ordinal, messageId: msg.id };
         if (isHostUnservedRow(msg)) markHostUnservedRow(meta);
 
+        // Host instructions are prompt material, not user decisions. Keep their
+        // ordinals for coverage, but omit their text as the Rust reader does.
+        if (msg.role === "system") {
+            recordFilteredNoise(meta);
+            continue;
+        }
+
         // Skip user messages that are pure system notifications (background task
         // completions, internal initiator markers, system directives). These carry
         // zero signal for compartment summaries — unless they contain tool results
@@ -1459,12 +1524,22 @@ export function readSessionChunk(
             .map(normalizeText)
             .filter((value) => value.length > 0);
 
+        // A user's answer to a parked ask arrives inside a reminder, so cleaning
+        // would drop it. Its answer lines follow the user's own words instead,
+        // in part order. A message with no answer notice appends nothing and is
+        // rendered exactly as before.
+        const answerParts =
+            msg.role === "user"
+                ? extractTexts(msg.parts).flatMap((text) => answerLineParts(text))
+                : [];
+        const userParts = answerParts.length > 0 ? [...textParts, ...answerParts] : textParts;
+
         // For messages with no text content, extract tool-call descriptions as
         // lightweight summaries so historian sees what actions were taken.
         const allParts =
             options.expand === false
                 ? [
-                      ...textParts,
+                      ...userParts,
                       ...(textParts.length === 0 ? extractToolCallSummaries(msg.parts) : []),
                   ]
                 : msg.parts.flatMap((part) => {
@@ -1475,6 +1550,13 @@ export function readSessionChunk(
                           .map((t) => (msg.role === "user" ? cleanUserText(t) : t))
                           .map(normalizeText)
                           .filter(Boolean);
+                      // The answer lines follow the text part that carried them,
+                      // so a message keeps its own order.
+                      if (msg.role === "user") {
+                          texts.push(
+                              ...extractTexts([part]).flatMap((text) => answerLineParts(text)),
+                          );
+                      }
                       return texts.length
                           ? texts
                           : textParts.length === 0
@@ -1493,7 +1575,7 @@ export function readSessionChunk(
         // Narrative is present iff this message contributed at least one real text part.
         // Tool summaries alone count as tool-only. User-role messages here always carry
         // meaningful text (the no-text user branch returned above).
-        const msgHasNarrative = textParts.length > 0;
+        const msgHasNarrative = userParts.length > 0;
 
         if (currentBlock && currentBlock.role === role) {
             currentBlock.endOrdinal = msg.ordinal;

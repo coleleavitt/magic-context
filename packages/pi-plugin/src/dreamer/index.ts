@@ -23,8 +23,13 @@ import {
 import { isUsableProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { startDreamScheduleTimer as defaultStartDreamScheduleTimer } from "@magic-context/core/plugin/dream-timer";
+import { extractLatestAssistantText } from "@magic-context/core/shared/assistant-message-extractor";
 import { log } from "@magic-context/core/shared/logger";
 import type { ModelHarness } from "@magic-context/core/shared/model-resolution";
+import {
+	noteModelActivityMonitored,
+	noteModelOutputReceived,
+} from "@magic-context/core/shared/model-suggestion-retry";
 import { isRecord } from "@magic-context/core/shared/record-type-guard";
 import type {
 	CompletedSubagentToolCall,
@@ -33,7 +38,9 @@ import type {
 import { HiddenAgentStepLimit } from "@magic-context/core/v2/hooks/hidden-child";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
 import { isPiModelRegistered } from "../model-chain-health";
+import { ZEN_FREE_TIER_FAILURE } from "../pi-zen-free-tier";
 import { PiSubagentRunner } from "../subagent-runner";
+import { piEventShowsModelOutput } from "./model-activity";
 import { createPiPrimerRawProviderFactory } from "./primer-raw-provider-pi";
 import { PiRetrospectiveRawProvider } from "./retrospective-raw-provider-pi";
 
@@ -105,6 +112,7 @@ interface SessionMessagesArgs {
 }
 
 interface SessionPromptArgs extends SessionMessagesArgs {
+	tokenBudget?: number;
 	body?: unknown;
 	signal?: AbortSignal | null;
 }
@@ -535,6 +543,17 @@ export async function awaitInFlightDreamers(
 	await Promise.allSettled(runs);
 }
 
+/**
+ * Minutes the Pi subprocess may run past its task's own timeout. The executor's
+ * abort signal ends a task at its configured timeout; the subprocess ceiling
+ * sits this far above it, so the signal always fires first and the run is
+ * reported as the task's timeout rather than a killed runner.
+ */
+const RUNNER_TIMEOUT_HEADROOM_MINUTES = 5;
+
+/** Task timeout assumed when the dream session's task can't be identified. */
+const UNKNOWN_TASK_TIMEOUT_MINUTES = 30;
+
 function createPiDreamerClient(
 	opts: PiDreamerOptions,
 	onAdjunctsRefreshNeeded = opts.onAdjunctsRefreshNeeded,
@@ -603,6 +622,12 @@ function createPiDreamerClient(
 			// double-iterate and override a task's own (possibly empty) chain.
 			const perTaskModel = extractBodyModel(args);
 			const requestedAgent = extractBodyAgent(args) ?? "magic-context-dreamer";
+			const accountingTask = accountingTaskFromTitle(dreamSession.title);
+			const taskConfig = accountingTask
+				? buildDreamTaskRuntimeConfigs(getDreamerConfig(), opts.harness).find(
+						(entry) => entry.task === accountingTask,
+					)
+				: undefined;
 			const controller = new AbortController();
 			let controllers = dreamAbortControllers.get(opts.registrationOwner);
 			if (!controllers) {
@@ -610,16 +635,28 @@ function createPiDreamerClient(
 				dreamAbortControllers.set(opts.registrationOwner, controllers);
 			}
 			controllers.add(controller);
+			noteModelActivityMonitored(args.signal ?? undefined);
 			const runPromise = runner.run({
+				onProgress: (progress) => {
+					if (
+						progress.type === "raw_event" &&
+						piEventShowsModelOutput(progress.event)
+					)
+						noteModelOutputReceived(args.signal ?? undefined);
+				},
 				agent: requestedAgent,
 				systemPrompt,
 				userMessage,
 				model: perTaskModel,
 				fallbackModels: undefined,
-				// The executor enforces the per-task timeout via its abort signal;
-				// give the subprocess a generous ceiling so the signal is the
-				// authority (not a second, conflicting wall-clock here).
-				timeoutMs: 30 * 60 * 1000,
+				// The executor enforces the per-task timeout via its abort signal.
+				// The subprocess ceiling follows that timeout plus headroom, so it
+				// never ends a task the signal would still let run.
+				timeoutMs:
+					((taskConfig?.timeoutMinutes ?? UNKNOWN_TASK_TIMEOUT_MINUTES) +
+						RUNNER_TIMEOUT_HEADROOM_MINUTES) *
+					60 *
+					1000,
 				cwd: dreamSession.directory,
 				signal: args.signal
 					? AbortSignal.any([args.signal, controller.signal])
@@ -631,15 +668,9 @@ function createPiDreamerClient(
 				maxOutputTokens: getMaxOutputTokens(),
 				accountingSessionId: opts.projectIdentity,
 				accountingSubagent: "dreamer",
-				accountingTask: accountingTaskFromTitle(dreamSession.title),
-				tokenBudget: (() => {
-					const task = accountingTaskFromTitle(dreamSession.title);
-					if (!task) return undefined;
-					return buildDreamTaskRuntimeConfigs(
-						getDreamerConfig(),
-						opts.harness,
-					).find((entry) => entry.task === task)?.tokenBudget;
-				})(),
+				accountingTask,
+				accountingModelConfigKey: taskConfig?.modelConfigKey,
+				tokenBudget: args.tokenBudget ?? taskConfig?.tokenBudget,
 			});
 			inFlightDreams.set(runPromise, opts.registrationOwner);
 			try {
@@ -647,7 +678,16 @@ function createPiDreamerClient(
 				const budget = result.meta?.tokenBudget as
 					| DreamTokenBudgetState
 					| undefined;
-				if (budget) childBudgetStates.set(sessionId, budget);
+				if (budget) {
+					const prior = childBudgetStates.get(sessionId);
+					childBudgetStates.set(sessionId, {
+						...budget,
+						budget: prior?.budget ?? budget.budget,
+						spent: (prior?.spent ?? 0) + budget.spent,
+						finalizeFired:
+							(prior?.finalizeFired ?? false) || budget.finalizeFired,
+					});
+				}
 				const budgetTask = accountingTaskFromTitle(dreamSession.title);
 				if (budgetTask && budget && typeof budget.spent === "number") {
 					const prior = budgetStates.get(budgetTask);
@@ -659,9 +699,15 @@ function createPiDreamerClient(
 				}
 				assertRegistrationOwnerActive();
 				const mappingMessages = result.meta?.mappingMessages;
-				if (budgetTask === "map-memories" && Array.isArray(mappingMessages)) {
+				const isVerification =
+					budgetTask === "verify" || budgetTask === "verify-broad";
+				const hasMemoryDecisions =
+					(budgetTask === "map-memories" || isVerification) &&
+					result.meta?.failureClass !== ZEN_FREE_TIER_FAILURE &&
+					Array.isArray(mappingMessages);
+				if (hasMemoryDecisions) {
 					// Retain decisions before raising a step/timeout error; the shared
-					// mapper reads this session to bank closed memory elements.
+					// mapper/verifier reads this session to bank closed decisions.
 					dreamSession.messages = mappingMessages
 						.filter(isRecord)
 						.filter((message) => message.role === "assistant")
@@ -681,6 +727,20 @@ function createPiDreamerClient(
 									: [],
 							),
 						);
+					// Pi may retain only tool turns while its runner keeps the final text separately.
+					if (
+						result.ok &&
+						result.assistantText?.trim() &&
+						!dreamSession.messages.some((message) =>
+							extractLatestAssistantText([message])?.trim(),
+						)
+					) {
+						dreamSession.messages.push(
+							makeMessage("assistant", [
+								{ type: "text", text: result.assistantText },
+							]),
+						);
+					}
 				}
 				if (!result.ok) {
 					if (result.reason === "token_budget") {
@@ -706,7 +766,7 @@ function createPiDreamerClient(
 					}
 					throw error;
 				}
-				if (!(budgetTask === "map-memories" && Array.isArray(mappingMessages)))
+				if (!hasMemoryDecisions)
 					dreamSession.messages = [
 						makeMessage("user", [{ type: "text", text: userMessage }]),
 						makeMessage("assistant", [
@@ -788,7 +848,10 @@ function accountingTaskFromTitle(title: string | undefined): string | null {
 	const task = title.slice("magic-context-dream-".length);
 	if (!title.startsWith("magic-context-dream-") || task.length === 0)
 		return null;
-	return task === "classify" ? "classify-memories" : task;
+	// Two child titles use a shorter name than their configured task.
+	if (task === "classify") return "classify-memories";
+	if (task === "user-memories") return "review-user-memories";
+	return task;
 }
 
 function readSessionTitle(args: { body?: unknown }): string | undefined {
@@ -920,6 +983,7 @@ function makeMessage(
 }
 
 export const __test = {
+	accountingTaskFromTitle,
 	registeredProjectCount: () => registeredProjects.size,
 	clearRegistrationGeneration: (projectIdentity: string) => {
 		const registration = registeredProjects.get(projectIdentity);

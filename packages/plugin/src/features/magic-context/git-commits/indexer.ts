@@ -39,6 +39,8 @@ const embedInProgress = new Set<string>();
 export interface IndexCommitsOptions {
     sinceDays: number;
     maxCommits: number;
+    /** A recovered retention cap may bound reads, but must not delete stored commits. */
+    skipRetention?: boolean;
     /** If true, skip the embed step after indexing. Useful when the caller
      *  plans to embed in a separate scheduled pass. Default false. */
     skipEmbed?: boolean;
@@ -79,6 +81,10 @@ export async function indexCommitsForProject(
         embedded: 0,
         nonIndexable: false,
     };
+    if (projectPath.startsWith("dir:")) {
+        result.nonIndexable = true;
+        return result;
+    }
 
     if (indexInProgress.has(projectPath)) {
         log(`[git-commits] index already in progress for ${projectPath}, skipping`);
@@ -110,7 +116,9 @@ export async function indexCommitsForProject(
 
         if (commits.length === 0) {
             // No new commits. Still enforce the cap in case prior runs overflowed.
-            result.evicted = enforceProjectCap(db, projectPath, options.maxCommits);
+            if (!options.skipRetention) {
+                result.evicted = enforceProjectCap(db, projectPath, options.maxCommits);
+            }
             log(
                 `[git-commits] no new commits for ${projectPath} (sinceMs=${sinceMs} latestIndexed=${latestIndexed?.slice(0, 7) ?? "none"} evicted=${result.evicted})`,
             );
@@ -124,7 +132,9 @@ export async function indexCommitsForProject(
         const upsert = upsertCommits(db, projectPath, commits);
         result.inserted = upsert.inserted;
         result.updated = upsert.updated;
-        result.evicted = enforceProjectCap(db, projectPath, options.maxCommits);
+        if (!options.skipRetention) {
+            result.evicted = enforceProjectCap(db, projectPath, options.maxCommits);
+        }
 
         const snapshot = getProjectEmbeddingSnapshot(projectPath);
         if (options.skipEmbed || !snapshot?.gitCommitEnabled) {
@@ -161,6 +171,7 @@ export async function embedUnembeddedCommits(db: Database, projectPath: string):
     embedInProgress.add(projectPath);
     const startedAt = Date.now();
     const deadline = startedAt + EMBED_SWEEP_MAX_WALL_CLOCK_MS;
+    const signal = AbortSignal.timeout(EMBED_SWEEP_MAX_WALL_CLOCK_MS);
     let total = 0;
 
     try {
@@ -177,7 +188,7 @@ export async function embedUnembeddedCommits(db: Database, projectPath: string):
                         text: row.message,
                         contentSha256: contentSha256(row.message),
                     })),
-                    undefined,
+                    signal,
                     db,
                     projectPath,
                 );

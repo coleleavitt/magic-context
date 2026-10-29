@@ -1,4 +1,9 @@
+import {
+    readReplayEnvelope,
+    updateReplayDocument,
+} from "../../features/magic-context/storage-replay-document";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
+import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { loadPersistedLkgSlot } from "./lkg-persist";
 import {
@@ -8,7 +13,7 @@ import {
     ownsLkgDirtyFence,
 } from "./lkg-recovery-fence";
 import { type LkgEntryProjection, resolveLkgModelKeys } from "./lkg-replay";
-import { getSlot, type LkgEntryNote, lkgContentDigest } from "./lkg-slot";
+import { getSlot, type LkgEntryNote, lkgContentDigest, lkgInputIdentity } from "./lkg-slot";
 import type { MessageLike } from "./transform-operations";
 
 interface RecoveryPrefix {
@@ -60,12 +65,56 @@ export function noteLkgCapturedPrefix(sessionId: string): void {
     if (!sessions.has(sessionId)) sessions.set(sessionId, {});
 }
 
+/**
+ * The host messages a last-good replay served without tags, kept in the
+ * session's replay document (`lkgUntaggedInputIds`) so a restart keeps serving
+ * them untagged. The in-memory recovery prefix holds the same set, but it dies
+ * with the process; without this record the first pass after a restart would
+ * tag those messages, a change in front of every signed thinking block served
+ * after the replay, even on a pass that must not change served bytes.
+ */
+export function readPersistedLkgUntaggedInputIds(db: Database, sessionId: string): string[] {
+    try {
+        const saved = readReplayEnvelope(db, sessionId, "read").lkgUntaggedInputIds;
+        return Array.isArray(saved)
+            ? saved.filter((id): id is string => typeof id === "string" && id.length > 0)
+            : [];
+    } catch (error) {
+        sessionLog(sessionId, "LKG untagged-input record unreadable:", error);
+        return [];
+    }
+}
+
+/** Replace the record (an empty set removes it). Returns false when it could not be written. */
+export function persistLkgUntaggedInputIds(
+    db: Database,
+    sessionId: string,
+    ids: Iterable<string>,
+): boolean {
+    const next = [...new Set(ids)].sort();
+    try {
+        return updateReplayDocument(db, sessionId, (doc) => {
+            const saved = Array.isArray(doc.lkgUntaggedInputIds) ? doc.lkgUntaggedInputIds : [];
+            if (JSON.stringify(saved) === JSON.stringify(next)) return false;
+            doc.version = 2;
+            if (next.length > 0) doc.lkgUntaggedInputIds = next;
+            else delete doc.lkgUntaggedInputIds;
+            return true;
+        });
+    } catch (error) {
+        sessionLog(sessionId, "LKG untagged-input record write failed:", error);
+        return false;
+    }
+}
+
 export function noteLkgRecoveryPrefix(args: {
     sessionId: string;
     entry: LkgEntryNote;
     messages: MessageLike[];
     modelKey: string | null;
     providerKey: string | null;
+    /** Also record the untagged messages durably (best effort; the next pass retries). */
+    db?: Database;
 }): boolean {
     const digests = [
         ...args.entry.entryContentDigests,
@@ -75,23 +124,45 @@ export function noteLkgRecoveryPrefix(args: {
         return false;
     const ids = args.entry.entryInputIds;
     if (ids.some((id) => !id) || new Set(ids).size !== ids.length) return false;
+    const untaggedInputIds = new Set([
+        ...(sessions.get(args.sessionId)?.prefix?.untaggedInputIds ?? []),
+        ...(args.db ? readPersistedLkgUntaggedInputIds(args.db, args.sessionId) : []),
+        ...ids.slice(args.entry.anchorIndex + 1),
+    ]);
     sessions.set(args.sessionId, {
         fenceRevision: sessions.get(args.sessionId)?.fenceRevision,
         prefix: {
             inputs: ids.map((id, index) => ({ id, digest: digests[index] as string })),
             json: JSON.stringify(args.messages),
-            untaggedInputIds: new Set([
-                ...(sessions.get(args.sessionId)?.prefix?.untaggedInputIds ?? []),
-                ...ids.slice(args.entry.anchorIndex + 1),
-            ]),
+            untaggedInputIds,
             modelKey: args.modelKey,
             providerKey: args.providerKey,
         },
     });
+    // A replay often follows a busy database, so this write may fail; the next
+    // pass that serves the replayed messages untagged writes it before it returns.
+    if (args.db) persistLkgUntaggedInputIds(args.db, args.sessionId, untaggedInputIds);
     return true;
 }
 
 export function readLkgRecoveryPrefix(
+    sessionId: string,
+    inputs: (Pick<LkgEntryProjection, "id" | "contentDigest"> & { role?: string })[],
+    messages: MessageLike[],
+    db?: Database,
+): { prefix?: RecoveryPrefix; rebuildReason?: string } {
+    return readRecoveryIdentityPrefix(
+        sessionId,
+        inputs.map((input, index) => ({
+            id: lkgInputIdentity(input.id, input.role, index),
+            contentDigest: input.contentDigest,
+        })),
+        messages,
+        db,
+    );
+}
+
+function readRecoveryIdentityPrefix(
     sessionId: string,
     inputs: Pick<LkgEntryProjection, "id" | "contentDigest">[],
     messages: MessageLike[],
@@ -140,8 +211,8 @@ export function noteLkgHealthyPrefix(
             prefix && !release
                 ? {
                       ...prefix,
-                      inputs: inputs.map((input) => ({
-                          id: input.id ?? "",
+                      inputs: inputs.map((input, index) => ({
+                          id: lkgInputIdentity(input.id, input.role, index) ?? "",
                           digest: input.contentDigest?.() ?? "",
                       })),
                       json: JSON.stringify(messages),
@@ -166,5 +237,5 @@ export function lkgRecoveryEntryUnproven(
         id,
         contentDigest: () => digests[index] ?? null,
     }));
-    return !!readLkgRecoveryPrefix(sessionId, inputs, messages).rebuildReason;
+    return !!readRecoveryIdentityPrefix(sessionId, inputs, messages).rebuildReason;
 }

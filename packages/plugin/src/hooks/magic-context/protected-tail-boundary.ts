@@ -12,6 +12,7 @@ import { escalationBands } from "../../shared/escalation-bands";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { deriveTriggerBudget } from "./derive-budgets";
+import { omitIncompleteFileTokenTotals } from "./file-token-coverage";
 import { retreatPastHostUnservedRows } from "./host-served-rows";
 import {
     getCachedAbsoluteMessageCount,
@@ -22,6 +23,7 @@ import {
     readRawSessionMessages,
 } from "./read-session-chunk";
 import { hasMeaningfulUserText } from "./read-session-formatting";
+import type { RawMessage } from "./read-session-raw";
 import {
     buildToolArcs,
     buildTrueRawTokenIndex,
@@ -61,6 +63,8 @@ export interface ResolvedBoundaryContext {
     protectedTailPolicyVersion: number;
     migrationFloorActive: boolean;
     emergencyTailScale?: 0.5 | 0.25;
+    /** One admitted trigger evaluation may cross the live prompt without changing any other fence. */
+    liftLivePromptFloor?: boolean;
     providerShapeVersion: "opencode-v1" | "pi-folded-v1";
     cacheNamespace: string;
     createdAt?: number;
@@ -73,7 +77,10 @@ export interface ResolvedBoundaryContext {
      * their own token source; store-backed callers load only the requested owners.
      */
     storedTokenTotals?: Map<string, number>;
-    storedTokenTotalsForMessages?: (messageIds: string[]) => Map<string, number> | undefined;
+    storedTokenTotalsForMessages?: (
+        messageIds: string[],
+        messages?: readonly RawMessage[],
+    ) => Map<string, number> | undefined;
     calibration?: ReturnType<typeof sessionDecisionCalibration>;
 }
 
@@ -100,6 +107,14 @@ export interface ProtectedTailBoundarySnapshot {
     priorBoundaryOrdinal: number;
     migrationFloorActive: boolean;
     emergencyTailScale?: 0.5 | 0.25;
+    /**
+     * True when the trigger resolved this boundary with the one-pass live-prompt
+     * floor lift. A historian run that re-resolves a stale copy of this snapshot
+     * must lift the floor again, or a session with a single prompt has no head
+     * to summarize below the force band. Only the run started from this
+     * snapshot may use it; nothing else should copy it.
+     */
+    liftLivePromptFloor?: boolean;
     providerShapeVersion: "opencode-v1" | "pi-folded-v1";
     cacheNamespace: string;
     createdAt: number;
@@ -122,7 +137,12 @@ export interface BoundaryDiagnostics {
     drainBudget: "not-reserved; does-not-size-cap";
     sizeWalkStart: number;
     protectedTailStart: number;
-    livePromptFloor: { ordinal: number | null; from: number; to: number };
+    livePromptFloor: {
+        ordinal: number | null;
+        messageId?: string | null;
+        from: number;
+        to: number;
+    };
     head: HeadCapDiagnostics;
 }
 
@@ -530,7 +550,10 @@ export function resolveProtectedTailBoundary(
         absoluteMessageCount,
     );
     const storedTotals =
-        ctx.storedTokenTotalsForMessages?.(messages.map((m) => m.id)) ?? ctx.storedTokenTotals;
+        ctx.storedTokenTotalsForMessages?.(
+            messages.map((m) => m.id),
+            messages,
+        ) ?? ctx.storedTokenTotals;
     const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
         providerShapeVersion: ctx.providerShapeVersion,
         cacheNamespace: ctx.cacheNamespace,
@@ -689,7 +712,7 @@ export function resolveProtectedTailBoundary(
     let runtimeFloor = offset;
     if (ctx.migrationFloorActive) runtimeFloor = Math.max(runtimeFloor, ctx.priorBoundaryOrdinal);
     let protectedTailStart = Math.max(boundary, runtimeFloor);
-    // Live-prompt floor: on routine (non-emergency) passes the boundary must
+    // Live-prompt floor: on routine passes without a one-shot escape the boundary must
     // never cross the newest MEANINGFUL user message — compacting the prompt
     // the agent is actively answering replaces it with a narration mid-turn
     // and renders the compaction divider at the live tail (observed in
@@ -722,7 +745,8 @@ export function resolveProtectedTailBoundary(
             break;
         }
         livePromptFloor.ordinal = lastMeaningfulUserOrdinal || null;
-        if (lastMeaningfulUserOrdinal >= offset) {
+        livePromptFloor.messageId = boundaryMessageId(index, lastMeaningfulUserOrdinal);
+        if (!ctx.liftLivePromptFloor && lastMeaningfulUserOrdinal >= offset) {
             protectedTailStart = Math.min(protectedTailStart, lastMeaningfulUserOrdinal);
         }
     }
@@ -793,6 +817,8 @@ export function resolveProtectedTailBoundary(
         priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
         migrationFloorActive: ctx.migrationFloorActive,
         emergencyTailScale: ctx.emergencyTailScale,
+        // Left undefined when not lifted so unlifted snapshots keep their old shape.
+        liftLivePromptFloor: ctx.liftLivePromptFloor === true ? true : undefined,
         providerShapeVersion: ctx.providerShapeVersion,
         cacheNamespace: ctx.cacheNamespace,
         createdAt,
@@ -847,6 +873,7 @@ export function resolveBoundaryContext(args: {
     usageSource?: ResolvedBoundaryContext["usageSource"];
     emergencyTailScale?: 0.5 | 0.25;
     providerShapeVersion?: "opencode-v1" | "pi-folded-v1";
+    liftLivePromptFloor?: boolean;
     cacheNamespace?: string;
     /**
      * Tagger load-scoping floor (OpenCode only). When > 0, the stored-token map
@@ -895,15 +922,19 @@ export function resolveBoundaryContext(args: {
     const calibration = sessionDecisionCalibration(args.db, args.sessionId);
     // Only messages above the compartment boundary enter the token index. Load
     // their owners by index, rather than materializing compacted tag history.
-    const storedTokenTotalsForMessages = (messageIds: string[]) => {
+    const storedTokenTotalsForMessages = (
+        messageIds: string[],
+        messages: readonly RawMessage[] = [],
+    ) => {
         try {
-            return getAllStatusTagTokenTotalsFlat(
+            const totals = getAllStatusTagTokenTotalsFlat(
                 args.db,
                 args.sessionId,
                 args.taggerFloor ?? 0,
                 calibration,
                 messageIds,
             ).totals;
+            return omitIncompleteFileTokenTotals(args.db, args.sessionId, messages, totals);
         } catch (error) {
             sessionLog(
                 args.sessionId,
@@ -927,6 +958,7 @@ export function resolveBoundaryContext(args: {
         protectedTailPolicyVersion: meta.protectedTailPolicyVersion,
         migrationFloorActive,
         emergencyTailScale: args.emergencyTailScale,
+        liftLivePromptFloor: args.liftLivePromptFloor,
         providerShapeVersion: args.providerShapeVersion ?? "opencode-v1",
         cacheNamespace: args.cacheNamespace ?? `opencode:${args.sessionId}`,
         storedTokenTotalsForMessages,
@@ -958,7 +990,10 @@ export function resolveWrapupProtectedTailBoundary(
         absoluteMessageCount,
     );
     const storedTotals =
-        ctx.storedTokenTotalsForMessages?.(messages.map((m) => m.id)) ?? ctx.storedTokenTotals;
+        ctx.storedTokenTotalsForMessages?.(
+            messages.map((m) => m.id),
+            messages,
+        ) ?? ctx.storedTokenTotals;
     const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
         providerShapeVersion: ctx.providerShapeVersion,
         cacheNamespace: ctx.cacheNamespace,

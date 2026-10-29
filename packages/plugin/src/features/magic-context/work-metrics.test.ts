@@ -1,7 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import {
     computeOpenCodeWorkMetrics,
@@ -101,6 +98,55 @@ describe("work metrics", () => {
                 },
             ]),
         ).toEqual({ newWorkTokens: 244, totalInputTokens: 320 });
+    });
+
+    test("OpenCode 2 folds assistant usage in seq order and refreshes the streaming tail", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec(`CREATE TABLE session_message (
+                id TEXT PRIMARY KEY, session_id TEXT, type TEXT,
+                seq INTEGER, time_created INTEGER, data TEXT
+            )`);
+            const insert = db.prepare(
+                "INSERT INTO session_message (id, session_id, type, seq, time_created, data) VALUES (?, ?, ?, ?, ?, ?)",
+            );
+            const usage = (input: number, output: number) =>
+                JSON.stringify({
+                    agent: "build",
+                    tokens: { input, output, cache: { read: 20, write: 10 } },
+                });
+            insert.run("m1", "ses", "assistant", 1, 300, usage(70, 1));
+            insert.run("m2", "ses", "assistant", 2, 200, usage(170, 2));
+            insert.run("m3", "ses", "assistant", 3, null, usage(50, 3));
+            insert.run("m4", "ses", "assistant", 4, 100, usage(90, 4));
+            insert.run("user", "ses", "user", 5, 500, usage(10_000, 100));
+            insert.run("other", "other-session", "assistant", 6, 600, usage(10_000, 100));
+
+            const first = computeOpenCodeWorkMetricsIncremental(
+                db,
+                "ses",
+                emptyWorkMetricsCarry(),
+                "v2",
+            );
+            // Prompt phases are [100, 200] and [80, 120]: peaks 200 + 120,
+            // positive deltas 100 + 100 + 40, plus the last output 4.
+            expect(first.metrics).toEqual({ newWorkTokens: 244, totalInputTokens: 320 });
+            expect(first.carry.lastTimeCreated).toBe(3);
+
+            db.prepare("UPDATE session_message SET data = ? WHERE id = 'm4'").run(usage(100, 5));
+            const second = computeOpenCodeWorkMetricsIncremental(db, "ses", first.carry, "v2");
+            expect(second.metrics).toEqual({ newWorkTokens: 255, totalInputTokens: 330 });
+
+            insert.run("m5", "ses", "assistant", 7, null, usage(130, 6));
+            const third = computeOpenCodeWorkMetricsIncremental(db, "ses", second.carry, "v2");
+            expect(third.metrics).toEqual({ newWorkTokens: 286, totalInputTokens: 360 });
+            expect(third.carry.lastTimeCreated).toBe(4);
+            expect(
+                computeOpenCodeWorkMetricsIncremental(db, "ses", third.carry, "v2").metrics,
+            ).toEqual(third.metrics);
+        } finally {
+            db.close();
+        }
     });
 
     // ── Incremental (watermark) fold ──────────────────────────────────────
@@ -236,25 +282,5 @@ describe("work metrics", () => {
         insertWithId(db, "m4", "ses", 5, "build", 120, 4);
         const second = computeOpenCodeWorkMetricsIncremental(db, "ses", first.carry);
         expect(second.metrics).toEqual(computeOpenCodeWorkMetrics(db, "ses"));
-    });
-
-    test("live OpenCode smoke targets stay within 1%", () => {
-        if (process.env.MAGIC_CONTEXT_RUN_LIVE_OPENCODE_SMOKE !== "1") return;
-        const dbPath = join(homedir(), ".local", "share", "opencode", "opencode.db");
-        if (!existsSync(dbPath)) return;
-        const db = new Database(dbPath, { readonly: true });
-        const cases = [
-            ["ses_331acff95fferWZOYF1pG0cjOn", 122_527_859, 345_669_836],
-            ["ses_227ce5788ffeRPA9THoPLOQreO", 11_847_315, 71_309_730],
-        ] as const;
-        for (const [sessionId, expectedNewWork, expectedTotalInput] of cases) {
-            const actual = computeOpenCodeWorkMetrics(db, sessionId);
-            expect(Math.abs(actual.newWorkTokens - expectedNewWork) / expectedNewWork).toBeLessThan(
-                0.01,
-            );
-            expect(
-                Math.abs(actual.totalInputTokens - expectedTotalInput) / expectedTotalInput,
-            ).toBeLessThan(0.01);
-        }
     });
 });

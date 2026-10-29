@@ -111,7 +111,7 @@ test("OpenCode 2 shapes all six dream routes and keeps timer work in its owning 
             } else if (system.includes(CURATE_SYSTEM_PROMPT)) {
                 if (!hasResult) {
                     memoryCalls++;
-                    return { openaiOutput: [{ type: "function_call", id: `fc_update_${memoryCalls}`, call_id: `call_update_${memoryCalls}`, name: "ctx_memory", arguments: JSON.stringify({ action: "update", ids: [ids[0]], content: `Fixture claim is recorded in fact.txt. Clarification ${memoryCalls} preserves the fixture fact.` }) }], usage: { input_tokens: 100, output_tokens: 10 } };
+                    return { openaiOutput: [{ type: "function_call", id: `fc_update_${memoryCalls}`, call_id: `call_update_${memoryCalls}`, name: "ctx_memory", arguments: JSON.stringify({ action: "update", ids: [ids[0]], category: "ARCHITECTURE", content: `Fixture claim is recorded in fact.txt. Clarification ${memoryCalls} preserves the fixture fact.` }) }], usage: { input_tokens: 100, output_tokens: 10 } };
                 }
                 text = "Kept the fixture fact and clarified its wording.";
             } else if (system.includes("You are a memory mapper")) text = `<mappings>${ids.map(id => `<memory id="${id}" files="fact.txt"/>`).join("")}</mappings>`;
@@ -123,6 +123,10 @@ test("OpenCode 2 shapes all six dream routes and keeps timer work in its owning 
         for (let index = 0; index < 5; index++) {
             const session = await client.session.create({ title: `real-user-${index}`, location: { directory: host.cwd }, model: { providerID: "openai", id: "mock-model" } });
             sessions.push(session.id);
+            await client.session.prompt({ sessionID: session.id, text: `OPENING_${index}: explain the Fixture project rule.` });
+            await client.session.wait({ sessionID: session.id }, { signal: AbortSignal.timeout(20_000) });
+            // The friction gate only reviews a user line that answers an assistant
+            // reply, so each session needs a correction after its opening message.
             await client.session.prompt({ sessionID: session.id, text: `REAL_USER_${index}: repeated correction about the Fixture project rule.` });
             await client.session.wait({ sessionID: session.id }, { signal: AbortSignal.timeout(20_000) });
         }

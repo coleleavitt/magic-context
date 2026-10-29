@@ -19,6 +19,7 @@
  *     message is a fresh turn anyway, no provider cache to preserve yet.
  */
 
+import { getLastCompartmentEndMessage } from "../../features/magic-context/compartment-storage";
 import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
@@ -44,9 +45,11 @@ import {
     wasAutoSearchSkipped,
     withAutoSearchDeadline,
 } from "./auto-search-deadline";
-import { buildAutoSearchHint } from "./auto-search-hint";
+import { buildAutoSearchHint, selectAutoSearchResults } from "./auto-search-hint";
 import {
+    AutoSearchBusyError,
     coalesceAutoSearchTurn,
+    disposeIdleAutoSearchWorkers,
     persistAutoSearchDecision,
     queueAutoSearchBackfill,
     queueAutoSearchRegistration,
@@ -341,6 +344,8 @@ export async function runAutoSearchHint(args: {
                         embeddingSnapshot?.gitCommitEnabled ?? options.gitCommitsEnabled ?? false;
                     const searchOptions: UnifiedSearchOptions = {
                         limit: 10,
+                        maxMessageOrdinal: Math.max(0, getLastCompartmentEndMessage(db, sessionId)),
+                        excludeMessageId: userMsgId,
                         memoryEnabled,
                         embeddingEnabled,
                         gitCommitsEnabled,
@@ -362,6 +367,9 @@ export async function runAutoSearchHint(args: {
                         // Leave primers out of automatic hints so primer updates cannot rewrite
                         // cached request prefixes. Explicit ctx_search and the dashboard expose them.
                         sources: ["memory", "message", "git_commit"],
+                        // Never wait for the history-chunk pool to be built: a
+                        // cold pool is warmed in the background for later turns.
+                        chunkPoolWarmOnly: true,
                     };
                     return searchAutoHint(db, sessionId, options.projectPath, rawPrompt, {
                         ...searchOptions,
@@ -371,6 +379,16 @@ export async function runAutoSearchHint(args: {
                 }, startedAt);
             } catch (error) {
                 if (lifecycleSignal.aborted) return AUTO_SEARCH_OK;
+                if (error instanceof AutoSearchBusyError) {
+                    // An earlier search of this session is still running. Serve this
+                    // turn without a hint and freeze that decision, as a timeout does.
+                    sessionLog(
+                        sessionId,
+                        "auto-search: an earlier search of this session is still running, skipping hint for this turn",
+                    );
+                    void persistAutoSearchSkip(db, sessionId, userMsgId);
+                    return { ok: false, kind: "timeout" };
+                }
                 // This pass serves the user message without a hint. Freeze that decision
                 // before returning so a recovered search cannot rewrite cached bytes.
                 log(
@@ -400,15 +418,19 @@ export async function runAutoSearchHint(args: {
                 if (results.length === 0) {
                     return writeNoHintAndReconcile("empty");
                 }
-                if (results[0].score < options.scoreThreshold) {
+                results = selectAutoSearchResults(results, options.scoreThreshold);
+                if (results.length === 0) {
                     sessionLog(
                         sessionId,
-                        `auto-search: top score ${results[0].score.toFixed(3)} below threshold ${options.scoreThreshold}`,
+                        `auto-search: no fragment meets relevance threshold ${options.scoreThreshold}`,
                     );
                     return writeNoHintAndReconcile("below-threshold");
                 }
 
-                const hintText = buildAutoSearchHint(results, { wordRules: options.wordRules });
+                const hintText = buildAutoSearchHint(results, {
+                    wordRules: options.wordRules,
+                    query: rawPrompt,
+                });
                 if (!hintText) {
                     return writeNoHintAndReconcile("empty");
                 }
@@ -443,7 +465,7 @@ export async function runAutoSearchHint(args: {
                 }
                 sessionLog(
                     sessionId,
-                    `auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,
+                    `auto-search: attached hint to ${userMsgId} (${results.length} fragments, top relevance ${(results[0].relevanceScore ?? results[0].score).toFixed(3)})`,
                 );
                 return AUTO_SEARCH_OK;
             } finally {
@@ -467,6 +489,7 @@ export async function runAutoSearchHint(args: {
 export function _resetAutoSearchCache(): void {
     clearAutoSearchTimeoutForSession();
     clearUnpublishedAutoSearchNoHints();
+    disposeIdleAutoSearchWorkers();
 }
 
 /** Session cleanup hook — call on session.deleted. */

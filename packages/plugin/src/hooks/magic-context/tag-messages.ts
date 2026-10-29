@@ -1,5 +1,13 @@
 import type { ContextDatabase } from "../../features/magic-context/storage";
-import { getSourceContents, saveSourceContent } from "../../features/magic-context/storage";
+import {
+    getSourceContents,
+    replaceSourceContent,
+    saveSourceContent,
+} from "../../features/magic-context/storage";
+import {
+    type CavemanReplayState,
+    getCavemanReplayState,
+} from "../../features/magic-context/storage-caveman-rules";
 import {
     adoptNullOwnerToolTag,
     getCandidateToolOwners,
@@ -10,11 +18,22 @@ import {
     getToolTagNumberByOwner,
     markWhitespaceAssistantTagInert,
     pickNearestPriorOwner,
+    updateTagByteSize,
+    updateTagTokenCount,
 } from "../../features/magic-context/storage-tags";
 import { makeToolCompositeKey, type Tagger } from "../../features/magic-context/tagger";
+import type { TagEntry } from "../../features/magic-context/types";
 import { textMentionsRecentCommit } from "../../shared/commit-detection";
 import { isRecord } from "../../shared/record-type-guard";
+import { buildReplacementContent } from "./apply-operations";
+import { cavemanReplayText } from "./caveman-cleanup";
 import { isReduceToolPart } from "./drop-stale-reduce-calls";
+import {
+    discardPendingOpForForeignTag,
+    type ForeignTextParts,
+    lastStoredPartIndex,
+    rememberLegacyForeignTextTags,
+} from "./foreign-text-parts";
 import {
     estimateImageTokensFromDataUrl,
     estimateToolAttachmentImageTokens,
@@ -22,15 +41,14 @@ import {
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import { neutralizeDroppedReasoningPart } from "./sentinel";
-import { byteSize, isThinkingPart, prependTag } from "./tag-content-primitives";
-import { createExistingTagResolver } from "./tag-id-fallback";
 import {
-    buildFileSourceContent,
-    isFilePart,
-    isTextPart,
-    isToolPartWithOutput,
-    stripTagPrefix,
-} from "./tag-part-guards";
+    byteSize,
+    isThinkingPart,
+    prependTag,
+    stripPersistedAssistantText,
+} from "./tag-content-primitives";
+import { createExistingTagResolver } from "./tag-id-fallback";
+import { isFilePart, isTextPart, isToolPartWithOutput, stripTagPrefix } from "./tag-part-guards";
 import {
     createToolDropTarget,
     extractToolCallObservation,
@@ -251,6 +269,7 @@ export type MessageInfo = {
     id?: string;
     role?: string;
     sessionID?: string;
+    providerID?: string;
     time?: { created?: number; completed?: number };
     summary?: boolean;
     /** Marks one of the two m[0]/m[1] messages prepended by compartment injection. */
@@ -308,6 +327,8 @@ export type TagTarget = {
      * for every later thinking block.
      */
     setContent: (content: string, options?: { keepReasoning?: boolean }) => boolean;
+    /** Read-only counterpart to setContent, including partial-compartment fences. */
+    canSetContent?: (content: string) => boolean;
     getContent?: () => string | null;
     /**
      * Text targets: the `§N§ ` prefix this pass puts in front of the text, or
@@ -330,7 +351,9 @@ export type TagTarget = {
     inputStringBytes?: () => number | null;
     /** Non-mutating: would removing this call leave the request ending on an
      * assistant turn (given what this pass already removed)? */
-    wouldStrandConversationEnd?: () => boolean;
+    wouldStrandConversationEnd?: (plannedRemovals?: ReadonlySet<unknown>) => boolean;
+    /** Project a full removal for later decisions without changing the transcript. */
+    notePlannedRemoval?: (plannedRemovals: Set<unknown>) => void;
     /** Non-mutating: the host adapter cannot remove this call structurally, so
      * drop() would keep a paired shell instead. A new drop then keeps the real
      * arguments (skeletonReal) rather than any placeholder. */
@@ -365,6 +388,116 @@ export interface TagMessagesResult {
     hasRecentCommit: boolean;
     /** Exact part references that received a Magic Context tag prefix while tagMessages processed them. */
     normalizationTargets: TagNormalizationTarget[];
+}
+
+interface LegacyForeignTextTag {
+    tagNumber: number;
+    status: TagEntry["status"];
+    cavemanDepth: number;
+    /** The saved copy, read only for a compressed tag whose replay depends on it. */
+    savedText?: string;
+}
+
+/**
+ * The bytes the previous release served for a legacy foreign tag, while the
+ * other plugin's text is unchanged. That release restored the saved copy,
+ * prefixed it, then replaced it with `[dropped §N§]` for a dropped tag or
+ * with its caveman form for a compressed one (both only where the part was
+ * not past a partial compartment's end). A compressed tag whose text the
+ * other plugin has since changed gets the prefix on the current text instead:
+ * replaying the saved copy is the bug this rule fixes.
+ */
+function serveLegacyForeignText(
+    legacy: LegacyForeignTextTag,
+    current: string,
+    options: {
+        skipPrefixInjection: boolean;
+        pastPartialEnd: boolean;
+        caveman: CavemanReplayState | null;
+    },
+): { text: string; dropsReasoning: boolean } {
+    const prefixed = options.skipPrefixInjection ? current : prependTag(legacy.tagNumber, current);
+    if (options.pastPartialEnd) return { text: prefixed, dropsReasoning: false };
+    if (legacy.status === "dropped") {
+        return { text: buildReplacementContent(legacy.tagNumber), dropsReasoning: true };
+    }
+    const unchanged =
+        legacy.savedText !== undefined && stripTagPrefix(current) === legacy.savedText;
+    if (
+        legacy.status === "active" &&
+        legacy.cavemanDepth > 0 &&
+        options.caveman &&
+        unchanged &&
+        legacy.savedText
+    ) {
+        const replayed = cavemanReplayText(
+            legacy.tagNumber,
+            legacy.savedText,
+            legacy.cavemanDepth,
+            options.caveman,
+            options.skipPrefixInjection ? "" : prependTag(legacy.tagNumber, ""),
+        );
+        if (replayed) return replayed;
+    }
+    return { text: prefixed, dropsReasoning: false };
+}
+
+/**
+ * Find tags an older release gave to another plugin's text part, keyed by the
+ * part. Only a part after the message's last stored part counts (where an
+ * appending plugin's part always sat, so a binding there cannot belong to a
+ * stored part that still exists), and only through the exact content id of
+ * its position, never the ordinal fallback. Every tag found is kept out of the
+ * fallback for stored parts, recorded for ctx_reduce, and has any queued drop
+ * discarded; the tag row and its saved copy are otherwise left as they are.
+ */
+function findLegacyForeignTextTags(
+    sessionId: string,
+    messages: MessageLike[],
+    assignments: ReadonlyMap<string, number>,
+    db: ContextDatabase,
+    isForeignTextPart: (part: unknown) => boolean,
+    inertWhitespaceTagNumbers: ReadonlySet<number>,
+): Map<unknown, LegacyForeignTextTag> {
+    const legacy = new Map<unknown, LegacyForeignTextTag>();
+    for (const message of messages) {
+        const messageId = typeof message.info.id === "string" ? message.info.id : null;
+        if (!messageId) continue;
+        const firstTrailingIndex = lastStoredPartIndex(message.parts) + 1;
+        for (let partIndex = firstTrailingIndex; partIndex < message.parts.length; partIndex += 1) {
+            const part = message.parts[partIndex];
+            if (!isTextPart(part) || !isForeignTextPart(part)) continue;
+            const contentId = `${messageId}:p${partIndex}`;
+            const tagNumber =
+                assignments.get(contentId) ?? getTagNumberByMessageId(db, sessionId, contentId);
+            if (tagNumber === null || tagNumber === undefined) continue;
+            if (inertWhitespaceTagNumbers.has(tagNumber)) continue;
+            const tag = getTagById(db, sessionId, tagNumber);
+            if (tag?.type !== "message") continue;
+            legacy.set(part, {
+                tagNumber,
+                status: tag.status,
+                cavemanDepth: tag.cavemanDepth,
+            });
+        }
+    }
+    if (legacy.size > 0) {
+        const tagNumbers = [...legacy.values()].map((entry) => entry.tagNumber);
+        rememberLegacyForeignTextTags(sessionId, tagNumbers);
+        for (const tagNumber of tagNumbers) discardPendingOpForForeignTag(db, sessionId, tagNumber);
+        const compressed = [...legacy.values()].filter(
+            (entry) => entry.status === "active" && entry.cavemanDepth > 0,
+        );
+        if (compressed.length > 0) {
+            const saved = getSourceContents(
+                db,
+                sessionId,
+                compressed.map((entry) => entry.tagNumber),
+            );
+            for (const entry of compressed) entry.savedText = saved.get(entry.tagNumber);
+        }
+    }
+    return legacy;
 }
 
 function collectRelevantSourceTagIds(
@@ -477,6 +610,9 @@ function extractToolTagMetadata(part: unknown): {
 }
 
 export interface TagMessagesOptions {
+    /** Rebaseline saved text when the host proves stored rows changed under the
+     * same ids. Also expire the cached history head so the shared transform rebuilds it. */
+    refreshSourceContents?: boolean;
     /** Original part references in the provider's unfinished signed assistant turn. */
     protectedThinkingMessages?: ReadonlySet<MessageLike>;
     /**
@@ -508,7 +644,21 @@ export interface TagMessagesOptions {
      * before that strip existed still holds the copies and would put them back.
      * Unset on every other host, where restored text is served as saved.
      */
-    normalizeRestoredAssistantText?: (text: string) => string;
+    normalizeRestoredAssistantText?: (text: string, providerID?: string) => string;
+    /**
+     * OpenCode 1 only: text parts another plugin appended to stored messages
+     * (see `collectForeignTextParts`). They are never tagged, saved, restored,
+     * prefixed or targeted. A part that an older release already tagged keeps
+     * serving what that release served for the tag (see serveLegacyForeignText).
+     */
+    foreignTextParts?: ForeignTextParts;
+    /**
+     * Whether this pass replays persisted caveman compression. The caller sets
+     * it with the same gate as its `replayCavemanCompression` call, so a legacy
+     * foreign tag is served compressed exactly when that replay would have
+     * compressed it.
+     */
+    replaysCaveman?: boolean;
     /** @internal diagnostic hook used by cache-stability/perf tests. */
     onToolOwnerFallbackLookup?: (lookup: ToolOwnerFallbackLookup) => void;
 }
@@ -595,11 +745,38 @@ export function tagMessages(
     logTransformTiming(sessionId, "tag.inertWhitespace", tInertWhitespace);
     const assignments = tagger.getAssignments(sessionId);
     const resolver = createExistingTagResolver(sessionId, tagger, db);
+    const foreignTextParts = options.foreignTextParts;
+    const isForeignTextPart = (part: unknown): boolean =>
+        foreignTextParts !== undefined &&
+        part !== null &&
+        typeof part === "object" &&
+        foreignTextParts.has(part);
+    const legacyForeignTags = findLegacyForeignTextTags(
+        sessionId,
+        messages,
+        assignments,
+        db,
+        isForeignTextPart,
+        inertWhitespaceTagNumbers,
+    );
+    const legacyForeignTagNumbers = new Set(
+        [...legacyForeignTags.values()].map((legacy) => legacy.tagNumber),
+    );
+    // Read once, and only when a compressed legacy foreign tag is on the wire.
+    let cavemanState: CavemanReplayState | null | undefined;
+    const legacyCavemanState = (): CavemanReplayState | null => {
+        cavemanState ??= options.replaysCaveman ? getCavemanReplayState(db, sessionId) : null;
+        return cavemanState;
+    };
     const tGetSourceContents = performance.now();
     const sourceContents = getSourceContents(
         db,
         sessionId,
-        collectRelevantSourceTagIds(messages, assignments),
+        // A legacy foreign tag's saved copy is the other plugin's old text;
+        // it is never restored over the current text.
+        collectRelevantSourceTagIds(messages, assignments).filter(
+            (tagNumber) => !legacyForeignTagNumbers.has(tagNumber),
+        ),
     );
     logTransformTiming(sessionId, "tag.getSourceContents", tGetSourceContents);
     // Partial compartment ends (a compartment that stops inside a message at
@@ -816,13 +993,50 @@ export function tagMessages(
                 ownerByPartKey.set(part, { ownerMsgId, callId: toolObservation.callId });
             }
 
+            if (messageId && isTextPart(part) && isForeignTextPart(part)) {
+                // Another plugin's part: serve its current text. It never takes
+                // a tag, a saved copy, a target or a text ordinal, so stored
+                // parts keep their ordinals wherever the plugin put it. A tag an
+                // older release gave this position keeps serving what that
+                // release served (its prefix, its drop placeholder or its
+                // caveman form) while the plugin's text is unchanged; see
+                // serveLegacyForeignText.
+                const legacy = legacyForeignTags.get(part);
+                if (legacy) {
+                    const partialEnd = getPartialEnds().get(messageId);
+                    const served = serveLegacyForeignText(legacy, part.text, {
+                        skipPrefixInjection,
+                        pastPartialEnd: partialEnd !== undefined && partIndex > partialEnd,
+                        caveman: legacy.cavemanDepth > 0 ? legacyCavemanState() : null,
+                    });
+                    part.text = served.text;
+                    // The previous release wrote these bytes through the text
+                    // target, whose non-reasoning-keeping writes also take the
+                    // message's reasoning off the wire.
+                    if (served.dropsReasoning) {
+                        for (const thinkingPart of messageThinkingParts) {
+                            if (protectedThinkingParts.has(thinkingPart)) continue;
+                            if (
+                                partialEnd !== undefined &&
+                                message.parts.indexOf(thinkingPart) > partialEnd
+                            )
+                                continue;
+                            neutralizeDroppedReasoningPart(thinkingPart);
+                        }
+                    }
+                }
+                continue;
+            }
+
             if (messageId && isTextPart(part)) {
                 const textPart = part;
                 const thinkingParts = messageThinkingParts;
                 const contentId = `${messageId}:p${partIndex}`;
                 const whitespaceOnlyAssistant =
                     message.info.role === "assistant" &&
-                    stripTagPrefix(textPart.text).trim().length === 0;
+                    (stripTagPrefix(textPart.text).trim().length === 0 ||
+                        (textPart.text.includes("§") &&
+                            stripPersistedAssistantText(textPart.text).length === 0));
                 // New whitespace-only assistant parts are provider framing, not reclaimable
                 // content. A pre-deploy row is different: replay its existing prefix forever
                 // so deployment never changes signed-adjacent bytes, but retire the row from
@@ -895,7 +1109,9 @@ export function tagMessages(
                     // re-assigns part IDs); the assigned tag below uses those bindings. Inert
                     // whitespace rows are replay-only and must never migrate onto real text.
                     existingTagId = resolver.resolve(messageId, "message", contentId, textOrdinal, {
-                        accept: (tagNumber) => !inertWhitespaceTagNumbers.has(tagNumber),
+                        accept: (tagNumber) =>
+                            !inertWhitespaceTagNumbers.has(tagNumber) &&
+                            !legacyForeignTagNumbers.has(tagNumber),
                     });
                     if (
                         existingTagId === undefined &&
@@ -937,16 +1153,28 @@ export function tagMessages(
                 // when assignTag's recovery rebound a different tag number
                 // than what the resolver expected.
                 const persistedSource = sourceContents.get(tagId);
-                if (persistedSource !== undefined) {
+                if (persistedSource !== undefined && !options.refreshSourceContents) {
                     textPart.text =
                         options.normalizeRestoredAssistantText && message.info.role === "assistant"
-                            ? options.normalizeRestoredAssistantText(persistedSource)
+                            ? options.normalizeRestoredAssistantText(
+                                  persistedSource,
+                                  message.info.providerID,
+                              )
                             : persistedSource;
                 } else {
                     const sourceContent = stripTagPrefix(textPart.text);
-                    if (sourceContent.trim().length > 0) {
+                    if (sourceContent.trim().length > 0 || options.refreshSourceContents) {
                         const _tSaveText = performance.now();
-                        saveSourceContent(db, sessionId, tagId, sourceContent);
+                        if (options.refreshSourceContents) {
+                            replaceSourceContent(db, sessionId, tagId, sourceContent);
+                            updateTagByteSize(db, sessionId, tagId, byteSize(sourceContent));
+                            updateTagTokenCount(
+                                db,
+                                sessionId,
+                                tagId,
+                                estimateTextTagTokenCount(sourceContent),
+                            );
+                        } else saveSourceContent(db, sessionId, tagId, sourceContent);
                         accSaveSource += performance.now() - _tSaveText;
                     }
                 }
@@ -968,6 +1196,13 @@ export function tagMessages(
                     dropReasoningParts: thinkingParts,
                     mutationParts: [{ message, part: textPart }],
                     textPrefix: skipPrefixInjection ? "" : prependTag(tagId, ""),
+                    canSetContent: (content) => {
+                        const partialEnd = messageId ? getPartialEnds().get(messageId) : undefined;
+                        return (
+                            textPart.text !== content &&
+                            (partialEnd === undefined || partIndex <= partialEnd)
+                        );
+                    },
                     setContent: (content, options) => {
                         if (textPart.text === content) return false;
                         const partialEnd = messageId ? getPartialEnds().get(messageId) : undefined;
@@ -1070,35 +1305,17 @@ export function tagMessages(
                 const filePart = part;
                 const messageParts = message.parts;
                 const contentId = `${messageId}:file${partIndex}`;
-                const existingTagId = resolver.resolve(messageId, "file", contentId, fileOrdinal);
-                const _tAssignFile = performance.now();
-                const tagId =
-                    existingTagId ??
-                    tagger.assignTag(
-                        sessionId,
-                        contentId,
-                        "file",
-                        byteSize(filePart.url),
-                        db,
-                        0,
-                        null,
-                        0,
-                        null,
-                        () => ({
-                            tokenCount: estimateTextTagTokenCount(filePart.url),
-                            inputTokenCount: null,
-                            reasoningTokenCount: null,
-                        }),
-                    );
-                accAssignTag += performance.now() - _tAssignFile;
-                if (existingTagId === undefined) {
-                    const sourceContent = buildFileSourceContent(message.parts);
-                    if (sourceContent) {
-                        const _tSaveFile = performance.now();
-                        saveSourceContent(db, sessionId, tagId, sourceContent);
-                        accSaveSource += performance.now() - _tSaveFile;
-                    }
-                }
+                const existingTagId =
+                    resolver.resolve(messageId, "file", contentId, fileOrdinal) ??
+                    getTagNumberByMessageId(db, sessionId, contentId) ??
+                    undefined;
+                fileOrdinal += 1;
+                // A file has no visible prefix, so allocating a number here would
+                // make the model's next visible number skip. Historical rows still
+                // bind their original drop targets without changing served bytes.
+                if (existingTagId === undefined) continue;
+                const tagId = existingTagId;
+                tagger.bindTag(sessionId, contentId, tagId);
                 messageTagNumbers.set(
                     message,
                     Math.max(messageTagNumbers.get(message) ?? 0, tagId),
@@ -1126,7 +1343,6 @@ export function tagMessages(
                         return true;
                     },
                 });
-                fileOrdinal += 1;
             }
         }
 

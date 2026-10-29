@@ -30,7 +30,7 @@ import {
 import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
 import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
 import { readFailedChildMessages } from "./failed-invocation-evidence";
-import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
+import { DREAMER_FIRST_OUTPUT_TIMEOUT_MS, runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertNoDuplicateManifestIds } from "./manifest-parser";
 import {
@@ -72,18 +72,20 @@ import { DreamTokenBudgetExceeded } from "./token-budget";
 // Five memories at three investigation calls plus one answer each need about
 // 20 steps. Even ten calls plus an answer each fit the mapper agent's 60-step
 // limit, leaving room to finalize output rather than aborting an oversized batch.
+// Timeouts retry smaller groups: five becomes 2+2+1, and two becomes 1+1.
 const MAP_BATCH_SIZE = 5;
 
 /**
  * Minimum wall-clock budget for one agentic mapping batch. Keep the existing
  * four-minute floor even with smaller batches: reducing the memory count does
  * not bound the latency of a slow provider or an individual tool investigation.
- * Large backfills then bank
- * each committed batch and resume their remainder on a later run.
+ * Timeout splits each receive this same floor, if the task deadline permits;
+ * otherwise the unmapped remainder resumes on a later run.
  */
 export const MAP_BATCH_FLOOR_MS = 240_000;
 
-/** Stop only when two timed-out batches bank no decisions, not on slow progress. */
+/** Split timed-out multi-memory batches; stop after two consecutive singleton
+ * timeouts with no committed mappings. */
 const CONSECUTIVE_TIMEOUT_LIMIT = 2;
 
 /** Cap on already-mapped file-independent rows re-queued per run. A silent
@@ -105,6 +107,9 @@ export interface MapMemoriesArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    /** How long a model may stay silent before the chain moves to the next model.
+     *  Defaults to DREAMER_FIRST_OUTPUT_TIMEOUT_MS. */
+    firstOutputTimeoutMs?: number;
     tokenBudget?: number;
     onBudgetUpdate?: (state: { spent: number; finalizeFired: boolean }) => void;
     moduleRoute?: DreamerModuleRoute;
@@ -112,6 +117,9 @@ export interface MapMemoriesArgs {
 }
 
 export interface MapMemoriesResult {
+    failure?: unknown;
+    failureStage?: "child-start" | "prompt" | "apply";
+    deferred?: boolean;
     mapped: number;
     independent: number;
     /** Batches whose mappings were durably committed, not merely attempted. */
@@ -134,6 +142,8 @@ interface MapBatchOutcome {
     requeue?: MapMemoryInput[];
     /** Interrupted batches may still bank closed per-memory decisions. */
     failure?: {
+        error?: unknown;
+        stage?: "child-start" | "prompt" | "apply";
         class: MapBatchFailureClass;
         elapsedMs: number;
     };
@@ -218,10 +228,12 @@ export function parseMapMemoriesCompletion(
     completion: { messages?: unknown[] },
     expectedIds: ReadonlySet<number>,
 ): ReturnType<typeof validateMapMemoriesManifest> {
-    return validateMapMemoriesManifest(
-        currentManifest(assistantText(completion.messages ?? []) || text),
-        expectedIds,
-    );
+    // A self-contained final reply replaces earlier incremental or rejected text.
+    // A closing fragment still needs the transcript's opening tag and decisions.
+    const source = /<mappings\b/i.test(text)
+        ? text
+        : assistantText(completion.messages ?? []) || text;
+    return validateMapMemoriesManifest(currentManifest(source), expectedIds);
 }
 
 export function validateClientMapMemories(
@@ -354,7 +366,10 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
     const inputs = allInputs.filter((memory) => !isDeferred(memory, retries));
     result.remaining = allInputs.length;
     result.complete = result.remaining === 0;
-    if (inputs.length === 0) return result;
+    if (inputs.length === 0) {
+        if (allInputs.length > 0) result.deferred = true;
+        return result;
+    }
 
     const batches: Array<{ inputs: MapMemoryInput[]; isOmissionRetry: boolean }> = [];
     for (let i = 0; i < inputs.length; i += MAP_BATCH_SIZE) {
@@ -393,9 +408,13 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
             const batch = batches[i];
             if (!batch) break;
             const outcome = await mapOneBatch(args, batch.inputs, sliceMs, abortController.signal);
+            if (outcome.failure) {
+                result.failure = outcome.failure.error;
+                result.failureStage = outcome.failure.stage;
+            }
             const committed = outcome.mapped + outcome.independent;
+            const committedIds = new Set(outcome.committedIds);
             runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
-                const committedIds = new Set(outcome.committedIds);
                 for (const memory of batch.inputs) {
                     if (committedIds.has(memory.id)) {
                         delete retries[memory.id];
@@ -441,7 +460,32 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
                 }
             }
 
-            if (outcome.failure?.class === "timeout" && committed === 0) {
+            if (outcome.failure?.class === "timeout" && batch.inputs.length > 1) {
+                const unmapped = batch.inputs.filter((memory) => !committedIds.has(memory.id));
+                const splitSize = Math.floor(batch.inputs.length / 2);
+                const splits: typeof batches = [];
+                for (let offset = 0; offset < unmapped.length; offset += splitSize) {
+                    splits.push({
+                        inputs: unmapped.slice(offset, offset + splitSize),
+                        isOmissionRetry: batch.isOmissionRetry,
+                    });
+                }
+                if (splits.length > 0) {
+                    // Queue children before later work and include each in the batch
+                    // count used to divide the deadline. Try these splits now, before
+                    // backoff, to distinguish a slow memory from an oversized batch.
+                    batches.splice(i + 1, 0, ...splits);
+                    log(
+                        `[dreamer] map-memories: splitting batch [${batch.inputs.map((memory) => memory.id).join(",")}] into ${splits.map((split) => split.inputs.length).join("+")} after timeout; retrying ${unmapped.length} uncommitted mapping(s)`,
+                    );
+                }
+            }
+
+            if (
+                outcome.failure?.class === "timeout" &&
+                batch.inputs.length === 1 &&
+                committed === 0
+            ) {
                 consecutiveTimeouts += 1;
                 timeoutStreakElapsedMs.push(outcome.failure.elapsedMs);
                 if (consecutiveTimeouts >= CONSECUTIVE_TIMEOUT_LIMIT) {
@@ -451,7 +495,7 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
                     );
                     break;
                 }
-            } else {
+            } else if (committed > 0 || outcome.failure?.class !== "timeout") {
                 // A success or non-timeout failure should not poison the next
                 // timeout streak; those preserve the existing retry-next-run path.
                 consecutiveTimeouts = 0;
@@ -486,6 +530,7 @@ async function mapOneBatch(
     const startedAt = Date.now();
     let budgetFinalized = false;
     let failedCompletion: HiddenCompletion | undefined;
+    let stage: "child-start" | "prompt" | "apply" = "child-start";
     const onBudgetUpdate: NonNullable<MapMemoriesArgs["onBudgetUpdate"]> = (state) => {
         budgetFinalized ||= state.finalizeFired;
         args.onBudgetUpdate?.(state);
@@ -509,7 +554,11 @@ async function mapOneBatch(
                 model: args.model,
                 fallbackModels: args.fallbackModels,
                 timeoutMs: sliceMs,
+                firstOutputTimeoutMs: args.firstOutputTimeoutMs ?? DREAMER_FIRST_OUTPUT_TIMEOUT_MS,
                 signal,
+                onOpened: () => {
+                    stage = "prompt";
+                },
                 onFailureOutput: (completion) => {
                     failedCompletion = completion;
                 },
@@ -523,7 +572,9 @@ async function mapOneBatch(
             recordInvocation(args, startedAt, {
                 status: "completed",
                 messages: run.completion.messages ?? [],
+                tokens: run.completion.usage,
             });
+            stage = "apply";
             const outcome = await applyParsedBatchMappings(
                 args,
                 batch,
@@ -563,6 +614,7 @@ async function mapOneBatch(
         );
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create map-memories session.");
+        stage = "prompt";
 
         const run = await shared.promptSyncWithValidatedOutputRetry(
             client,
@@ -584,6 +636,7 @@ async function mapOneBatch(
                     onBudgetUpdate,
                 }),
                 timeoutMs: sliceMs,
+                firstOutputTimeoutMs: args.firstOutputTimeoutMs ?? DREAMER_FIRST_OUTPUT_TIMEOUT_MS,
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:map-memories",
@@ -603,6 +656,7 @@ async function mapOneBatch(
         promptSettled = true;
 
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
+        stage = "apply";
         const outcome = await applyParsedBatchMappings(
             args,
             batch,
@@ -630,6 +684,7 @@ async function mapOneBatch(
             status: failedInvocationStatus(error),
             error,
             messages,
+            tokens: failedCompletion?.usage,
         });
         // Stop if another worker took ownership of this task or the shared memory
         // module rejected its write. Neither condition permits a local fallback write.
@@ -653,6 +708,8 @@ async function mapOneBatch(
         return {
             ...outcome,
             failure: {
+                error,
+                stage,
                 class: isTimeoutClassError(error) ? "timeout" : "other",
                 elapsedMs: Date.now() - startedAt,
             },
@@ -874,18 +931,29 @@ async function applyParsedBatchMappings(
 function recordInvocation(
     args: MapMemoriesArgs,
     startedAt: number,
-    params: { status: SubagentInvocationStatus; messages?: unknown[]; error?: unknown },
+    params: {
+        status: SubagentInvocationStatus;
+        messages?: unknown[];
+        tokens?: HiddenCompletion["usage"];
+        error?: unknown;
+    },
 ): void {
     if (!args.parentSessionId) return;
     recordChildInvocation({
         db: args.db,
         parentSessionId: args.parentSessionId,
-        harness: "opencode",
+        harness: args.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
         subagent: "dreamer",
         task: "map-memories",
         startedAt,
         status: params.status,
         messages: params.messages,
+        tokens:
+            args.hiddenCompletionExecutor?.capabilities.harness === "opencode2"
+                ? params.tokens
+                : undefined,
+        attemptedModel: args.model,
+        configuredModels: args.fallbackModels,
         error: params.error,
     });
 }

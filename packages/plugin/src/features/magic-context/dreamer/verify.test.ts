@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createV1HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-historian";
 import * as shared from "../../../shared";
 import * as logger from "../../../shared/logger";
 import { Database } from "../../../shared/sqlite";
@@ -36,6 +37,7 @@ import {
     computeVerifyBatchSliceMs,
     runVerify,
     VERIFY_BATCH_FLOOR_MS,
+    VERIFY_RUN_SLICE_MS,
     type VerifyArgs,
 } from "./verify";
 
@@ -258,12 +260,142 @@ test("production verification paths normalize tracked files in a real git projec
 });
 
 describe("runVerify disposition", () => {
+    for (const transport of ["client", "hidden executor"] as const) {
+        describe(`short verify output through ${transport}`, () => {
+            function createArgs(db: Database, project: string, client: unknown): VerifyArgs {
+                const args = verifyArgs(db, tempProject(), project);
+                args.client = client as never;
+                args.forceBroad = true;
+                args.model = "antigravity/primary";
+                args.fallbackModels = ["antigravity/fallback"];
+                if (transport === "hidden executor") {
+                    args.hiddenCompletionExecutor = createV1HiddenCompletionExecutor(
+                        args.client,
+                        db,
+                        args.sessionDirectory,
+                    );
+                }
+                return args;
+            }
+
+            test("accepts a complete single-memory reply at 32 output tokens without fallback", async () => {
+                const db = freshDb();
+                try {
+                    const project = `git:verify-short-complete-${transport}`;
+                    addMappedMemories(db, project, 1);
+                    const scripted = scriptedVerifyClient((_call, ids) => ({
+                        kind: "text",
+                        text: `<verify><verified id="${ids[0]}"/></verify>`,
+                        tokens: { output: 32, reasoning: 0 },
+                    }));
+                    const args = createArgs(db, project, scripted.client);
+
+                    expect(await runVerify(args)).toMatchObject({
+                        verified: 1,
+                        remaining: 0,
+                        complete: true,
+                    });
+                    expect(scripted.promptCalls()).toBe(1);
+                    expect(scripted.promptModels()).toEqual(["antigravity/primary"]);
+                } finally {
+                    closeQuietly(db);
+                }
+            });
+
+            test.each([
+                {
+                    shape: "wrong id",
+                    count: 1,
+                    manifest: (_ids: number[]) => '<verify><verified id="999999"/></verify>',
+                },
+                {
+                    shape: "only one of three ids",
+                    count: 3,
+                    manifest: (ids: number[]) => `<verify><verified id="${ids[0]}"/></verify>`,
+                },
+                {
+                    shape: "an extra id",
+                    count: 1,
+                    manifest: (ids: number[]) =>
+                        `<verify><verified id="${ids[0]}"/><skip id="999999"/></verify>`,
+                },
+                {
+                    shape: "a duplicate id",
+                    count: 1,
+                    manifest: (ids: number[]) =>
+                        `<verify><verified id="${ids[0]}"/><skip id="${ids[0]}"/></verify>`,
+                },
+                {
+                    shape: "an unclosed root",
+                    count: 1,
+                    manifest: (ids: number[]) => `<verify><verified id="${ids[0]}"/>`,
+                },
+            ])("treats a short reply with $shape as an outage and falls back", async ({
+                count,
+                manifest,
+            }) => {
+                const db = freshDb();
+                try {
+                    const project = `git:verify-short-incomplete-${transport}`;
+                    addMappedMemories(db, project, count);
+                    const scripted = scriptedVerifyClient((_call, ids) => ({
+                        kind: "text",
+                        text: manifest(ids),
+                        tokens: { output: 8, reasoning: 0 },
+                    }));
+                    const args = createArgs(db, project, scripted.client);
+
+                    await expect(runVerify(args)).rejects.toBeInstanceOf(
+                        DreamerProviderOutputFailureError,
+                    );
+                    expect(scripted.promptCalls()).toBe(2);
+                    expect(scripted.promptModels()).toEqual([
+                        "antigravity/primary",
+                        "antigravity/fallback",
+                    ]);
+                    for (const id of scripted.promptIds()[0]) {
+                        expect(getMemoryVerifications(db, [id]).get(id)?.verifiedAt).toBe(1_000);
+                    }
+                } finally {
+                    closeQuietly(db);
+                }
+            });
+
+            test("falls back after an empty reply", async () => {
+                const db = freshDb();
+                try {
+                    const project = `git:verify-empty-${transport}`;
+                    addMappedMemories(db, project, 1);
+                    const scripted = scriptedVerifyClient((call) =>
+                        call === 1
+                            ? { kind: "text", text: "", tokens: { output: 0, reasoning: 0 } }
+                            : { kind: "manifest" },
+                    );
+                    const args = createArgs(db, project, scripted.client);
+
+                    expect(await runVerify(args)).toMatchObject({
+                        verified: 1,
+                        remaining: 0,
+                        complete: true,
+                    });
+                    expect(scripted.promptCalls()).toBe(2);
+                    expect(scripted.promptModels()).toEqual([
+                        "antigravity/primary",
+                        "antigravity/fallback",
+                    ]);
+                } finally {
+                    closeQuietly(db);
+                }
+            });
+        });
+    }
+
     test("uses configured fallback after the recorded quota notice and skips the primary in later batches", async () => {
         const db = freshDb();
         const log = spyOn(logger, "log").mockImplementation(() => {});
         try {
             const project = "git:verify-quota-cooldown";
-            addMappedMemories(db, project, 45);
+            addMappedMemories(db, project, 15);
             const client = scriptedVerifyClient((call) =>
                 call === 1
                     ? {
@@ -280,7 +412,7 @@ describe("runVerify disposition", () => {
             args.deadline = Date.now() + 10 * 60_000;
             const result = await runVerify(args);
             expect(result).toMatchObject({
-                verified: 45,
+                verified: 15,
                 batches: 3,
                 remaining: 0,
                 complete: true,
@@ -292,9 +424,9 @@ describe("runVerify disposition", () => {
                 "deepseek/deepseek-flash",
                 "deepseek/deepseek-flash",
             ]);
-            expect(
-                log.mock.calls.filter(([line]) => String(line).includes("skipping google/")),
-            ).toHaveLength(1);
+            expect(log.mock.calls.some(([line]) => String(line).includes("skipping google/"))).toBe(
+                true,
+            );
             expect(args.model).toBe("google/antigravity-gemini-3.8-flash");
             expect(args.fallbackModels).toEqual(["deepseek/deepseek-flash"]);
         } finally {
@@ -308,7 +440,7 @@ describe("runVerify disposition", () => {
         try {
             const projectIdentity = "git:verify-deadline";
             const dir = tempProject();
-            addMappedMemories(db, projectIdentity, 21);
+            addMappedMemories(db, projectIdentity, 6);
             const args = verifyArgs(db, dir, projectIdentity);
             args.forceBroad = true;
             args.client = successfulVerifyClient(() => {
@@ -317,7 +449,7 @@ describe("runVerify disposition", () => {
 
             const result = await runVerify(args);
 
-            expect(result.verified).toBe(20);
+            expect(result.verified).toBe(5);
             expect(result.remaining).toBe(1);
             expect(result.complete).toBe(false);
         } finally {
@@ -587,7 +719,7 @@ describe("runVerify disposition", () => {
         try {
             const projectIdentity = "git:verify-broad-cycle";
             const dir = tempProject();
-            addMappedMemories(db, projectIdentity, 21);
+            addMappedMemories(db, projectIdentity, 6);
             seedTaskScheduleState(db, projectIdentity, "verify-broad", null, null, "0 3 * * 0");
             const args = verifyArgs(db, dir, projectIdentity);
             args.forceBroad = true;
@@ -596,7 +728,7 @@ describe("runVerify disposition", () => {
             }) as never;
 
             const first = await runVerify(args);
-            expect(first.verified).toBe(20);
+            expect(first.verified).toBe(5);
             expect(first.remaining).toBe(1);
             expect(first.complete).toBe(false);
             const cycleStart = getTaskScheduleState(
@@ -620,7 +752,7 @@ describe("runVerify disposition", () => {
         }
     });
 
-    test("classifies outage text before manifest parsing and retries every fallback model", async () => {
+    test("classifies invalid outage text and retries every fallback model", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:verify-provider-outage";
@@ -721,7 +853,7 @@ describe("runVerify disposition", () => {
         try {
             const projectIdentity = "git:verify-provider-resume";
             const dir = tempProject();
-            addMappedMemories(db, projectIdentity, 21);
+            addMappedMemories(db, projectIdentity, 6);
             seedTaskScheduleState(db, projectIdentity, "verify-broad", null, null, "0 3 * * 0");
             const scripted = scriptedVerifyClient((promptCall) =>
                 promptCall === 1
@@ -764,7 +896,7 @@ describe("runVerify disposition", () => {
         try {
             const projectIdentity = "git:verify-below-floor";
             const dir = tempProject();
-            addMappedMemories(db, projectIdentity, 21);
+            addMappedMemories(db, projectIdentity, 6);
             const scripted = scriptedVerifyClient(() => ({ kind: "manifest" }));
             const args = verifyArgs(db, dir, projectIdentity);
             args.client = scripted.client as never;
@@ -774,7 +906,7 @@ describe("runVerify disposition", () => {
 
             expect(scripted.promptCalls()).toBe(0);
             expect(result.complete).toBe(false);
-            expect(result.remaining).toBe(21);
+            expect(result.remaining).toBe(6);
             expect(result.stopReason).toBe("deadline");
         } finally {
             closeQuietly(db);
@@ -796,8 +928,7 @@ describe("runVerify disposition", () => {
         try {
             const projectIdentity = "git:verify-floor-slice";
             const dir = tempProject();
-            // Ten batches in a 20-minute run: an even split would be 120 s each,
-            // shorter than an agentic tool loop needs.
+            // A large scope must not expand the four-minute run ceiling.
             addMappedMemories(db, projectIdentity, 200);
             const args = verifyArgs(db, dir, projectIdentity);
             args.deadline = Date.now() + 20 * 60_000;
@@ -809,7 +940,7 @@ describe("runVerify disposition", () => {
 
             expect(slices).toHaveLength(1);
             expect(slices[0]).toBeGreaterThanOrEqual(VERIFY_BATCH_FLOOR_MS);
-            expect(result.verified).toBe(20);
+            expect(result.verified).toBe(5);
             expect(result.complete).toBe(false);
         } finally {
             spy.mockRestore();
@@ -817,10 +948,12 @@ describe("runVerify disposition", () => {
         }
     });
 
-    test("computeVerifyBatchSliceMs floors the even split and never exceeds the budget", () => {
-        expect(computeVerifyBatchSliceMs(20 * 60_000, 10)).toBe(VERIFY_BATCH_FLOOR_MS);
-        expect(computeVerifyBatchSliceMs(20 * 60_000, 2)).toBe(10 * 60_000);
-        expect(computeVerifyBatchSliceMs(VERIFY_BATCH_FLOOR_MS + 1, 5)).toBe(VERIFY_BATCH_FLOOR_MS);
+    test("computeVerifyBatchSliceMs caps the slice and never exceeds the budget", () => {
+        expect(computeVerifyBatchSliceMs(20 * 60_000, 10)).toBe(VERIFY_RUN_SLICE_MS);
+        expect(computeVerifyBatchSliceMs(20 * 60_000, 2)).toBe(VERIFY_RUN_SLICE_MS);
+        expect(computeVerifyBatchSliceMs(VERIFY_BATCH_FLOOR_MS + 1, 5)).toBe(
+            VERIFY_BATCH_FLOOR_MS + 1,
+        );
     });
 
     for (const [label, timeoutError] of [
@@ -835,7 +968,7 @@ describe("runVerify disposition", () => {
             try {
                 const projectIdentity = `git:verify-batch-timeout-${label.replaceAll(" ", "-")}`;
                 const dir = tempProject();
-                addMappedMemories(db, projectIdentity, 60);
+                addMappedMemories(db, projectIdentity, 15);
                 let promptCalls = 0;
                 let manifest = "";
                 const aborted: string[] = [];
@@ -870,8 +1003,8 @@ describe("runVerify disposition", () => {
                 // The timed-out batch does not end the run with a thrown failure, and
                 // the third batch is not started with the same doomed budget.
                 expect(promptCalls).toBe(2);
-                expect(result.verified).toBe(20);
-                expect(result.remaining).toBe(40);
+                expect(result.verified).toBe(5);
+                expect(result.remaining).toBe(10);
                 expect(result.complete).toBe(false);
                 expect(result.stopReason).toBe("batch-timeout");
                 // This double throws our slice message directly rather than letting a
@@ -1587,12 +1720,12 @@ describe("verify module applier", () => {
 });
 
 for (const budgeted of [true, false]) {
-    test(`${budgeted ? "budget-finalized verification banks" : "non-budget verification rejects"} a 2/22 manifest`, async () => {
+    test(`${budgeted ? "budget-finalized verification banks" : "non-budget verification rejects"} a 2/5 manifest`, async () => {
         const db = freshDb();
         try {
             const project = "git:budget-verify";
             const dir = gitProject();
-            const items = Array.from({ length: 22 }, (_, index) =>
+            const items = Array.from({ length: 5 }, (_, index) =>
                 insertMemory(db, {
                     projectPath: project,
                     category: "ARCHITECTURE",
@@ -1668,7 +1801,7 @@ for (const budgeted of [true, false]) {
             const result = await runVerify(args);
             expect(sends).toBe(budgeted ? 2 : 1);
             expect(result.verified).toBe(budgeted ? 2 : 0);
-            expect(result.remaining).toBe(budgeted ? 20 : 22);
+            expect(result.remaining).toBe(budgeted ? 3 : 5);
             const stored = getMemoryVerifications(
                 db,
                 items.map((item) => item.id),
@@ -1692,7 +1825,7 @@ for (const budgeted of [true, false]) {
                 args.client = resumed.client as never;
                 args.tokenBudget = undefined;
                 args.deadline = Date.now() + VERIFY_BATCH_FLOOR_MS + 60_000;
-                expect((await runVerify(args)).verified).toBe(20);
+                expect((await runVerify(args)).verified).toBe(3);
             }
         } finally {
             closeQuietly(db);

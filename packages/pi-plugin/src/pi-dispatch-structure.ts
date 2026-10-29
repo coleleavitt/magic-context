@@ -1,4 +1,14 @@
-import { piAgentHistory } from "./pi-dispatch-agent-history";
+import {
+	piAgentHistory,
+	piIsDeveloperHistory,
+} from "./pi-dispatch-agent-history";
+import {
+	type PiAnthropicOptionalThinking,
+	piAnthropicAssistantReplay,
+	piAnthropicOptionalThinking,
+	piExplainsOptionalAssistant,
+	piOmitsTruncatedAssistant,
+} from "./pi-dispatch-assistant-history";
 import {
 	type PiChatHistoryModel,
 	piChatHistoryPlan,
@@ -21,9 +31,10 @@ import {
 	piResponsesWireTexts,
 } from "./pi-dispatch-responses-history";
 import { piToolCallWireId } from "./pi-dispatch-tool-ids";
+import { piToolCallPairing } from "./pi-dispatch-tool-pairing";
 
 interface MessageStructure {
-	role: "user" | "assistant" | "toolResult";
+	role: "user" | "assistant" | "toolResult" | "system";
 	calls: string[];
 	results: string[];
 	wireCalls?: (string | undefined)[];
@@ -32,6 +43,7 @@ interface MessageStructure {
 	resultNames?: string[];
 	timestamp?: number;
 	exactText?: string;
+	systemText?: readonly string[];
 	exactImages?: readonly string[];
 	wireContent?: unknown;
 	wireRole?: unknown;
@@ -40,6 +52,25 @@ interface MessageStructure {
 	/** JSON [text, phase] pairs for every assistant text block, retained in wire order. */
 	responseTexts?: string[];
 	images?: readonly PiInputImage[];
+	/**
+	 * Set on an assistant the Anthropic converter may or may not send; see
+	 * piAnthropicAssistantReplay. When the row is sent, each wire block must
+	 * come from this evidence (see piExplainsOptionalAssistant), or be the
+	 * converter's thinking placeholder.
+	 */
+	optionalThinking?: PiAnthropicOptionalThinking;
+}
+
+/**
+ * Rows before developer promotion and Continue pads, for a request whose
+ * prepared history has optional assistants. The comparator rebuilds the
+ * expected rows for each choice of sent optional assistants.
+ */
+interface PiAnthropicOptionalPlan {
+	rows: readonly MessageStructure[];
+	/** Developer rows that become system rows when placed after a user turn
+	 * and before an assistant or the end, with their system texts. */
+	promotable: ReadonlyMap<MessageStructure, readonly string[]>;
 }
 
 /** Transport-independent roles and ordered tool IDs, captured before text transforms. */
@@ -47,16 +78,81 @@ export interface PiPreparedStructure {
 	messages: readonly MessageStructure[];
 	chatMessages?: readonly MessageStructure[];
 	responsesMessages?: readonly MessageStructure[];
+	responsesAlternatives?: readonly (readonly MessageStructure[])[];
 	api?: string;
 	googleFunctionIds?: boolean;
 	structuralSkipReason?: string;
 	imageBudget?: PiImageBudgetPlan<MessageStructure>;
+	/** Set when the Anthropic Continue-pad rule was modeled for this route. */
+	anthropicContinuePad?: boolean;
+	/** Set when some prepared assistants may be absent from the wire. */
+	anthropicOptional?: PiAnthropicOptionalPlan;
 }
 
 const MAX_MESSAGES = 100_000;
 const ORPHAN_NOTE = Symbol("prepared orphan tool result");
-// These native serializers share transformMessages. Cursor, GitLab and custom
-// APIs do not, so their result rows must retain their existing expectations.
+
+/**
+ * Neutral user nudge Oh My Pi's Anthropic converter inserts between adjacent
+ * assistant params (and after a trailing assistant for non-compaction
+ * requests) so the API does not reject consecutive assistant messages.
+ * The pad is a string-content user row, placed directly after the earlier
+ * assistant with request controls looked through.
+ * @oh-my-pi/pi-ai 18.10.4 providers/anthropic.ts:5992-6001,6065-6075,6098-6101;
+ * 18.12.3 :6159-6163,6232-6242,6265-6268; 18.12.6 :6356-6360,6429-6439,6462-6465.
+ * All three pin the same rule; 17.1.7 has the same repair without the
+ * control look-through. Only this converter pads: Bedrock converse,
+ * Google/Vertex, Ollama, OpenAI completions/responses and Pi's own
+ * converter emit adjacent assistants unchanged or reject them, so the pad
+ * is modeled only for the Anthropic Messages route on the OMP host.
+ * Bedrock/Vertex endpoint variants of that route share the same api and
+ * converter, so they are covered; Plain Pi never pads, so it is excluded.
+ */
+export const ANTHROPIC_CONTINUE_PAD_TEXT = "Continue.";
+const ANTHROPIC_CONTINUE_PAD_APIS = new Set(["anthropic-messages"]);
+
+/**
+ * Whether this route models the Anthropic adjacent-assistant repair.
+ * One shared predicate for the prepared builder, the trailing-pad allowance
+ * and the tests; do not copy the api/host rule elsewhere.
+ */
+export function piModelsAnthropicContinuePad(
+	api: string | undefined,
+	host: PiDispatchHost,
+): boolean {
+	return (
+		host === "omp" && api !== undefined && ANTHROPIC_CONTINUE_PAD_APIS.has(api)
+	);
+}
+
+/** Whether a wire row is the string-content Continue pad. */
+function isAnthropicContinuePadRow(row: MessageStructure): boolean {
+	return row.role === "user" && row.wireContent === ANTHROPIC_CONTINUE_PAD_TEXT;
+}
+// APIs whose Oh My Pi provider runs transformMessages, so the host's tool-call
+// windows and interrupted-assistant omissions are known for them. Source lines
+// below are @oh-my-pi/pi-ai src/providers/, in version order 18.8.9 / 18.11.3 /
+// 18.12.3 (the pinned package versions):
+// - openai-completions: openai-completions.ts:2310/2371/2372 (convertMessages).
+// - openrouter: src/stream.ts:991/975/925 routes it to openai-responses, or to
+//   openai-completions when PI_OPENROUTER_RESPONSES=0.
+// - openai-responses: openai-responses.ts:1568/1611/1612, and
+//   azure-openai-responses: azure-openai-responses.ts:373 (all three), call
+//   buildResponsesInput, which runs it at openai-shared.ts:2121/2162/2162.
+// - openai-codex-responses: openai-codex-responses.ts:4973/5013/4977.
+// - anthropic-messages: anthropic.ts:5210/5818/5835.
+// - bedrock-converse-stream: amazon-bedrock.ts:1089/1090/1093.
+// - google-generative-ai, google-vertex, google-gemini-cli: google.ts:35 (all),
+//   google-vertex.ts:33/32/32 and google-gemini-cli.ts:1256/1266/1266 reach
+//   google-shared.ts convertMessages, which runs it at :169/165/213.
+// - ollama-chat: ollama.ts:257/260/269. devin-agent: devin.ts:234/248/248.
+// - factory-droid-agent: factory-droid.ts streamWire sends every route through
+//   factory-droid/gemini.ts:175/179/190 or the Anthropic, Responses or Chat streams.
+// - apple-foundation-models: apple-foundation-models.ts:194 (all three).
+// cursor-agent (providers/cursor.ts) and gitlab-duo-agent
+// (gitlab-duo-workflow.ts:2581, "bypasses transformMessages") do not, and an
+// extension's custom API is unknown. Those use projectUnmodeledToolResults,
+// which keeps every result where the history has it.
 const TRANSFORM_MESSAGES_APIS = new Set([
 	"openai-completions",
 	"openai-responses",
@@ -94,7 +190,12 @@ function messageStructure(value: unknown): MessageStructure | undefined {
 	].includes(String(message.role))
 		? "user"
 		: message.role;
-	if (role !== "user" && role !== "assistant" && role !== "toolResult")
+	if (
+		role !== "user" &&
+		role !== "assistant" &&
+		role !== "toolResult" &&
+		role !== "system"
+	)
 		return undefined;
 	const row: MessageStructure = { role, calls: [], results: [] };
 	if (ORPHAN_NOTE in message && typeof message.content === "string") {
@@ -119,14 +220,335 @@ function messageStructure(value: unknown): MessageStructure | undefined {
 	return row;
 }
 
+/**
+ * Which host serializes the prepared history. Oh My Pi and Pi ship different
+ * transformMessages tool-call window rules; see projectMissingToolResults.
+ */
+export type PiDispatchHost = "omp" | "pi";
+
+interface WindowCall {
+	id: string;
+	name: string;
+}
+
+function windowCalls(message: Record<string, unknown>): WindowCall[] {
+	if (!Array.isArray(message.content)) return [];
+	return message.content.flatMap((value) => {
+		const block = object(value);
+		return block?.type === "toolCall" && typeof block.id === "string"
+			? [
+					{
+						id: block.id,
+						name: typeof block.name === "string" ? block.name : "",
+					},
+				]
+			: [];
+	});
+}
+
+/**
+ * The `_dup` suffix and per-segment id budget the provider hands
+ * transformMessages for a reused call id. openai-completions.ts and devin.ts
+ * pass their own; every other provider takes the defaults ("_dup", 64).
+ */
+function duplicateSuffix(model?: PiChatHistoryModel): {
+	prefix: string;
+	max: number;
+} {
+	const compat = object(model?.compat);
+	if (model?.api === "openai-completions") {
+		if (compat?.requiresMistralToolIds === true)
+			return { prefix: "dup", max: 9 };
+		if (compat?.usesOpenAIToolCallIdLimit === true)
+			return { prefix: "_dup", max: 40 };
+	}
+	if (model?.api === "devin-agent") return { prefix: "_dup", max: 40 };
+	return { prefix: "_dup", max: 64 };
+}
+
+/** transform-messages.ts appendDuplicateSuffix: every composite segment gets the suffix. */
+function appendDuplicateSuffix(id: string, suffix: string, max: number) {
+	const segment = (part: string) =>
+		part.length + suffix.length <= max
+			? `${part}${suffix}`
+			: `${part.slice(0, Math.max(0, max - suffix.length))}${suffix}`;
+	return id.includes("|") ? id.split("|").map(segment).join("|") : segment(id);
+}
+
+/**
+ * Mirror the host's tool-call window pass so prepared rows sit where the host
+ * puts them. Oh My Pi and Pi differ:
+ *
+ * Oh My Pi (identical in 18.2.6, 18.8.9, 18.11.3, 18.12.3 and 18.12.5;
+ * @oh-my-pi/pi-ai src/providers/transform-messages.ts deduplicateToolCallIds,
+ * takeRealToolResult, flushPendingToolCalls, flushPendingAbortedToolCalls and
+ * the second pass of transformMessages):
+ * - A reused call id is renamed with a duplicate suffix (`_dupN`, or `dupN`
+ *   for Mistral-style ids), and the next result for that id follows it. A
+ *   later turn reusing the id discards the earlier turn's unclaimed renames.
+ * - Every assistant, user, developer or other non-result message closes the
+ *   open window. Each call still unanswered there takes the earliest real
+ *   result for its pairing key that sits after the call's assistant message
+ *   and was not taken before, and that result moves into the window; a call
+ *   with no such result gets a "No result provided" stub. An aborted or
+ *   errored turn's calls get an "aborted" stub stamped with that turn's
+ *   timestamp; without a timestamp its window never closes.
+ * - A result for an already answered call is dropped, so a moved result never
+ *   appears again at its old position. So is a result whose call is valid but
+ *   whose window is not open (it arrived before its call).
+ * - On providers that use transformMessages, a result whose call is not in
+ *   the history is dropped while a window is unanswered; otherwise its
+ *   nonblank text becomes a `<stale-tool-result>` user note.
+ *
+ * Pi (0.87.1 and 1.3.0; @earendil-works/pi-ai dist/api/transform-messages.js)
+ * never moves a result. Only assistant and user messages close a window, and
+ * only calls with no result after their assistant message get a stub. System
+ * messages inside an open window are held until it closes. Errored and aborted
+ * assistant messages are not replayed at all.
+ *
+ * The input is not mutated; the projection may add, drop, move or replace rows
+ * and rename duplicate tool ids.
+ */
 function projectMissingToolResults(
 	messages: readonly unknown[],
-	api?: string,
+	model?: PiChatHistoryModel,
+	host: PiDispatchHost = "omp",
 ): unknown[] {
-	const projectOrphans = TRANSFORM_MESSAGES_APIS.has(api ?? "");
+	// Excluded executions never reach the host transform (convertToLlm drops
+	// them), so they neither close a window nor take a position.
+	const input = messages.filter((value) => {
+		const message = object(value);
+		return !(
+			(message?.role === "bashExecution" ||
+				message?.role === "pythonExecution") &&
+			message.excludeFromContext === true
+		);
+	});
+	if (host === "pi") return projectPiToolResults(input);
+	const api = model?.api;
+	if (!TRANSFORM_MESSAGES_APIS.has(api ?? ""))
+		return projectUnmodeledToolResults(messages);
+	const pairingId = piToolCallPairing(input);
+	const { prefix, max } = duplicateSuffix(model);
+	// Deduplication pass: rename reused call ids and file every real result by
+	// its pairing key at its position.
+	const seen = new Map<string, number>();
+	const renames = new Map<string, (string | undefined)[]>();
+	const realResults = new Map<
+		string,
+		{ index: number; message: unknown; consumed: boolean }[]
+	>();
+	const validToolUseIds = new Set<string>();
+	const deduplicated = input.map((value, index) => {
+		const message = object(value);
+		if (
+			message?.role === "toolResult" &&
+			typeof message.toolCallId === "string"
+		) {
+			let key = pairingId(message.toolCallId);
+			let output: unknown = value;
+			const queue = renames.get(key);
+			if (queue?.length) {
+				const replacement = queue.shift();
+				if (!queue.length) renames.delete(key);
+				if (replacement !== undefined) {
+					output = { ...message, toolCallId: replacement };
+					key = pairingId(replacement);
+				}
+			}
+			const entry = { index, message: output, consumed: false };
+			const entries = realResults.get(key);
+			if (entries) entries.push(entry);
+			else realResults.set(key, [entry]);
+			return output;
+		}
+		if (message?.role !== "assistant" || !Array.isArray(message.content))
+			return value;
+		const touched = new Set<string>();
+		let changed = false;
+		const content = message.content.map((part) => {
+			const block = object(part);
+			if (block?.type !== "toolCall" || typeof block.id !== "string")
+				return part;
+			const key = pairingId(block.id);
+			// An earlier turn's unclaimed renames for this id are discarded: its
+			// call is stubbed, and the next result belongs to this turn.
+			if (!touched.has(key)) {
+				touched.add(key);
+				renames.delete(key);
+			}
+			const count = seen.get(key) ?? 0;
+			const queue = renames.get(key) ?? [];
+			renames.set(key, queue);
+			if (count === 0) {
+				seen.set(key, 1);
+				queue.push(undefined);
+				return part;
+			}
+			let suffix = count;
+			let replacement = appendDuplicateSuffix(
+				block.id,
+				`${prefix}${suffix}`,
+				max,
+			);
+			while (seen.has(pairingId(replacement))) {
+				suffix++;
+				replacement = appendDuplicateSuffix(
+					block.id,
+					`${prefix}${suffix}`,
+					max,
+				);
+			}
+			seen.set(key, suffix + 1);
+			seen.set(pairingId(replacement), 1);
+			queue.push(replacement);
+			changed = true;
+			return { ...block, id: replacement };
+		});
+		for (const call of windowCalls({ content }))
+			validToolUseIds.add(pairingId(call.id));
+		return changed ? { ...message, content } : value;
+	});
+	const takeRealResult = (id: string, afterIndex: number) => {
+		for (const entry of realResults.get(pairingId(id)) ?? []) {
+			if (entry.consumed || entry.index <= afterIndex) continue;
+			entry.consumed = true;
+			return entry.message;
+		}
+		return undefined;
+	};
+	const projected: unknown[] = [];
+	// Pairing keys of calls that already have their one provider-visible result.
+	const answered = new Set<string>();
+	let pending: WindowCall[] = [];
+	let pendingStart = -1;
+	let aborted = new Map<string, WindowCall>();
+	let abortedTimestamp: unknown;
+	let abortedStart = -1;
+	const stub = (call: WindowCall, text: string, timestamp: unknown) => ({
+		role: "toolResult",
+		toolCallId: call.id,
+		toolName: call.name,
+		content: [{ type: "text", text }],
+		isError: true,
+		timestamp,
+	});
+	const flush = (boundaryTimestamp?: unknown) => {
+		for (const call of pending) {
+			const key = pairingId(call.id);
+			if (answered.has(key)) continue;
+			projected.push(
+				takeRealResult(call.id, pendingStart) ??
+					stub(call, "No result provided", boundaryTimestamp),
+			);
+			answered.add(key);
+		}
+		pending = [];
+		// The host keeps an aborted window open while its turn has no timestamp.
+		if (abortedTimestamp === undefined) return;
+		for (const call of aborted.values()) {
+			const key = pairingId(call.id);
+			if (answered.has(key)) continue;
+			projected.push(
+				takeRealResult(call.id, abortedStart) ??
+					stub(call, "aborted", abortedTimestamp),
+			);
+			answered.add(key);
+		}
+		aborted = new Map();
+		abortedTimestamp = undefined;
+	};
+	for (let index = 0; index < deduplicated.length; index++) {
+		const value = deduplicated[index];
+		const message = object(value);
+		if (message?.role === "assistant") {
+			flush(message.timestamp);
+			// The host closes the preceding window before omitting this turn.
+			if (piOmitsTruncatedAssistant(message)) continue;
+			projected.push(value);
+			const calls = windowCalls(message);
+			if (message.stopReason === "aborted" || message.stopReason === "error") {
+				aborted = new Map(calls.map((call) => [pairingId(call.id), call]));
+				abortedTimestamp = message.timestamp;
+				abortedStart = index;
+			} else if (calls.length) {
+				pending = calls;
+				pendingStart = index;
+			}
+			continue;
+		}
+		if (
+			message?.role !== "toolResult" ||
+			typeof message.toolCallId !== "string"
+		) {
+			if (message?.role !== "toolResult") flush(message?.timestamp);
+			projected.push(value);
+			continue;
+		}
+		const key = pairingId(message.toolCallId);
+		if (answered.has(key)) continue;
+		if (
+			aborted.has(key) ||
+			pending.some((call) => pairingId(call.id) === key)
+		) {
+			aborted.delete(key);
+			answered.add(key);
+			projected.push(value);
+			continue;
+		}
+		if (validToolUseIds.has(key)) continue;
+		if (
+			typeof message.toolName !== "string" ||
+			!Array.isArray(message.content)
+		) {
+			// A malformed result is preserved unchanged.
+			projected.push(value);
+			continue;
+		}
+		// Native replay drops an orphan inside an unresolved normal or aborted
+		// result window; otherwise it preserves nonblank text as an unprivileged
+		// user note.
+		if (
+			pending.some((call) => !answered.has(pairingId(call.id))) ||
+			aborted.size > 0
+		)
+			continue;
+		const parts = message.content.flatMap((value) => {
+			const part = object(value);
+			return part?.type === "text" &&
+				typeof part.text === "string" &&
+				part.text.trim()
+				? [part.text]
+				: [];
+		});
+		if (!parts.length) continue;
+		const error = message.isError ? ' is-error="true"' : "";
+		const note = `<stale-tool-result tool="${message.toolName}" id="${message.toolCallId}"${error}>\n${parts.join("\n")}\n</stale-tool-result>`;
+		projected.push({
+			role: "user",
+			content:
+				api === "ollama-chat"
+					? note
+					: new TextDecoder().decode(new TextEncoder().encode(note)),
+			timestamp: message.timestamp,
+			[ORPHAN_NOTE]: true,
+		});
+	}
+	flush();
+	return projected;
+}
+
+/**
+ * The projection for APIs whose provider does not run transformMessages (see
+ * TRANSFORM_MESSAGES_APIS), whose tool-result handling is not known.
+ * It synthesizes a stub at every boundary for a call with no later result and
+ * leaves every result where the history has it; it never moves, drops or
+ * renames anything. It writes no <stale-tool-result> notes, because those come
+ * from transformMessages.
+ */
+function projectUnmodeledToolResults(messages: readonly unknown[]): unknown[] {
 	const responsesComponents = new Set<string>();
 	const opaqueIds = new Set<string>();
-	const validToolUseIds = projectOrphans ? new Set<string>() : undefined;
 	const component = (id: string) => {
 		const pipe = id.indexOf("|");
 		return pipe > 0 ? id.slice(0, pipe) : id;
@@ -144,17 +566,13 @@ function projectMissingToolResults(
 					"azure-openai-responses",
 					"openai-codex-responses",
 				].includes(String(message.api))
-			) {
+			)
 				responsesComponents.add(component(block.id));
-				validToolUseIds?.add(component(block.id));
-			} else {
-				if (block.id.includes("|")) opaqueIds.add(block.id);
-				validToolUseIds?.add(block.id);
-			}
+			else if (block.id.includes("|")) opaqueIds.add(block.id);
 		}
 	}
 	// Responses item suffixes are not part of the call identity; opaque Chat IDs
-	// containing a pipe remain whole (transform-messages.ts:56-59,94-143).
+	// containing a pipe remain whole.
 	const pairingId = (id: string) =>
 		!opaqueIds.has(id) && responsesComponents.has(component(id))
 			? component(id)
@@ -170,7 +588,7 @@ function projectMissingToolResults(
 	});
 	const projected: unknown[] = [];
 	const resolved = new Set<string>();
-	let pending: { id: string; name: string }[] = [];
+	let pending: WindowCall[] = [];
 	let start = -1;
 	let aborted = false;
 	let timestamp: unknown;
@@ -201,10 +619,8 @@ function projectMissingToolResults(
 			message.excludeFromContext === true
 		)
 			continue;
-		// OMP flushes unresolved calls at every non-result boundary and at EOF,
-		// not only on the latest turn. A later real result prevents synthesis;
-		// its reordering and all other history rewrites still fail comparison.
-		// @oh-my-pi/pi-ai transform-messages.ts:1256-1303,1305-1327,1457-1469 (18.10.4).
+		// Unresolved calls are flushed at every non-result boundary and at EOF. A
+		// later real result prevents synthesis and keeps its own position.
 		if (message?.role !== "toolResult") flush(message?.timestamp);
 		else if (
 			typeof message.toolCallId === "string" &&
@@ -213,42 +629,6 @@ function projectMissingToolResults(
 			)
 		)
 			resolved.add(pairingId(message.toolCallId));
-		else if (
-			validToolUseIds &&
-			message?.role === "toolResult" &&
-			typeof message.toolCallId === "string" &&
-			typeof message.toolName === "string" &&
-			!validToolUseIds.has(pairingId(message.toolCallId)) &&
-			Array.isArray(message.content)
-		) {
-			// Native replay drops an orphan inside an unresolved normal or aborted
-			// result window; otherwise it preserves nonblank text as an unprivileged
-			// user note. This changes only the plan, never the returned history.
-			// @oh-my-pi/pi-ai transform-messages.ts:1406-1460 (18.11.1).
-			if (pending.some((call) => !resolved.has(pairingId(call.id)))) continue;
-			const parts = message.content.flatMap((value) => {
-				const part = object(value);
-				return part?.type === "text" &&
-					typeof part.text === "string" &&
-					part.text.trim()
-					? [part.text]
-					: [];
-			});
-			if (parts.length) {
-				const error = message.isError ? ' is-error="true"' : "";
-				const note = `<stale-tool-result tool="${message.toolName}" id="${message.toolCallId}"${error}>\n${parts.join("\n")}\n</stale-tool-result>`;
-				projected.push({
-					role: "user",
-					content:
-						api === "ollama-chat"
-							? note
-							: new TextDecoder().decode(new TextEncoder().encode(note)),
-					timestamp: message.timestamp,
-					[ORPHAN_NOTE]: true,
-				});
-			}
-			continue;
-		}
 		projected.push(value);
 		if (message?.role !== "assistant" || !Array.isArray(message.content))
 			continue;
@@ -257,24 +637,72 @@ function projectMissingToolResults(
 			message.stopReason === "aborted" || message.stopReason === "error";
 		timestamp = message.timestamp;
 		if (aborted && typeof timestamp !== "number") continue;
-		for (const value of message.content) {
-			const block = object(value);
-			if (block?.type === "toolCall" && typeof block.id === "string")
-				pending.push({
-					id: block.id,
-					name: typeof block.name === "string" ? block.name : "",
-				});
-		}
+		pending.push(...windowCalls(message));
 	}
 	flush();
+	return projected;
+}
+
+/** Pi's window pass; see projectMissingToolResults. */
+function projectPiToolResults(messages: readonly unknown[]): unknown[] {
+	const projected: unknown[] = [];
+	let pending: WindowCall[] = [];
+	let answered = new Set<string>();
+	const held: unknown[] = [];
+	const close = (timestamp?: unknown) => {
+		for (const call of pending)
+			if (!answered.has(call.id))
+				projected.push({
+					role: "toolResult",
+					toolCallId: call.id,
+					toolName: call.name,
+					content: [{ type: "text", text: "No result provided" }],
+					isError: true,
+					timestamp,
+				});
+		pending = [];
+		answered = new Set();
+		projected.push(...held);
+		held.length = 0;
+	};
+	for (const value of messages) {
+		const message = object(value);
+		const role = message?.role;
+		if (role === "assistant") {
+			close(message?.timestamp);
+			if (message?.stopReason === "error" || message?.stopReason === "aborted")
+				continue;
+			const calls = message ? windowCalls(message) : [];
+			if (calls.length) pending = calls;
+		} else if (role === "toolResult") {
+			if (typeof message?.toolCallId === "string")
+				answered.add(message.toolCallId);
+		} else if (role === "system" && pending.length) {
+			held.push(value);
+			continue;
+		} else if (
+			// Pi's convertToLlm turns these into user messages before the transform.
+			[
+				"user",
+				"custom",
+				"bashExecution",
+				"branchSummary",
+				"compactionSummary",
+			].includes(String(role))
+		)
+			close(message?.timestamp);
+		projected.push(value);
+	}
+	close();
 	return projected;
 }
 
 export function piPreparedStructure(
 	messages: readonly unknown[],
 	model?: PiChatHistoryModel,
+	host: PiDispatchHost = "omp",
 ): PiPreparedStructure | undefined {
-	return buildPiPreparedStructure(messages, model);
+	return buildPiPreparedStructure(messages, model, undefined, host);
 }
 
 /** Prepare the returned OMP messages and their dispatch receipt in one walk. */
@@ -298,6 +726,7 @@ export function preparePiDispatch<T>(
 					output[index] = copy as T;
 				}
 			: undefined,
+		omp ? "omp" : "pi",
 	);
 	return { messages: output, structure };
 }
@@ -306,6 +735,7 @@ function buildPiPreparedStructure(
 	messages: readonly unknown[],
 	model?: PiChatHistoryModel,
 	prepareUser?: (index: number, source: Record<string, unknown>) => void,
+	host: PiDispatchHost = "omp",
 ): PiPreparedStructure | undefined {
 	if (!messages.length || messages.length > MAX_MESSAGES) return undefined;
 	for (let index = 0; index < messages.length; index++) {
@@ -314,8 +744,11 @@ function buildPiPreparedStructure(
 			prepareUser?.(index, source);
 	}
 	const projectedMessages = projectMissingToolResults(
-		model?.api ? piAgentHistory(messages, model.api) : messages,
-		model?.api,
+		model?.api && host === "omp"
+			? piAgentHistory(messages, model.api)
+			: messages,
+		model,
+		host,
 	);
 	if (projectedMessages.length > MAX_MESSAGES) return undefined;
 	const rows: MessageStructure[] = [];
@@ -330,7 +763,7 @@ function buildPiPreparedStructure(
 		const source = object(message);
 		// History injection and the provider renderer both put instructions before
 		// conversation turns. Ignore only that leading system/developer prefix on
-		// both sides; a system message inside the conversation remains invalid.
+		// both sides; positioned system messages are conversation rows instead.
 		if (
 			rows.length === 0 &&
 			(source?.role === "system" || source?.role === "developer")
@@ -378,6 +811,16 @@ function buildPiPreparedStructure(
 					}))
 		)
 			continue;
+		if (source?.role === "assistant") {
+			// The Anthropic converter sends no row for an assistant whose blocks
+			// it skips, and may or may not send one whose only blocks are
+			// thinking. Earlier passes still count the assistant, since the
+			// host's replay pass keeps it.
+			const replay = piAnthropicAssistantReplay(source, model, host);
+			if (replay === "dropped") continue;
+			if (replay === "optional")
+				row.optionalThinking = piAnthropicOptionalThinking(source);
+		}
 		row.calls.forEach((id, index) => {
 			toolNames.set(id, row.callNames?.[index] ?? "");
 			if (model?.api) {
@@ -409,37 +852,137 @@ function buildPiPreparedStructure(
 		piRecordImages(imageBudget, row, source);
 	}
 	if (!valid) return undefined;
+	// The rows before developer promotion and Continue pads, which the
+	// comparator rebuilds when an optional assistant is left out.
+	const baseRows = [...rows];
+	const promotable = new Map<MessageStructure, readonly string[]>();
+	// OMP renders non-user-attributed developer messages as system only after a
+	// user turn (including tool results packed into user) and before assistant or end.
+	// Iterate backwards, as the serializer does, so a promoted notice prevents
+	// the notice immediately before it from becoming a consecutive system row.
+	// @oh-my-pi/pi-ai 18.12.3, providers/anthropic.ts:6150-6210.
+	const positionedRows = [...byIndex];
+	for (let position = positionedRows.length - 1; position >= 0; position--) {
+		const [index, row] = positionedRows[position];
+		const source = object(projectedMessages[index]);
+		if (!source) return undefined;
+		const content = source.content;
+		const parts =
+			typeof content === "string" ? [{ type: "text", text: content }] : content;
+		const textOnly =
+			Array.isArray(parts) &&
+			parts.every(
+				(part) =>
+					object(part)?.type === "text" &&
+					typeof object(part)?.text === "string",
+			);
+		const systemTexts = () => {
+			// Called only when textOnly holds, so every part is a text block.
+			const texts = (parts as { text: string }[]).map((part) => part.text);
+			return model?.api === "anthropic-messages"
+				? texts
+						.filter((text) => text.trim())
+						.map((text) =>
+							new TextDecoder().decode(new TextEncoder().encode(text)),
+						)
+				: texts;
+		};
+		if (piIsDeveloperHistory(source) && source.attribution !== "user") {
+			const previous = rows[position - 1];
+			const next = rows[position + 1];
+			const anthropicPromotable =
+				model?.api === "anthropic-messages" &&
+				object(model.compat)?.supportsMidConversationSystem === true &&
+				textOnly;
+			if (anthropicPromotable) promotable.set(row, systemTexts());
+			if (
+				model?.api === "ollama-chat" ||
+				(anthropicPromotable &&
+					(previous?.role === "user" || previous?.role === "toolResult") &&
+					(!next || next.role === "assistant"))
+			)
+				row.role = "system";
+		}
+		if (row.role === "system") {
+			if (!textOnly) return undefined;
+			row.systemText = systemTexts();
+		}
+	}
+	// Model OMP's adjacent-assistant repair on the Anthropic route: an assistant
+	// directly followed by another assistant gains a neutral user Continue pad.
+	// Prepared rows hold no request controls, so looking through them is vacuous
+	// here while matching the host walk that skips them. The pad carries exact
+	// text so only the host's neutral nudge matches, not any other user turn.
+	const modelsContinuePad = piModelsAnthropicContinuePad(model?.api, host);
+	if (modelsContinuePad) {
+		for (let position = rows.length - 1; position > 0; position--) {
+			if (
+				rows[position]?.role === "assistant" &&
+				rows[position - 1]?.role === "assistant"
+			)
+				rows.splice(position, 0, {
+					role: "user",
+					calls: [],
+					results: [],
+					exactText: ANTHROPIC_CONTINUE_PAD_TEXT,
+				});
+		}
+	}
 	const responsesApi = responsesLane(model?.api);
 	let responsesMessages: MessageStructure[] | undefined = responsesApi
 		? []
 		: undefined;
+	const fallbackMessages: MessageStructure[] = [];
+	const coldMessages: MessageStructure[] = [];
+	let unsignedAlternatives = false;
+	const appendResponse = (
+		output: MessageStructure[],
+		row: MessageStructure,
+		texts: readonly string[],
+	) => {
+		if (!texts.length && !row.calls.length) return;
+		const previous = output.at(-1);
+		if (previous?.role === "assistant") {
+			previous.calls.push(...row.calls);
+			previous.wireCalls?.push(...(row.wireCalls ?? []));
+			previous.responseTexts?.push(...texts);
+		} else
+			output.push({
+				...row,
+				calls: [...row.calls],
+				...(row.wireCalls ? { wireCalls: [...row.wireCalls] } : {}),
+				responseTexts: [...texts],
+			});
+	};
 	if (responsesMessages) {
 		for (const [index, row] of byIndex) {
 			if (row.role !== "assistant") {
 				responsesMessages.push(row);
+				fallbackMessages.push(row);
+				coldMessages.push(row);
 				continue;
 			}
-			const texts = piResponsesAssistantTexts(projectedMessages[index], model);
+			const alternatives: {
+				fallback?: readonly string[];
+				cold?: readonly string[];
+			} = {};
+			const texts = piResponsesAssistantTexts(
+				projectedMessages[index],
+				model,
+				host,
+				alternatives,
+			);
 			if (!texts) {
 				responsesMessages = undefined;
 				break;
 			}
-			if (!texts.length && !row.calls.length) continue;
 			// OpenAI Responses encodes assistant text and calls as separate input
 			// items. Its normalized role rows combine adjacent assistant messages;
 			// mirror that on prepared history without discarding any text or call ID.
-			const previous = responsesMessages.at(-1);
-			if (previous?.role === "assistant") {
-				previous.calls.push(...row.calls);
-				previous.wireCalls?.push(...(row.wireCalls ?? []));
-				previous.responseTexts?.push(...texts);
-			} else
-				responsesMessages.push({
-					...row,
-					calls: [...row.calls],
-					...(row.wireCalls ? { wireCalls: [...row.wireCalls] } : {}),
-					responseTexts: [...texts],
-				});
+			unsignedAlternatives ||= alternatives.fallback !== undefined;
+			appendResponse(responsesMessages, row, texts);
+			appendResponse(fallbackMessages, row, alternatives.fallback ?? texts);
+			appendResponse(coldMessages, row, alternatives.cold ?? texts);
 		}
 	}
 	const plan = piChatHistoryPlan(projectedMessages, model);
@@ -479,7 +1022,18 @@ function buildPiPreparedStructure(
 				: {}),
 		...(chatMessages ? { chatMessages } : {}),
 		...(responsesMessages ? { responsesMessages } : {}),
+		// OMP 17.1.7 openai-shared.ts:1691-1719 chooses replay per request.
+		// 18.12.x :2267-2271 additionally replays cold-safe turns (:2098-2107).
+		// Each alternative is a complete fallback or cold message list for the
+		// whole request; individual rows cannot choose different alternatives.
+		...(responsesMessages && unsignedAlternatives
+			? { responsesAlternatives: [fallbackMessages, coldMessages] }
+			: {}),
 		...(model?.api ? { api: model.api } : {}),
+		...(modelsContinuePad ? { anthropicContinuePad: true as const } : {}),
+		...(modelsContinuePad && baseRows.some((row) => row.optionalThinking)
+			? { anthropicOptional: { rows: baseRows, promotable } }
+			: {}),
 		...(model?.api?.startsWith("google-")
 			? {
 					googleFunctionIds:
@@ -526,6 +1080,22 @@ function payloadStructure(
 		if (
 			rows.length === 0 &&
 			(message.role === "system" || message.role === "developer")
+		)
+			continue;
+		// Oh My Pi's Anthropic provider inserts request-control system messages while
+		// building the request, after the context pass, so they are never prepared
+		// turns. Their content holds only tool_addition/tool_removal blocks; an
+		// effort-only control has empty content and carries its effort in
+		// output_config. A control can sit at the end of the request, before an
+		// earlier response it was recorded with, or before the turn's user message,
+		// so it is skipped wherever it appears. @oh-my-pi/pi-ai
+		// src/providers/anthropic.ts insertAnthropicControlMarkers (18.12.6).
+		if (
+			message.role === "system" &&
+			Array.isArray(message.content) &&
+			message.content.every((block) =>
+				["tool_addition", "tool_removal"].includes(String(object(block)?.type)),
+			)
 		)
 			continue;
 		// Responses emits reasoning/text/calls as separate items for one assistant
@@ -638,11 +1208,7 @@ function payloadStructure(
 				continue;
 			}
 		}
-		const row = messageStructure(
-			ollama && message.role === "system"
-				? { ...message, role: "user" }
-				: message,
-		);
+		const row = messageStructure(message);
 		if (!row) return undefined;
 		row.wireContent = message.content;
 		if (imageProjection)
@@ -814,6 +1380,7 @@ type StructureComparison =
 	| "count"
 	| "timestamp"
 	| "content"
+	| "alignment"
 	| "exception";
 
 function safeRole(
@@ -822,7 +1389,7 @@ function safeRole(
 ): string {
 	if (!readable) return "unreadable";
 	if (!row) return "missing";
-	return ["user", "assistant", "toolResult"].includes(row.role)
+	return ["user", "assistant", "toolResult", "system"].includes(row.role)
 		? row.role
 		: "unknown";
 }
@@ -888,6 +1455,127 @@ function trimPreparedImageRows(
 	return projected;
 }
 
+/**
+ * Count the ways the wire rows read as the prepared rows with some optional
+ * assistants left out, stopping at two. Leaving an assistant out changes its
+ * neighbours as the converter does: OMP puts a Continue pad between two
+ * assistants that end up adjacent, and promotes a developer row to system
+ * only between a user turn and an assistant or the end (see
+ * buildPiPreparedStructure). Each wire row maps to exactly one prepared row
+ * or pad; a trailing Continue pad after a final assistant is also accepted.
+ *
+ * The walk is forward over prepared rows. A state is the last chosen row,
+ * whose final form waits for the next chosen row, the role of the row chosen
+ * before it, and the wire row it must match. Required rows cannot be skipped,
+ * so a state reaches only the run of optional rows that follows it.
+ */
+function countAnthropicOptionalAlignments(
+	plan: PiAnthropicOptionalPlan,
+	base: readonly MessageStructure[],
+	wire: readonly MessageStructure[],
+	compare: (
+		expected: MessageStructure,
+		actual: MessageStructure,
+	) => StructureComparison | undefined,
+): number {
+	const pad: MessageStructure = {
+		role: "user",
+		calls: [],
+		results: [],
+		exactText: ANTHROPIC_CONTINUE_PAD_TEXT,
+	};
+	// Promoted rows were rewritten in place for the all-present rows; their
+	// role before promotion is always user.
+	const role = (index: number) =>
+		plan.promotable.has(base[index]) ? "user" : base[index].role;
+	const final = (
+		index: number,
+		previous: string | undefined,
+		next: string | undefined,
+	): MessageStructure => {
+		const row = base[index];
+		const systemText = plan.promotable.get(row);
+		if (!systemText) return row;
+		const promoted =
+			(previous === "user" || previous === "toolResult") &&
+			(next === undefined || next === "assistant");
+		return promoted
+			? { ...row, role: "system", systemText }
+			: { ...row, role: "user", systemText: undefined };
+	};
+	const matches = (expected: MessageStructure, at: number) =>
+		at < wire.length && compare(expected, wire[at]) === undefined;
+	// states[index] maps "previous role|wire position" to a path count.
+	const states = new Map<number, Map<string, number>>();
+	const add = (
+		index: number,
+		previous: string | undefined,
+		at: number,
+		count: number,
+	) => {
+		let bucket = states.get(index);
+		if (!bucket) {
+			bucket = new Map();
+			states.set(index, bucket);
+		}
+		const key = `${previous ?? ""}|${at}`;
+		bucket.set(key, Math.min(2, (bucket.get(key) ?? 0) + count));
+	};
+	let complete = 0;
+	const advance = (
+		current: number,
+		previous: string | undefined,
+		at: number,
+		count: number,
+	) => {
+		// Place the current row once its successor is known, then a pad when
+		// both are assistants.
+		const place = (next: number | undefined): number | undefined => {
+			if (current < 0) return at;
+			const nextRole = next === undefined ? undefined : role(next);
+			if (!matches(final(current, previous, nextRole), at)) return undefined;
+			let after = at + 1;
+			if (role(current) === "assistant" && nextRole === "assistant") {
+				if (!matches(pad, after)) return undefined;
+				after++;
+			}
+			return after;
+		};
+		for (let next = current + 1; next < base.length; next++) {
+			const after = place(next);
+			if (after !== undefined)
+				add(next, current < 0 ? undefined : role(current), after, count);
+			if (!base[next].optionalThinking) return;
+		}
+		// Every remaining row is optional and left out: the current row ends
+		// the request.
+		if (current < 0) {
+			if (wire.length === 0) complete = Math.min(2, complete + count);
+			return;
+		}
+		const after = place(undefined);
+		if (
+			after === wire.length ||
+			(after === wire.length - 1 &&
+				role(current) === "assistant" &&
+				isAnthropicContinuePadRow(wire[after]))
+		)
+			complete = Math.min(2, complete + count);
+	};
+	advance(-1, undefined, 0, 1);
+	for (let index = 0; index < base.length && complete < 2; index++) {
+		const bucket = states.get(index);
+		if (!bucket) continue;
+		states.delete(index);
+		for (const [key, count] of bucket) {
+			const split = key.lastIndexOf("|");
+			const previous = key.slice(0, split) || undefined;
+			advance(index, previous, Number(key.slice(split + 1)), count);
+		}
+	}
+	return complete;
+}
+
 /** Return metadata for the first differing zero-based normalized row, or no mismatch. */
 export function piPreparedStructureMismatch(
 	payload: unknown,
@@ -944,6 +1632,23 @@ export function piPreparedStructureMismatch(
 				: chat && prepared?.chatMessages
 					? prepared.chatMessages
 					: prepared?.messages;
+		if (responses && rows && prepared?.responsesAlternatives) {
+			const actual = rows;
+			expectedRows =
+				[prepared.responsesMessages, ...prepared.responsesAlternatives].find(
+					(candidate) =>
+						candidate?.length === actual.length &&
+						candidate.every(
+							(expected, index) =>
+								JSON.stringify(expected.responseTexts) ===
+								JSON.stringify(actual[index].responseTexts),
+						),
+				) ?? expectedRows;
+		}
+		const optionalPlan =
+			expectedRows === prepared?.messages
+				? prepared?.anthropicOptional
+				: undefined;
 		if (expectedRows && imageProjection && imageBudget)
 			expectedRows = trimPreparedImageRows(expectedRows, imageBudget, trimmed);
 		if (!rows || !expectedRows)
@@ -958,17 +1663,40 @@ export function piPreparedStructureMismatch(
 			(!prepared?.api &&
 				body.max_tokens !== undefined &&
 				Array.isArray(body.system));
-		for (let i = 0; i < Math.min(rows.length, expectedRows.length); i++) {
-			row = i;
-			const expected = expectedRows[i];
-			const actual = rows[i];
-			if (actual.role !== expected.role)
-				return structureDetail(i, expectedRows, rows, "role");
+		// One prepared row against one wire row: the comparison that failed, or
+		// none when the wire row is the one prepared.
+		const compareRow = (
+			expected: MessageStructure,
+			actual: MessageStructure,
+		): StructureComparison | undefined => {
+			if (actual.role !== expected.role) return "role";
+			if (expected.systemText !== undefined) {
+				const texts = expected.systemText;
+				const content = actual.wireContent;
+				const actualTexts =
+					typeof content === "string"
+						? [content]
+						: Array.isArray(content) &&
+								content.every(
+									(part) =>
+										object(part)?.type === "text" &&
+										typeof object(part)?.text === "string",
+								)
+							? content.map((part) => part.text)
+							: undefined;
+				if (
+					!actualTexts ||
+					(typeof content === "string"
+						? content !== texts.join("\n")
+						: JSON.stringify(actualTexts) !== JSON.stringify(texts))
+				)
+					return "content";
+			}
 			if (
 				imageProjection &&
 				!piMatchesImages(actual.images ?? [], expected.images ?? [])
 			)
-				return structureDetail(i, expectedRows, rows, "content");
+				return "content";
 			if (
 				expected.responseTexts !== undefined &&
 				(expected.responseTexts.length !== actual.responseTexts?.length ||
@@ -976,13 +1704,12 @@ export function piPreparedStructureMismatch(
 						(text, index) => text !== actual.responseTexts?.[index],
 					))
 			)
-				return structureDetail(i, expectedRows, rows, "content");
+				return "content";
 			if (
 				expected.exactText !== undefined ||
 				expected.exactImages !== undefined
 			) {
-				if (actual.wireRole !== "user")
-					return structureDetail(i, expectedRows, rows, "role");
+				if (actual.wireRole !== "user") return "role";
 				if (
 					(expected.exactText !== undefined &&
 						!matchesUserText(
@@ -995,18 +1722,18 @@ export function piPreparedStructureMismatch(
 					(expected.exactImages !== undefined &&
 						!piMatchesChatImages(actual.wireContent, expected.exactImages))
 				)
-					return structureDetail(i, expectedRows, rows, "content");
+					return "content";
 			}
 			if (
 				actual.calls.length !== expected.calls.length ||
 				actual.results.length !== expected.results.length
 			)
-				return structureDetail(i, expectedRows, rows, "count");
+				return "count";
 			if (
 				actual.timestamp !== undefined &&
 				actual.timestamp !== expected.timestamp
 			)
-				return structureDetail(i, expectedRows, rows, "timestamp");
+				return "timestamp";
 			for (let j = 0; j < actual.calls.length; j++)
 				if (
 					(google &&
@@ -1021,15 +1748,10 @@ export function piPreparedStructureMismatch(
 									? expected.wireCalls[j]
 									: wireId(expected.calls[j], anthropic, responses))
 				)
-					return structureDetail(
-						i,
-						expectedRows,
-						rows,
-						(google && actual.calls[j] === "") ||
-							(ollama && actual.idlessCalls?.[j] === true)
-							? "name"
-							: "call id",
-					);
+					return (google && actual.calls[j] === "") ||
+						(ollama && actual.idlessCalls?.[j] === true)
+						? "name"
+						: "call id";
 			for (let j = 0; j < actual.results.length; j++)
 				if (
 					(google &&
@@ -1044,23 +1766,79 @@ export function piPreparedStructureMismatch(
 									? expected.wireResults[j]
 									: wireId(expected.results[j], anthropic, responses))
 				)
-					return structureDetail(
-						i,
-						expectedRows,
-						rows,
-						(google && actual.results[j] === "") ||
-							(ollama && actual.idlessResults?.[j] === true)
-							? "name"
-							: "result id",
-					);
-		}
-		if (rows.length !== expectedRows.length)
-			return structureDetail(
-				Math.min(rows.length, expectedRows.length),
-				expectedRows,
+					return (google && actual.results[j] === "") ||
+						(ollama && actual.idlessResults?.[j] === true)
+						? "name"
+						: "result id";
+			if (
+				expected.optionalThinking &&
+				!piExplainsOptionalAssistant(
+					expected.optionalThinking,
+					actual.wireContent,
+				)
+			)
+				return "content";
+			return undefined;
+		};
+		// Some prepared assistants may be absent from the wire. Count the ways
+		// the wire can be read as the prepared rows with some of them left out;
+		// exactly one must fit, and more than one refuses. With none, the
+		// comparison below against the rows with every assistant present names
+		// the first difference.
+		if (optionalPlan) {
+			stage = "optional assistants";
+			const alignments = countAnthropicOptionalAlignments(
+				optionalPlan,
+				imageProjection && imageBudget
+					? trimPreparedImageRows(optionalPlan.rows, imageBudget, trimmed)
+					: optionalPlan.rows,
 				rows,
-				"count",
+				compareRow,
 			);
+			if (alignments > 1)
+				return structureDetail(0, expectedRows, rows, "alignment");
+			if (alignments === 1) {
+				if (imageProjection && imageBudget)
+					onImageTrim?.({
+						planned: imageBudget.count,
+						actual: actualImages,
+						trimmed,
+					});
+				return undefined;
+			}
+			stage = "row comparison";
+		}
+		for (let i = 0; i < Math.min(rows.length, expectedRows.length); i++) {
+			row = i;
+			const comparison = compareRow(expectedRows[i], rows[i]);
+			if (comparison) return structureDetail(i, expectedRows, rows, comparison);
+		}
+		if (rows.length !== expectedRows.length) {
+			// OMP appends the same neutral Continue pad after a trailing assistant
+			// for live requests, but not for compaction requests. Accept the single
+			// trailing pad when the prepared turn ends with an assistant on a
+			// route that models the repair. Interior pads are already prepared
+			// with exact text, so any other length still refuses.
+			const lastActual = rows[rows.length - 1] as MessageStructure | undefined;
+			const allowsTrailingPad =
+				prepared?.anthropicContinuePad === true &&
+				expectedRows.length > 0 &&
+				expectedRows[expectedRows.length - 1]?.role === "assistant" &&
+				rows.length === expectedRows.length + 1 &&
+				!!lastActual &&
+				isAnthropicContinuePadRow(lastActual);
+			if (!allowsTrailingPad)
+				return structureDetail(
+					Math.min(rows.length, expectedRows.length),
+					expectedRows,
+					rows,
+					"count",
+				);
+		}
+		// No reading of the wire fit the optional assistants, so the wire is not
+		// the prepared turn even where the all-present rows above raised nothing.
+		if (optionalPlan)
+			return structureDetail(0, expectedRows, rows, "alignment");
 		if (imageProjection && imageBudget)
 			onImageTrim?.({
 				planned: imageBudget.count,

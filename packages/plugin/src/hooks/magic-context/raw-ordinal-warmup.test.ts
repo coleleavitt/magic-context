@@ -2,15 +2,20 @@
 
 import { Database as UnwrappedDatabase } from "bun:sqlite";
 import { afterEach, describe, expect, it } from "bun:test";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { OPENCODE1_MESSAGE_PART_SCHEMA } from "../../features/magic-context/__tests__/opencode1-query-fixture";
 import { scheduleIncrementalIndex } from "../../features/magic-context/message-index-async";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDir } from "../../shared/test-temp-dir";
+import { getWorkerShutdownStats } from "../../shared/worker-shutdown";
 import {
     getRawOrdinalWarmupFailures,
     prewarmRawSessionOrdinalsForDb,
+    type RawOrdinalWarmupReply,
     resetRawSessionOrdinalWarmupsForTest,
+    runSessionWarmupWorker,
     stopRawSessionOrdinalWarmups,
 } from "./raw-ordinal-warmup";
 import {
@@ -93,6 +98,84 @@ function withStore(length: number, run: (path: string, reader: Database) => Prom
 afterEach(() => resetRawSessionOrdinalWarmupsForTest());
 
 describe("canonical ordinal warm-up", () => {
+    it("a canceled worker generation never opens its database after imports", async () => {
+        const { dir, cleanup } = createTestTempDir("mc-canceled-warmup-");
+        const path = join(dir, "must-not-be-created.db");
+        const cancellation = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+        Atomics.store(cancellation, 0, 1);
+        const worker = new Worker(new URL("./raw-ordinal-warmup-worker.ts", import.meta.url), {
+            workerData: {
+                path,
+                sessionId: SESSION,
+                ftsRowidBackfill: true,
+                openCancellation: cancellation.buffer,
+            },
+        });
+        try {
+            const reply = await new Promise<RawOrdinalWarmupReply>((resolve, reject) => {
+                worker.on("message", (reply: RawOrdinalWarmupReply) => {
+                    if (reply.kind !== "accepted") resolve(reply);
+                });
+                worker.on("error", reject);
+                worker.on("exit", (code) =>
+                    reject(new Error(`worker exited without reply: ${code}`)),
+                );
+            });
+            expect(existsSync(path)).toBe(false);
+            expect(reply.kind).toBe("error");
+            if (reply.kind === "error")
+                expect(reply.error).toContain("owner closed before database open");
+        } finally {
+            await worker.terminate();
+            cleanup();
+        }
+    });
+
+    it("does not start a warmup for an already closed owner", async () => {
+        const controller = new AbortController();
+        controller.abort();
+        expect(
+            await runSessionWarmupWorker(
+                { path: ":memory:", sessionId: SESSION },
+                { signal: controller.signal },
+            ),
+        ).toEqual({ failure: "stopped", detail: "stopped" });
+    });
+
+    it(
+        "joins a terminated warmup when its owner closes",
+        withStore(600, async (path) => {
+            const controller = new AbortController();
+            const running = runSessionWarmupWorker(
+                { path, sessionId: SESSION },
+                { signal: controller.signal },
+            );
+            controller.abort();
+            expect(await running).toEqual({ failure: "stopped", detail: "stopped" });
+        }),
+    );
+
+    it(
+        "a stopped warm-up closes its connections and exits instead of being terminated",
+        withStore(600, async (path) => {
+            const before = getWorkerShutdownStats().get("raw-ordinal-warmup") ?? {
+                graceful: 0,
+                forced: 0,
+            };
+            const controller = new AbortController();
+            const running = runSessionWarmupWorker(
+                { path, sessionId: SESSION },
+                { signal: controller.signal },
+            );
+            controller.abort();
+            expect(await running).toEqual({ failure: "stopped", detail: "stopped" });
+            expect(getWorkerShutdownStats().get("raw-ordinal-warmup")).toEqual({
+                graceful: before.graceful + 1,
+                forced: before.forced,
+            });
+        }),
+    );
+
     it(
         "scans on a worker and leaves the serving connection nothing to scan",
         withStore(600, async (_path, reader) => {

@@ -2,6 +2,10 @@ import {
     createDreamTokenBudget,
     DreamTokenBudgetExceeded,
 } from "../features/magic-context/dreamer/token-budget";
+import {
+    annotateSubagentInvocationError,
+    recordChildInvocation,
+} from "../features/magic-context/subagent-token-capture";
 import type {
     HiddenCompletion,
     HiddenCompletionExecutor,
@@ -14,6 +18,11 @@ import { recordHiddenVariantWarning } from "../shared/hidden-variant-warnings";
 import { needsBlockedRead } from "../shared/hidden-zen-read";
 import { log } from "../shared/logger";
 import type { PromptArgs } from "../shared/model-suggestion-retry";
+import {
+    ModelProducedNoOutputError,
+    noteModelActivityMonitored,
+    noteModelOutputReceived,
+} from "../shared/model-suggestion-retry";
 import { parseProviderModel, toModelEntry } from "../shared/resolve-fallbacks";
 import { runTokenLog } from "../shared/run-token-log";
 import type { Database } from "../shared/sqlite";
@@ -32,10 +41,12 @@ import {
 } from "./hidden-child-record";
 import {
     HIDDEN_CURATE_AGENT,
+    HIDDEN_RUN_DISPOSED_REASON,
     HiddenAgentStepLimit,
     type HiddenChildAttempt,
     type HiddenChildHook,
     hiddenToolLoop,
+    noteChildOfDisposedInstance,
 } from "./hooks/hidden-child";
 import type { StoreRow } from "./store-reader";
 
@@ -68,6 +79,52 @@ export interface V2HiddenCompletionOptions {
      * receive it.
      */
     historianTemperature?: () => number | undefined;
+    /**
+     * Keep the store reader pool open for one hidden run; returns its release. The run
+     * reads the store from its first attempt until it is closed, so a pool closed in the
+     * meantime must wait for it rather than refuse its next read.
+     */
+    holdStore?: () => () => void;
+    /** Maximum time `dispose` waits for cancelled runs to settle. */
+    disposeDrainMs?: number;
+}
+
+/** The OpenCode 2 executor, plus the cancellation its plugin instance runs on dispose. */
+export interface V2HiddenCompletionExecutor extends HiddenCompletionExecutor {
+    /**
+     * Cancel every hidden run in flight and refuse new ones, with
+     * `HIDDEN_RUN_DISPOSED_REASON`. Each in-flight child is interrupted at the host, so
+     * the host stops stepping it before this instance's hooks are removed and the
+     * instance that replaces it never receives its turns. Waits at most
+     * `disposeDrainMs` for the cancelled attempts to settle.
+     */
+    dispose(): Promise<void>;
+}
+
+interface InFlightAttempt {
+    cancel(refusal: HiddenCompletionRefusal): Promise<void>;
+    reject(refusal: HiddenCompletionRefusal): void;
+    settled: Promise<void>;
+}
+
+const DEFAULT_DISPOSE_DRAIN_MS = 2_000;
+
+/** Resolves when `work` settles or `ms` elapses, whichever is first. */
+async function settleWithin(work: Promise<unknown>, ms: number): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        await Promise.race([
+            work.then(
+                () => undefined,
+                () => undefined,
+            ),
+            new Promise<void>((resolve) => {
+                timer = setTimeout(resolve, Math.max(0, ms));
+            }),
+        ]);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
 }
 
 interface RunState {
@@ -76,7 +133,11 @@ interface RunState {
     role: HiddenChildRole;
     child: PersistedHiddenChild;
     releaseRole: () => void;
+    /** Releases this run's hold on the store reader pool. */
+    releaseStore: () => void;
     completion?: HiddenCompletion;
+    partialCompletion?: HiddenCompletion;
+    attempt?: { child: HiddenChildAttempt; baseline: number };
     failed: boolean;
     /** A failure other than a settled provider error row (dispatch error, refusal, timeout, abort). */
     unsettledFailure: boolean;
@@ -156,13 +217,33 @@ function toolResultText(result: unknown): string | undefined {
     return text.length > 0 ? text : undefined;
 }
 
+function sumRowUsage(rows: readonly StoreRow<"assistant">[]): HiddenCompletion["usage"] {
+    const count = (value: unknown): number =>
+        typeof value === "number" && Number.isFinite(value) ? value : 0;
+    return rows.reduce<HiddenCompletion["usage"]>(
+        (total, row) => ({
+            input: total.input + count(row.data.tokens?.input),
+            output: total.output + count(row.data.tokens?.output),
+            cacheRead: total.cacheRead + count(row.data.tokens?.cache?.read),
+            cacheWrite: total.cacheWrite + count(row.data.tokens?.cache?.write),
+            ...(total.reasoning !== undefined || row.data.tokens?.reasoning !== undefined
+                ? { reasoning: (total.reasoning ?? 0) + count(row.data.tokens?.reasoning) }
+                : {}),
+        }),
+        { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    );
+}
+
 /**
- * Rebuild the child's tool calls in the host message shape the dreamer validators read
+ * Rebuild the child's assistant text and tool calls in the host message shape the dreamer validators read
  * (`state.status`, `state.input`, `state.output`), matching what the OpenCode 1 transport
  * returns. Curate counts an operation as applied only from its result text, so the text
  * has to survive this conversion.
  */
-export function toolLoopMessages(attempt: HiddenChildAttempt): unknown[] {
+export function toolLoopMessages(
+    attempt: HiddenChildAttempt,
+    rows?: readonly StoreRow<"assistant">[],
+): unknown[] {
     const messages = attempt.observedMessages ?? [];
     const results = new Map<string, { status: string; output?: string }>();
     for (const message of messages) {
@@ -183,9 +264,43 @@ export function toolLoopMessages(attempt: HiddenChildAttempt): unknown[] {
             });
         }
     }
-    return messages.flatMap((message) => {
+    // Persisted rows include the final reply, which never passes through the next
+    // context hook. Keep earlier text too: a manifest can span investigation steps.
+    const transcript = rows
+        ? rows.map((row) => ({ role: "assistant", content: row.data.content ?? [] }))
+        : messages;
+    return transcript.flatMap((message) => {
         if (message.role !== "assistant") return [];
-        const parts = message.content.flatMap((part) => {
+        const parts = message.content.flatMap<Record<string, unknown>>((part) => {
+            if (part.type === "text" && typeof part.text === "string")
+                return [{ type: "text", text: part.text }];
+            if (
+                part.type === "tool" &&
+                typeof part.name === "string" &&
+                typeof part.state === "object" &&
+                part.state !== null
+            ) {
+                const state = part.state as {
+                    status?: unknown;
+                    input?: unknown;
+                    content?: unknown;
+                };
+                const output =
+                    state.status === "completed"
+                        ? toolResultText({ value: state.content })
+                        : undefined;
+                return [
+                    {
+                        type: "tool",
+                        tool: part.name,
+                        state: {
+                            status: state.status,
+                            input: state.input,
+                            ...(output === undefined ? {} : { output }),
+                        },
+                    },
+                ];
+            }
             if (
                 part.type !== "tool-call" ||
                 typeof part.id !== "string" ||
@@ -235,11 +350,13 @@ function assistantText(row: StoreRow<"assistant">): string | null {
  */
 export class HiddenProviderError extends Error {
     readonly settled: boolean;
+    readonly hostError?: unknown;
 
-    constructor(detail: string, options: { settled?: boolean } = {}) {
+    constructor(detail: string, options: { settled?: boolean; hostError?: unknown } = {}) {
         super(`Hidden completion provider error: ${detail}`);
         this.name = "HiddenProviderError";
         this.settled = options.settled ?? true;
+        this.hostError = options.hostError;
     }
 }
 
@@ -297,6 +414,9 @@ async function awaitAssistantRow(
     signal?: AbortSignal,
 ): Promise<StoreRow<"assistant">> {
     for (;;) {
+        // Checked before reading: a cancelled run must not open another reader.
+        const refusedBefore = localFailure();
+        if (refusedBefore) throw refusedBefore;
         const { assistant, idle } = withReader(openReader, (reader) => ({
             assistant: reader.latestAssistant(childID),
             idle: reader.latestIdle(childID),
@@ -315,8 +435,10 @@ async function awaitAssistantRow(
                     `session_error=${sessionError === undefined ? "unavailable" : errorText(sessionError)}`,
                 ];
                 throw sessionError === undefined || !isProviderFailure(sessionError)
-                    ? new Error(`Hidden completion failed: ${details.join("; ")}`)
-                    : new HiddenProviderError(details.join("; "));
+                    ? new Error(`Hidden completion failed: ${details.join("; ")}`, {
+                          cause: sessionError,
+                      })
+                    : new HiddenProviderError(details.join("; "), { hostError: sessionError });
             }
             if (outcome === "succeeded" && newAssistant) return newAssistant;
         }
@@ -330,8 +452,10 @@ async function awaitAssistantRow(
                     `session_error=${sessionError === undefined ? "unavailable" : errorText(sessionError)}`,
                 ];
                 throw sessionError === undefined || !isProviderFailure(sessionError)
-                    ? new Error(`Hidden completion failed: ${details.join("; ")}`)
-                    : new HiddenProviderError(details.join("; "));
+                    ? new Error(`Hidden completion failed: ${details.join("; ")}`, {
+                          cause: sessionError,
+                      })
+                    : new HiddenProviderError(details.join("; "), { hostError: sessionError });
             }
             if (newAssistant.data.error !== undefined) {
                 throw new HiddenProviderError(errorText(newAssistant.data.error), {
@@ -378,6 +502,10 @@ export function createLateHiddenExecutor(
         open: (run) => wired().open(run),
         attempt: (handle, request) => wired().attempt(handle, request),
         collect: (handle, limit) => wired().collect(handle, limit),
+        collectPartial: (handle, limit) => {
+            const executor = wired();
+            return executor.collectPartial?.(handle, limit) ?? executor.collect(handle, limit);
+        },
         close: (handle, settlement) => wired().close(handle, settlement),
     };
 }
@@ -385,11 +513,15 @@ export function createLateHiddenExecutor(
 export async function createV2HiddenCompletionExecutor(
     host: HiddenChildHost,
     options: V2HiddenCompletionOptions,
-): Promise<HiddenCompletionExecutor> {
+): Promise<V2HiddenCompletionExecutor> {
     const runs = new WeakMap<HiddenRunHandle, RunState>();
     const generation = options.generation ?? "opencode2";
     const roleTails = new Map<HiddenChildRole, Promise<void>>();
     const note = options.log ?? log;
+    /** Set once by `dispose`; every later open or attempt is refused with it. */
+    let disposed: HiddenCompletionRefusal | undefined;
+    const openRuns = new Set<RunState>();
+    const inFlight = new Set<InFlightAttempt>();
 
     const removeSession = host.removeSession;
     if (!removeSession) throw new Error("Magic Context requires OpenCode 2.0.22 session.remove");
@@ -442,9 +574,11 @@ export async function createV2HiddenCompletionExecutor(
             ) as { variants?: unknown } | undefined;
             if (!entry) return model;
             if (
-                entry.variants &&
-                typeof entry.variants === "object" &&
-                Object.hasOwn(entry.variants, model.variant)
+                Array.isArray(entry.variants)
+                    ? entry.variants.some((variant) => variant?.id === model.variant)
+                    : entry.variants &&
+                      typeof entry.variants === "object" &&
+                      Object.hasOwn(entry.variants, model.variant)
             )
                 return model;
             const key = `${model.providerID}/${model.modelID}:${model.variant}`;
@@ -498,8 +632,39 @@ export async function createV2HiddenCompletionExecutor(
         run.child = lifecycle.updateModel(run.child, requested);
     };
 
+    const partialCompletion = (run: RunState): HiddenCompletion => {
+        const attempt = run.attempt;
+        const rows = attempt
+            ? withReader(options.openReader, (reader) => {
+                  const latest = reader.latestAssistant(run.child.id);
+                  return (
+                      reader.assistantSince?.(run.child.id, attempt.baseline) ??
+                      (latest ? [latest] : [])
+                  ).filter((row) => row.seq > attempt.baseline);
+              })
+            : [];
+        const usage = sumRowUsage(rows);
+        return {
+            text: rows.map(assistantText).filter(Boolean).join("\n") || null,
+            messages: attempt ? toolLoopMessages(attempt.child, rows) : [],
+            usage,
+            tokenLog: runTokenLog(usage),
+            lengthCapped: false,
+        };
+    };
+
     const retire = (run: RunState, reason: string): void => {
         if (run.retired) return;
+        // Native retirement can delete the child's rows immediately. Preserve the
+        // interrupted transcript before cleanup so complete per-memory mapping
+        // decisions can still be committed from an unfinished manifest.
+        if (hiddenToolLoop(run.identity) && !run.completion) {
+            try {
+                run.partialCompletion = partialCompletion(run);
+            } catch (error) {
+                note(`[magic-context] could not read interrupted child output: ${String(error)}`);
+            }
+        }
         lifecycle.retire(run.child, reason);
         run.retired = true;
     };
@@ -515,15 +680,28 @@ export async function createV2HiddenCompletionExecutor(
     return {
         capabilities: V2_HIDDEN_EXECUTOR_CAPABILITIES,
         async open(identity) {
+            if (disposed) throw disposed;
             const role = roleFor(identity);
-            const releaseRole = await acquireRole(role);
+            const releaseStore = options.holdStore?.() ?? (() => {});
+            let releaseRole: (() => void) | undefined;
             let openedChild: PersistedHiddenChild | undefined;
+            let opened: RunState | undefined;
             try {
+                releaseRole = await acquireRole(role);
+                if (disposed) throw disposed;
                 await options.ensureAgent?.();
                 const head = await resolveHead(identity);
                 const active = await lifecycle.open(identity, role, head);
                 openedChild = active;
-                const handle = { id: active.id, childSessionId: active.id };
+                const configuredModel = toModelEntry(identity.model);
+                const handle: HiddenRunHandle = {
+                    id: active.id,
+                    childSessionId: active.id,
+                    attemptedModel: modelKey(head),
+                    ...(configuredModel?.sourceConfigKey
+                        ? { modelConfigKey: configuredModel.sourceConfigKey }
+                        : {}),
+                };
                 const tokenBudget = identity.metadata?.tokenBudget;
                 const run: RunState = {
                     identity,
@@ -533,28 +711,49 @@ export async function createV2HiddenCompletionExecutor(
                     role,
                     child: active,
                     releaseRole,
+                    releaseStore,
                     failed: false,
                     unsettledFailure: false,
                     retired: false,
                 };
                 runs.set(handle, run);
+                opened = run;
+                openRuns.add(run);
+                if (disposed) noteChildOfDisposedInstance(active.id);
                 await switchChildModel(run, head);
                 return handle;
             } catch (error) {
                 if (openedChild) lifecycle.retire(openedChild, "hidden-run-open-failed");
-                releaseRole();
+                if (opened) openRuns.delete(opened);
+                releaseRole?.();
+                releaseStore();
                 throw error;
             }
         },
         async attempt(handle, request) {
+            const startedAt = Date.now();
             const run = runs.get(handle);
             if (!run) throw new Error("Unknown hidden completion run");
+            const refuseDisposed = (): void => {
+                if (!disposed) return;
+                run.failed = true;
+                run.unsettledFailure = true;
+                retire(run, "plugin-instance-disposed");
+                throw disposed;
+            };
+            refuseDisposed();
             if (request.signal?.aborted) {
                 await interruptAndRetire(run, "aborted-before-prompt");
                 throw new Error("Hidden completion prompt aborted");
             }
 
             const requested = await validateVariant(requestModel(request, run.child.model));
+            const requestedRef = modelKey(requested);
+            const configuredModel = [run.identity.model, ...(run.identity.configuredModels ?? [])]
+                .map(toModelEntry)
+                .find((entry) => entry?.model === requestedRef);
+            handle.attemptedModel = requestedRef;
+            handle.modelConfigKey = configuredModel?.sourceConfigKey ?? handle.modelConfigKey;
             if (run.identity.kind !== "dreamer-task" && request.body.temperature === undefined) {
                 const configured = options.historianTemperature?.();
                 if (typeof configured === "number" && Number.isFinite(configured))
@@ -606,6 +805,8 @@ export async function createV2HiddenCompletionExecutor(
                 handle.childSessionId = run.child.id;
             }
             await switchChildModel(run, requested);
+            // Every await above can span a dispose; nothing is prompted after one.
+            refuseDisposed();
             const baseline = withReader(options.openReader, (reader) =>
                 reader.latestSequence(run.child.id),
             );
@@ -618,6 +819,8 @@ export async function createV2HiddenCompletionExecutor(
                 shaped: false,
                 budget: run.budget,
             };
+            run.partialCompletion = undefined;
+            run.attempt = { child: attempt, baseline };
             options.hook.registerAttempt(marker, attempt);
             const deadline = Date.now() + run.identity.timeoutMs;
             const budget = run.budget;
@@ -690,6 +893,27 @@ export async function createV2HiddenCompletionExecutor(
                 abortReject = reject;
             });
             const onAbort = () => {
+                const reason = request.signal?.reason;
+                if (
+                    reason instanceof ModelProducedNoOutputError &&
+                    run.identity.kind === "dreamer-task"
+                ) {
+                    // The outer task records its result after fallback, not the first model's
+                    // no-output timeout. Keep that failed attempt separately so it is not lost.
+                    recordChildInvocation({
+                        db: options.db,
+                        parentSessionId: run.identity.parentSessionId ?? options.projectIdentity,
+                        parentInvocationId: run.identity.parentInvocationId,
+                        harness: "opencode2",
+                        subagent: "dreamer",
+                        task: run.identity.title.replace(/^magic-context-dream-/, ""),
+                        startedAt,
+                        status: "timed_out",
+                        error: reason,
+                        providerId: requested.providerID,
+                        modelId: requested.modelID,
+                    });
+                }
                 void interruptAndRetire(run, "prompt-aborted").finally(() =>
                     abortReject(new Error("Hidden completion prompt aborted")),
                 );
@@ -703,6 +927,36 @@ export async function createV2HiddenCompletionExecutor(
                 Math.max(0, deadline - Date.now()),
             );
             request.signal?.addEventListener("abort", onAbort, { once: true });
+            let settle!: () => void;
+            const entry: InFlightAttempt = {
+                cancel: async (refusal) => {
+                    attempt.refusal ??= refusal;
+                    noteChildOfDisposedInstance(run.child.id);
+                    try {
+                        // Stop the host stepping this child while this instance's hooks
+                        // still serve it; any later step would reach the next instance.
+                        await interruptAndRetire(run, "plugin-instance-disposed");
+                    } catch (error) {
+                        note(
+                            `[magic-context] hidden child ${run.child.id} could not be interrupted on dispose: ${errorText(error)}`,
+                        );
+                    } finally {
+                        abortReject(refusal);
+                    }
+                },
+                reject: (refusal) => {
+                    attempt.refusal ??= refusal;
+                    abortReject(refusal);
+                },
+                settled: new Promise<void>((resolve) => {
+                    settle = resolve;
+                }),
+            };
+            inFlight.add(entry);
+            const stopWatching = host.watchModelActivity?.(run.child.id, () =>
+                noteModelOutputReceived(request.signal),
+            );
+            if (stopWatching) noteModelActivityMonitored(request.signal);
             try {
                 await Promise.race([
                     host.prompt({ sessionID: run.child.id, text: marker }),
@@ -764,17 +1018,7 @@ export async function createV2HiddenCompletionExecutor(
                         tokenNumber(step.data.tokens?.input) !== undefined ||
                         tokenNumber(step.data.tokens?.output) !== undefined,
                 );
-                const usage = steps.reduce(
-                    (total, step) => ({
-                        input: total.input + (tokenNumber(step.data.tokens?.input) ?? 0),
-                        output: total.output + (tokenNumber(step.data.tokens?.output) ?? 0),
-                        cacheRead:
-                            total.cacheRead + (tokenNumber(step.data.tokens?.cache?.read) ?? 0),
-                        cacheWrite:
-                            total.cacheWrite + (tokenNumber(step.data.tokens?.cache?.write) ?? 0),
-                    }),
-                    { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                );
+                const usage = sumRowUsage(steps);
                 // A host promise may resolve at the same instant as cancellation.
                 // Never publish a completion after the child has been retired.
                 if (request.signal?.aborted || run.retired || Date.now() >= deadline) {
@@ -787,9 +1031,13 @@ export async function createV2HiddenCompletionExecutor(
                 }
                 run.completion = {
                     text,
-                    tokenLog: runTokenLog(tokens, run.identity.maxOutputTokens, row.data.finish),
+                    tokenLog: runTokenLog(
+                        reportedUsage ? usage : tokens,
+                        run.identity.maxOutputTokens,
+                        row.data.finish,
+                    ),
                     ...(hiddenToolLoop(run.identity)
-                        ? { messages: toolLoopMessages(attempt) }
+                        ? { messages: toolLoopMessages(attempt, steps) }
                         : {}),
                     reasoning: text ? null : assistantReasoning(row),
                     // If either side is numeric, retain the provider's partial usage
@@ -799,12 +1047,26 @@ export async function createV2HiddenCompletionExecutor(
                     lengthCapped: ["length", "max_tokens"].includes(row.data.finish ?? ""),
                     providerId: row.data.model?.providerID ?? requested.providerID,
                     modelId: row.data.model?.id ?? requested.modelID,
+                    attemptedModel: requestedRef,
+                    modelConfigKey: handle.modelConfigKey,
                 };
                 // Recorded for `keep_subagents` retention: this child now holds a settled run.
                 if (!run.child.ever_settled) run.child = lifecycle.markEverSettled(run.child);
             } catch (caught) {
                 const error =
                     attempt.budgetExceeded ?? attempt.stepLimit ?? attempt.refusal ?? caught;
+                const hostError =
+                    error instanceof HiddenProviderError
+                        ? error.hostError
+                        : error instanceof Error &&
+                            error.message.startsWith("Hidden completion failed:")
+                          ? error.cause
+                          : undefined;
+                annotateSubagentInvocationError(error, {
+                    attemptedModel: handle.attemptedModel,
+                    modelConfigKey: handle.modelConfigKey,
+                    ...(hostError === undefined ? {} : { hostError }),
+                });
                 run.failed = true;
                 if (!(error instanceof HiddenProviderError)) {
                     run.unsettledFailure = true;
@@ -835,16 +1097,24 @@ export async function createV2HiddenCompletionExecutor(
                 }
                 throw error;
             } finally {
+                stopWatching?.();
                 clearTimeout(deadlineTimer);
                 if (budgetPoll) clearInterval(budgetPoll);
                 request.signal?.removeEventListener("abort", onAbort);
                 options.hook.releaseAttempt(marker);
+                inFlight.delete(entry);
+                settle();
             }
         },
         async collect(handle) {
             const completion = runs.get(handle)?.completion;
             if (!completion) throw new Error("Hidden completion has no settled output");
             return completion;
+        },
+        async collectPartial(handle) {
+            const run = runs.get(handle);
+            if (!run) throw new Error("Hidden completion handle is closed");
+            return run.completion ?? run.partialCompletion ?? partialCompletion(run);
         },
         async close(handle, settlement) {
             if (!handle) return;
@@ -869,9 +1139,38 @@ export async function createV2HiddenCompletionExecutor(
                 }
             } finally {
                 runs.delete(handle);
+                openRuns.delete(run);
                 run.releaseRole();
+                // Session removal below needs no store reads.
+                run.releaseStore();
             }
             await lifecycle.finish(run.child, run.retired);
+        },
+        async dispose() {
+            disposed ??= new HiddenCompletionRefusal(
+                "hidden_instance_disposed",
+                HIDDEN_RUN_DISPOSED_REASON,
+                true,
+            );
+            const refusal = disposed;
+            for (const run of openRuns) noteChildOfDisposedInstance(run.child.id);
+            const entries = [...inFlight];
+            if (entries.length === 0) return;
+            note(
+                `[magic-context] plugin instance disposed with ${entries.length} hidden run(s) in flight; cancelling them`,
+            );
+            const bound = options.disposeDrainMs ?? DEFAULT_DISPOSE_DRAIN_MS;
+            const deadline = Date.now() + bound;
+            await settleWithin(
+                Promise.allSettled(entries.map((entry) => entry.cancel(refusal))),
+                bound,
+            );
+            // A host interrupt that has not answered in time must not keep the run waiting.
+            for (const entry of entries) entry.reject(refusal);
+            await settleWithin(
+                Promise.allSettled(entries.map((entry) => entry.settled)),
+                deadline - Date.now(),
+            );
         },
     };
 }

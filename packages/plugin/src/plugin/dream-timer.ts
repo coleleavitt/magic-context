@@ -1,5 +1,5 @@
 import { statSync } from "node:fs";
-
+import { isCommitRetentionPaused } from "../config/commit-retention-recovery";
 import type { DreamerConfig } from "../config/schema/magic-context";
 import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
@@ -48,7 +48,7 @@ import {
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
 import { isUsableProjectIdentity } from "../features/magic-context/memory/project-identity";
-import { sweepOrphanedOpenCodeMessageIndexesOffThread } from "../features/magic-context/message-index-async";
+import { pruneMissingProjectIdentities } from "../features/magic-context/memory/project-identity-cache";
 import {
     drainCommitBacklogForProject,
     drainProjectEmbeddingIdentityMaintenance,
@@ -282,7 +282,7 @@ export async function startDreamScheduleTimer(
     const embeddingSweepEnabled = args.memoryEnabled === true;
     const commitIndexingEnabled = args.gitCommitIndexing?.enabled === true;
 
-    // The timer also owns global message-history privacy maintenance, so an
+    // The timer also retries explicitly requested session deletions, so an
     // enabled plugin registers even when project dream/embedding/git work is off.
 
     // Idempotent registration — re-registering the same directory replaces
@@ -381,7 +381,7 @@ function runTick(origin: "startup" | "interval"): void {
     // One tick already covers every project, so do not start duplicate work.
     if (tickInFlight) return;
     tickInFlight = true;
-    log(`[dreamer] timer tick (${origin}) — projects=${registeredProjects.size}`);
+    log(`[magic-context] maintenance tick (${origin}) — projects=${registeredProjects.size}`);
     void (async () => {
         try {
             const db = openTimerDatabaseOrNull("maintenance tick");
@@ -448,6 +448,9 @@ function persistTickOutcome(db: Database, failure: DreamerTickFailure | null): v
 }
 
 async function runMessageHistoryMaintenance(db: Database): Promise<void> {
+    const prunedIdentities = await pruneMissingProjectIdentities();
+    if (prunedIdentities > 0)
+        log(`[magic-context] pruned ${prunedIdentities} missing project identities`);
     try {
         await drainStaleLkgSlots(db);
     } catch (error) {
@@ -480,14 +483,6 @@ async function runMessageHistoryMaintenance(db: Database): Promise<void> {
                 `[message-index] pending Rust session cleanup: cleared=${rustCleanup.cleared} failed=${rustCleanup.failedSessionIds.length}`,
             );
         }
-    }
-
-    const sweep = await sweepOrphanedOpenCodeMessageIndexesOffThread(db, openOpenCodeDb);
-    if (sweep.reason) log(`[message-index] orphan sweep parked: ${sweep.reason}`);
-    if (sweep.deleted > 0) {
-        log(
-            `[message-index] orphan sweep: scanned=${sweep.scanned} deleted=${sweep.deleted} cursor=${sweep.cursor || "<complete>"}`,
-        );
     }
 }
 
@@ -748,6 +743,10 @@ export function _getDreamTimerStateForTests(): { active: boolean; directories: s
     return { active: activeTimer !== null, directories: [...registeredProjects.keys()] };
 }
 
+export function _isDreamTimerTickInFlightForTests(): boolean {
+    return tickInFlight;
+}
+
 export function _resetDreamTimerForTests(): void {
     if (activeTimer) {
         clearInterval(activeTimer);
@@ -822,7 +821,7 @@ function startGitSweepLeaseRenewal(
     return () => clearInterval(timer);
 }
 
-async function sweepGitCommits(args: {
+export async function sweepGitCommits(args: {
     directory: string;
     projectIdentity: string;
     db: Database;
@@ -832,11 +831,20 @@ async function sweepGitCommits(args: {
     const holderId = crypto.randomUUID();
     const lease = acquireGitSweepLease(db, projectIdentity, holderId);
     if (!lease.acquired) {
-        const reason =
-            lease.reason === "cooldown_active"
-                ? `cooldown active until ${lease.nextAllowedAt}`
-                : `lease held by ${lease.leaseHolder ?? "another holder"} until ${lease.leaseExpiresAt ?? "unknown"}`;
+        if (lease.reason === "cooldown_active") return;
+        const reason = `lease held by ${lease.leaseHolder ?? "another holder"} until ${lease.leaseExpiresAt ?? "unknown"}`;
         log(`[git-commits] sweep skipped for ${projectIdentity}: ${reason}`);
+        return;
+    }
+
+    if (projectIdentity.startsWith("dir:")) {
+        if (parkGitSweepNonIndexable(db, projectIdentity, holderId)) {
+            log(
+                `[git-commits] sweep parked for ${projectIdentity}: directory identity has no commits`,
+            );
+        } else {
+            releaseGitSweepLease(db, projectIdentity, holderId);
+        }
         return;
     }
 
@@ -849,6 +857,7 @@ async function sweepGitCommits(args: {
         const result = await indexCommitsForProject(db, projectIdentity, directory, {
             sinceDays: gitCommitIndexing.since_days,
             maxCommits: gitCommitIndexing.max_commits,
+            skipRetention: isCommitRetentionPaused(gitCommitIndexing),
         });
         if (result.nonIndexable) {
             // Not a repo / repo with no commits: park on the long re-probe

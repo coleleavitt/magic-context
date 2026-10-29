@@ -4587,11 +4587,13 @@ describe("Rust mode authority adapter", () => {
             });
             const runPass = async () => {
                 const messages = wire();
-                await transform.run(
-                    sessionId,
-                    messages,
-                    { messages: messages as unknown[] },
-                    makeMeta(db, sessionId),
+                await withTransformTimingSummary(() =>
+                    transform.run(
+                        sessionId,
+                        messages,
+                        { messages: messages as unknown[] },
+                        makeMeta(db, sessionId),
+                    ),
                 );
             };
             await runPass();
@@ -4622,11 +4624,15 @@ describe("Rust mode authority adapter", () => {
             expect(store.fullReads).toBe(0);
             const ordinalLines = logSpy.mock.calls
                 .map((call) => String(call[1]))
-                .filter((line) => line.includes("stage=rust.ordinal_resolve"));
+                .filter(
+                    (line) =>
+                        line.startsWith("transform stages:") &&
+                        line.includes("rust.ordinal_resolve="),
+                );
             expect(ordinalLines.length).toBeGreaterThanOrEqual(3);
             expect(ordinalLines.some((line) => line.includes("mode=prime"))).toBe(false);
             const elapsedMs = ordinalLines.map((line) =>
-                Number(/elapsed=([\d.]+)ms/.exec(line)?.[1] ?? Number.NaN),
+                Number(/rust\.ordinal_resolve=([\d.]+)ms/.exec(line)?.[1] ?? Number.NaN),
             );
             expect(elapsedMs.every((ms) => ms < 250)).toBe(true);
 
@@ -4642,7 +4648,11 @@ describe("Rust mode authority adapter", () => {
             expect(store.fullReads).toBe(0);
             const removalLines = logSpy.mock.calls
                 .map((call) => String(call[1]))
-                .filter((line) => line.includes("stage=rust.ordinal_resolve"));
+                .filter(
+                    (line) =>
+                        line.startsWith("transform stages:") &&
+                        line.includes("rust.ordinal_resolve="),
+                );
             expect(removalLines.some((line) => line.includes("mode=rewind"))).toBe(true);
             expect(removalLines.some((line) => line.includes("mode=prime"))).toBe(false);
         } finally {
@@ -10039,7 +10049,7 @@ it("refuses LKG plus suffix when no tool-definition envelope exists", async () =
     expect(output.messages).toEqual(input);
 });
 
-it("serves a fitting LKG with an envelope from another measured model", async () => {
+it("serves a fitting LKG with an envelope from the model this session last flew", async () => {
     const sessionId = "fit-envelope-replay";
     sessions.push(sessionId);
     const db = makeDb();
@@ -10058,7 +10068,17 @@ it("serves a fitting LKG with an envelope from another measured model", async ()
     await transform.run(sessionId, input, { messages: [...input] }, meta);
     expect(getSlot(sessionId)).toBeDefined();
     __resetToolDefinitionMeasurements();
-    recordToolDefinition("test-provider", "previous-model", "default", "read", "Read a file", {});
+    // The session's previous request flew another model; the current one has
+    // no tool measurement yet.
+    recordToolDefinition(
+        "test-provider",
+        "previous-model",
+        "default",
+        "read",
+        "Read a file",
+        {},
+        sessionId,
+    );
     failing = true;
     const output = { messages: [...input] as unknown[] };
     await transform.run(sessionId, input, output, meta);
@@ -10169,6 +10189,17 @@ describe("proactive thinking strip on a released frozen replay", () => {
         const transform = createRustModeTransform(deps, { moduleClient });
         const run = async (input: MessageLike[]) => {
             lastInput = input;
+            // OpenCode 1 measures the session's own route's tools before every
+            // transform pass.
+            recordToolDefinition(
+                PREFIX_BOUND_MODEL.providerID,
+                PREFIX_BOUND_MODEL.modelID,
+                undefined,
+                "read",
+                "read fixture",
+                { type: "object" },
+                sessionId,
+            );
             const output = { messages: [...input] as unknown[] };
             await transform.run(sessionId, input, output, makeMeta(db, sessionId));
             return output.messages;
@@ -10685,6 +10716,7 @@ it("Rust-mode typed protected overflow cannot become passthrough or LKG replay",
 });
 
 import { bindSystemDateRequestIdentity } from "./system-date-refresh";
+import { withTransformTimingSummary } from "./transform-stage-logger";
 
 // scripts/test-rust-raw-replay.sh builds the library driver and sets its staged executable path.
 const rawReplayProbe = process.env.MC_RAW_REPLAY_PROBE;

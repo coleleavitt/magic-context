@@ -81,6 +81,11 @@ import {
 } from "./compartment-runner-validation";
 import { producerSourceLocalBudget } from "./derive-budgets";
 import {
+    clearHistorianHistoryWait,
+    recordHistorianNoProgress,
+    shouldWaitForNewHistorianHistory,
+} from "./historian-history-wait";
+import {
     describeHistorianPromptTrim,
     fitHistorianPrompt,
     resolveHistorianProducerWindow,
@@ -107,7 +112,10 @@ import {
     resolveOpenCodeProtectedTailBoundary,
     selectPerRunCap,
 } from "./protected-tail-boundary";
-import { validateBoundarySnapshotOffThread } from "./raw-exact-ordinal-read";
+import {
+    type OffThreadBoundaryValidation,
+    validateBoundarySnapshotOffThread,
+} from "./raw-exact-ordinal-read";
 import {
     getRawSessionTagKeysThrough,
     hasRawMessageProvider,
@@ -116,10 +124,20 @@ import {
     readRawSessionMessageOrdinalById,
     readRawSessionMessageRange,
     readSessionChunk,
+    resolveHistorianChunkStart,
 } from "./read-session-chunk";
-import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
+import {
+    getMessageTimesFromOpenCodeDb,
+    openCodeDbExists,
+    withReadOnlySessionDb,
+} from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
-import { isStrictGapHealingMessage, RawOrdinalsNotReady } from "./read-session-raw";
+import {
+    areRustHistorianSyntheticParts,
+    dropRawSessionOrdinalCheckpoints,
+    isStrictGapHealingMessage,
+    RawOrdinalsNotReady,
+} from "./read-session-raw";
 import { sendStatusNotification } from "./send-session-notification";
 
 const inconsistentProducerWindows = new Set<string>();
@@ -140,30 +158,48 @@ function logInconsistentProducerWindowOnce(
 /** Suppress repeated historian failure notifications — at most once per 60 seconds per session */
 const HISTORIAN_ALERT_COOLDOWN_MS = 60 * 1000;
 
-export function v2NonNarrativeStoredGapRanges(
+export function nonNarrativeStoredGapRanges(
     db: HiddenCompartmentRunnerDeps["db"],
     sessionId: string,
     compartments: ReadonlyArray<{ startMessage: number; endMessage: number }>,
 ): Array<{ start: number; end: number }> {
-    if (readCoordinateRebaseNotice(db, sessionId)?.generation !== "v2") return [];
+    const rebasedToV2 = readCoordinateRebaseNotice(db, sessionId)?.generation === "v2";
     const safeRanges: Array<{ start: number; end: number }> = [];
-    for (let index = 1; index < compartments.length; index += 1) {
+    for (let index = 0; index < compartments.length; index += 1) {
         const previous = compartments[index - 1];
         const current = compartments[index];
-        if (!previous || !current) continue;
-        const start = previous.endMessage + 1;
+        if (!current) continue;
+        const start = previous ? previous.endMessage + 1 : 1;
         const end = current.startMessage - 1;
         if (end < start) continue;
         const messages = readRawSessionMessageRange(sessionId, start, end);
         const ordinals = new Set(messages.map((message) => message.ordinal));
         const complete =
             ordinals.size === end - start + 1 &&
-            messages.every((message) => isStrictGapHealingMessage(message));
+            messages.every(
+                (message) =>
+                    message.ordinal >= start &&
+                    message.ordinal <= end &&
+                    (areRustHistorianSyntheticParts(message.parts) ||
+                        (index > 0 && rebasedToV2 && isStrictGapHealingMessage(message))),
+            );
         if (complete) safeRanges.push({ start, end });
     }
     return safeRanges;
 }
 const lastHistorianAlertBySession = new Map<string, number>();
+const loggedStoredValidationFailures = new Map<string, Set<string>>();
+
+function logStoredValidationFailureOnce(sessionId: string, error: string): void {
+    // Ordinals vary as history changes; the failure class, not its coordinates,
+    // determines whether this session has already logged the problem.
+    const failureClass = error.split(" ", 2).join(" ");
+    const logged = loggedStoredValidationFailures.get(sessionId) ?? new Set<string>();
+    if (logged.has(failureClass)) return;
+    logged.add(failureClass);
+    loggedStoredValidationFailures.set(sessionId, logged);
+    sessionLog(sessionId, `historian failure: source=existing-validation reason="${error}"`);
+}
 
 /**
  * How long the historian waits before re-checking stored compartments that
@@ -192,6 +228,48 @@ function shouldSuppressHistorianAlert(sessionId: string): boolean {
     }
     lastHistorianAlertBySession.set(sessionId, Date.now());
     return false;
+}
+
+/**
+ * Whether a stale-snapshot detail proves the serving thread's ordinal ranks
+ * disagree with the exact read on a check that never moves by itself: one of
+ * the `offset`, `protectedTailStart` or `eligibleEnd` boundary id checks found
+ * a different message id at its ordinal, or the session shrank (deleted rows
+ * shift every later ordinal). The `last` id moves every turn as the live tail
+ * grows, so a changed last id alone never proves drift. Other stale reasons —
+ * stored compartments moved, raw content changed, the model or limit changed
+ * — say nothing about the ranks.
+ */
+export function isServingOrdinalDriftSignal(detail: string | undefined): boolean {
+    if (!detail) return false;
+    if (detail === "raw message count shrank") return true;
+    return /(?:offset|protectedTailStart|eligibleEnd) ordinal \d+ id changed$/.test(detail);
+}
+
+/**
+ * Refuse only a file-store session (OpenCode 1 reads straight from its store
+ * file; provider sessions on OpenCode 2, Pi and in-memory test stores keep
+ * no serving-thread ranks) whose stale detail is a drift signal from the
+ * check above. Anything else refreshes and adopts as before.
+ */
+function shouldRefuseStaleSnapshotForDrift(sessionId: string, detail: string | undefined): boolean {
+    if (hasRawMessageProvider(sessionId) || !openCodeDbExists()) return false;
+    return isServingOrdinalDriftSignal(detail);
+}
+
+/**
+ * Drop the serving thread's drifted ordinal ranks for a session so the next
+ * warm-up rebuilds them from a full scan. Only sessions read straight from
+ * the OpenCode 1 store file keep such ranks; provider sessions (OpenCode 2,
+ * Pi, in-memory test stores) have nothing to rebuild.
+ */
+function dropDriftedServingOrdinalRanks(sessionId: string, detail: string): void {
+    if (hasRawMessageProvider(sessionId) || !openCodeDbExists()) return;
+    withReadOnlySessionDb((reader) => dropRawSessionOrdinalCheckpoints(reader, sessionId));
+    sessionLog(
+        sessionId,
+        `historian: dropped drifted ordinal checkpoints after exact-read disagreement (${detail}); the next run rebuilds them from a full scan`,
+    );
 }
 
 export interface DanglingPublicationBoundary {
@@ -232,7 +310,9 @@ export function findDanglingPublicationBoundary(
 
 /** Clean up module-level session state on session deletion. */
 export function clearHistorianAlertState(sessionId: string): void {
+    clearHistorianHistoryWait(sessionId);
     lastHistorianAlertBySession.delete(sessionId);
+    loggedStoredValidationFailures.delete(sessionId);
 }
 
 export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Promise<void> {
@@ -384,7 +464,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
 
         let existingValidationError = validateStoredCompartments(
             priorCompartments,
-            v2NonNarrativeStoredGapRanges(db, sessionId, priorCompartments),
+            nonNarrativeStoredGapRanges(db, sessionId, priorCompartments),
         );
         // A compartment a store-projection rebase left unresolved keeps stale
         // ordinals that can overlap its neighbour. Stored rows in that state do
@@ -394,17 +474,18 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             existingValidationError !== null &&
             priorCompartments.some((compartment) => compartment.rebaseStatus === "unresolved");
         if (
-            unresolvedInvolved &&
             existingValidationError &&
             storedCompartmentFailureBackingOff(db, sessionId, existingValidationError)
         ) {
             // The same stored rows already failed this check recently. Nothing
             // but a rebuild changes them, so re-running now would only repeat
             // the failure and its notice.
-            sessionLog(
-                sessionId,
-                `historian no-op: stored compartments still invalid ("${existingValidationError}"); backing off`,
-            );
+            if (unresolvedInvolved) {
+                sessionLog(
+                    sessionId,
+                    `historian no-op: stored compartments still invalid ("${existingValidationError}"); backing off`,
+                );
+            }
             telemetry.status = "noop";
             telemetry.failureReason = `existing-validation backoff: ${existingValidationError}`;
             return;
@@ -423,23 +504,27 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 priorCompartments = getCompartments(db, sessionId);
                 existingValidationError = validateStoredCompartments(
                     priorCompartments,
-                    v2NonNarrativeStoredGapRanges(db, sessionId, priorCompartments),
+                    nonNarrativeStoredGapRanges(db, sessionId, priorCompartments),
                 );
             }
         }
         if (existingValidationError) {
-            sessionLog(
-                sessionId,
-                `historian failure: source=existing-validation reason="${existingValidationError}"`,
-            );
+            if (unresolvedInvolved) {
+                sessionLog(
+                    sessionId,
+                    `historian failure: source=existing-validation reason="${existingValidationError}"`,
+                );
+            } else {
+                logStoredValidationFailureOnce(sessionId, existingValidationError);
+            }
             // This is a real failure (stored compartments are corrupt) — record
             // it so `doctor --issue` and the >=95% abort path can see it.
             const failCount = incrementHistorianFailure(db, sessionId, existingValidationError);
             telemetry.failureReason = `existing-validation: ${existingValidationError}`;
+            retainDrainReservationForRetryThrottle = true;
             if (unresolvedInvolved) {
                 // Record the failure time like any other permanent historian
                 // failure, which is also what the backoff above measures from.
-                retainDrainReservationForRetryThrottle = true;
                 await notifyHistorianIssue(buildStoredCompartmentsInvalidNotice());
             } else {
                 await notifyHistorianIssue(
@@ -449,10 +534,25 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             return;
         }
 
-        const offset =
-            priorCompartments.length > 0
-                ? priorCompartments[priorCompartments.length - 1].endMessage + 1
-                : 1;
+        // On OpenCode 1 the next chunk continues after the last summarized
+        // message id, so a stored end_message number that drifted below its id
+        // can neither skip nor repeat a message. Provider sessions, and an id
+        // a revert removed, keep the stored number, as before. The
+        // id read can outrun a cold or just-rebuilt rank cache and defer like
+        // any other unreadable ordinal.
+        let offset: number;
+        try {
+            offset = resolveHistorianChunkStart(
+                sessionId,
+                priorCompartments[priorCompartments.length - 1] ?? null,
+            );
+        } catch (error) {
+            if (error instanceof RawOrdinalsNotReady) {
+                deferUntilOrdinalsReady("chunk start unreadable");
+                return;
+            }
+            throw error;
+        }
 
         let boundarySnapshot =
             deps.boundarySnapshot ??
@@ -473,16 +573,56 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             // The exact id reads scan the session up to each checked ordinal, so
             // they run on a worker; this run waits for them without blocking the
             // thread that serves every session.
-            const checked = await validateBoundarySnapshotOffThread({
-                db,
-                snapshot: boundarySnapshot,
-                currentContextLimit: deps.currentContextLimit ?? boundarySnapshot.contextLimit,
-            });
+            // The serving-thread count and fingerprint reads run the rank
+            // extension above; when that extension just dropped drifted ranks
+            // they defer until the rebuild lands instead of answering half.
+            let checked: OffThreadBoundaryValidation;
+            try {
+                checked = await validateBoundarySnapshotOffThread({
+                    db,
+                    snapshot: boundarySnapshot,
+                    currentContextLimit: deps.currentContextLimit ?? boundarySnapshot.contextLimit,
+                });
+            } catch (error) {
+                if (error instanceof RawOrdinalsNotReady) {
+                    deferUntilOrdinalsReady("boundary validation unreadable");
+                    return;
+                }
+                throw error;
+            }
             if (checked.kind === "not-ready") {
                 deferUntilOrdinalsReady(`boundary validation ${checked.reason}`);
                 return;
             }
             validation = checked.result;
+        }
+        // Refuse only a drifted OpenCode 1 file-store snapshot: when the exact
+        // read disagrees on a check that never moves by itself (`offset`,
+        // `protectedTailStart` or `eligibleEnd`, or a shrunk count), the
+        // serving-thread ranks are wrong, so a refreshed snapshot would carry
+        // the same wrong numbers. The chunk already continues after the stored
+        // end id in the chunk reader's own coordinates, so ending this run
+        // without publishing loses nothing: the ranks rebuild and the next
+        // trigger retries. Every other stale snapshot — a `last` id that moves
+        // every turn, stored compartments that moved, changed content —
+        // refreshes and adopts below as before.
+        if (
+            !validation.ok &&
+            validation.reason === "stale_snapshot" &&
+            shouldRefuseStaleSnapshotForDrift(sessionId, validation.detail)
+        ) {
+            dropDriftedServingOrdinalRanks(
+                sessionId,
+                validation.detail ?? validation.reason ?? "stale_snapshot",
+            );
+            sessionLog(
+                sessionId,
+                `historian: refusing to publish over a stale protected-tail snapshot (was: ${validation.detail ?? "stale"}); ending the run without publishing`,
+            );
+            telemetry.status = "noop";
+            telemetry.failureReason = "stale_snapshot";
+            rollbackDrainReservation();
+            return;
         }
         // In an active session the protected tail's newest message changes every
         // turn (a fresh user/assistant message lands), so a snapshot captured at
@@ -512,6 +652,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                       },
                       usageSource: boundarySnapshot.usageSource,
                       emergencyTailScale: boundarySnapshot.emergencyTailScale,
+                      // Honour exactly the trigger's one-pass floor lift for this run;
+                      // the protected tail is still recomputed from live messages.
+                      liftLivePromptFloor: boundarySnapshot.liftLivePromptFloor === true,
                   });
             if (refreshed && hasRunnableCompartmentWindow(refreshed)) {
                 sessionLog(
@@ -578,12 +721,11 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         const producerLimits = { input: producerWindow.inputLimitTokens };
         const producerReserve = producerWindow.maxOutputTokens;
         const projectPath = resolveProjectIdentity(directory ?? process.cwd());
-        // Every attempt in the chain (configured fallbacks, then the session
-        // model as the last resort) sends this same prompt, so size it for each
+        // Every configured attempt sends this same prompt, so size it for each
         // of their windows too, resolved as their pre-send check resolves them.
         const fallbackWindows = [
             ...(deps.fallbackModels ?? []).map((entry) => toModelEntry(entry)?.model),
-            deps.fallbackModelId,
+            ...(toModelEntry(deps.model) ? [] : [deps.fallbackModelId]),
         ]
             .filter((key): key is string => typeof key === "string" && key !== producerModel)
             .map((key) => resolveHistorianProducerWindow(key, deps.historianMaxOutputTokens));
@@ -634,6 +776,20 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         }
 
         const perRunCap = selectPerRunCap(boundarySnapshot);
+        if (
+            !deps.forceDrainQuota &&
+            shouldWaitForNewHistorianHistory(boundarySnapshot, {
+                emergency: getOverflowState(db, sessionId).needsEmergencyRecovery,
+            })
+        ) {
+            telemetry.status = "noop";
+            telemetry.failureReason = "waiting for new history after no forward progress";
+            sessionLog(
+                sessionId,
+                "historian no-op: waiting for new history after no forward progress",
+            );
+            return;
+        }
         const usable = Math.max(
             1,
             Math.round(
@@ -821,6 +977,12 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         const sequenceOffset = priorCompartments.length === 0 ? 0 : maxExistingSequence + 1;
 
         retainDrainReservationForRetryThrottle = true;
+        if (!deps.forceDrainQuota) {
+            shouldWaitForNewHistorianHistory(boundarySnapshot, {
+                emergency: getOverflowState(db, sessionId).needsEmergencyRecovery,
+                claim: true,
+            });
+        }
         const validatedPass = await runValidatedHistorianPass({
             client,
             hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
@@ -926,12 +1088,18 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 sessionId,
                 `no forward progress beyond raw message ${offset - 1}`,
             );
-            await notifyHistorianIssue(
-                buildHistorianFailureNotice(
-                    failCount,
-                    `historian made no forward progress beyond raw message ${offset - 1}`,
-                ),
-            );
+            try {
+                await notifyHistorianIssue(
+                    buildHistorianFailureNotice(
+                        failCount,
+                        `historian made no forward progress beyond raw message ${offset - 1}`,
+                    ),
+                );
+            } finally {
+                // OpenCode can append the notice itself as a no-reply user message.
+                // Include it in the wait watermark so it cannot trigger another paid retry.
+                recordHistorianNoProgress(boundarySnapshot, inEmergency);
+            }
             return;
         }
 
@@ -1202,6 +1370,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             db.exec("COMMIT");
             published = true;
             publishCommitted = true;
+            clearHistorianHistoryWait(sessionId);
             finishHistorianPublishStage(
                 sessionId,
                 "publish-txn",

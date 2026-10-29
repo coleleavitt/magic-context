@@ -2,13 +2,25 @@ import { withContentLanguageDirective } from "../../../agents/language-directive
 import type {
     HiddenCompletion,
     HiddenCompletionExecutor,
+    HiddenRunHandle,
 } from "../../../hooks/magic-context/compartment-runner-types";
 import * as shared from "../../../shared";
 import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import type { PromptArgs } from "../../../shared/model-suggestion-retry";
-import { modelBodyField } from "../../../shared/resolve-fallbacks";
+import { modelBodyField, toModelEntry } from "../../../shared/resolve-fallbacks";
 import { formatRunTokenLog, runTokenLog } from "../../../shared/run-token-log";
+import { annotateSubagentInvocationError } from "../subagent-token-capture";
+
+/**
+ * How long a Dreamer model may stay completely silent (nothing streamed, no
+ * tokens) before the model chain gives up on it and moves to the next
+ * configured model. A free or overloaded model that stops answering otherwise
+ * holds the whole task slice, up to 20 minutes, before failing. Healthy models
+ * start streaming within seconds, so this only trips on a model that is not
+ * answering at all.
+ */
+export const DREAMER_FIRST_OUTPUT_TIMEOUT_MS = 90_000;
 
 export interface HiddenSingleShotArgs<T> {
     executor: HiddenCompletionExecutor;
@@ -26,6 +38,8 @@ export interface HiddenSingleShotArgs<T> {
     fallbackModels?: readonly ModelInput[];
     language?: string;
     timeoutMs: number;
+    /** See `PromptRetryOptions.firstOutputTimeoutMs`. Undefined = no first-output deadline. */
+    firstOutputTimeoutMs?: number;
     signal?: AbortSignal;
     metadata?: Record<string, unknown>;
     privacySensitive?: boolean;
@@ -33,6 +47,7 @@ export interface HiddenSingleShotArgs<T> {
     allowEmpty?: boolean;
     /** Read completed per-memory XML entries before closing a failed hidden session. */
     onFailureOutput?: (completion: HiddenCompletion) => void;
+    onOpened?: (sessionId: string) => void;
     /**
      * Turn the complete assistant text into the caller's result. Throwing here
      * rejects this model's answer and advances to the next configured fallback.
@@ -51,12 +66,12 @@ export interface HiddenSingleShotResult<T> {
  * caller the parsed answer. The carrier owns any tool steps for its agent.
  *
  * Tasks normally answer with one self-contained document (JSON or XML), so
- * incomplete output is rejected. Mapping alone can recover closed per-memory
+ * incomplete output is rejected. Mapping and verification can recover closed per-memory
  * entries through onFailureOutput. Two guards keep normal completion fail-closed,
  * matching what the memory classifier
  * already does on this same transport:
  *  - a completion the provider cut short at the output limit is rejected before
- *    the parser sees it, so a truncated prefix can never be applied; and
+ *    the parser sees it, so a truncated prefix is never accepted as a complete answer; and
  *  - an empty completion is rejected rather than parsed as "nothing to do".
  * The caller's own parser is still responsible for rejecting a document whose
  * structure is incomplete — for these tasks that means a JSON object that does
@@ -66,7 +81,7 @@ export async function runHiddenSingleShotPrompt<T>(
     args: HiddenSingleShotArgs<T>,
 ): Promise<HiddenSingleShotResult<T>> {
     const system = withContentLanguageDirective(args.system, args.language);
-    const handle = await args.executor.open({
+    const opening = args.executor.open({
         parentSessionId: args.parentSessionId,
         agent: args.agent,
         kind: "dreamer-task",
@@ -78,6 +93,21 @@ export async function runHiddenSingleShotPrompt<T>(
         directory: args.sessionDirectory,
         ...(args.metadata ? { metadata: args.metadata } : {}),
     });
+    // If opening ignores cancellation, retire its eventual handle without dispatching.
+    void opening
+        .then((handle) => {
+            if (args.signal?.aborted)
+                return args.executor.close(handle, {
+                    promptSettled: false,
+                    privacySensitive: args.privacySensitive ?? true,
+                    context: `[dreamer] ${args.callContext}`,
+                    log,
+                });
+        })
+        .catch(() => {});
+    const handle: HiddenRunHandle = await shared.raceWithSignal(opening, args.signal);
+    let completion: HiddenCompletion | undefined;
+    args.onOpened?.(handle.id);
     let promptSettled = false;
     try {
         if (!handle.id) throw new Error(`${args.callContext}: carrier returned no session id`);
@@ -102,10 +132,16 @@ export async function runHiddenSingleShotPrompt<T>(
                     { childSessionId: handle.childSessionId },
                 ),
                 timeoutMs: args.timeoutMs,
+                ...(args.firstOutputTimeoutMs !== undefined
+                    ? { firstOutputTimeoutMs: args.firstOutputTimeoutMs }
+                    : {}),
                 ...(args.signal ? { signal: args.signal } : {}),
                 fallbackModels: args.fallbackModels,
                 callContext: args.callContext,
-                fetchOutput: () => args.executor.collect(handle, 50),
+                fetchOutput: async () => {
+                    completion = await args.executor.collect(handle, 50);
+                    return completion;
+                },
                 validateOutput: (completion) => {
                     const tokens = completion.tokenLog ?? runTokenLog(undefined);
                     shared.sessionLog(
@@ -129,11 +165,22 @@ export async function runHiddenSingleShotPrompt<T>(
         promptSettled = true;
         return { validated: run.validated, completion: run.output, childSessionId: handle.id };
     } catch (error) {
+        const configuredModel = toModelEntry(args.model);
+        annotateSubagentInvocationError(error, {
+            attemptedModel:
+                completion?.attemptedModel ?? handle.attemptedModel ?? configuredModel?.model,
+            modelConfigKey:
+                completion?.modelConfigKey ??
+                handle.modelConfigKey ??
+                configuredModel?.sourceConfigKey,
+            ...(completion?.hostError === undefined ? {} : { hostError: completion.hostError }),
+        });
         if (args.onFailureOutput) {
             let timer: ReturnType<typeof setTimeout> | undefined;
             try {
                 const completion = await Promise.race([
-                    args.executor.collect(handle, 200),
+                    args.executor.collectPartial?.(handle, 200) ??
+                        args.executor.collect(handle, 200),
                     new Promise<null>((resolve) => {
                         timer = setTimeout(() => resolve(null), 5_000);
                     }),
@@ -149,11 +196,14 @@ export async function runHiddenSingleShotPrompt<T>(
         }
         throw error;
     } finally {
-        await args.executor.close(handle, {
+        const close = args.executor.close(handle, {
             promptSettled,
             privacySensitive: args.privacySensitive ?? true,
             context: `[dreamer] ${args.callContext}`,
             log,
         });
+        // Retiring an interrupted child must not reopen the investigation deadline.
+        if (args.signal?.aborted) void close.catch(() => {});
+        else await shared.raceWithSignal(close, args.signal);
     }
 }

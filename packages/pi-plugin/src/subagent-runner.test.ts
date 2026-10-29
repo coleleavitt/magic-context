@@ -34,10 +34,14 @@ import type { SubagentRunOptions } from "@magic-context/core/shared/subagent-run
 import { __temperatureTest } from "@magic-context/core/shared/subagent-temperature";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 
-import { __setPiHarnessKindForTesting } from "./pi-harness-kind";
+import {
+	__setPiHarnessKindForTesting,
+	resolvePiHarnessKind,
+} from "./pi-harness-kind";
 import {
 	__test,
 	configurePiSubagentHostTools,
+	HIDDEN_CHILD_OUTPUT_CEILING,
 	PiSubagentRunner,
 } from "./subagent-runner";
 
@@ -209,7 +213,11 @@ function buildArgsForTest(
 ) {
 	return __test.buildArgs(options, {
 		systemPromptPath: TEST_SYSTEM_PROMPT_PATH,
-		historianCalibrationEntryPath: null,
+		ompToolConfigPath: "/tmp/omp-child-tools.yml",
+		historianCalibrationEntryPath:
+			(opts?.targetHarness ?? resolvePiHarnessKind()) === "omp"
+				? "/tmp/historian-calibration.js"
+				: null,
 		...opts,
 	});
 }
@@ -1200,6 +1208,60 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--tools");
 	});
 
+	it("selects exact OMP active tools without disabling discovered provider extensions", () => {
+		for (const [agent, tools] of __test.STRICT_TOOL_ALLOWLIST) {
+			const args = buildArgsForTest(
+				{ ...baseOptions, agent },
+				{ targetHarness: "omp" },
+			);
+			const index = args.indexOf("--magic-context-tool-allowlist");
+			const expected = [
+				...new Set(
+					tools.map((tool) =>
+						tool === "find" || tool === "ls" ? "glob" : tool,
+					),
+				),
+			];
+			expect(JSON.parse(args[index + 1])).toEqual(expected);
+			expect(args).not.toContain("--no-extensions");
+			expect(args).toContain("/tmp/historian-calibration.js");
+		}
+		const unknown = buildArgsForTest(
+			{ ...baseOptions, agent: "future-check" },
+			{ targetHarness: "omp" },
+		);
+		expect(unknown[unknown.indexOf("--magic-context-tool-allowlist") + 1]).toBe(
+			"[]",
+		);
+		const filtered = buildArgsForTest(
+			{ ...baseOptions, agent: "dreamer-primer-investigator" },
+			{ targetHarness: "omp", hostToolNames: ["read"] },
+		);
+		expect(
+			JSON.parse(
+				filtered[filtered.indexOf("--magic-context-tool-allowlist") + 1],
+			),
+		).toEqual(["read", "aft_outline", "aft_zoom", "aft_search", "ctx_search"]);
+	});
+
+	it("refuses an OMP child without the startup tool boundary entry", () => {
+		expect(() =>
+			buildArgsForTest(baseOptions, {
+				targetHarness: "omp",
+				historianCalibrationEntryPath: null,
+			}),
+		).toThrow("tool-boundary startup extension");
+	});
+
+	it("refuses an OMP child without its private tool config overlay", () => {
+		expect(() =>
+			buildArgsForTest(baseOptions, {
+				targetHarness: "omp",
+				ompToolConfigPath: undefined,
+			}),
+		).toThrow("tool-boundary config overlay");
+	});
+
 	it("locks dreamer-docs to read-only file tools and optional AFT reads", () => {
 		const args = buildArgsForTest({
 			...baseOptions,
@@ -1381,6 +1443,195 @@ describe("subagent-runner pure helpers", () => {
 });
 
 describe("PiSubagentRunner spawn lifecycle", () => {
+	for (const harness of ["omp", "pi"] as const) {
+		for (const delivery of ["argv", "windows-stdin", "large-stdin"] as const) {
+			it(`${harness} ${delivery} keeps transcript mentions literal only on OMP`, async () => {
+				const child = createMockChild();
+				const { runner, spawnImpl } = runnerWith(child, {
+					invocation: {
+						command: "host-test",
+						prefixArgs: [],
+						targetHarness: harness,
+					},
+					platform: delivery === "windows-stdin" ? "win32" : "linux",
+				});
+				const text = `see @skill://name @"some file" a@b.com${delivery === "large-stdin" ? " ".repeat(100_000) : ""}`;
+				const pending = runner.run({ ...baseOptions, userMessage: text });
+				await nextTick();
+				const args = spawnImpl.mock.calls[0]?.[1] as unknown as string[];
+				const delivered = delivery === "argv" ? args.at(-1) : child.stdinText;
+				expect(delivered).toBe(
+					harness === "omp" ? text.replaceAll(" @", " \u2060@") : text,
+				);
+				const reply = {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					stopReason: "stop",
+				};
+				child.writeStdoutLine(agentEnd([reply]));
+				child.emitClose();
+				expect(await pending).toMatchObject({
+					ok: true,
+					assistantText: "done",
+				});
+			});
+		}
+	}
+
+	it("keeps an OMP token-budget child on print mode with a neutralized prompt", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			invocation: { command: "omp-test", prefixArgs: [], targetHarness: "omp" },
+		});
+		const pending = runner.run({
+			...baseOptions,
+			userMessage: "see @skill://name",
+			tokenBudget: 1_000,
+		});
+		await nextTick();
+		const args = spawnImpl.mock.calls[0]?.[1] as unknown as string[];
+		expect(args).toContain("--print");
+		expect(args).not.toContain("rpc");
+		expect(args.at(-1)).toBe("see \u2060@skill://name");
+		expect(child.stdinText).toBe("");
+		const configPath = args[args.indexOf("--config") + 1];
+		expect(readFileSync(configPath, "utf8")).toBe(
+			"tools:\n  xdev: false\nplan:\n  enabled: false\n  defaultOnStartup: false\n",
+		);
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		child.emitClose();
+		expect(await pending).toMatchObject({ ok: true, assistantText: "done" });
+		expect(existsSync(configPath)).toBe(false);
+	});
+
+	it("restores OMP output before streaming or returning nested summary, facts and memory text", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child, {
+			invocation: { command: "omp-test", prefixArgs: [], targetHarness: "omp" },
+		});
+		const events: unknown[] = [];
+		const pending = runner.run({
+			...baseOptions,
+			onProgress: (event) => {
+				if (event.type === "raw_event") events.push(event.event);
+			},
+		});
+		await nextTick();
+		const reply = {
+			role: "assistant",
+			content: [
+				{
+					type: "text",
+					text: '{"summary":"\u2060@skill://name","facts":["\u2060@agent://foo"],"memory":"\u2060@proc://bg_1"}',
+				},
+			],
+			stopReason: "stop",
+		};
+		// JSON escapes are decoded before restoration, not edited as raw bytes.
+		child.writeRawStdoutLine(
+			JSON.stringify(agentEnd([reply])).replaceAll("\u2060", "\\u2060"),
+		);
+		child.emitClose();
+		expect(await pending).toMatchObject({
+			ok: true,
+			assistantText:
+				'{"summary":"@skill://name","facts":["@agent://foo"],"memory":"@proc://bg_1"}',
+		});
+		expect(JSON.stringify(events)).not.toContain("\u2060");
+	});
+
+	it("leaves Pi output markers and unmarked OMP output byte-identical", () => {
+		for (const harness of ["pi", "omp"] as const) {
+			const text =
+				harness === "pi"
+					? "\u2060@skill://name"
+					: "@skill://name a@b.com 中文\nunchanged";
+			const event = agentEnd([
+				{ role: "assistant", content: [{ type: "text", text }] },
+			]);
+			expect(__test.parsePiEventLine(JSON.stringify(event), harness)).toEqual({
+				ok: true,
+				event,
+			});
+		}
+	});
+
+	for (const targetHarness of ["pi", "omp"] as const) {
+		it(`${targetHarness} records a refused model without an assistant reply`, async () => {
+			__setPiHarnessKindForTesting(targetHarness);
+			const child = createMockChild();
+			const { runner } = runnerWith(child, {
+				invocation: { command: targetHarness, prefixArgs: [], targetHarness },
+			});
+			const testDataDir = createTestTempDirFromPath(
+				join(tmpdir(), `mc-${targetHarness}-model-refusal-`),
+			);
+			const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+			const previousXdgDataHome = process.env.XDG_DATA_HOME;
+			process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
+			process.env.XDG_DATA_HOME = testDataDir;
+			closeDatabase();
+			try {
+				const model = "unknown-provider/model-not-installed";
+				const suggestion = "unknown-provider/model-available";
+				const resultPromise = runner.run({
+					...baseOptions,
+					model,
+					accountingSessionId: `${targetHarness}-model-refusal`,
+					accountingSubagent: "historian",
+					accountingModelConfigKey: `historian.${targetHarness}.model`,
+				});
+				const errorMessage = `ProviderModelNotFoundError: Model not found: ${model}. Did you mean: ${suggestion}?`;
+				const assistant = {
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage,
+				};
+				child.writeStdoutLine({ type: "message_end", message: assistant });
+				child.writeStdoutLine(agentEnd([assistant]));
+				child.emitClose(0);
+
+				await expect(resultPromise).resolves.toMatchObject({
+					ok: false,
+					reason: "no_assistant",
+				});
+				const db = openDatabase();
+				if (!db) throw new Error("accounting test database did not open");
+				const [row] = getSubagentInvocations(
+					db,
+					`${targetHarness}-model-refusal`,
+				);
+				expect(row).toMatchObject({
+					harness: targetHarness,
+					providerId: "unknown-provider",
+					modelId: "model-not-installed",
+					status: "empty",
+				});
+				expect(row?.error).toContain(
+					`${targetHarness === "omp" ? "Oh My Pi" : "Pi"} refused the model`,
+				);
+				expect(row?.error).toContain(suggestion);
+			} finally {
+				closeDatabase();
+				if (previousTestDataDir === undefined)
+					delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+				else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = previousTestDataDir;
+				if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+				else process.env.XDG_DATA_HOME = previousXdgDataHome;
+				rmSync(testDataDir, { recursive: true, force: true });
+			}
+		});
+	}
+
 	it("records OMP usage and message provider for an unqualified model ref", async () => {
 		__setPiHarnessKindForTesting("omp");
 		const child = createMockChild();
@@ -1968,6 +2219,46 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		if (!result.ok) expect(result.reason).toBe("no_assistant");
 	});
 
+	it("only gives registered historian children the per-call cache-marker flag", async () => {
+		const previous = process.env.MAGIC_CONTEXT_HISTORIAN_CACHE_TAIL;
+		process.env.MAGIC_CONTEXT_HISTORIAN_CACHE_TAIL = "skip";
+		try {
+			for (const [agent, accountingSubagent, cacheTail, expected] of [
+				["historian", "historian", "skip", "skip"],
+				["historian", "historian", "write", "write"],
+				["historian", "historian_editor", "skip", undefined],
+				["magic-context-dreamer", "dreamer", "skip", undefined],
+				["historian", "historian", undefined, undefined],
+			] as const) {
+				const child = createMockChild();
+				const { runner, spawnImpl } = runnerWith(child);
+				const resultPromise = runner.run({
+					...baseOptions,
+					agent,
+					accountingSubagent,
+					cacheTail,
+				});
+				child.writeStdoutLine(
+					agentEnd([
+						{
+							role: "assistant",
+							content: [{ type: "text", text: "done" }],
+							stopReason: "stop",
+						},
+					]),
+				);
+				child.emitClose(0);
+				await resultPromise;
+				const env = spawnImpl.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+				expect(env.MAGIC_CONTEXT_HISTORIAN_CACHE_TAIL).toBe(expected);
+			}
+		} finally {
+			if (previous === undefined)
+				delete process.env.MAGIC_CONTEXT_HISTORIAN_CACHE_TAIL;
+			else process.env.MAGIC_CONTEXT_HISTORIAN_CACHE_TAIL = previous;
+		}
+	});
+
 	it("spawns pi, parses stdout, trims assistant text, and captures stderr", async () => {
 		const child = createMockChild();
 		const { runner, spawnImpl } = runnerWith(child, { piBinary: "custom-pi" });
@@ -2014,6 +2305,99 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			toolCallCount: 0,
 			durationMs: expect.any(Number),
 			meta: { stderr: "warning from pi" },
+		});
+	});
+
+	it("caps the output tokens a Pi dreamer child sends to its provider", async () => {
+		const { default: extension } = await import(
+			"./historian-calibration-extension"
+		);
+		// Run the runner for a dreamer child, then load the child extension with
+		// exactly the environment that child receives and replay a provider request.
+		const providerRequest = async (maxOutputTokens?: number) => {
+			const child = createMockChild();
+			const { runner, spawnImpl } = runnerWith(child);
+			const resultPromise = runner.run({
+				...baseOptions,
+				agent: "magic-context-dreamer",
+				...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
+			});
+			child.writeStdoutLine(
+				agentEnd([
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "<verify></verify>" }],
+						stopReason: "stop",
+					},
+				]),
+			);
+			child.emitClose(0);
+			await resultPromise;
+			const childEnv = (
+				spawnImpl.mock.calls[0] as unknown as [
+					string,
+					string[],
+					{ env: Record<string, string | undefined> },
+				]
+			)[2].env;
+			const keys = [
+				"MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY",
+				"MAGIC_CONTEXT_HISTORIAN_TEMPERATURE",
+				"MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS",
+				"MAGIC_CONTEXT_SUBAGENT_OUTPUT_CEILING",
+			];
+			const previous = keys.map((key) => process.env[key]);
+			const previousPromptFile = process.env.MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE;
+			const hooks = new Map<string, (event: { payload: unknown }) => unknown>();
+			try {
+				for (const key of keys) {
+					if (childEnv[key] === undefined) delete process.env[key];
+					else process.env[key] = childEnv[key];
+				}
+				// The runner has already removed its prompt file; provenance
+				// observation is not under test here.
+				delete process.env.MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE;
+				extension({
+					registerFlag: () => {},
+					on: (
+						name: string,
+						handler: (event: { payload: unknown }) => unknown,
+					) => hooks.set(name, handler),
+				} as never);
+			} finally {
+				keys.forEach((key, index) => {
+					if (previous[index] === undefined) delete process.env[key];
+					else process.env[key] = previous[index];
+				});
+				if (previousPromptFile === undefined)
+					delete process.env.MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE;
+				else
+					process.env.MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE = previousPromptFile;
+			}
+			expect(childEnv.MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY).toBe("1");
+			// Pi's request for a 1M-window OpenRouter model with no cap: the
+			// model's output limit, clamped only by the context window.
+			return hooks.get("before_provider_request")?.({
+				payload: {
+					model: "meta/muse-spark",
+					max_tokens: 936_066,
+					temperature: 0.7,
+				},
+			});
+		};
+
+		expect(await providerRequest()).toEqual({
+			model: "meta/muse-spark",
+			max_tokens: HIDDEN_CHILD_OUTPUT_CEILING,
+			temperature: 0.7,
+		});
+		expect(HIDDEN_CHILD_OUTPUT_CEILING).toBe(32_000);
+		// A configured dreamer.maxTokens is sent exactly, and dreamer sampling
+		// is never recalibrated.
+		expect(await providerRequest(4_096)).toEqual({
+			model: "meta/muse-spark",
+			max_tokens: 4_096,
+			temperature: 0.7,
 		});
 	});
 

@@ -29,6 +29,7 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import {
+    addMergedReasoningStrippedIds,
     casChannel2NudgeState,
     clearDetectedContextLimit,
     clearEmergencyDropSample,
@@ -41,6 +42,7 @@ import {
     getEmergencyInputSample,
     getHistorianFailureState,
     getLastNudgeUndropped,
+    getMergedReasoningStrippedIds,
     getOverflowState,
     getPersistedCompactionMarkerState,
     loadTransformPassStateSnapshot,
@@ -72,7 +74,6 @@ import type { ModelInput } from "../../shared/model-resolution";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
-import { isRecord } from "../../shared/record-type-guard";
 import { withoutSqliteTransformPass } from "../../shared/sqlite";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import type { CavemanWordRules } from "./caveman";
@@ -101,6 +102,7 @@ import {
 } from "./ctx-reduce-nudge";
 import { DegradedPassRefusalError, degradedPassError } from "./degraded-pass-refusal";
 import { deriveTriggerBudget } from "./derive-budgets";
+import { clearDiagnosticLogState, diagnosticStateChanged } from "./diagnostic-log-state";
 import { contextRefusalError, EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
@@ -110,14 +112,18 @@ import {
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
+import { maintainExecuteFloorMark } from "./execute-reclaim";
+import { omitIncompleteFileTokenTotals } from "./file-token-coverage";
 import {
     createFinalWireUsageTracker,
     describeFinalWireTail,
     estimateFinalWireInputTokens,
     estimateMessageTokens,
 } from "./final-wire-token-estimate";
+import type { ForeignTextParts } from "./foreign-text-parts";
 import { isHistorianDrainBudgetSpent } from "./historian-drain-gate";
 import type { LiveModelBySession } from "./hook-handlers";
+import { takeCoveredInstructionRows } from "./host-served-rows";
 import { assertNoInheritedMagicContextMarker } from "./inherited-compaction-marker-guard";
 import {
     capturePrefixTrimSourceOrder,
@@ -147,18 +153,28 @@ import {
     lkgDirtyRevision,
     noteLkgHealthyPrefix,
     noteUncertifiedNormalLkg,
+    persistLkgUntaggedInputIds,
     readLkgRecoveryPrefix,
+    readPersistedLkgUntaggedInputIds,
 } from "./lkg-recovery-prefix";
 import { captureLkgSlot, createLkgEntryProjector, resolveLkgModelKeys } from "./lkg-replay";
-import { beginLkgPass, dropSlot, getInMemorySlot } from "./lkg-slot";
+import { beginLkgPass, dropSlot, getInMemorySlot, lkgInputIdentity } from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
+import { logNudgeEvaluation } from "./nudge-evaluation-log";
 import {
     createPassOutcome,
     degradationChangesRequest,
     type PassDegradationKind,
     type PassDegradationSite,
 } from "./pass-outcome";
-import { requestPendingMaterialization } from "./pending-materialization";
+import {
+    createPendingDropEligibilityCache,
+    pendingDropEligibilityKey,
+} from "./pending-drop-eligibility";
+import {
+    hasPendingMaterializationOrigin,
+    requestPendingMaterialization,
+} from "./pending-materialization";
 import {
     createDefaultBoundarySnapshotForTests,
     hasRunnableCompartmentWindow,
@@ -170,6 +186,7 @@ import {
 import { noteTransformPassForExactOrdinalReads } from "./raw-exact-ordinal-read";
 import { prepareRawSessionOrdinals, readRawSessionMessages } from "./read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
+import { estimateTokens } from "./read-session-formatting";
 import { extractInMemoryMessageViews } from "./read-session-raw";
 import {
     projectOpencodeReasoningBudgetCutoff,
@@ -179,6 +196,8 @@ import { createM0RenderOptions } from "./render-options";
 import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
 import { sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute, modelAcceptsEmptyContent } from "./sentinel";
+import { takeSignedThinkingFitSnapshot } from "./signed-thinking-fit-snapshot";
+import { decideSignedThinkingHold, type SignedThinkingHoldDecision } from "./signed-thinking-hold";
 import {
     replayClearedReasoning,
     replayStrippedInlineThinking,
@@ -196,6 +215,7 @@ import {
     loadContextUsage,
     resolveSchedulerDecision,
     resolveUnknownUsageFromWireEstimate,
+    savedProviderReadingForPass,
 } from "./transform-context-state";
 import { findLastUserMessageId, findSessionId } from "./transform-message-helpers";
 import {
@@ -213,8 +233,9 @@ import {
     defaultCompactionMarkerStrategy,
     evaluateEmergencyFailClosed,
     runPostTransformPhase,
+    servesThinkingBlock,
 } from "./transform-postprocess-phase";
-import { logTransformTiming } from "./transform-stage-logger";
+import { logTransformTiming, withTransformTimingSummary } from "./transform-stage-logger";
 import { isClearlyOverWindow, UnmanagedOverWindowError } from "./unmanaged-over-window";
 import {
     storedHistoryBoundaryPresence,
@@ -457,6 +478,12 @@ export interface TransformDeps {
     hostRefusalNotice?: HostRefusalNotice;
     hostRefuse?: typeof abortSessionFailClosed;
     tagger: Tagger;
+    /**
+     * OpenCode 1 only: find the text parts another plugin appended to stored
+     * messages, on the array the host handed to the hook. Unset on hosts whose
+     * parts carry no ids (OpenCode 2), where an id-less part may be stored text.
+     */
+    collectForeignTextParts?: (messages: MessageLike[]) => ForeignTextParts | undefined;
     scheduler: Scheduler;
     contextUsageMap: Map<
         string,
@@ -699,7 +726,8 @@ export interface TransformDeps {
      * `TagMessagesOptions.normalizeRestoredAssistantText`). Only the OpenCode 2
      * adapter supplies it.
      */
-    normalizeRestoredAssistantText?: (text: string) => string;
+    normalizeRestoredAssistantText?: (text: string, providerID?: string) => string;
+    refreshSourceContents?: (sessionId: string) => boolean;
 }
 
 export function resolveTransformHostSeams(
@@ -727,6 +755,10 @@ export function resolveTransformHostSeams(
     };
 }
 
+// A control entry for the thinking-omission ledger, not a message id. After a
+// signed-fit refusal, check later requests against the model window even if thinking was omitted.
+const SIGNED_FIT_REFUSED_MARKER = "signed_fit:refused:v1";
+
 export function createTransform(deps: TransformDeps) {
     registerSystemDateRefresh(deps.historyRefreshSessions);
     const finalWireUsage = createFinalWireUsageTracker();
@@ -734,8 +766,13 @@ export function createTransform(deps: TransformDeps) {
     const loadedSessions = new Set<string>();
     const prefixHoldLogTurnIds = new Map<string, string | null>();
     const thinkingFitRetries = new Set<string>();
+    // Sessions whose compaction mode changed in this process and that have not
+    // finished a pass in the new mode yet. The flag outlives a pass that fails
+    // before its thinking strip is recorded, so the retry still strips.
+    const compactionModeTransitionPending = new Set<string>();
     const clearSessionLogState = (sessionId: string): void => {
         prefixHoldLogTurnIds.delete(sessionId);
+        clearDiagnosticLogState(sessionId);
     };
     // Sessions whose history was clearly over the model's window, with no
     // Magic Context state to send in its place, on a pass that could not bring
@@ -755,6 +792,7 @@ export function createTransform(deps: TransformDeps) {
               })
             : undefined;
     let entryReuse: { reused: number; retained: number; retainedBytes: number } | undefined;
+    const pendingDropEligibility = createPendingDropEligibilityCache();
     const projectEntry = createLkgEntryProjector({
         onReuse: (stats) => {
             entryReuse = stats;
@@ -787,15 +825,19 @@ export function createTransform(deps: TransformDeps) {
         const startTime = performance.now();
         const historianRun = deps.resolveHistorianRun?.();
         const messages = output.messages as MessageLike[];
-        const originalForThinkingFit = messages.some((message) =>
-            message.parts.some(
-                (part) =>
-                    isRecord(part) &&
-                    ["reasoning", "thinking", "redacted_thinking"].includes(String(part.type)),
-            ),
-        )
-            ? structuredClone(messages)
-            : null;
+        // Captured before Magic Context edits anything, so only parts the host
+        // delivered can count as another plugin's. In Rust mode the module does
+        // the tagging, so this collector isn't used there.
+        const foreignTextParts =
+            deps.transformMode === "rust" ? undefined : deps.collectForeignTextParts?.(messages);
+        // The entry order, for the signed-thinking fit snapshot taken once the
+        // hold is decided (see takeSignedThinkingFitSnapshot). No message or
+        // part is edited before that point; only covered instruction rows are
+        // taken out of the array just below.
+        const entryOrderForThinkingFit = messages.slice();
+        // Covered instruction rows restored by the OpenCode 2 hook stay out of
+        // every stage until postprocess decides whether this session serves them.
+        const coveredHostInstructions = takeCoveredInstructionRows(messages);
         const passOutcome = createPassOutcome();
         const tSessionId = performance.now();
         const sessionId = findSessionId(messages);
@@ -823,11 +865,44 @@ export function createTransform(deps: TransformDeps) {
         const tLkgEntry = performance.now();
         // The Rust adapter captures its own last-known-good input snapshot and returns
         // before the TypeScript capture, so it does not need this entry projection.
-        const lkgInput = deps.transformMode === "rust" ? [] : projectEntry(sessionId, messages);
+        // Covered instructions still belong to the proof, even while working
+        // stages set them aside: replay can serve their saved bytes too.
+        const lkgInput =
+            deps.transformMode === "rust" ? [] : projectEntry(sessionId, entryOrderForThinkingFit);
         const recovery =
             deps.compactionOff || deps.transformMode === "rust"
                 ? {}
                 : readLkgRecoveryPrefix(sessionId, lkgInput, messages, deps.db);
+        const recoveryTailSources: { identity: string; pristineSystem?: MessageLike }[] = [];
+        if (recovery.prefix) {
+            const priorIdentities = new Set(recovery.prefix.inputs.map((input) => input.id));
+            lkgInput.forEach((input, index) => {
+                const identity = lkgInputIdentity(input.id, input.role, index);
+                if (!identity || priorIdentities.has(identity)) return;
+                recoveryTailSources.push({
+                    identity,
+                    // Anonymous instructions have no taggable host id. Freeze
+                    // their pristine bytes before stages edit the working tail.
+                    pristineSystem:
+                        input.id === null && input.role === "system"
+                            ? structuredClone(entryOrderForThinkingFit[index])
+                            : undefined,
+                });
+            });
+        }
+        // Messages an earlier last-good replay served untagged that still go out
+        // untagged: the in-memory recovery prefix's set and, after a restart, the
+        // durable record of it. Ordinary tagging skips them until a pass allowed
+        // to rewrite the prefix tags them (normalizeRecoveryTail below), so a pass
+        // that must not change served bytes keeps them byte-identical.
+        const persistedUntaggedInputIds =
+            deps.compactionOff || deps.transformMode === "rust"
+                ? []
+                : readPersistedLkgUntaggedInputIds(deps.db, sessionId);
+        const untaggedReplayIds = new Set<string>([
+            ...(recovery.prefix?.untaggedInputIds ?? []),
+            ...persistedUntaggedInputIds,
+        ]);
         logTransformTiming(
             sessionId,
             "lkg.entryProjection",
@@ -922,7 +997,7 @@ export function createTransform(deps: TransformDeps) {
             }
         }
 
-        if (deps.client !== undefined) {
+        if (deps.client !== undefined || deps.hostMessageReconciliationSource !== undefined) {
             withoutSqliteTransformPass(() =>
                 scheduleReconciliation(db, sessionId, host.hostMessageReconciliationSource),
             );
@@ -1039,6 +1114,9 @@ export function createTransform(deps: TransformDeps) {
                 transition.historianCatchUpSignaled;
             if (hasTransitionEffects) {
                 if (transition.invalidatedM0Baseline) {
+                    // A mode switch: the next postprocess strips signed thinking
+                    // bound to the previous mode's message bytes.
+                    compactionModeTransitionPending.add(sessionId);
                     // The persisted baseline bytes were nulled; drop the
                     // pass-local copies too so this pass re-materializes
                     // instead of replaying the pre-flip render.
@@ -1270,13 +1348,12 @@ export function createTransform(deps: TransformDeps) {
                     return true;
                 }
             })();
-        let activeThinkingPrefixHold =
-            activeThinkingTurn &&
-            isPrefixBoundThinkingModel(
-                activeThinkingModel?.providerID,
-                activeThinkingModel?.modelID,
-            );
-        let freezeM0M1 = unresolvedDirectoryHold || activeThinkingPrefixHold;
+        // Whether this pass is held for recent heavy signed thinking is decided
+        // once the execute threshold and the pass's usage are known (see
+        // decideSignedThinkingHold below). Until then only the directory freeze
+        // applies.
+        let activeThinkingPrefixHold = false;
+        let freezeM0M1 = unresolvedDirectoryHold;
         const compartmentDirectory = sessionDirectory;
         const historianRunnable = deps.historianRunnable !== false;
         const canRunCompartments =
@@ -1632,20 +1709,13 @@ export function createTransform(deps: TransformDeps) {
             resolvedProviderID,
             modelForBudget?.modelID,
         );
-        activeThinkingPrefixHold ||=
+        const signedThinkingPrefixBound =
             activeThinkingTurn &&
-            isPrefixBoundThinkingModel(resolvedProviderID, modelForBudget?.modelID);
-        freezeM0M1 ||= activeThinkingPrefixHold;
-        if (freezeM0M1 && prefixHoldLogTurnIds.get(sessionId) !== currentTurnId) {
-            prefixHoldLogTurnIds.set(sessionId, currentTurnId);
-            const reason = activeThinkingPrefixHold
-                ? "active thinking turn (prefix-bound model)"
-                : "session directory unresolved";
-            sessionLog(
-                sessionId,
-                `m[0]/m[1] frozen: ${reason}; replaying the frozen prefix and deferring any rebuild`,
-            );
-        }
+            (isPrefixBoundThinkingModel(
+                activeThinkingModel?.providerID,
+                activeThinkingModel?.modelID,
+            ) ||
+                isPrefixBoundThinkingModel(resolvedProviderID, modelForBudget?.modelID));
         const canUseEmptySentinels = modelAcceptsEmptyContent(resolvedProviderID);
         const protectedThinkingMessages =
             activeThinkingTurn ||
@@ -1695,6 +1765,7 @@ export function createTransform(deps: TransformDeps) {
                     providerID: modelForBudget?.providerID,
                     modelID: modelForBudget?.modelID,
                     agentName: runNotificationParams(sessionId)?.agent,
+                    sessionId,
                 });
                 // The history alone, unscaled: system prompt and tool
                 // definitions are not something this pass can reduce, and the
@@ -1777,6 +1848,62 @@ export function createTransform(deps: TransformDeps) {
         const { forceMaterializationPercentage } = escalationBands(
             effectiveExecuteThresholdPercentage,
         );
+        // Prefix-bound thinking models hold prefix changes only right after heavy
+        // reasoning and only below the cap; every other pass busts as on any
+        // other model and strips the turn's signed thinking when it does.
+        let holdProseRatio: number | undefined;
+        const signedThinkingHold: SignedThinkingHoldDecision | null = signedThinkingPrefixBound
+            ? decideSignedThinkingHold({
+                  messages,
+                  usagePercentage: contextUsageEarly.percentage,
+                  executeThresholdPercentage: effectiveExecuteThresholdPercentage,
+                  // The session's frozen calibration, read without adopting a new one.
+                  estimateTextTokens: (text) => {
+                      holdProseRatio ??= sessionDecisionCalibration(db, sessionId).proseRatio;
+                      return estimateTokens(text) * holdProseRatio;
+                  },
+              })
+            : null;
+        // Compaction-off has no bust permission, so nothing could strip a turn
+        // whose prefix changes (an idle-expiry or memory fold still re-renders
+        // m[0] there). It keeps the blanket hold for every open signed turn, as
+        // before the hold was bounded; it has no history reclaim for the hold to
+        // delay.
+        activeThinkingPrefixHold =
+            signedThinkingPrefixBound && (compactionOff || signedThinkingHold?.held === true);
+        freezeM0M1 ||= activeThinkingPrefixHold;
+        const originalForThinkingFit = takeSignedThinkingFitSnapshot({
+            sessionId,
+            entryOrder: entryOrderForThinkingFit,
+            held: activeThinkingPrefixHold,
+            activeAnthropicThinkingTurn: activeThinkingTurn,
+            compactionOff,
+        });
+        const prefixHoldLogKey = signedThinkingHold
+            ? `${currentTurnId}:${signedThinkingHold.reason}:${signedThinkingHold.heavyStepsBack ?? "none"}`
+            : freezeM0M1
+              ? `${currentTurnId}:directory`
+              : null;
+        if (prefixHoldLogKey !== null && prefixHoldLogTurnIds.get(sessionId) !== prefixHoldLogKey) {
+            prefixHoldLogTurnIds.set(sessionId, prefixHoldLogKey);
+            if (signedThinkingHold) {
+                sessionLog(
+                    sessionId,
+                    `signed thinking hold: held=${signedThinkingHold.held} reason=${signedThinkingHold.reason} heavyStepsBack=${signedThinkingHold.heavyStepsBack ?? "none"} heavyStepTokens=${signedThinkingHold.heavyStepTokens} usage=${contextUsageEarly.percentage.toFixed(1)}% cap=${signedThinkingHold.capPercentage}%`,
+                );
+            }
+            if (freezeM0M1) {
+                const reason = activeThinkingPrefixHold
+                    ? compactionOff
+                        ? "active thinking turn in compaction-off mode (prefix-bound model)"
+                        : "recent heavy reasoning in the active thinking turn (prefix-bound model)"
+                    : "session directory unresolved";
+                sessionLog(
+                    sessionId,
+                    `m[0]/m[1] frozen: ${reason}; replaying the frozen prefix and deferring any rebuild`,
+                );
+            }
+        }
         const persistedUsageFreshForBoundary =
             persistedUsageBeforeResets &&
             Date.now() - persistedUsageBeforeResets.updatedAt <= 10 * 60 * 1000 &&
@@ -1896,6 +2023,13 @@ export function createTransform(deps: TransformDeps) {
             },
         );
         let _boundarySnapshotCache: ProtectedTailBoundarySnapshot | null | undefined;
+        if (fullFeatureMode && !compactionOff)
+            maintainExecuteFloorMark(
+                db,
+                sessionId,
+                currentTurnId,
+                boundaryUsageForProtectedTail.percentage < boundaryExecuteThreshold,
+            );
         const getRunnableBoundaryForCompartment = (
             emergencyTailScale?: 0.5 | 0.25,
         ): ProtectedTailBoundarySnapshot | null => {
@@ -2157,15 +2291,27 @@ export function createTransform(deps: TransformDeps) {
         // deriving it here keeps both tag scans scoped on every pass (those
         // anchor-miss passes were the residual ~90ms full-scan regression).
         const taggerFloor = compactionOff ? 0 : deriveTaggerLoadFloor(messages, sessionId, db);
-        // floor 0 = no leading wire message resolved to a tag → BOTH tag scans
+        // Floor 0 means no scoped lower bound above the safety margin: a tagless
+        // head or an early tag number can both cause it. BOTH tag scans
         // (tagger initFromDb + the trigger's token scans) fall back to the full
         // ~O(session) load. On a large session that's the ~70ms compartmentTrigger
         // we are trying to avoid, so surface it as a one-line health signal rather
         // than letting it hide as silent latency.
-        if (!compactionOff && taggerFloor === 0 && messages.length > 0) {
+        const tagFloorMode =
+            compactionOff || messages.length === 0
+                ? "inactive"
+                : taggerFloor === 0
+                  ? "fallback"
+                  : "scoped";
+        if (
+            diagnosticStateChanged(sessionId, "tag-floor", tagFloorMode) &&
+            tagFloorMode !== "inactive"
+        ) {
             sessionLog(
                 sessionId,
-                `tag floor: 0 (full-scan fallback) — no leading wire message resolved a tag across ${messages.length} msgs`,
+                taggerFloor === 0
+                    ? `tag floor: 0 (full-scan fallback) — no scoped floor above the safety margin across ${messages.length} msgs`
+                    : `tag floor: ${taggerFloor} (scoped load)`,
             );
         }
 
@@ -2182,6 +2328,22 @@ export function createTransform(deps: TransformDeps) {
         void prewarmTagOwners(db, sessionId, ownerRatio);
         const tagOwnersReady = isTagOwnerSummaryReady(db, sessionId, ownerRatio);
         let triggerBoundarySnapshot: ProtectedTailBoundarySnapshot | undefined;
+        let dropProjectionEmergency = contextUsageEarly.percentage >= 95;
+        // The historian decision runs before tagMessages builds mutation targets.
+        // Reuse the previous applyPendingOperations eligibility only for identical
+        // host input bytes, persisted thinking omissions and protection settings.
+        const dropProjectionKey = () =>
+            pendingDropEligibilityKey(db, sessionId, lkgInput, {
+                currentTurnId,
+                model: modelForBudget,
+                protectedTokens: deps.protectedTokens,
+                protectedTokenTierOverrides: deps.protectedTokenTierOverrides,
+                protectedTools: deps.protectedTools,
+                keepReasoningTokens: deps.keepReasoningTokens,
+                usableSoft: windowGeometry?.usableSoft ?? boundaryContextLimit,
+                emergency: dropProjectionEmergency,
+                clearedReasoningThroughTag: sessionMeta?.clearedReasoningThroughTag,
+            });
         if (
             fullFeatureMode &&
             !compactionOff &&
@@ -2233,9 +2395,27 @@ export function createTransform(deps: TransformDeps) {
                             contextUsageEarly.percentage >= forceMaterializationPercentage &&
                             (contextUsageEarly.percentage >= 95 ||
                                 getEmergencyInputSample(db, sessionId) === 0),
-                        explicitFlush: deps.pendingMaterializationSessions.has(sessionId),
+                        // Postprocess counts a pending materialization as the flush
+                        // ride only when a user flush requested it.
+                        explicitFlush: hasPendingMaterializationOrigin(
+                            deps.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        ),
                         publishedHistory: isCacheBusting,
+                        // The same gate postprocess applies. First render and idle
+                        // expiry are not known yet, so a held pass is credited no
+                        // ride here unless it is under emergency pressure.
+                        permission: {
+                            signedThinkingHold: activeThinkingPrefixHold,
+                            firstRender: false,
+                            idleExpiry: false,
+                            emergency:
+                                contextUsageEarly.percentage >= forceMaterializationPercentage,
+                        },
                     },
+                    pendingDropEligibility.read(sessionId, dropProjectionKey()),
+                    schedulerDecision === "execute",
                 );
                 if (triggerResult.shouldFire) {
                     sessionLog(
@@ -2270,6 +2450,7 @@ export function createTransform(deps: TransformDeps) {
                 sessionId,
                 messages,
                 isCacheBusting,
+                coveredHostInstructions,
                 projectIdentity,
                 deps.memoryConfig?.injectionBudgetTokens,
                 deps.experimentalTemporalAwareness,
@@ -2348,19 +2529,32 @@ export function createTransform(deps: TransformDeps) {
             logTransformTiming(sessionId, "injectTemporalMarkers", tTemporal);
         }
 
+        // One gate for persisted caveman replay, shared with the tagger so a legacy
+        // foreign tag is served compressed exactly when the replay below runs.
+        const replaysCaveman =
+            !reducedMode && !compactionOff && deps.cavemanTextCompression?.enabled === true;
         let taggingSucceeded = false;
         let recoveryBatch: { finalize: () => void } | null = null;
         let recoveryNormalized = false;
-        const normalizeRecoveryTail = recovery.prefix
+        // A recovery prefix is always normalized once a pass may rewrite it,
+        // even with nothing untagged: until then every pass re-serves its bytes.
+        const untaggedReplayTailServed =
+            !!recovery.prefix ||
+            (untaggedReplayIds.size > 0 &&
+                messages.some((message) => untaggedReplayIds.has(message.info.id ?? "")));
+        const normalizeRecoveryTail = untaggedReplayTailServed
             ? () => {
                   if (recoveryNormalized) return;
                   const tail = messages.filter((message) =>
-                      recovery.prefix?.untaggedInputIds.has(message.info.id ?? ""),
+                      untaggedReplayIds.has(message.info.id ?? ""),
                   );
                   const tagged = tagMessages(sessionId, tail, deps.tagger, db, {
                       skipPrefixInjection: !ctxReduceCallable,
                       servedMessages: messages,
                       normalizeRestoredAssistantText: deps.normalizeRestoredAssistantText,
+                      refreshSourceContents: deps.refreshSourceContents?.(sessionId),
+                      foreignTextParts,
+                      replaysCaveman,
                   });
                   for (const [number, target] of tagged.targets) targets.set(number, target);
                   for (const [message, parts] of tagged.reasoningByMessage)
@@ -2413,10 +2607,9 @@ export function createTransform(deps: TransformDeps) {
                     : createPreAdoptionToolSweepResolver(db, sessionId);
                 const result = tagMessages(
                     sessionId,
-                    recovery.prefix
+                    untaggedReplayIds.size > 0
                         ? messagesForTagging.filter(
-                              (message) =>
-                                  !recovery.prefix?.untaggedInputIds.has(message.info.id ?? ""),
+                              (message) => !untaggedReplayIds.has(message.info.id ?? ""),
                           )
                         : messagesForTagging,
                     deps.tagger,
@@ -2426,6 +2619,9 @@ export function createTransform(deps: TransformDeps) {
                         scopedToolSweep,
                         servedMessages: messages,
                         normalizeRestoredAssistantText: deps.normalizeRestoredAssistantText,
+                        refreshSourceContents: deps.refreshSourceContents?.(sessionId),
+                        foreignTextParts,
+                        replaysCaveman,
                     },
                 );
                 targets = result.targets;
@@ -2551,7 +2747,7 @@ export function createTransform(deps: TransformDeps) {
         // caveman compression even when no new cleanup is allowed. Replay it before
         // inline-reasoning removal: compression would otherwise bring back thinking
         // that an earlier request removed. Fresh cleanup uses the same ordering.
-        if (!reducedMode && !compactionOff && deps.cavemanTextCompression?.enabled) {
+        if (replaysCaveman) {
             const tCavemanReplay = performance.now();
             const replayedCaveman = replayCavemanCompression(sessionId, db, targets, activeTags);
             if (replayedCaveman > 0) {
@@ -2585,6 +2781,7 @@ export function createTransform(deps: TransformDeps) {
                 messages,
                 messageTagNumbers,
                 persistedReasoningWatermark,
+                !canUseEmptySentinels,
             );
             if (replayed > 0 || replayedInline > 0) {
                 sessionLog(
@@ -2647,6 +2844,7 @@ export function createTransform(deps: TransformDeps) {
             fallbackModels: historianRun?.fallbackModels ?? deps.fallbackModels,
             compartmentDirectory,
             messages,
+            coveredInstructions: coveredHostInstructions,
             pendingCompartmentInjection,
             fallbackModelId,
             projectPath: projectIdentity,
@@ -2786,26 +2984,91 @@ export function createTransform(deps: TransformDeps) {
             bustReason: calibrationBustReason,
             onAdopt: (message) => sessionLog(sessionId, message),
         });
-        // A cache-busting pass can lack input-token usage for the selected model
-        // after a switch or overflow. Estimate from the transformed payload so
-        // emergency tool-output reclaim does not skip the pass as unknown usage.
+        // A cache-busting pass can lack input-token usage for the selected model:
+        // the first pass after a process restart resets the reading, and a model
+        // switch clears it. Emergency tool-output reclaim needs a reading, so
+        // size the pass here. This is a pressure reading, not a fit check: the
+        // over-window first-pass check, the overflow-recovery bump and the final
+        // refusal check stay the fit guards.
+        //
+        // The request is counted with calibrated ratios (`pressureTokens`): an
+        // unseeded model counts neutrally. The fit envelope (`tokens`) doubles
+        // an unseeded model's count; read as pressure it put healthy sessions
+        // in the force band after a restart.
+        //
+        // The provider's own last reading, saved in session_meta, is preferred
+        // when it is for this model and limit and the cache is still warm. The
+        // one exception is a count at or past the 95% emergency line while the
+        // saved reading is lower: the request grew after that reading was taken
+        // (a long paste or tool output while the host was down), and waiting for
+        // the provider would send a request that may not fit.
+        let contextUsageFromEstimate = false;
         if (contextUsage.inputTokens <= 0 && protectionCacheBustingPass) {
+            // Overflow recovery sizes the request the provider just rejected, so
+            // the saved reading (the last accepted request, which predates it) is
+            // never used here, and the request is counted with the fit envelope
+            // as before: recovery is a fit decision, and the emergency planner
+            // must plan its reclaim against the whole rejected request.
+            const overflowRecoveryPass = usagePercentageSynthetic || emergencyRecoveryArmed;
+            const savedProviderReading = overflowRecoveryPass
+                ? null
+                : savedProviderReadingForPass({
+                      persisted: persistedUsageBeforeResets,
+                      currentModelKey: currentModelKeyForBoundary ?? (hardModelKey || undefined),
+                      contextLimit: resolvedContextLimit,
+                      lastResponseTime: sessionMeta.lastResponseTime,
+                      cacheExpired: hardCacheExpired,
+                  });
+            let pressureEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
             try {
-                const pressureEstimate = estimateFinalWireInputTokens({
+                pressureEstimate = estimateFinalWireInputTokens({
                     messages,
                     systemPromptTokens: sessionMeta.systemPromptTokens,
                     providerID: modelForBudget?.providerID,
                     modelID: modelForBudget?.modelID,
                     agentName: notificationParams.agent,
+                    sessionId,
                 });
+            } catch (error) {
+                sessionLog(
+                    sessionId,
+                    `transform: wire-estimate pressure fallback unavailable: ${getErrorMessage(error)}`,
+                );
+            }
+            const usableHard = windowGeometry?.usableHard;
+            const countPercentage =
+                pressureEstimate?.pressureTokens !== undefined &&
+                Number.isFinite(pressureEstimate.pressureTokens) &&
+                typeof usableHard === "number" &&
+                usableHard > 0
+                    ? (pressureEstimate.pressureTokens / usableHard) * 100
+                    : 0;
+            const grewPastSavedReading =
+                savedProviderReading !== null &&
+                countPercentage >= 95 &&
+                countPercentage > savedProviderReading.percentage;
+            if (savedProviderReading && !grewPastSavedReading) {
+                // Never lower a reading this pass already raised (the overflow-recovery bump).
+                contextUsage = {
+                    inputTokens: savedProviderReading.inputTokens,
+                    percentage: Math.max(contextUsage.percentage, savedProviderReading.percentage),
+                };
+                sessionLog(
+                    sessionId,
+                    `transform: unknown provider usage; using saved provider reading for priced pass inputTokens=${contextUsage.inputTokens} percentage=${contextUsage.percentage.toFixed(1)} countPercentage=${countPercentage.toFixed(1)}`,
+                );
+            } else if (pressureEstimate) {
+                const percentageBeforeEstimate = contextUsage.percentage;
                 contextUsage = resolveUnknownUsageFromWireEstimate({
                     usage: contextUsage,
                     pricedPass: true,
-                    wireEstimateTokens: pressureEstimate.tokens,
+                    wireEstimateTokens: overflowRecoveryPass
+                        ? pressureEstimate.tokens
+                        : pressureEstimate.pressureTokens,
                     wireEstimateTrusted: pressureEstimate.trusted,
                     providerProvenInputTokens: providerProvenInputForRecovery,
                     providerProvenLimitTokens: providerProvenLimitForRecovery,
-                    usableHardLimit: windowGeometry?.usableHard,
+                    usableHardLimit: usableHard,
                 });
                 if (contextUsage.inputTokens > 0) {
                     const usedProviderInput =
@@ -2813,16 +3076,18 @@ export function createTransform(deps: TransformDeps) {
                         providerProvenLimitForRecovery !== undefined &&
                         providerProvenInputForRecovery !== undefined &&
                         contextUsage.inputTokens >= providerProvenInputForRecovery;
+                    // A reading raised only by the local count, with no provider
+                    // measurement and no overflow latch behind it.
+                    contextUsageFromEstimate =
+                        !overflowRecoveryPass &&
+                        !usedProviderInput &&
+                        !usagePercentageSynthetic &&
+                        contextUsage.percentage > percentageBeforeEstimate;
                     sessionLog(
                         sessionId,
-                        `transform: unknown provider usage; using ${usedProviderInput ? "provider-proven input" : "wire estimate"} for priced pass inputTokens=${contextUsage.inputTokens} percentage=${contextUsage.percentage.toFixed(1)} trusted=${pressureEstimate.trusted} wireTokens=${pressureEstimate.tokens}`,
+                        `transform: unknown provider usage; using ${usedProviderInput ? "provider-proven input" : "wire estimate"} for priced pass inputTokens=${contextUsage.inputTokens} percentage=${contextUsage.percentage.toFixed(1)} trusted=${pressureEstimate.trusted} wireTokens=${pressureEstimate.tokens} pressureTokens=${pressureEstimate.pressureTokens}${grewPastSavedReading ? ` grewPastSavedReading=${savedProviderReading?.percentage.toFixed(1)}` : ""}`,
                     );
                 }
-            } catch (error) {
-                sessionLog(
-                    sessionId,
-                    `transform: wire-estimate pressure fallback unavailable: ${getErrorMessage(error)}`,
-                );
             }
         }
         const protectionUsableSoft = windowGeometry?.usableSoft ?? boundaryContextLimit;
@@ -2855,6 +3120,7 @@ export function createTransform(deps: TransformDeps) {
         const protectedCutoff = protectionWindow.cutoff;
 
         const tPostProcess = performance.now();
+        dropProjectionEmergency = contextUsage.percentage >= 95;
         const postTransformResult = await runPostTransformPhase({
             opencode2: deps.storeGeneration === "v2",
             normalizeRecoveryTail,
@@ -2883,9 +3149,10 @@ export function createTransform(deps: TransformDeps) {
             client: deps.client,
             activeAgent,
             batch,
-            contextUsage: thinkingFitRetries.has(sessionId)
-                ? { ...contextUsage, percentage: Math.max(95, contextUsage.percentage) }
-                : contextUsage,
+            // A fit retry permits rebuilding signed thinking, not yielding the
+            // protected tool tail. Only real pressure may open the 95% drop lane.
+            contextUsage,
+            contextUsageFromEstimate,
             usableWindow: resolvedContextLimit ?? 0,
             schedulerDecision,
             schedulerDeferReason,
@@ -2903,6 +3170,7 @@ export function createTransform(deps: TransformDeps) {
             activeThinkingPrefixHold,
             directoryPrefixHold: unresolvedDirectoryHold,
             forceSignedRebuildForFit: thinkingFitRetries.has(sessionId) || !!recovery.rebuildReason,
+            compactionModeTransition: compactionModeTransitionPending.has(sessionId),
             readLastServedMessages: () => {
                 const slot = getInMemorySlot(sessionId) ?? loadPersistedLkgSlot(db, sessionId);
                 try {
@@ -2931,12 +3199,15 @@ export function createTransform(deps: TransformDeps) {
                 currentModelKeyForBoundary,
             ),
             protectedTagIds,
+            onPendingDropEligibility: (eligible) =>
+                pendingDropEligibility.record(sessionId, dropProjectionKey(), eligible),
             protectedTagNumbers,
             protectedCutoff,
             protectedCount: protectionWindow.status.protectedCount,
             emergencyCeilingTokens,
             pendingCompartmentInjection,
             prefixTrimSourceOrder,
+            coveredHostInstructions,
             hiddenMessagesAtCompactionSeam,
             trimmedMessagesAtCompactionBoundary,
             didMutateFromFlushedStatuses,
@@ -2985,15 +3256,19 @@ export function createTransform(deps: TransformDeps) {
                 hardSignals: m0HardSignals,
             },
         });
+        // The pass recorded any strip the mode switch required; later passes
+        // replay it from the persisted ledger.
+        compactionModeTransitionPending.delete(sessionId);
         if (recovery.prefix && !recoveryNormalized) {
-            const priorIds = new Set(recovery.prefix.inputs.map((input) => input.id));
-            const newIds = new Set(
-                lkgInput.flatMap((input) =>
-                    input.id && !priorIds.has(input.id) ? [input.id] : [],
-                ),
-            );
-            const suffix = messages.filter(
-                (message) => message.info.id && newIds.has(message.info.id),
+            const renderedById = new Map<string, MessageLike[]>();
+            for (const message of messages) {
+                if (!message.info.id) continue;
+                const group = renderedById.get(message.info.id) ?? [];
+                group.push(message);
+                renderedById.set(message.info.id, group);
+            }
+            const suffix = recoveryTailSources.flatMap(({ identity, pristineSystem }) =>
+                pristineSystem ? [pristineSystem] : (renderedById.get(identity) ?? []),
             );
             messages.splice(0, messages.length, ...JSON.parse(recovery.prefix.json), ...suffix);
         }
@@ -3007,6 +3282,14 @@ export function createTransform(deps: TransformDeps) {
         // A persisted latch is cleared by the off-transition, never consumed
         // here; overflow propagates to native compaction instead of blocking.
         const finalWireTail = describeFinalWireTail(messages);
+        // The durable refusal marker remembers, across restarts, that a held
+        // signed turn could not be made to fit. It applies only to a held pass:
+        // an unheld pass strips and drains like any model without prefix-bound
+        // thinking, so it is estimated and refused exactly as such a model is.
+        const signedFitPreviouslyRefused =
+            !compactionOff &&
+            activeThinkingPrefixHold &&
+            getMergedReasoningStrippedIds(db, sessionId).has(SIGNED_FIT_REFUSED_MARKER);
         let finalWireEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
         if (postTransformResult.bustedThisPass) {
             try {
@@ -3018,6 +3301,7 @@ export function createTransform(deps: TransformDeps) {
                         providerID: modelForBudget?.providerID,
                         modelID: modelForBudget?.modelID,
                         agentName: notificationParams.agent,
+                        sessionId,
                         systemPromptHash: sessionMeta.systemPromptHash,
                     },
                     boundaryContextLimit,
@@ -3039,7 +3323,9 @@ export function createTransform(deps: TransformDeps) {
                   : contextUsage.percentage;
             finalWireEstimate =
                 finalWireEstimate ??
-                (emergencyUsagePercentage >= 95 || schedulerDecision === "execute"
+                (emergencyUsagePercentage >= 95 ||
+                schedulerDecision === "execute" ||
+                signedFitPreviouslyRefused
                     ? finalWireUsage.estimate(
                           sessionId,
                           {
@@ -3048,6 +3334,7 @@ export function createTransform(deps: TransformDeps) {
                               providerID: modelForBudget?.providerID,
                               modelID: modelForBudget?.modelID,
                               agentName: notificationParams.agent,
+                              sessionId,
                               systemPromptHash: sessionMeta.systemPromptHash,
                           },
                           boundaryContextLimit,
@@ -3066,16 +3353,15 @@ export function createTransform(deps: TransformDeps) {
                 boundaryContextLimit > 0 &&
                 (finalWireEstimate.refusalTokens ?? finalWireEstimate.tokens) > boundaryContextLimit
             ) {
-                if (
+                const signedFitRetryWanted =
                     !thinkingFitRetries.has(sessionId) &&
                     activeThinkingPrefixHold &&
-                    originalForThinkingFit &&
                     hasActiveAnthropicThinkingTurn(
                         messages,
                         resolvedProviderID,
                         modelForBudget?.modelID,
-                    )
-                ) {
+                    );
+                if (signedFitRetryWanted && originalForThinkingFit) {
                     thinkingFitRetries.add(sessionId);
                     requestPendingMaterialization(
                         deps.pendingMaterializationSessions,
@@ -3090,10 +3376,37 @@ export function createTransform(deps: TransformDeps) {
                     }
                     return;
                 }
-                if (thinkingFitRetries.has(sessionId) || postTransformResult.thinkingReleasedForFit)
+                // A held pass that needs the retry but has no copy of its input
+                // (the copy failed) is refused like a retry that still did not
+                // fit, never sent over the window.
+                if (signedFitRetryWanted) {
+                    sessionLog(
+                        sessionId,
+                        "signed thinking fit: the held request is over the window and no copy of the pass input exists to retry from; refusing it",
+                    );
+                }
+                // Only a held turn refuses on an estimated overflow: it cannot
+                // reclaim anything, so sending would loop on provider rejections.
+                // An unheld pass has already stripped and drained like any other
+                // model's bust; if it is still over, the ordinary overflow path
+                // (provider error, learned limit, emergency reclaim) takes over.
+                if (
+                    signedFitRetryWanted ||
+                    thinkingFitRetries.has(sessionId) ||
+                    postTransformResult.thinkingReleasedForFit ||
+                    signedFitPreviouslyRefused
+                ) {
+                    // The omission ledger outlives the recursive retry flag and host restarts.
+                    // Remember refusal there without granting another prefix rewrite or tool drop.
+                    if (
+                        !signedFitPreviouslyRefused &&
+                        !addMergedReasoningStrippedIds(db, sessionId, [SIGNED_FIT_REFUSED_MARKER])
+                    )
+                        throw contextRefusalError("Cannot persist the signed-fit refusal");
                     throw contextRefusalError(
                         "The request remains over the model window after stripping signed thinking and reclaiming context",
                     );
+                }
             }
             // The prefix trim could not find the history boundary, so the whole
             // window is about to go out uncut. That is harmless while it fits and
@@ -3108,6 +3421,7 @@ export function createTransform(deps: TransformDeps) {
                         providerID: modelForBudget?.providerID,
                         modelID: modelForBudget?.modelID,
                         agentName: notificationParams.agent,
+                        sessionId,
                     });
                 if (untrimmed.tokens > boundaryContextLimit) {
                     sessionLog(
@@ -3132,12 +3446,13 @@ export function createTransform(deps: TransformDeps) {
                     providerID: modelForBudget?.providerID,
                     modelID: modelForBudget?.modelID,
                     agentName: notificationParams.agent,
+                    sessionId,
                 });
                 // Count the request the way it will really go out: system
                 // prompt, history and this route's measured tool definitions,
                 // unscaled. When the route's tool definitions are not measured
-                // yet, the estimate's figure is an upper envelope (the largest
-                // tool set seen on any route, scaled up), which would refuse
+                // yet, the estimate's figure is an upper envelope (the tool set
+                // this session last sent, scaled up), which would refuse
                 // a request that fits and keep the session flagged; leave it
                 // out then, as the entry check does. The system prompt and
                 // history stay in, so a carried session whose host-cut history
@@ -3297,6 +3612,7 @@ export function createTransform(deps: TransformDeps) {
                         providerID: modelForBudget?.providerID,
                         modelID: modelForBudget?.modelID,
                         agentName: notificationParams.agent,
+                        sessionId,
                     });
                 } catch (error) {
                     sessionLog(sessionId, "degraded pass size guard could not estimate:", error);
@@ -3328,11 +3644,38 @@ export function createTransform(deps: TransformDeps) {
             );
         }
 
+        // Keep the durable untagged-message record equal to what this pass serves
+        // untagged, before the pass is served: a restart then keeps serving them
+        // untagged. It empties once a pass tagged them (or none is left to serve).
+        // A failed write fails the pass, so the last good request is replayed.
+        if (!compactionOff) {
+            const stillUntagged =
+                untaggedReplayTailServed && !recoveryNormalized ? [...untaggedReplayIds] : [];
+            if (
+                JSON.stringify([...new Set(stillUntagged)].sort()) !==
+                    JSON.stringify([...new Set(persistedUntaggedInputIds)].sort()) &&
+                !persistLkgUntaggedInputIds(db, sessionId, stillUntagged)
+            )
+                throw new Error("Cannot persist the last-good untagged-message record");
+        }
+        // The system date rides a bust, but on a prefix-bound model only one
+        // that serves no signed thinking: every such block is bound to the
+        // system prompt in front of it, whether the bust kept it (it edited
+        // nothing in front of it) or a hold did. The served array, after every
+        // strip and any recovered prefix, is what decides. The last argument
+        // carries the same fact to an idle-expired request, whose date would
+        // otherwise advance without asking for permission.
+        const signedThinkingServed =
+            isPrefixBoundThinkingModel(modelForBudget?.providerID, modelForBudget?.modelID) &&
+            servesThinkingBlock(messages, modelForBudget?.providerID, modelForBudget?.modelID);
         finishSystemDateRefresh(
             deps.historyRefreshSessions,
             dateRequest,
-            (postTransformResult.bustedThisPass && !activeThinkingPrefixHold) ||
+            (postTransformResult.bustedThisPass &&
+                !activeThinkingPrefixHold &&
+                !signedThinkingServed) ||
                 postTransformResult.thinkingReleasedForFit === true,
+            signedThinkingServed,
         );
         if (
             activeThinkingPrefixHold &&
@@ -3555,10 +3898,13 @@ export function createTransform(deps: TransformDeps) {
         });
         if (uncachedMessageIds.length > 0) {
             try {
-                storedByMessage = getActiveTagTokenTotalsByMessage(
+                storedByMessage = omitIncompleteFileTokenTotals(
                     db,
                     sessionId,
-                    uncachedMessageIds,
+                    messages.flatMap((message) =>
+                        message.info.id ? [{ id: message.info.id, parts: message.parts }] : [],
+                    ),
+                    getActiveTagTokenTotalsByMessage(db, sessionId, uncachedMessageIds),
                 );
             } catch {
                 storedByMessage = new Map();
@@ -3622,7 +3968,11 @@ export function createTransform(deps: TransformDeps) {
                     postReduceGraceBaselineU: channel1State.postReduceGraceBaselineU,
                     postReduceGracePreLevel: channel1State.postReduceGracePreLevel,
                 });
-                sessionLog(sessionId, formatChannel1Evaluation(channel1Decision));
+                logNudgeEvaluation(
+                    sessionId,
+                    "transform",
+                    formatChannel1Evaluation(channel1Decision),
+                );
 
                 const channel2Evaluation = evaluateChannel2(channelBaseline);
                 const leaseBefore = getChannel2NudgeState(db, sessionId);
@@ -3638,8 +3988,9 @@ export function createTransform(deps: TransformDeps) {
                     }
                 }
                 const leaseAfter = getChannel2NudgeState(db, sessionId);
-                sessionLog(
+                logNudgeEvaluation(
                     sessionId,
+                    "transform",
                     formatChannel2Evaluation(channel2Evaluation, {
                         leaseBefore,
                         leaseAfter,
@@ -3680,11 +4031,14 @@ export function createTransform(deps: TransformDeps) {
                 providerID: modelForBudget?.providerID,
                 modelID: modelForBudget?.modelID,
                 agentName: notificationParams.agent,
+                sessionId,
                 systemPromptHash: sessionMeta.systemPromptHash,
             });
     };
 
-    return Object.assign(transform, {
+    const timedTransform: typeof transform = (input, output) =>
+        withTransformTimingSummary(() => transform(input, output));
+    return Object.assign(timedTransform, {
         clearSessionLogState,
         invalidateRustWireState(sessionId: string): void {
             rustModeTransform?.invalidateWireState(sessionId);

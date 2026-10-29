@@ -110,16 +110,88 @@ test("OpenCode 2 requests carry assistant replies without copied §N§ tag notat
 		}
 		// Those later passes are defer passes: the ones allowed to change nothing
 		// already sent. Only the session's first pass (its first m[0] render) is not.
-		const deferPasses = readPluginLog(host.env)
-			.split("\n")
-			.filter(
-				(line) => line.includes(session.id) && line.includes("pending ops WILL NOT APPLY — reason=scheduler_defer"),
-			);
+		// The plugin buffers log writes for up to half a second, so the last
+		// turns' lines may not be on disk when the last turn returns. Wait for
+		// every turn after the first to log its pass before counting.
+		const readDeferPasses = () =>
+			readPluginLog(host.env)
+				.split("\n")
+				.filter(
+					(line) =>
+						line.includes(session.id) && line.includes("pending ops WILL NOT APPLY — reason=scheduler_defer"),
+				);
+		const logDeadline = Date.now() + 5_000;
+		let deferPasses = readDeferPasses();
+		while (deferPasses.length < PROMPTS.length - 1 && Date.now() < logDeadline) {
+			await Bun.sleep(100);
+			deferPasses = readDeferPasses();
+		}
 		console.log(`defer passes: ${deferPasses.length}`);
 		expect(deferPasses.length).toBeGreaterThanOrEqual(3);
 	} catch (error) {
 		console.error(host.stderr().slice(-4000));
 		throw error;
+	} finally {
+		await host.stop();
+	}
+}, 180_000);
+
+test("OpenCode 2 recovers a stored whole copied tag followed by failed turns without editing its store", async () => {
+	const fixture = isolation();
+	const host = await spawnOpencode2({
+		existingIsolation: fixture,
+		magicContextConfig: { historian: { disable: true }, dreamer: { disable: true } },
+	});
+	try {
+		const client = OpenCode.make({ baseUrl: host.url, headers: { authorization: `Basic ${btoa(`opencode:${host.password}`)}` } });
+		const session = await client.session.create({ title: "strict copied tag recovery", location: { directory: host.cwd }, model: { providerID: "openai", id: "mock-model" } });
+		await waitForPluginActive(client, host.cwd);
+		const violations: string[] = [];
+		host.mock.addMatcher((body) => {
+			const input = body.input as Item[] | undefined;
+			if (!Array.isArray(input)) return null;
+			for (const item of input) {
+				if (item.role !== "assistant") continue;
+				for (const part of item.content ?? []) {
+					if (part.type === "output_text" && !part.text?.trim()) {
+						violations.push(JSON.stringify(part));
+						return { error: { status: 400, type: "invalid_request_error", message: "missing input.content.text" } };
+					}
+				}
+			}
+			return null;
+		});
+		const requests: Item[][] = [];
+		for (let turn = 0; turn < 5; turn++) {
+			const prompt = `strict recovery ${turn}`;
+			host.mock.setDefault(turn === 1 || turn === 2
+				? { error: { status: 400, type: "invalid_request_error", message: "record a failed turn" } }
+				: { text: turn === 0 ? "§58§" : "recovered", usage: { input_tokens: 100, output_tokens: 10 } });
+			const before = host.mock.requests().length;
+			await client.session.prompt({ sessionID: session.id, text: prompt });
+			await client.session.wait({ sessionID: session.id }, { signal: AbortSignal.timeout(30_000) });
+			const request = host.mock.requests().slice(before).find((request) => JSON.stringify(request.body.input).includes(prompt));
+			expect(request).toBeDefined();
+			requests.push(request!.body.input as Item[]);
+		}
+		expect(violations).toEqual([]);
+		for (const input of requests.slice(1)) expect(assistantTexts(input)).toContain("§58§");
+		for (let turn = 2; turn < requests.length; turn++) {
+			const oldTag = requests[turn - 1]!.filter((item) => item.role === "assistant")[0];
+			expect(JSON.stringify(requests[turn]!.filter((item) => item.role === "assistant")[0])).toBe(JSON.stringify(oldTag));
+		}
+		const store = new Database(join(fixture.env.XDG_DATA_HOME!, "opencode", fixture.env.OPENCODE_DB!), { readonly: true });
+		const rows = store.prepare("SELECT data FROM session_message WHERE session_id = ? AND type = 'assistant' ORDER BY seq").all(session.id) as Array<{ data: string }>;
+		store.close();
+		expect(rows.some((row) => row.data.includes("§58§"))).toBe(true);
+		expect(rows.filter((row) => row.data.includes("record a failed turn")).length).toBeGreaterThanOrEqual(2);
+		expect(rows.at(-1)!.data).toContain("recovered");
+		const open = spawnSync("lsof", ["-p", String(host.pid), "-Fn"], { encoding: "utf8" });
+		expect(open.status).toBe(0);
+		const databases = open.stdout.split("\n").filter((line) => line.startsWith("n") && /\.db(-wal|-shm)?$/.test(line)).map((line) => line.slice(1));
+		expect(databases.length).toBeGreaterThan(0);
+		for (const database of databases) expect(database.startsWith(fixture.root)).toBe(true);
+		console.log(`strict recovery host ${host.pid} isolated databases: ${JSON.stringify(databases)}`);
 	} finally {
 		await host.stop();
 	}

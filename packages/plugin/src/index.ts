@@ -614,11 +614,7 @@ const server: Plugin = async (ctx) => {
                 retinaHandoff: pluginConfig.smart_notes.retina_handoff,
                 smartNotesEnabled: pluginConfig.smart_notes.enabled,
                 gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled
-                    ? {
-                          enabled: true,
-                          since_days: pluginConfig.memory.git_commit_indexing.since_days,
-                          max_commits: pluginConfig.memory.git_commit_indexing.max_commits,
-                      }
+                    ? pluginConfig.memory.git_commit_indexing
                     : undefined,
                 ensureRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
                 onDreamerProgress: (
@@ -839,7 +835,12 @@ const server: Plugin = async (ctx) => {
     // to a key. The hook input only carries `toolID`, and `registry.tools()`
     // runs right after `chat.message` in OpenCode's prompt flow, so this
     // captures the correct owner for each flight.
-    let lastChatContext: { providerID: string; modelID: string; agentName: string } | null = null;
+    let lastChatContext: {
+        providerID: string;
+        modelID: string;
+        agentName: string;
+        sessionID: string;
+    } | null = null;
 
     // Directory of the project THIS plugin instance serves. Desktop can run two
     // instances whose directories resolve to the same project identity (for
@@ -1009,7 +1010,12 @@ const server: Plugin = async (ctx) => {
             const agent = typed.agent;
             lastChatContext =
                 provId && modId
-                    ? { providerID: provId, modelID: modId, agentName: agent || "default" }
+                    ? {
+                          providerID: provId,
+                          modelID: modId,
+                          agentName: agent || "default",
+                          sessionID: input.sessionID,
+                      }
                     : null;
             shapeV1HiddenMessage(input.sessionID, output.message);
             await magicContextRuntime.magicContext?.["chat.message"]?.(input, output);
@@ -1035,6 +1041,7 @@ const server: Plugin = async (ctx) => {
                 typedInput.toolID,
                 typeof typedOutput.description === "string" ? typedOutput.description : "",
                 typedOutput.parameters,
+                lastChatContext.sessionID,
             );
         },
         "tool.execute.before": async (input, output) => {

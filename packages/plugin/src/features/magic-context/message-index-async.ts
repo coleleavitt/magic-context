@@ -21,9 +21,6 @@ import {
     indexSingleMessage,
     isMessageIndexReconciledThrough,
     isMessageIndexSourceCurrent,
-    type MessageHistoryOrphanSweepOptions,
-    type MessageHistoryOrphanSweepResult,
-    sweepOrphanedOpenCodeMessageIndexes,
 } from "./message-index";
 import type { IndexWorkerMeasurements } from "./message-index-bounded";
 
@@ -76,8 +73,8 @@ function isDatabaseLockedError(error: unknown): boolean {
  *    single-message read and `indexSingleMessage()` insert/replace. Events are
  *    debounced per message for 100ms and completed revisions are keyed by the
  *    source version plus normalized-content hash.
- * 2. Per-session lazy reconciliation: the first transform/hook touch schedules
- *    one catch-up pass. It reads raw messages, resumes from
+ * 2. Per-session lazy reconciliation: a transform/hook touch schedules
+ *    a catch-up pass. Hosts exposing getRevision also catch up after appends. It resumes from
  *    `message_history_index.last_indexed_ordinal`, rewinds from any recorded
  *    dirty floor left by a failed incremental write, inserts missing rows, and
  *    advances the watermark to `messages.length`.
@@ -99,6 +96,15 @@ const RECONCILIATION_BATCH_SIZE = 100;
 
 class MagicContextMessageIndexHeapHolder {
     readonly reconciledSessions = new Set<string>();
+    readonly reconciledSnapshots = new Map<
+        string,
+        {
+            revision: number;
+            count: number;
+            after?: RawMessageOrdinalAnchor;
+        }
+    >();
+    readonly stalledSessions = new Set<string>();
     readonly reconciliationScheduledSessions = new Set<string>();
     readonly clearAndReindexScheduledSessions = new Map<
         string,
@@ -128,6 +134,12 @@ function clearCompletedIncrementalKeys(sessionId: string): void {
  */
 type PreparedSource = { prepare?: (sessionId: string) => Promise<boolean> };
 
+interface RevisionedSource {
+    /** Append-only host sequence; unchanged sessions need no history count or page read. */
+    getRevision?(sessionId: string): number;
+    getCountAfterRevision?(sessionId: string, after: number, through: number): number;
+}
+
 const PREPARE_RETRY_MS = 60_000;
 
 async function sourceReady(source: unknown, sessionId: string): Promise<boolean> {
@@ -144,9 +156,10 @@ type FullReadMessages = ((sessionId: string) => RawMessage[]) & {
         after?: RawMessageOrdinalAnchor,
     ) => RawMessage[];
     getCount?: (sessionId: string) => number;
-} & PreparedSource;
+} & PreparedSource &
+    RevisionedSource;
 
-export interface BoundedMessageReconciliationSource extends PreparedSource {
+export interface BoundedMessageReconciliationSource extends PreparedSource, RevisionedSource {
     readPage(
         sessionId: string,
         afterOrdinal: number,
@@ -221,6 +234,12 @@ function serializedMessageBytes(messages: readonly RawMessage[]): number {
     }
 }
 
+function logReconciliationStall(sessionId: string, reason: string): void {
+    if (heapHolder.stalledSessions.has(sessionId)) return;
+    heapHolder.stalledSessions.add(sessionId);
+    sessionLog(sessionId, `message FTS reconciliation stalled: ${reason}; will retry`);
+}
+
 async function reconcileSessionIndex(
     db: Database,
     sessionId: string,
@@ -228,18 +247,35 @@ async function reconcileSessionIndex(
 ): Promise<boolean> {
     // Wait for the warm-up outside the session lock, so live indexing of this
     // session is not held behind it.
-    if (!(await sourceReady(readMessages, sessionId))) return false;
+    if (!(await sourceReady(readMessages, sessionId))) {
+        logReconciliationStall(sessionId, "raw message reader is not ready");
+        return false;
+    }
     await runWithSessionLock(sessionId, async () => {
-        if (heapHolder.reconciledSessions.has(sessionId)) return;
+        if (!readMessages.getRevision && heapHolder.reconciledSessions.has(sessionId)) return;
 
         let fallbackSnapshot: RawMessage[] | null = null;
         try {
             const fullReader = typeof readMessages === "function" ? readMessages : null;
-            const finalWatermark = readMessages.getCount
-                ? readMessages.getCount(sessionId)
-                : (fallbackSnapshot = fullReader?.(sessionId) ?? []).length;
+            const revision = readMessages.getRevision?.(sessionId);
+            const previous = heapHolder.reconciledSnapshots.get(sessionId);
+            const finalWatermark =
+                previous && revision === previous.revision
+                    ? previous.count
+                    : revision !== undefined && readMessages.getCountAfterRevision
+                      ? previous && revision > previous.revision
+                          ? previous.count +
+                            readMessages.getCountAfterRevision(
+                                sessionId,
+                                previous.revision,
+                                revision,
+                            )
+                          : readMessages.getCountAfterRevision(sessionId, -1, revision)
+                      : readMessages.getCount
+                        ? readMessages.getCount(sessionId)
+                        : (fallbackSnapshot = fullReader?.(sessionId) ?? []).length;
             let cursor = getMessageIndexReconciliationStartOrdinal(db, sessionId);
-            let after: RawMessageOrdinalAnchor | undefined;
+            let after = cursor === previous?.count ? previous.after : undefined;
 
             while (cursor < finalWatermark) {
                 const pageEnd = Math.min(finalWatermark, cursor + RECONCILIATION_BATCH_SIZE);
@@ -281,6 +317,27 @@ async function reconcileSessionIndex(
 
             if (isMessageIndexReconciledThrough(db, sessionId, finalWatermark)) {
                 heapHolder.reconciledSessions.add(sessionId);
+                if (revision !== undefined) {
+                    // A rebase may already cover the entire store. Capture its last
+                    // row once so later appends start with a keyset seek, not OFFSET.
+                    if (!after && finalWatermark > 0 && readMessages.readPage) {
+                        const last = readMessages
+                            .readPage(sessionId, finalWatermark - 1, 1, finalWatermark)
+                            .at(-1);
+                        if (last?.ordinal === finalWatermark && typeof last.createdAt === "number")
+                            after = { timeCreated: last.createdAt, id: last.id };
+                    }
+                    heapHolder.reconciledSnapshots.set(sessionId, {
+                        revision,
+                        count: finalWatermark,
+                        after,
+                    });
+                }
+            } else {
+                logReconciliationStall(
+                    sessionId,
+                    `gap after ordinal ${cursor} (store count ${finalWatermark})`,
+                );
             }
         } finally {
             heapHolder.activeReconcilerBuffers.delete(sessionId);
@@ -295,7 +352,7 @@ export function scheduleReconciliation(
     readMessages: MessageReconciliationSource,
 ): void {
     if (
-        heapHolder.reconciledSessions.has(sessionId) ||
+        (!readMessages.getRevision && heapHolder.reconciledSessions.has(sessionId)) ||
         heapHolder.reconciliationScheduledSessions.has(sessionId)
     ) {
         return;
@@ -304,9 +361,21 @@ export function scheduleReconciliation(
 
     scheduleAfterBootQuiet(() => {
         defer(() => {
+            let appendedDuringReconciliation = false;
+            const previousSnapshot = heapHolder.reconciledSnapshots.get(sessionId);
             void reconcileSessionIndex(db, sessionId, readMessages)
                 .then((ran) => {
-                    if (ran) return;
+                    if (ran) {
+                        const snapshot = heapHolder.reconciledSnapshots.get(sessionId);
+                        // A failed catch-up keeps the old snapshot. Wait for another
+                        // touch after a gap rather than repeatedly retrying that snapshot.
+                        appendedDuringReconciliation =
+                            snapshot !== undefined &&
+                            snapshot !== previousSnapshot &&
+                            readMessages.getRevision !== undefined &&
+                            readMessages.getRevision(sessionId) !== snapshot.revision;
+                        return;
+                    }
                     // The source could not be prepared: try again later.
                     inRootAsyncContext(() =>
                         setTimeout(() => {
@@ -316,7 +385,10 @@ export function scheduleReconciliation(
                     ).unref?.();
                 })
                 .catch((error) => {
-                    logIndexingError(sessionId, "reconciliation", error);
+                    logReconciliationStall(
+                        sessionId,
+                        error instanceof Error ? error.message : String(error),
+                    );
                     if (isDatabaseLockedError(error))
                         inRootAsyncContext(() =>
                             setTimeout(
@@ -327,6 +399,8 @@ export function scheduleReconciliation(
                 })
                 .finally(() => {
                     heapHolder.reconciliationScheduledSessions.delete(sessionId);
+                    if (appendedDuringReconciliation)
+                        scheduleReconciliation(db, sessionId, readMessages);
                 });
         });
     });
@@ -463,46 +537,13 @@ export async function indexSingleMessageOffThread(
     return result.inserted;
 }
 
-/** Candidate scans, cascaded deletes and FTS commits belong on a worker, not a timer's event loop. */
-export async function sweepOrphanedOpenCodeMessageIndexesOffThread(
-    db: Database,
-    openSource: () => Database | null,
-    options: MessageHistoryOrphanSweepOptions = {},
-): Promise<MessageHistoryOrphanSweepResult> {
-    const path = getSqliteDatabasePath(db);
-    if (!path || getHarness() !== "opencode")
-        return sweepOrphanedOpenCodeMessageIndexes(db, openSource, options);
-    let source: Database | null = null;
-    let sourcePath: string | null = null;
-    try {
-        source = openSource();
-        if (source) sourcePath = getSqliteDatabasePath(source);
-    } catch {
-        // An unavailable source needs only the persisted probe cooldown below,
-        // not the expensive candidate scan or deletion work delegated to a worker.
-    } finally {
-        if (sourcePath) source?.close();
-    }
-    if (!sourcePath) return sweepOrphanedOpenCodeMessageIndexes(db, () => source, options);
-    const reply = await runSessionWarmupWorker(
-        {
-            path,
-            sessionId: "",
-            harness: getHarness(),
-            orphanSweep: { sourcePath, options },
-        },
-        {},
-    );
-    if (!("orphanSweep" in reply)) throw new Error("message history orphan sweep worker failed");
-    return reply.orphanSweep;
-}
-
 export function scheduleClearAndReindex(
     db: Database,
     sessionId: string,
     readMessages: MessageReconciliationSource,
 ): void {
     heapHolder.reconciledSessions.delete(sessionId);
+    heapHolder.reconciledSnapshots.delete(sessionId);
     heapHolder.reconciliationScheduledSessions.delete(sessionId);
     clearCompletedIncrementalKeys(sessionId);
 
@@ -526,6 +567,7 @@ export function scheduleClearAndReindex(
                 // scheduled, so invalidate process state under the same session lock
                 // that clears the durable index.
                 heapHolder.reconciledSessions.delete(sessionId);
+                heapHolder.reconciledSnapshots.delete(sessionId);
                 clearCompletedIncrementalKeys(sessionId);
                 clearIndexedMessages(db, sessionId);
                 cleared = true;
@@ -587,6 +629,8 @@ export function clearSessionTracking(sessionId: string): void {
         Atomics.store(cancellation, 0, 1);
     heapHolder.clearAndReindexScheduledSessions.delete(sessionId);
     heapHolder.reconciledSessions.delete(sessionId);
+    heapHolder.reconciledSnapshots.delete(sessionId);
+    heapHolder.stalledSessions.delete(sessionId);
     heapHolder.reconciliationScheduledSessions.delete(sessionId);
     heapHolder.sessionLocks.delete(sessionId);
     heapHolder.activeReconcilerBuffers.delete(sessionId);
@@ -616,6 +660,8 @@ export function __resetMessageIndexAsyncForTests(): void {
         clearTimeout(timer);
     }
     heapHolder.reconciledSessions.clear();
+    heapHolder.reconciledSnapshots.clear();
+    heapHolder.stalledSessions.clear();
     heapHolder.reconciliationScheduledSessions.clear();
     heapHolder.sessionLocks.clear();
     heapHolder.incrementalTimers.clear();

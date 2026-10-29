@@ -14,6 +14,7 @@ import type {
     SubagentKind,
 } from "../../features/magic-context/storage-subagent-invocations";
 import {
+    annotateSubagentInvocationError,
     failedInvocationStatus,
     recordChildInvocation,
     sumTokensFromChildMessages,
@@ -183,6 +184,8 @@ export function createV1HiddenCompletionExecutor(
     // the only timer, and it still aborts the child when it fires. Clients without
     // prompt_async (the Pi facades) keep the synchronous prompt.
     const historianChildren = new Set<string>();
+    const hostErrors = new Map<string, unknown>();
+    const runIdentities = new Map<string, import("./compartment-runner-types").HiddenRunIdentity>();
     return {
         capabilities: { tools: true, harness: "opencode" },
         async open(run) {
@@ -198,18 +201,51 @@ export function createV1HiddenCompletionExecutor(
                 preferResponseOnMissingData: true,
             });
             const id = typeof created?.id === "string" ? created.id : "";
-            if (id) rememberV1HiddenRun(id, run);
+            if (id) {
+                rememberV1HiddenRun(id, run);
+                runIdentities.set(id, run);
+            }
             if (id && run.kind !== "dreamer-task") {
                 historianChildren.add(id);
                 rememberHistorianOutputCap(id, run.maxOutputTokens);
             }
-            return { id, childSessionId: id || undefined };
+            const configured = toModelEntry(run.model);
+            return {
+                id,
+                childSessionId: id || undefined,
+                ...(configured ? { attemptedModel: configured.model } : {}),
+                ...(configured?.sourceConfigKey
+                    ? { modelConfigKey: configured.sourceConfigKey }
+                    : {}),
+            };
         },
         async attempt(handle, request) {
             if (!client) throw new Error("Hidden completion client is unavailable");
+            const identity = runIdentities.get(handle.id);
+            const requestedModel = request.body?.model;
+            const requestedRef =
+                requestedModel &&
+                typeof requestedModel.providerID === "string" &&
+                typeof requestedModel.modelID === "string"
+                    ? `${requestedModel.providerID}/${requestedModel.modelID}`
+                    : undefined;
+            const matchingConfigured = (identity?.configuredModels ?? [])
+                .map(toModelEntry)
+                .find((entry) => entry?.model === requestedRef);
+            const configured =
+                matchingConfigured ??
+                (requestedRef &&
+                identity?.model &&
+                toModelEntry(identity.model)?.model === requestedRef
+                    ? toModelEntry(identity.model)
+                    : toModelEntry(identity?.model));
+            handle.attemptedModel = requestedRef ?? configured?.model ?? handle.attemptedModel;
+            handle.modelConfigKey = configured?.sourceConfigKey ?? handle.modelConfigKey;
             if (shared.supportsPromptAsync(client)) {
                 try {
-                    await shared.promptAsyncAndWaitForIdle(client, request);
+                    await shared.promptAsyncAndWaitForIdle(client, request, {
+                        modelConfigKey: handle.modelConfigKey,
+                    });
                 } catch (error) {
                     // A provider error the host recorded ends the historian's run. The
                     // synchronous prompt returned normally in that case and collect()
@@ -217,8 +253,16 @@ export function createV1HiddenCompletionExecutor(
                     // its next model in a fresh child. Keep that: rethrowing here would
                     // make the historian's retry loop send the same prompt again into
                     // this child.
-                    if (historianChildren.has(handle.id) && shared.isHostSessionError(error))
-                        return;
+                    if (shared.isHostSessionError(error)) {
+                        const hostError = shared.hostSessionErrorOf(error);
+                        hostErrors.set(handle.id, hostError);
+                        annotateSubagentInvocationError(error, {
+                            attemptedModel: handle.attemptedModel,
+                            modelConfigKey: handle.modelConfigKey,
+                            hostError,
+                        });
+                        if (historianChildren.has(handle.id)) return;
+                    }
                     throw error;
                 }
                 return;
@@ -235,13 +279,21 @@ export function createV1HiddenCompletionExecutor(
                 preferResponseOnMissingData: true,
             });
             const assistantFailure = extractLatestAssistantFailure(messages);
+            const hostError = hostErrors.get(handle.id);
             if (assistantFailure) {
                 const finish = assistantFailure.finish
                     ? ` (finish=${assistantFailure.finish})`
                     : "";
-                throw new Error(
+                const error = new Error(
                     `Historian host recorded an assistant error${finish}: ${describeAssistantFailure(assistantFailure.error)}`,
+                    hostError === undefined ? undefined : { cause: hostError },
                 );
+                annotateSubagentInvocationError(error, {
+                    attemptedModel: handle.attemptedModel,
+                    modelConfigKey: handle.modelConfigKey,
+                    hostError,
+                });
+                throw error;
             }
             const text = extractLatestAssistantText(messages);
             const latest = Array.isArray(messages)
@@ -269,12 +321,17 @@ export function createV1HiddenCompletionExecutor(
                     undefined,
                     info.finish ?? info.finish_reason ?? info.finishReason,
                 ),
+                attemptedModel: handle.attemptedModel,
+                modelConfigKey: handle.modelConfigKey,
+                ...(hostError === undefined ? {} : { hostError }),
             };
         },
         async close(handle, settlement) {
             if (handle?.id) {
                 rememberV1HiddenRun(handle.id, undefined);
                 historianChildren.delete(handle.id);
+                hostErrors.delete(handle.id);
+                runIdentities.delete(handle.id);
                 forgetHistorianOutputCap(handle.id);
             }
             if (!client) return;
@@ -302,6 +359,8 @@ export async function runValidatedHistorianPass(args: {
     parentSessionId: string;
     sessionDirectory: string;
     prompt: string;
+    /** Use `write` to retain message-block cache markers for a later conversational turn. */
+    cacheTail?: import("../../shared/historian-cache").HistorianCacheTail;
     chunk: HistorianValidationChunk;
     priorCompartments: StoredCompartmentRange[];
     sequenceOffset: number;
@@ -314,8 +373,8 @@ export async function runValidatedHistorianPass(args: {
     /**
      * Resolved historian fallback chain ("provider/modelID" entries). When the
      * primary historian model fails (auth, model-not-found, transient network),
-     * each fallback is tried in order. Independent of `fallbackModelId` (which
-     * is a last-ditch single-model retry against the active session model).
+     * each fallback is tried in order. The active session model is eligible
+     * only when no historian primary was configured.
      */
     fallbackModels?: readonly ModelInput[];
     callbacks?: HistorianProgressCallbacks;
@@ -530,6 +589,8 @@ async function runHistorianPrompt(args: {
     dumpLabel?: string;
     language?: string;
     modelOverride?: ModelInput;
+    /** Use `write` to retain cache markers when a later turn can reuse the complete user block. */
+    cacheTail?: import("../../shared/historian-cache").HistorianCacheTail;
     /** Agent identifier to route the request to. Defaults to HISTORIAN_AGENT.
      *  Use HISTORIAN_EDITOR_AGENT for the second pass in two-pass mode. */
     agentId?: string;
@@ -563,6 +624,10 @@ async function runHistorianPrompt(args: {
         sessionDirectory,
         "historian",
     );
+    // OpenCode 1 keeps the host's historical cache behavior; OpenCode 2 can
+    // omit the one-shot body tail while still caching its configured system prompt.
+    const cacheTail =
+        args.cacheTail ?? (executor.capabilities.harness === "opencode2" ? "skip" : undefined);
     let promptSettled = false;
     let hadUnsettledPrompt = false;
     const startedAt = Date.now();
@@ -572,13 +637,15 @@ async function runHistorianPrompt(args: {
         status: SubagentInvocationStatus;
         messages?: unknown[];
         error?: unknown;
+        hostError?: unknown;
     }): number | null => {
         if (invocationRecorded) return null;
         invocationRecorded = true;
+        const configuredModel = toModelEntry(modelOverride);
         const actualModelRef =
             completion?.providerId && completion.modelId
                 ? `${completion.providerId}/${completion.modelId}`
-                : null;
+                : (handle?.attemptedModel ?? configuredModel?.model ?? null);
         const usedConfiguredFallback =
             actualModelRef !== null &&
             (fallbackModels ?? []).some(
@@ -603,6 +670,10 @@ async function runHistorianPrompt(args: {
                       modelId: completion.modelId,
                   }
                 : {}),
+            attemptedModel: handle?.attemptedModel ?? modelOverride,
+            configuredModels: fallbackModels,
+            modelConfigKey: handle?.modelConfigKey ?? configuredModel?.sourceConfigKey,
+            hostError: params.hostError ?? completion?.hostError,
             error: params.error,
             parentInvocationId:
                 agentId === HISTORIAN_EDITOR_AGENT ? (parentInvocationId ?? null) : null,
@@ -685,6 +756,9 @@ async function runHistorianPrompt(args: {
                     client,
                     {
                         path: { id: agentSessionId },
+                        ...(cacheTail !== undefined
+                            ? { cacheTail: retryIndex > 0 ? "write" : cacheTail }
+                            : {}),
                         query: { directory: sessionDirectory },
                         body: {
                             // Use the specified agent (HISTORIAN_AGENT by default, or
@@ -718,6 +792,9 @@ async function runHistorianPrompt(args: {
                             { childSessionId: opened.childSessionId },
                         ),
                         timeoutMs: timeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
+                        // A provider's spelling suggestion may name an unconfigured, costly model.
+                        // Only the configured historian fallback chain may select a different model.
+                        allowModelSuggestions: false,
                         // When modelOverride is set we're already in the last-ditch retry
                         // path; iterating fallbacks again would be redundant.
                         fallbackModels: modelOverride ? undefined : fallbackModels,
@@ -781,6 +858,7 @@ async function runHistorianPrompt(args: {
             status: emptyError ? "empty" : "completed",
             messages: completion.messages,
             error: emptyError,
+            hostError: completion.hostError,
         });
         if (emptyError && (!reasoningResult || lengthCapped)) {
             return {
@@ -859,7 +937,7 @@ async function runFallbackHistorianPass(args: {
     model?: ModelInput;
     /**
      * Configured historian fallback chain (e.g. `anthropic/claude-sonnet-4-6`),
-     * tried IN ORDER before the session-model last resort. Each candidate's
+     * tried in order without adding the session model. Each candidate's
      * output is validated — empty or unparseable output (e.g. a misconfigured
      * primary that returns nothing, or a model that replies conversationally
      * instead of emitting compartments) escalates to the next candidate rather
@@ -867,8 +945,7 @@ async function runFallbackHistorianPass(args: {
      */
     fallbackModels?: readonly ModelInput[];
     /**
-     * The live session provider/model, used as the absolute last resort AFTER
-     * the configured chain is exhausted.
+     * The live session provider/model, used only when no primary is configured.
      */
     fallbackModelId?: string;
     callbacks?: HistorianProgressCallbacks;
@@ -879,7 +956,8 @@ async function runFallbackHistorianPass(args: {
     dumpPaths: Array<string | undefined>;
 }): Promise<ValidatedHistorianPassResult> {
     // Ordered escalation that matches the intended fallback policy:
-    //   configured fallback_models (in order)  →  live session model (last resort)
+    //   configured fallback_models (in order); only an absent primary permits
+    //   the session model. A configured primary owns the complete allowed chain.
     // The primary model already ran (and was repaired) before we get here.
     // Validation gates EVERY candidate, so a model that returns no usable
     // compartments escalates to the next instead of ending the pass — this is
@@ -891,7 +969,7 @@ async function runFallbackHistorianPass(args: {
     const primary = toModelEntry(args.model);
     for (const candidateInput of [
         ...(args.fallbackModels ?? []),
-        ...(args.fallbackModelId ? [{ model: args.fallbackModelId }] : []),
+        ...(!primary && args.fallbackModelId ? [{ model: args.fallbackModelId }] : []),
     ]) {
         const candidate = toModelEntry(candidateInput);
         if (!candidate) continue;

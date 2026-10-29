@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,6 +11,8 @@ import {
     type CacheBustDecisionAttribution,
     type CacheBustDivergenceClass,
     classifyCacheBust,
+    createCacheBustDecisionJoiner,
+    DEFAULT_CACHE_TTL_MS,
     isUnaccountedCacheBustClass,
     nearestCacheBustDecision,
 } from "./cache-bust-attribution";
@@ -387,7 +389,7 @@ describe("cache-bust attribution contract", () => {
         );
     });
 
-    test("still joins a following pass when no pass ran before the request", () => {
+    test("does not join a following pass when no pass ran before the request", () => {
         const requestMs = Date.parse("2026-09-21T12:26:17.760Z");
         const following = decision({
             timestampMs: requestMs + 4_000,
@@ -395,10 +397,45 @@ describe("cache-bust attribution contract", () => {
             canonicalDecision: "defer",
         });
 
-        expect(nearestCacheBustDecision([following], requestMs)).toBe(following);
+        expect(nearestCacheBustDecision([following], requestMs)).toBeUndefined();
         expect(
             nearestCacheBustDecision([decision({ timestampMs: requestMs + 5_001 })], requestMs),
         ).toBeUndefined();
+    });
+
+    test("joins a pressure-refold pass sent 31 seconds after its decision row", () => {
+        const servingPass = decision({
+            timestampMs: Date.parse("2026-10-28T12:56:32Z"),
+            materialized: true,
+            materializeReason: "pressure_refold",
+            droppedCount: 183,
+        });
+        const joined = nearestCacheBustDecision([servingPass], Date.parse("2026-10-28T12:57:03Z"));
+        expect(joined).toBe(servingPass);
+        expect(
+            classifyCacheBust({ divergenceIndex: 2, previousMessageCount: 200, decision: joined }),
+        ).toBe("accounted_hard_pressure_refold");
+    });
+
+    test("consecutive requests each claim their nearest unclaimed preceding pass", () => {
+        const first = decision({ timestampMs: 10_000 });
+        const second = decision({ timestampMs: 50_000 });
+        const join = createCacheBustDecisionJoiner([second, first]);
+
+        expect(join(41_000)).toBe(first);
+        expect(join(81_000)).toBe(second);
+        expect(join(82_000)).toBeUndefined();
+    });
+
+    test("a pass older than one default cache TTL leaves no_mc_pass_row", () => {
+        const stale = decision({ timestampMs: 10_000 });
+        const atBound = nearestCacheBustDecision([stale], 10_000 + DEFAULT_CACHE_TTL_MS);
+        expect(atBound).toBe(stale);
+        const joined = nearestCacheBustDecision([stale], 10_001 + DEFAULT_CACHE_TTL_MS);
+        expect(joined).toBeUndefined();
+        expect(
+            classifyCacheBust({ divergenceIndex: 2, previousMessageCount: 200, decision: joined }),
+        ).toBe("no_mc_pass_row");
     });
 
     test("accounts all ten long-turn post-restart rows by request time", () => {
@@ -1032,6 +1069,40 @@ describe("agent.deliver contract", () => {
 });
 
 describe("cache-bust sentinel runs", () => {
+    test("saves its state once per run, and keeps a failed run's progress", async () => {
+        // The state file covers every session ever seen and a run walks thousands
+        // of them, so saving after each session rewrote gigabytes an hour.
+        const directory = temporaryDirectory("cache-bust-sentinel-save-once-");
+        const stateFile = join(directory, "state.json");
+        const sessions = ["ses_a", "ses_b", "ses_c"].map((sessionId) => ({ ...activeSession, sessionId }));
+        const seenDuringRun: string[][] = [];
+        let failOn: string | undefined;
+        const deps = {
+            now: () => 1_000,
+            listActiveSessions: () => sessions,
+            loadDecisions: () => [],
+            analyzeSession: async (session: ActiveCacheBustSession) => {
+                seenDuringRun.push(
+                    existsSync(stateFile) ? Object.keys(loadSentinelState(stateFile).sessions).sort() : [],
+                );
+                if (session.sessionId === failOn) throw new Error("analysis failed");
+                return { requests: [], highWaterMarkMs: 900 };
+            },
+            stdout: () => {},
+            stderr: () => {},
+        };
+
+        await runSentinelOnce(options(stateFile), deps);
+        expect(seenDuringRun).toEqual([[], [], []]);
+        expect(Object.keys(loadSentinelState(stateFile).sessions).sort()).toEqual(["ses_a", "ses_b", "ses_c"]);
+
+        rmSync(stateFile);
+        seenDuringRun.length = 0;
+        failOn = "ses_c";
+        await expect(runSentinelOnce(options(stateFile), deps)).rejects.toThrow("analysis failed");
+        expect(seenDuringRun).toEqual([[], [], []]);
+        expect(Object.keys(loadSentinelState(stateFile).sessions).sort()).toEqual(["ses_a", "ses_b"]);
+    });
     test("resumes a timed-out pass and emits every window", async () => {
         const directory = temporaryDirectory("cache-bust-sentinel-resume-");
         const stateFile = join(directory, "state.json");

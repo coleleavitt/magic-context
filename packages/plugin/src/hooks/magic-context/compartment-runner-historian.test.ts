@@ -6,6 +6,7 @@ import { closeDatabase, openDatabase } from "../../features/magic-context/storag
 import { getSubagentInvocations } from "../../features/magic-context/storage-subagent-invocations";
 import type { PluginContext } from "../../plugin/types";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
+import { recordPromptSessionError } from "../../shared/prompt-async-transport";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     resolveHiddenCompletionExecutor,
@@ -83,6 +84,60 @@ test("historian ledger distinguishes empty, reasoning-only, length-capped and va
     }
 });
 
+test("OpenCode 1 records the configured model and session.error when a child has no assistant", async () => {
+    const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-model-refusal-"));
+    tempDirs.push(directory);
+    process.env.XDG_DATA_HOME = directory;
+    const db = openDatabase();
+    const model = "provider-not-configured/model-missing";
+    const suggestion = "provider-not-configured/model-available";
+    const hostError = {
+        name: "ProviderModelNotFoundError",
+        data: {
+            message: `Model not found: ${model}. Did you mean: ${suggestion}?`,
+            prompt: "PRIVATE_PROMPT_SENTINEL",
+        },
+    };
+    const client = {
+        session: {
+            create: async () => ({ data: { id: "child-model-refusal" } }),
+            promptAsync: async () => {
+                setTimeout(() => recordPromptSessionError("child-model-refusal", hostError), 10);
+                return { data: undefined };
+            },
+            status: async () => ({ data: {} }),
+            messages: async () => ({ data: [] }),
+            abort: async () => ({}),
+            update: async () => ({}),
+            delete: async () => ({}),
+        },
+    } as unknown as PluginContext["client"];
+
+    await runValidatedHistorianPass({
+        client,
+        db,
+        parentSessionId: "parent-model-refusal",
+        sessionDirectory: directory,
+        prompt: "Messages 1-1:\n1: U: preserve this",
+        timeoutMs: 5_000,
+        model: { model, sourceConfigKey: "historian.opencode.model" },
+        chunk: { startIndex: 1, endIndex: 1, lines: [{ ordinal: 1, messageId: "message-1" }] },
+        priorCompartments: [],
+        sequenceOffset: 0,
+        dumpLabelBase: "model-refusal",
+    });
+
+    const [row] = getSubagentInvocations(db, "parent-model-refusal");
+    expect(row).toMatchObject({
+        providerId: "provider-not-configured",
+        modelId: "model-missing",
+        status: "empty",
+    });
+    expect(row?.error).toContain("No reply: OpenCode refused the model");
+    expect(row?.error).toContain(suggestion);
+    expect(row?.error).not.toContain("PRIVATE_PROMPT_SENTINEL");
+});
+
 test("a resolving timed-out historian prompt is archived and recorded as timed_out", async () => {
     const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-timeout-"));
     tempDirs.push(directory);
@@ -109,6 +164,7 @@ test("a resolving timed-out historian prompt is archived and recorded as timed_o
         sessionDirectory: directory,
         prompt: "Messages 1-1:\n1: U: preserve this",
         timeoutMs: 20,
+        model: { model: "provider/timeout-model", sourceConfigKey: "historian.opencode.model" },
         chunk: { startIndex: 1, endIndex: 1, lines: [{ ordinal: 1, messageId: "message-1" }] },
         priorCompartments: [],
         sequenceOffset: 0,
@@ -117,6 +173,8 @@ test("a resolving timed-out historian prompt is archived and recorded as timed_o
     const rows = getSubagentInvocations(db, "parent-timeout");
     expect(rows[0]?.status).toBe("timed_out");
     expect(rows[0]?.error).toContain("prompt timed out after 20ms");
+    expect(rows[0]?.providerId).toBe("provider");
+    expect(rows[0]?.modelId).toBe("timeout-model");
     expect(abort).toHaveBeenCalledTimes(1);
     expect(update).toHaveBeenCalledTimes(1);
     expect(remove).not.toHaveBeenCalled();
@@ -185,6 +243,65 @@ test("a timed-out primary historian falls back to the next model and publishes i
     expect(invocations.find((row) => row.status === "completed")?.task).toBe("fallback");
 });
 
+test("a failed historian repair passes its repair prompt to fallback models", async () => {
+    const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-repair-fallback-"));
+    tempDirs.push(directory);
+    process.env.XDG_DATA_HOME = directory;
+    const db = openDatabase();
+    const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    const outputs = [
+        "not xml",
+        "still not xml",
+        '<output><compartment start="1" end="1" title="History"><p1>Fallback repaired this.</p1></compartment></output>',
+    ];
+    const prompts: string[] = [];
+    const outputIndexByChild = new Map<string, number>();
+    let nextOutput = 0;
+    const executor: HiddenCompletionExecutor = {
+        capabilities: { tools: false, harness: "opencode" },
+        open: async () => {
+            const index = nextOutput++;
+            const id = `child-repair-fallback-${index}`;
+            outputIndexByChild.set(id, index);
+            return { id, childSessionId: id };
+        },
+        attempt: (_handle, request) => {
+            const parts = (request.body as { parts?: Array<{ text?: string }> }).parts;
+            prompts.push(parts?.[0]?.text ?? "");
+            return Promise.resolve();
+        },
+        collect: async (handle) => ({
+            text: outputs[outputIndexByChild.get(handle.id) ?? -1] ?? "",
+            reasoning: null,
+            lengthCapped: false,
+            usage,
+        }),
+        close: async () => {},
+    };
+
+    const result = await runValidatedHistorianPass({
+        client: undefined,
+        hiddenCompletionExecutor: executor,
+        db,
+        parentSessionId: "parent-repair-fallback",
+        sessionDirectory: directory,
+        prompt: "Messages 1-1:\n1: U: preserve this",
+        model: { model: "prov/primary" },
+        fallbackModels: [{ model: "prov/fallback" }],
+        chunk: { startIndex: 1, endIndex: 1, lines: [{ ordinal: 1, messageId: "message-1" }] },
+        priorCompartments: [],
+        sequenceOffset: 0,
+        dumpLabelBase: "repair-fallback",
+    });
+
+    expect(prompts).toHaveLength(3);
+    expect(prompts[1]).toContain("Validation error:");
+    expect(prompts[1]).toContain("Previous invalid XML:\nnot xml");
+    expect(prompts[2]).toBe(prompts[1]);
+    expect(result.ok).toBe(true);
+    expect(result.compartments?.[0]?.content).toContain("Fallback repaired this.");
+});
+
 test("32k historian reaches the provider without a configured output cap and surfaces its assistant error", async () => {
     const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-assistant-error-"));
     tempDirs.push(directory);
@@ -222,7 +339,11 @@ test("32k historian reaches the provider without a configured output cap and sur
                         {
                             id: "google",
                             models: {
-                                "fixture-model": { limit: { context: 32_000, output: 1_024 } },
+                                // Unknown calibration doubles the estimate: the system prompt alone
+                                // costs 30,108 tokens. This reserve leaves a 30,170-token input limit,
+                                // barely enough for the tiny chunk. Keep the fixture near the 32k
+                                // boundary to catch the old implicit 32,768-token output cap.
+                                "fixture-model": { limit: { context: 32_000, output: 896 } },
                             },
                         },
                     ],
@@ -376,4 +497,51 @@ test("a prompt refused for the selected model's window opens no child session", 
     expect(result.error).toContain("producer_prompt_exceeds_window");
     expect(create).toHaveBeenCalledTimes(0);
     expect(prompted).toHaveBeenCalledTimes(0);
+});
+
+test("historian cache admission skips fresh prompts, writes transient retries and rebuilds repair", async () => {
+    const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-cache-"));
+    tempDirs.push(directory);
+    process.env.XDG_DATA_HOME = directory;
+    const requests: import("../../shared/model-suggestion-retry").PromptArgs[] = [];
+    let opened = 0;
+    let collected = 0;
+    const executor: HiddenCompletionExecutor = {
+        capabilities: { tools: false, harness: "opencode2" },
+        open: async () => ({ id: `child-${++opened}` }),
+        attempt: async (_handle, request) => {
+            requests.push(request);
+            if (requests.length === 1) throw new Error("503 overloaded");
+        },
+        collect: async () => ({
+            text:
+                ++collected === 1
+                    ? "invalid XML"
+                    : '<output><compartment start="1" end="1" title="History"><p1>Preserve this.</p1></compartment></output>',
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            lengthCapped: false,
+        }),
+        close: async () => {},
+    };
+    const result = await runValidatedHistorianPass({
+        client: undefined,
+        hiddenCompletionExecutor: executor,
+        db: openDatabase(),
+        parentSessionId: "parent-cache",
+        sessionDirectory: directory,
+        prompt: "Messages 1-1:\n1: U: preserve this",
+        chunk: { startIndex: 1, endIndex: 1, lines: [{ ordinal: 1, messageId: "message-1" }] },
+        priorCompartments: [],
+        sequenceOffset: 0,
+        dumpLabelBase: "cache",
+    });
+    expect(result.ok).toBe(true);
+    expect(opened).toBe(2);
+    expect(requests.map((request) => request.cacheTail)).toEqual(["skip", "write", "skip"]);
+    expect(requests[0]!.body).toEqual(requests[1]!.body);
+    const originalText = (requests[0]!.body.parts as Array<{ text: string }>)[0]!.text;
+    const repairText = (requests[2]!.body.parts as Array<{ text: string }>)[0]!.text;
+    expect(repairText.startsWith(originalText)).toBe(true);
+    expect(repairText).not.toBe(originalText);
+    expect(requests.every((request) => !("cacheTail" in request.body))).toBe(true);
 });

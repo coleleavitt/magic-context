@@ -74,7 +74,69 @@ const GATED_VERSION: u8 = 3;
 /// usage, steps and timestamps are unchanged. `structured-output-downgrade/v1`
 /// marks a frame recording that a run's structured output fell back to
 /// non-strict after the provider refused a strict schema; it carries no
-/// messages, usage or timestamps.
+/// messages, usage or timestamps. `delivery-order/v1` records how an ordered
+/// send was accepted, delivered (as a steer, or as text appended to a tool
+/// result) or ended unsent; usage, steps and timestamps are unchanged.
+/// `runner-tags/v1` adds `tags` and `origin` members to records that carry
+/// message parts, and may set `render_tags` in the frozen render config; it
+/// changes no text, usage, step or timestamp. `compaction-view/v1` adds
+/// records for an applied compaction view, the advance notice it published, and
+/// a ceiling in a compaction Setup message. The stored messages stay byte for
+/// byte, so usage, steps and timestamps are unchanged. A future transcript view
+/// that shows the prompt as rendered must apply the recorded view.
+/// `context-ceiling/v1` adds records for a run held at its context ceiling and
+/// the ceiling decision, plus a `context_ceiling` run end. This reader ignores
+/// both record types and, as with `budget_exhausted`, records only that the
+/// run finished. `interrupt-reason/v1` may add `interrupt_reason` to an
+/// interrupted run's `run_finished`; this reader records only that the run
+/// finished. `turn-directives/v1` adds `turn_directives_v1` to a run's config
+/// and `directives` to a queued send's request, neither of which this reader
+/// uses. `google-rpc-error-details/v1` adds an optional `provider_details`
+/// object (Google RPC QuotaFailure, ErrorInfo and RetryInfo) inside a run's or
+/// step's `error`; this reader never reads errors, so it needs no handling.
+/// `chatgpt-codex-wire/v1` adds a frozen `chatgpt_wire` profile to `RunStarted`
+/// (and to a refreeze record) and transport fields to model-attempt records;
+/// usage, steps and timestamps are unchanged. `tool-reply/v1` adds a `reply`
+/// object with an integer `max_ms` to tools in a run's frozen `tools` list
+/// (on `RunStarted` and queued sends); this reader never reads tools.
+/// `runner-tags/v2` adds `computed_tags` (a tag checkpoint) to a run's config
+/// and a `tag_checkpoint` with its cut to a compaction Setup message; this
+/// reader uses neither. `structured-output-paragraph/v1` adds a boolean
+/// `instructions_paragraph_break` to a run's frozen structured-output render
+/// config (on `RunStarted` and `RunConfigRefrozen`); it affects only how the
+/// schema instructions are rendered, so this reader ignores it.
+/// `client-message-id/v1` adds a `client_message_id` member inside the
+/// `request_identity_digest` JSON of a `run_started`, `queued` or `steered`
+/// record; this reader never reads request identity. `compaction-ride-wait/v1`
+/// adds an optional `ride_wait_ms` to a compaction Setup message and two
+/// records, `compaction_ride_wait` and `compaction_ride_wait_ended`, written
+/// while a step waits for the compaction provider's answer before a prompt
+/// rewrite; this reader ignores all three
+/// and keeps the step's usage and timestamps. `auth-selection-method/v1` adds
+/// an optional `auth_method` to the frozen `config.auth_selection` on
+/// `RunStarted` (and a refreeze record) and makes `credential_id` an opaque
+/// vault id; this reader reads neither. `tool-times/v1` records when each
+/// new tool call started and finished; this reader takes a step's timing from
+/// its own records, so it ignores the tool times. `message-times/v1` adds an
+/// optional `written_at_ms` to `run_started`, `model_step_finished`,
+/// `steered`, `queued` and `send_delivered`; this reader keeps using `ts_ms`
+/// and ignores it. `plan-reference-slots/v1` adds an optional
+/// `reference_slots` map (tool name to `{name, kind}` slots) beside `reply` on
+/// an answered fetch in a run's frozen plan manifest, and
+/// `provider-declarations/v1` adds `declarations_frozen` (tool result formats
+/// and the `late_results` capability) to the same answered fetch; this reader
+/// never reads the manifest. `provider-held/v1` adds held-call records and a
+/// `tool_held` pause reason; this reader skips record types it doesn't use and
+/// never reads pause reasons. `tool-schema-pins/v1` adds frozen `schema_pins`
+/// to the run's plan manifest; this reader never reads the manifest.
+/// `provider-fallback-block/v1` adds a `provider_fallback` message content
+/// part (a provider's server-side model handoff); this reader never reads
+/// message content. `refusal-fallback/v1` adds a `model_step_refused` record,
+/// which this reader skips, and optional `model_step_finished` members
+/// (`served_model`, `usage_iterations`, `route`, `refusal_fallback`,
+/// `refusal_after_tool_use`), which it ignores. `output-reservation/v1` adds an
+/// `output_reservation_clamped` record (a step's output cap lowered so input
+/// plus cap fits the window), which this reader skips.
 const KNOWN_FEATURES: &[&str] = &[
     "flow-scopes/v1",
     "plan-manifest/v1",
@@ -96,6 +158,29 @@ const KNOWN_FEATURES: &[&str] = &[
     "provider-text-state/v1",
     "openrouter-reasoning/v1",
     "structured-output-downgrade/v1",
+    "delivery-order/v1",
+    "runner-tags/v1",
+    "compaction-view/v1",
+    "context-ceiling/v1",
+    "interrupt-reason/v1",
+    "turn-directives/v1",
+    "google-rpc-error-details/v1",
+    "chatgpt-codex-wire/v1",
+    "tool-reply/v1",
+    "runner-tags/v2",
+    "structured-output-paragraph/v1",
+    "client-message-id/v1",
+    "compaction-ride-wait/v1",
+    "auth-selection-method/v1",
+    "tool-times/v1",
+    "message-times/v1",
+    "plan-reference-slots/v1",
+    "provider-declarations/v1",
+    "provider-held/v1",
+    "tool-schema-pins/v1",
+    "provider-fallback-block/v1",
+    "refusal-fallback/v1",
+    "output-reservation/v1",
 ];
 
 #[derive(serde::Deserialize)]
@@ -1823,6 +1908,29 @@ pub(crate) mod tests {
             "provider-text-state/v1",
             "openrouter-reasoning/v1",
             "structured-output-downgrade/v1",
+            "delivery-order/v1",
+            "runner-tags/v1",
+            "compaction-view/v1",
+            "context-ceiling/v1",
+            "interrupt-reason/v1",
+            "turn-directives/v1",
+            "google-rpc-error-details/v1",
+            "chatgpt-codex-wire/v1",
+            "tool-reply/v1",
+            "runner-tags/v2",
+            "structured-output-paragraph/v1",
+            "client-message-id/v1",
+            "compaction-ride-wait/v1",
+            "auth-selection-method/v1",
+            "tool-times/v1",
+            "message-times/v1",
+            "plan-reference-slots/v1",
+            "provider-declarations/v1",
+            "provider-held/v1",
+            "tool-schema-pins/v1",
+            "provider-fallback-block/v1",
+            "refusal-fallback/v1",
+            "output-reservation/v1",
         ] {
             let bytes = wal_bytes(&[
                 json!({"requires": [feature], "record": run_started("r1", 1)}),
@@ -1830,6 +1938,283 @@ pub(crate) mod tests {
             ]);
             let runs = decode(&bytes).unwrap_or_else(|e| panic!("{feature}: {e}"));
             assert_eq!(step_ids(&runs), [("r1".to_string(), 1)], "{feature}");
+        }
+    }
+
+    /// `tool-reply/v1` adds a `reply` deadline to a long-running tool in the
+    /// run's frozen tool list; a run that carries one still yields its steps.
+    #[test]
+    fn a_tool_reply_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["tools"] = json!([{"name": "research", "reply": {"max_ms": 120000}}]);
+        let bytes = wal_bytes(&[
+            json!({"requires": ["tool-reply/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("tool-reply/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `client-message-id/v1` carries the sender's message id inside the run's
+    /// request identity digest; such a run still yields its steps.
+    #[test]
+    fn a_client_message_id_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["request_identity_digest"] = json!({"client_message_id": "msg-1", "digest": "00"});
+        let bytes = wal_bytes(&[
+            json!({"requires": ["client-message-id/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("client-message-id/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `compaction-ride-wait/v1` records a step that waited for the compaction
+    /// provider's answer before a prompt rewrite; that step keeps its usage.
+    #[test]
+    fn a_compaction_ride_wait_keeps_the_step() {
+        let bytes = wal_bytes(&[
+            json!(run_started("r1", 1)),
+            json!({"requires": ["compaction-ride-wait/v1"],
+                   "record": {"type": "compaction_ride_wait", "step_id": 1,
+                              "deadline_ms": 10_000}}),
+            json!({"requires": ["compaction-ride-wait/v1"],
+                   "record": {"type": "compaction_ride_wait_ended", "step_id": 1}}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("compaction-ride-wait/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `auth-selection-method/v1` records the vault's method for the run's
+    /// credential in its frozen auth selection; such a run still yields its
+    /// steps.
+    #[test]
+    fn an_auth_selection_method_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["config"]["auth_selection"] =
+            json!({"credential_id": "cred_01opaque", "auth_method": "oauth"});
+        let bytes = wal_bytes(&[
+            json!({"requires": ["auth-selection-method/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("auth-selection-method/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `tool-times/v1` adds an optional time to existing tool records (when a
+    /// call was dispatched, when its result finished, when an approval
+    /// closed it). These are the record bodies Broca's encoder writes; a run
+    /// that carries them still yields its steps.
+    #[test]
+    fn a_tool_times_run_keeps_its_steps() {
+        let bytes = wal_bytes(&[
+            json!(run_started("r1", 1)),
+            json!({"requires": ["tool-times/v1"],
+                   "record": {"type": "tool_dispatch_intent", "batch_id": "b",
+                              "tool_call_id": "c", "args": {},
+                              "dispatched_at_ms": 1_800_000_000_123u64}}),
+            json!({"requires": ["tool-times/v1"],
+                   "record": {"type": "tool_result", "batch_id": "b",
+                              "result": {"tool_call_id": "c",
+                                         "output": {"kind": "text", "text": "ok"},
+                                         "is_error": false},
+                              "outcome": "completed",
+                              "finished_at_ms": 1_800_000_000_123u64}}),
+            json!({"requires": ["tool-times/v1"],
+                   "record": {"type": "approval_recorded", "call_key": "key",
+                              "call_id": "c", "decision": "declined",
+                              "closing_result": {"tool_call_id": "c",
+                                                 "output": {"kind": "text",
+                                                            "text": "pre_tool_declined"},
+                                                 "is_error": true},
+                              "closed_at_ms": 1_800_000_000_123u64}}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("tool-times/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `message-times/v1` adds an optional `written_at_ms` to the run's start
+    /// and to its finished steps; a run carrying it still yields its steps.
+    #[test]
+    fn a_message_times_run_keeps_its_steps() {
+        let mut started = run_started("r1", 1_000);
+        started["written_at_ms"] = json!(1_800_000_000_123u64);
+        let mut finished = step_finished(1, usage(1, 2, 3, 4));
+        finished["written_at_ms"] = json!(1_800_000_000_456u64);
+        let bytes = wal_bytes(&[
+            json!({"requires": ["message-times/v1"], "record": started}),
+            json!(step_started(1)),
+            json!(attempt(1, 1_010)),
+            json!({"requires": ["message-times/v1"], "record": finished}),
+        ]);
+        let runs = decode(&bytes).expect("message-times/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `plan-reference-slots/v1` adds `reference_slots` beside `reply` on an
+    /// answered fetch in the run's frozen plan manifest. This reader never
+    /// reads the manifest, so a run carrying it still yields its steps.
+    #[test]
+    fn a_plan_reference_slots_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["manifest"] = json!({"items": [{"outcome": {"answered": {
+            "reply": {"research": {"max_ms": 120000}},
+            "reference_slots": {"read": [{"name": "path", "kind": "file"}]},
+        }}}]});
+        let bytes = wal_bytes(&[
+            json!({"requires": ["plan-reference-slots/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("plan-reference-slots/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `provider-declarations/v1` adds `declarations_frozen` beside `reply` on
+    /// an answered fetch in the run's frozen plan manifest. This reader never
+    /// reads the manifest, so a run carrying it still yields its steps.
+    #[test]
+    fn a_provider_declarations_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["manifest"] = json!({"items": [{"outcome": {"answered": {
+            "reply": {},
+            "declarations_frozen": {"result_formats": {"read": "text"}, "late_results": true},
+        }}}]});
+        let bytes = wal_bytes(&[
+            json!({"requires": ["provider-declarations/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("provider-declarations/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `provider-held/v1` adds held-call records and a `tool_held` pause
+    /// reason. This reader skips record types it doesn't use, so a run that
+    /// carries them still yields its steps.
+    #[test]
+    fn a_provider_held_run_keeps_its_steps() {
+        let bytes = wal_bytes(&[
+            json!(run_started("r1", 1)),
+            json!({"requires": ["provider-held/v1"],
+                   "record": {"type": "tool_call_held", "tool_call_id": "c"}}),
+            json!({"requires": ["provider-held/v1"],
+                   "record": {"type": "run_paused", "reason": "tool_held"}}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("provider-held/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `tool-schema-pins/v1` adds frozen `schema_pins` to the run's plan
+    /// manifest. This reader never reads the manifest, so a run carrying it
+    /// still yields its steps.
+    #[test]
+    fn a_tool_schema_pins_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["manifest"] = json!({
+            "items": [{"outcome": {"answered": {"reply": {}}}}],
+            "schema_pins": {"read": "sha256:00"},
+        });
+        let bytes = wal_bytes(&[
+            json!({"requires": ["tool-schema-pins/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("tool-schema-pins/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `provider-fallback-block/v1` puts a `provider_fallback` part in a
+    /// message's content. This reader never reads message content, so a step
+    /// whose assistant message carries one still counts.
+    #[test]
+    fn a_provider_fallback_block_run_keeps_its_steps() {
+        let mut finished = step_finished(1, usage(1, 2, 3, 4));
+        finished["assistant_message"]["content"] = json!([
+            {"type": "provider_fallback", "from_model": "claude-opus-5", "to_model": "claude-sonnet-5"},
+        ]);
+        let bytes = wal_bytes(&[
+            json!(run_started("r1", 1)),
+            json!({"requires": ["provider-fallback-block/v1"], "record": finished}),
+        ]);
+        let runs = decode(&bytes).expect("provider-fallback-block/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `refusal-fallback/v1` writes a `model_step_refused` record, which this
+    /// reader skips, and adds optional members to `model_step_finished`, which
+    /// it ignores. The refused attempt adds no step; the finished one does,
+    /// with its usage.
+    #[test]
+    fn a_refusal_fallback_run_keeps_its_steps() {
+        let mut finished = step_finished(1, usage(1, 2, 3, 4));
+        finished["served_model"] = json!("claude-sonnet-5");
+        finished["usage_iterations"] = json!([]);
+        finished["route"] = json!("fallback");
+        finished["refusal_fallback"] = json!(true);
+        finished["refusal_after_tool_use"] = json!(false);
+        let bytes = wal_bytes(&[
+            json!(run_started("r1", 1)),
+            json!({"requires": ["refusal-fallback/v1"],
+                   "record": {"type": "model_step_refused", "step_id": 1}}),
+            json!({"requires": ["refusal-fallback/v1"], "record": finished}),
+        ]);
+        let runs = decode(&bytes).expect("refusal-fallback/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+        assert_eq!(runs[0].steps[0].usage.output_tokens, Some(4));
+    }
+
+    /// `output-reservation/v1` writes an `output_reservation_clamped` record
+    /// before a step whose output cap was lowered. This reader skips it, so the
+    /// step that follows still counts, with its usage.
+    #[test]
+    fn an_output_reservation_run_keeps_its_steps() {
+        let bytes = wal_bytes(&[
+            json!(run_started("r1", 1)),
+            json!({"requires": ["output-reservation/v1"],
+                   "record": {"type": "output_reservation_clamped", "step_id": 1,
+                               "max_output_tokens": 8_000, "estimated_input_tokens": 190_000,
+                               "context_limit": 200_000}}),
+            json!(step_finished(1, usage(1, 2, 3, 4))),
+        ]);
+        let runs = decode(&bytes).expect("output-reservation/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+        assert_eq!(runs[0].steps[0].usage.output_tokens, Some(4));
+    }
+
+    /// `structured-output-paragraph/v1` marks a structured-output run whose
+    /// schema instructions start a new paragraph; such a run still yields its
+    /// steps.
+    #[test]
+    fn a_structured_output_paragraph_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["config"]["frozen_render_config"] =
+            json!({"structured_output": {"instructions_paragraph_break": true}});
+        let bytes = wal_bytes(&[
+            json!({"requires": ["structured-output-paragraph/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("structured-output-paragraph/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `runner-tags/v2` puts a tag checkpoint on every run Broca starts, so a
+    /// run that requires it (alone, or with `runner-tags/v1` when it renders
+    /// tags) must still yield its steps.
+    #[test]
+    fn a_computed_tags_run_keeps_its_steps() {
+        for requires in [
+            vec!["runner-tags/v2"],
+            vec!["runner-tags/v1", "runner-tags/v2"],
+        ] {
+            let mut record = run_started("r1", 1);
+            record["config"]["computed_tags"] = json!({"checkpoint": 41});
+            let bytes = wal_bytes(&[
+                json!({"requires": requires, "record": record}),
+                step_finished(1, usage(1, 2, 3, 4)),
+            ]);
+            let runs = decode(&bytes).expect("runner-tags/v2 run decodes");
+            assert_eq!(step_ids(&runs), [("r1".to_string(), 1)], "{requires:?}");
         }
     }
 
@@ -1848,6 +2233,64 @@ pub(crate) mod tests {
         ]);
         let runs = decode(&bytes).unwrap();
         assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `context-ceiling/v1` adds a ceiling wait, a ceiling decision and a
+    /// `context_ceiling` run end; a run that hits its ceiling still yields its
+    /// steps and finishes.
+    #[test]
+    fn a_run_ended_at_its_context_ceiling_keeps_its_steps() {
+        let bytes = wal_bytes(&[
+            run_started("r1", 1),
+            step_finished(1, usage(1, 2, 3, 4)),
+            json!({"requires": ["context-ceiling/v1"],
+                   "record": {"type": "context_ceiling_wait", "run_id": "r1",
+                              "step_id": 2, "deadline_ms": 5_000, "unavailable": false}}),
+            json!({"requires": ["context-ceiling/v1"],
+                   "record": {"type": "context_ceiling_decided", "run_id": "r1", "step_id": 2,
+                              "ceiling": {"window": 200_000, "size": 199_000, "cause": "overflow"}}}),
+            json!({"requires": ["context-ceiling/v1"],
+                   "record": {"type": "run_finished", "run_id": "r1", "reason": "context_ceiling"}}),
+        ]);
+        let runs = decode(&bytes).unwrap();
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+        assert!(runs[0].finished);
+    }
+
+    /// `interrupt-reason/v1` adds `interrupt_reason` to an interrupted run's
+    /// end, and `turn-directives/v1` adds directives to its config; such a run
+    /// still yields its steps and finishes.
+    #[test]
+    fn an_interrupted_run_with_a_reason_and_directives_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["config"]["turn_directives_v1"] = json!(["wake"]);
+        let bytes = wal_bytes(&[
+            json!({"requires": ["turn-directives/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+            json!({"requires": ["interrupt-reason/v1"],
+                   "record": {"type": "run_finished", "run_id": "r1", "reason": "interrupted",
+                              "interrupt_reason": "runner_shutdown"}}),
+        ]);
+        let runs = decode(&bytes).unwrap();
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+        assert!(runs[0].finished);
+    }
+
+    /// `google-rpc-error-details/v1` adds Google RPC error details inside a
+    /// failed run's `error`; such a run still yields its steps and finishes.
+    #[test]
+    fn a_run_failed_with_google_rpc_error_details_keeps_its_steps() {
+        let bytes = wal_bytes(&[
+            run_started("r1", 1),
+            step_finished(1, usage(1, 2, 3, 4)),
+            json!({"requires": ["google-rpc-error-details/v1"],
+                   "record": {"type": "run_finished", "run_id": "r1", "reason": "failed",
+                              "error": {"code": "quota_exhausted", "message": "quota",
+                                        "provider_details": {"retry_info": {"retry_delay": "3600s"}}}}}),
+        ]);
+        let runs = decode(&bytes).unwrap();
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+        assert!(runs[0].finished);
     }
 
     /// `session-class/v1` adds `session_class` to `RunStarted`; a run that

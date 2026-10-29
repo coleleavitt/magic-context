@@ -108,6 +108,11 @@ import {
 	resolveKnownHistorianContextLimit,
 } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import {
+	clearHistorianHistoryWait,
+	recordHistorianNoProgress,
+	shouldWaitForNewHistorianHistory,
+} from "@magic-context/core/hooks/magic-context/historian-history-wait";
+import {
 	describeHistorianPromptTrim,
 	fitHistorianPrompt,
 	PRODUCER_PROMPT_FIT_FAILURE_PATTERN,
@@ -183,12 +188,7 @@ function shortTraceError(message: string): string {
 		: flat;
 }
 
-type HistorianTracePass =
-	| "first"
-	| "repair"
-	| "fallback"
-	| "fallback-session"
-	| "editor";
+type HistorianTracePass = "first" | "repair" | "fallback" | "editor";
 
 /** Trace outcome for one `historian.subagent` span (run + validation). */
 function historianPassTraceOutcome(outcome: ValidationOutcome): {
@@ -333,6 +333,8 @@ async function runHistorianSubagentWithTransientRetriesGuarded(args: {
 			args.onDispatch?.();
 			result = await args.runner.run({
 				...args.options,
+				cacheTail:
+					retryIndex > 0 ? "write" : (args.options.cacheTail ?? "skip"),
 				// The historian runner owns fallback iteration because every candidate's
 				// output must be parsed and validated before the chain can stop.
 				fallbackModels: undefined,
@@ -379,27 +381,18 @@ function buildHistorianFallbackChain(
 	primaryModel: string,
 	primaryThinkingLevel: string | undefined,
 	fallbackModels?: readonly ModelInput[],
-	fallbackModelId?: string,
-): Array<{ entry: ResolvedModelEntry; kind: "configured" | "session" }> {
+): ResolvedModelEntry[] {
 	const seen = new Set<string>([
 		`${primaryModel}\u0000${primaryThinkingLevel ?? ""}`,
 	]);
-	const chain: Array<{
-		entry: ResolvedModelEntry;
-		kind: "configured" | "session";
-	}> = [];
+	const chain: ResolvedModelEntry[] = [];
 	for (const candidate of fallbackModels ?? []) {
 		const entry =
 			typeof candidate === "string" ? { model: candidate } : candidate;
 		const key = `${entry.model}\u0000${entry.qualifier ?? ""}`;
 		if (!entry.model || seen.has(key)) continue;
 		seen.add(key);
-		chain.push({ entry, kind: "configured" });
-	}
-	if (fallbackModelId) {
-		const entry = { model: fallbackModelId };
-		const key = `${entry.model}\u0000`;
-		if (!seen.has(key)) chain.push({ entry, kind: "session" });
+		chain.push(entry);
 	}
 	return chain;
 }
@@ -443,6 +436,7 @@ function shouldSuppressHistorianAlert(sessionId: string): boolean {
 
 /** Cleanup module-scope state on session deletion. */
 export function clearPiHistorianAlertState(sessionId: string): void {
+	clearHistorianHistoryWait(sessionId);
 	lastHistorianAlertBySession.delete(sessionId);
 }
 
@@ -459,9 +453,11 @@ export interface PiHistorianDeps {
 	runner: SubagentRunner;
 	/** Historian model id (provider/model) — required for PiSubagentRunner. */
 	historianModel: string;
+	/** Config key supplying the selected historian model. */
+	modelConfigKey?: string;
 	/** Optional ordered fallback chain, retaining each entry's Pi thinking level. */
 	fallbackModels?: readonly ModelInput[];
-	/** Live session model used as the final fallback after configured fallbacks. */
+	/** Live session model for host context; never appended to the configured chain. */
 	fallbackModelId?: string;
 	/** Historian chunk budget derived from its context window. */
 	historianChunkTokens: number;
@@ -476,8 +472,12 @@ export interface PiHistorianDeps {
 	/**
 	 * Optional live boundary resolver used only to recover a stale trigger snapshot.
 	 * It must recompute against the currently registered Pi raw-message provider.
+	 * It receives the stale snapshot so it can carry that snapshot's one-pass
+	 * live-prompt floor lift into the re-resolved boundary.
 	 */
-	refreshBoundarySnapshot?: () => ProtectedTailBoundarySnapshot;
+	refreshBoundarySnapshot?: (
+		stale: ProtectedTailBoundarySnapshot,
+	) => ProtectedTailBoundarySnapshot;
 	/** Current resolved context limit used to reject stale snapshots after model switches. */
 	currentContextLimit?: number;
 	/** Optional per-call timeout (default 600s). */
@@ -759,7 +759,7 @@ async function runPiHistorianTraced(
 				refreshBoundarySnapshot
 			) {
 				try {
-					const refreshed = refreshBoundarySnapshot();
+					const refreshed = refreshBoundarySnapshot(boundarySnapshot);
 					if (hasRunnableCompartmentWindow(refreshed)) {
 						sessionLog(
 							sessionId,
@@ -786,6 +786,21 @@ async function runPiHistorianTraced(
 				return;
 			}
 			const protectedTailStart = boundarySnapshot.protectedTailStart;
+			if (
+				!forceDrainQuota &&
+				shouldWaitForNewHistorianHistory(boundarySnapshot, {
+					emergency: getOverflowState(db, sessionId).needsEmergencyRecovery,
+				})
+			) {
+				telemetry.status = "noop";
+				telemetry.failureReason =
+					"waiting for new history after no forward progress";
+				sessionLog(
+					sessionId,
+					"historian no-op: waiting for new history after no forward progress",
+				);
+				return;
+			}
 			const eligibleEndOrdinal = Math.min(
 				boundarySnapshot.eligibleEndOrdinal,
 				protectedTailStart,
@@ -1186,6 +1201,12 @@ async function runPiHistorianTraced(
 			);
 
 			// First pass.
+			if (!forceDrainQuota) {
+				shouldWaitForNewHistorianHistory(boundarySnapshot, {
+					emergency: getOverflowState(db, sessionId).needsEmergencyRecovery,
+					claim: true,
+				});
+			}
 			const { result: firstResult, outcome: firstPass } = await runTracedPass(
 				"first",
 				{
@@ -1202,6 +1223,7 @@ async function runPiHistorianTraced(
 					onProgress: buildProgressLogger("first"),
 					accountingSessionId: sessionId,
 					accountingSubagent: "historian",
+					accountingModelConfigKey: deps.modelConfigKey,
 				},
 			);
 
@@ -1217,6 +1239,7 @@ async function runPiHistorianTraced(
 			let validatedDraftText: string | null = firstResult.ok
 				? firstResult.assistantText
 				: null;
+			let fallbackPrompt = prompt;
 
 			// Repair retry on validation failure (mirrors OpenCode behavior).
 			if (validatedPass.kind === "validation-failed") {
@@ -1230,6 +1253,7 @@ async function runPiHistorianTraced(
 					validatedPass.error,
 					deps.language,
 				);
+				fallbackPrompt = repairPrompt;
 				const { result: repairResult, outcome: repairPass } =
 					await runTracedPass("repair", {
 						agent: HISTORIAN_AGENT_NAME,
@@ -1258,13 +1282,12 @@ async function runPiHistorianTraced(
 
 			// Escalate through the fallback chain on empty/invalid output. Each
 			// candidate is run and validated explicitly because a model can complete
-			// successfully while producing no usable compartments. The live session's
-			// current model is appended as the final last-resort candidate.
+			// successfully while producing no usable compartments. Only explicitly
+			// configured fallback models may receive these summarization requests.
 			const fallbackChain = buildHistorianFallbackChain(
 				historianModel,
 				thinkingLevel,
 				fallbackModels,
-				fallbackModelId,
 			);
 			if (
 				validatedPass.kind !== "ok" &&
@@ -1287,26 +1310,27 @@ async function runPiHistorianTraced(
 								: "historian returned no usable text";
 					sessionLog(
 						sessionId,
-						`historian: escalating to ${candidate.kind === "session" ? "session-model last resort" : "configured fallback model"} ${candidate.entry.model} after ${why}`,
+						`historian: escalating to configured fallback model ${candidate.model} after ${why}`,
 					);
 					const { result: fbResult, outcome: fbPass } = await runTracedPass(
-						candidate.kind === "session" ? "fallback-session" : "fallback",
+						"fallback",
 						{
 							agent: HISTORIAN_AGENT_NAME,
 							systemPrompt: historianSystemPrompt,
-							userMessage: prompt,
-							model: candidate.entry.model,
+							userMessage: fallbackPrompt,
+							model: candidate.model,
 							timeoutMs: historianTimeoutMs,
 							cwd: directory,
 							signal,
-							thinkingLevel: candidate.entry.qualifier,
+							thinkingLevel: candidate.qualifier,
 							temperature,
 							maxOutputTokens,
 							onProgress: buildProgressLogger("fallback"),
 							accountingSessionId: sessionId,
 							accountingSubagent: "historian",
-							accountingTask:
-								candidate.kind === "session" ? "fallback-session" : "fallback",
+							accountingModelConfigKey:
+								candidate.sourceConfigKey ?? deps.modelConfigKey,
+							accountingTask: "fallback",
 						},
 					);
 					if (fbPass.kind === "ok") {
@@ -1384,6 +1408,7 @@ async function runPiHistorianTraced(
 						onProgress: buildProgressLogger("editor"),
 						accountingSessionId: sessionId,
 						accountingSubagent: "historian_editor",
+						accountingModelConfigKey: deps.modelConfigKey,
 					});
 					if (editorPass.kind === "ok") {
 						sessionLog(
@@ -1450,6 +1475,7 @@ async function runPiHistorianTraced(
 					const failCount = incrementHistorianFailure(db, sessionId, errorMsg);
 					await notify(buildHistorianFailureNotice(failCount, errorMsg));
 				}
+				recordHistorianNoProgress(boundarySnapshot, inEmergency);
 				rollbackDrainReservation();
 				return;
 			}
@@ -1664,6 +1690,7 @@ async function runPiHistorianTraced(
 						}
 						db.exec("COMMIT");
 						published = true;
+						clearHistorianHistoryWait(sessionId);
 						logSlowWriteTransaction(
 							"pi_historian_publish",
 							transactionStartedAt,

@@ -64,6 +64,8 @@ export interface SubagentRunOptions {
     agent: string;
     systemPrompt: string;
     userMessage: string;
+    /** Hidden historian only: use `write` to retain cache markers for retries or later turns. */
+    cacheTail?: import("./historian-cache").HistorianCacheTail;
     model?: string | undefined;
     fallbackModels?: readonly ModelInput[];
     timeoutMs?: number | undefined;
@@ -101,6 +103,8 @@ export interface SubagentRunOptions {
 
     /** Optional token accounting metadata. When present, harness runners persist subagent_invocations. */
     accountingSessionId?: string | undefined;
+    /** Config key supplying the selected model, for host refusal diagnostics. */
+    accountingModelConfigKey?: string | undefined;
     accountingSubagent?:
         | "historian"
         | "historian_editor"
