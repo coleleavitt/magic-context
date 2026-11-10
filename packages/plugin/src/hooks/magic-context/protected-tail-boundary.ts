@@ -63,6 +63,8 @@ export interface ResolvedBoundaryContext {
     protectedTailPolicyVersion: number;
     migrationFloorActive: boolean;
     emergencyTailScale?: 0.5 | 0.25;
+    /** Recovery from overflow or a switch to a smaller context window must drain even a small head. */
+    recovery?: boolean;
     /** One admitted trigger evaluation may cross the live prompt without changing any other fence. */
     liftLivePromptFloor?: boolean;
     providerShapeVersion: "opencode-v1" | "pi-folded-v1";
@@ -77,10 +79,17 @@ export interface ResolvedBoundaryContext {
      * their own token source; store-backed callers load only the requested owners.
      */
     storedTokenTotals?: Map<string, number>;
+    /** Separate all-status text/input weights; never substitute full-size totals for these. */
+    storedSummaryRemovedTokenTotals?: Map<string, number>;
     storedTokenTotalsForMessages?: (
         messageIds: string[],
         messages?: readonly RawMessage[],
-    ) => Map<string, number> | undefined;
+    ) =>
+        | {
+              totals: Map<string, number>;
+              summaryRemovedTotals: Map<string, number>;
+          }
+        | undefined;
     calibration?: ReturnType<typeof sessionDecisionCalibration>;
 }
 
@@ -107,6 +116,8 @@ export interface ProtectedTailBoundarySnapshot {
     priorBoundaryOrdinal: number;
     migrationFloorActive: boolean;
     emergencyTailScale?: 0.5 | 0.25;
+    /** Carries recovery admission through historian snapshot refreshes. */
+    recovery?: boolean;
     /**
      * True when the trigger resolved this boundary with the one-pass live-prompt
      * floor lift. A historian run that re-resolves a stale copy of this snapshot
@@ -120,6 +131,8 @@ export interface ProtectedTailBoundarySnapshot {
     createdAt: number;
     rawRangeFingerprint: string;
     trueRawEligibleTokens: number;
+    /** Text and tool inputs reserved against the run's drain budget, regardless of drop state. */
+    summaryRemovedEligibleTokens: number;
     oversizeAtomicUnit: boolean;
     boundaryReason: string;
     /** Captured before drain reservation; historian runners log these diagnostics without rereading newer history. */
@@ -237,13 +250,6 @@ const FORCE95_MAX_CAP = 750_000;
 const NORMAL_HYSTERESIS_TOKENS = 256;
 
 export const RECOVERY_NO_HEAD_LIMIT = 2;
-
-/** A tiny complete head is still worth summarizing at force pressure; below this, wait for a real arc/user turn. */
-export const MIN_FORCE_ELIGIBLE_TOKENS_CAP = 1_000;
-
-export function deriveMinForceEligibleTokens(scaledN: number): number {
-    return Math.min(MIN_FORCE_ELIGIBLE_TOKENS_CAP, Math.max(1, Math.floor(scaledN / 8)));
-}
 
 function clampPercentage(value: number): number {
     if (!Number.isFinite(value)) return 0;
@@ -549,11 +555,13 @@ export function resolveProtectedTailBoundary(
         Math.max(1, offset - 1),
         absoluteMessageCount,
     );
-    const storedTotals =
-        ctx.storedTokenTotalsForMessages?.(
-            messages.map((m) => m.id),
-            messages,
-        ) ?? ctx.storedTokenTotals;
+    const storedWeights = ctx.storedTokenTotalsForMessages?.(
+        messages.map((m) => m.id),
+        messages,
+    );
+    const storedTotals = storedWeights?.totals ?? ctx.storedTokenTotals;
+    const storedRemovedTotals =
+        storedWeights?.summaryRemovedTotals ?? ctx.storedSummaryRemovedTokenTotals;
     const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
         providerShapeVersion: ctx.providerShapeVersion,
         cacheNamespace: ctx.cacheNamespace,
@@ -564,6 +572,16 @@ export function resolveProtectedTailBoundary(
                   const v = storedTotals.get(m.id);
                   return v === undefined ? null : v;
               }
+            : undefined,
+    });
+    const summaryRemovedIndex = buildTrueRawTokenIndex(ctx.sessionId, messages, {
+        providerShapeVersion: ctx.providerShapeVersion,
+        cacheNamespace: ctx.cacheNamespace,
+        calibration: ctx.calibration,
+        absoluteMessageCount,
+        measure: "summary-removed",
+        storedTotalForMessage: storedRemovedTotals
+            ? (m) => storedRemovedTotals.get(m.id) ?? null
             : undefined,
     });
     const rawMessageCount = index.rawMessageCount;
@@ -593,11 +611,13 @@ export function resolveProtectedTailBoundary(
             priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
             migrationFloorActive: ctx.migrationFloorActive,
             emergencyTailScale: ctx.emergencyTailScale,
+            recovery: ctx.recovery,
             providerShapeVersion: ctx.providerShapeVersion,
             cacheNamespace: ctx.cacheNamespace,
             createdAt,
             rawRangeFingerprint: "",
             trueRawEligibleTokens: 0,
+            summaryRemovedEligibleTokens: 0,
             oversizeAtomicUnit: false,
             boundaryReason: "empty-session",
         };
@@ -651,11 +671,16 @@ export function resolveProtectedTailBoundary(
             priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
             migrationFloorActive: false,
             emergencyTailScale: ctx.emergencyTailScale,
+            recovery: ctx.recovery,
             providerShapeVersion: ctx.providerShapeVersion,
             cacheNamespace: ctx.cacheNamespace,
             createdAt,
             rawRangeFingerprint,
             trueRawEligibleTokens: index.rangeTokens(offset, protectedTailStart),
+            summaryRemovedEligibleTokens: summaryRemovedIndex.rangeTokens(
+                offset,
+                protectedTailStart,
+            ),
             oversizeAtomicUnit: false,
             boundaryReason: firstOpenArc ? "open-tool-arc" : "manual-full-recomp",
         };
@@ -781,7 +806,7 @@ export function resolveProtectedTailBoundary(
         observeDiagnostics: (value) => {
             headDiagnostics = value;
         },
-        index,
+        index: summaryRemovedIndex,
         protectedTailStart,
         offset,
         arcs,
@@ -817,6 +842,7 @@ export function resolveProtectedTailBoundary(
         priorBoundaryOrdinal: ctx.priorBoundaryOrdinal,
         migrationFloorActive: ctx.migrationFloorActive,
         emergencyTailScale: ctx.emergencyTailScale,
+        recovery: ctx.recovery,
         // Left undefined when not lifted so unlifted snapshots keep their old shape.
         liftLivePromptFloor: ctx.liftLivePromptFloor === true ? true : undefined,
         providerShapeVersion: ctx.providerShapeVersion,
@@ -824,6 +850,7 @@ export function resolveProtectedTailBoundary(
         createdAt,
         rawRangeFingerprint,
         trueRawEligibleTokens: index.rangeTokens(offset, eligibleEndOrdinal),
+        summaryRemovedEligibleTokens: summaryRemovedIndex.rangeTokens(offset, eligibleEndOrdinal),
         oversizeAtomicUnit: head.oversizeAtomicUnit,
         boundaryReason,
         diagnostics: boundaryDiagnostics({
@@ -872,6 +899,7 @@ export function resolveBoundaryContext(args: {
     usage?: BoundaryUsage | null;
     usageSource?: ResolvedBoundaryContext["usageSource"];
     emergencyTailScale?: 0.5 | 0.25;
+    recovery?: boolean;
     providerShapeVersion?: "opencode-v1" | "pi-folded-v1";
     liftLivePromptFloor?: boolean;
     cacheNamespace?: string;
@@ -927,14 +955,22 @@ export function resolveBoundaryContext(args: {
         messages: readonly RawMessage[] = [],
     ) => {
         try {
-            const totals = getAllStatusTagTokenTotalsFlat(
+            const weights = getAllStatusTagTokenTotalsFlat(
                 args.db,
                 args.sessionId,
                 args.taggerFloor ?? 0,
                 calibration,
                 messageIds,
-            ).totals;
-            return omitIncompleteFileTokenTotals(args.db, args.sessionId, messages, totals);
+            );
+            return {
+                totals: omitIncompleteFileTokenTotals(
+                    args.db,
+                    args.sessionId,
+                    messages,
+                    weights.totals,
+                ),
+                summaryRemovedTotals: weights.summaryRemovedTotals,
+            };
         } catch (error) {
             sessionLog(
                 args.sessionId,
@@ -958,6 +994,7 @@ export function resolveBoundaryContext(args: {
         protectedTailPolicyVersion: meta.protectedTailPolicyVersion,
         migrationFloorActive,
         emergencyTailScale: args.emergencyTailScale,
+        recovery: args.recovery,
         liftLivePromptFloor: args.liftLivePromptFloor,
         providerShapeVersion: args.providerShapeVersion ?? "opencode-v1",
         cacheNamespace: args.cacheNamespace ?? `opencode:${args.sessionId}`,
@@ -989,11 +1026,13 @@ export function resolveWrapupProtectedTailBoundary(
         Math.max(1, offset - 1),
         absoluteMessageCount,
     );
-    const storedTotals =
-        ctx.storedTokenTotalsForMessages?.(
-            messages.map((m) => m.id),
-            messages,
-        ) ?? ctx.storedTokenTotals;
+    const storedWeights = ctx.storedTokenTotalsForMessages?.(
+        messages.map((m) => m.id),
+        messages,
+    );
+    const storedTotals = storedWeights?.totals ?? ctx.storedTokenTotals;
+    const storedRemovedTotals =
+        storedWeights?.summaryRemovedTotals ?? ctx.storedSummaryRemovedTokenTotals;
     const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
         providerShapeVersion: ctx.providerShapeVersion,
         cacheNamespace: ctx.cacheNamespace,
@@ -1004,6 +1043,16 @@ export function resolveWrapupProtectedTailBoundary(
                   const value = storedTotals?.get(m.id);
                   return value === undefined ? null : value;
               }
+            : undefined,
+    });
+    const summaryRemovedIndex = buildTrueRawTokenIndex(ctx.sessionId, messages, {
+        providerShapeVersion: ctx.providerShapeVersion,
+        cacheNamespace: ctx.cacheNamespace,
+        calibration: ctx.calibration,
+        absoluteMessageCount,
+        measure: "summary-removed",
+        storedTotalForMessage: storedRemovedTotals
+            ? (m) => storedRemovedTotals.get(m.id) ?? null
             : undefined,
     });
     const rawMessageCount = index.rawMessageCount;
@@ -1088,7 +1137,7 @@ export function resolveWrapupProtectedTailBoundary(
         observeDiagnostics: (value) => {
             headDiagnostics = value;
         },
-        index,
+        index: summaryRemovedIndex,
         protectedTailStart: targetProtectedTailStart,
         offset,
         arcs: buildToolArcs(messages),
@@ -1129,6 +1178,7 @@ export function resolveWrapupProtectedTailBoundary(
         createdAt,
         rawRangeFingerprint,
         trueRawEligibleTokens: index.rangeTokens(offset, targetProtectedTailStart),
+        summaryRemovedEligibleTokens: summaryRemovedIndex.rangeTokens(offset, eligibleEndOrdinal),
         oversizeAtomicUnit: head.oversizeAtomicUnit,
         boundaryReason,
         diagnostics: boundaryDiagnostics({
@@ -1181,14 +1231,21 @@ export function hasProtectedEligibleHead(snapshot: ProtectedTailBoundarySnapshot
 export function hasRunnableCompartmentWindow(snapshot: ProtectedTailBoundarySnapshot): boolean {
     if (snapshot.offset >= snapshot.protectedTailStart) return false;
     if (snapshot.eligibleEndOrdinal <= snapshot.offset) return false;
+    if (
+        snapshot.recovery ||
+        snapshot.usagePercentage >= 95 ||
+        snapshot.mode === "manual-wrapup" ||
+        snapshot.mode === "manual-full-recomp"
+    )
+        return true;
     const forceMaterializationPercentage = escalationBands(
         snapshot.executeThresholdPercentage,
     ).forceMaterializationPercentage;
     if (snapshot.usagePercentage >= forceMaterializationPercentage || snapshot.emergencyTailScale) {
-        return (
-            snapshot.trueRawEligibleTokens >= deriveMinForceEligibleTokens(snapshot.N) ||
-            snapshot.eligibleEndOrdinal > snapshot.offset
-        );
+        // contextLimit is the resolved usable window, also passed to execute reclaim.
+        // Use the historian's per-run text/input budget accounting: a large tool
+        // result must not make a tiny narratable head justify a routine rewrite.
+        return snapshot.summaryRemovedEligibleTokens >= snapshot.contextLimit * 0.02;
     }
     return snapshot.eligibleEndOrdinal > snapshot.offset;
 }
@@ -1333,6 +1390,11 @@ export function createDefaultBoundarySnapshotForTests(
         cacheNamespace: `test:${sessionId}`,
     });
     const trueRawEligibleTokens = index.rangeTokens(1, protectedTailStart);
+    const summaryRemovedEligibleTokens = buildTrueRawTokenIndex(sessionId, messages, {
+        providerShapeVersion: "opencode-v1",
+        cacheNamespace: `test:${sessionId}`,
+        measure: "summary-removed",
+    }).rangeTokens(1, protectedTailStart);
     const messageIdAt = (ordinal: number): string | null =>
         messages.find((message) => message.ordinal === ordinal)?.id ?? null;
     return {
@@ -1360,6 +1422,7 @@ export function createDefaultBoundarySnapshotForTests(
         createdAt: Date.now(),
         rawRangeFingerprint: "",
         trueRawEligibleTokens,
+        summaryRemovedEligibleTokens,
         oversizeAtomicUnit: false,
         boundaryReason: "test-legacy",
     };

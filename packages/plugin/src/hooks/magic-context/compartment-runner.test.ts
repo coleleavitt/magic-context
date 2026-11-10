@@ -36,8 +36,14 @@ import {
     loadProtectedTailMeta,
     openDatabase,
     recordOverflowDetected,
+    recordProtectedTailNoEligibleHead,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import {
+    getOverflowState,
+    isEmergencyRecoveryArmed,
+    resetEmergencyRecoveryRegistryForTest,
+} from "../../features/magic-context/storage-meta-persisted";
 import { rebaseSessionCoordinates } from "../../features/magic-context/store-generation-rebase";
 import { createTagger } from "../../features/magic-context/tagger";
 import type { PluginContext } from "../../plugin/types";
@@ -1723,6 +1729,77 @@ describe("runCompartmentAgent", () => {
         ).toEqual({ discarded_last: 0 });
     });
 
+    it("leaves overflow recovery armed after a publication, and resets the no-eligible-head count", async () => {
+        // A publication is progress, not proof that the next request fits: after
+        // a switch to a much smaller model one summary can leave the request
+        // several times over the window. Only a recovery pass that counts its
+        // request under the line ends recovery (issue 889).
+        useTempDataHome("compartment-runner-publication-keeps-recovery-");
+        const sessionId = "ses-publication-keeps-recovery";
+        createOpenCodeDb(sessionId, [
+            { id: "m-1", role: "user", text: "First eligible message" },
+            { id: "m-2", role: "assistant", text: "Second eligible message" },
+            { id: "m-3", role: "user", text: "protected 1" },
+            { id: "m-4", role: "user", text: "protected 2" },
+            { id: "m-5", role: "user", text: "protected 3" },
+            { id: "m-6", role: "user", text: "protected 4" },
+            { id: "m-7", role: "user", text: "protected 5" },
+        ]);
+        const db = openDatabase();
+        recordOverflowDetected(
+            db,
+            sessionId,
+            undefined,
+            "anthropic/test",
+            "proactive_model_shrink",
+        );
+        recordProtectedTailNoEligibleHead(db, sessionId);
+        expect(loadProtectedTailMeta(db, sessionId).recoveryNoEligibleHeadCount).toBe(1);
+
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: "/tmp/publication-keeps-recovery" } })),
+                create: mock(async () => ({
+                    data: { id: "ses-agent-publication-keeps-recovery" },
+                })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: [
+                        {
+                            info: { role: "assistant", time: { created: 1 } },
+                            parts: [
+                                {
+                                    type: "text",
+                                    text: '<compartment start="1" end="2" title="First"><p1>First summary</p1></compartment>',
+                                },
+                            ],
+                        },
+                    ],
+                })),
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+        });
+
+        try {
+            expect(getCompartments(db, sessionId)).toHaveLength(1);
+            const overflow = getOverflowState(db, sessionId);
+            expect(overflow.needsEmergencyRecovery).toBe(true);
+            expect(overflow.emergencyRecoveryOrigin).toBe("proactive_model_shrink");
+            expect(isEmergencyRecoveryArmed(sessionId)).toBe(true);
+            expect(loadProtectedTailMeta(db, sessionId).recoveryNoEligibleHeadCount).toBe(0);
+        } finally {
+            resetEmergencyRecoveryRegistryForTest();
+        }
+    });
+
     it("keeps a committed publish succeeded and signaled when post-commit project registration throws", async () => {
         useTempDataHome("compartment-runner-post-commit-registration-throw-");
         createOpenCodeDb("ses-post-commit-registration", [
@@ -3250,6 +3327,7 @@ describe("runCompartmentAgent", () => {
             createdAt: Date.now(),
             rawRangeFingerprint: "",
             trueRawEligibleTokens: 0,
+            summaryRemovedEligibleTokens: 0,
             oversizeAtomicUnit: false,
             boundaryReason: "size-walk",
         };
@@ -3394,15 +3472,23 @@ it("rolls back protected-tail drain reservation when publish throws after histor
         createdAt: Date.now(),
         rawRangeFingerprint: "",
         trueRawEligibleTokens: 500,
+        summaryRemovedEligibleTokens: 7,
         oversizeAtomicUnit: false,
         boundaryReason: "size-walk",
     };
 
+    let reservedAtDispatch = 0;
     const client = {
         session: {
             get: mock(async () => ({ data: { directory: "/tmp/parent" } })),
             create: mock(async () => ({ data: { id: "ses-agent" } })),
-            prompt: mock(async () => ({})),
+            prompt: mock(async () => {
+                reservedAtDispatch = loadProtectedTailMeta(
+                    db,
+                    "ses-drain-rollback",
+                ).protectedTailDrainTokens;
+                return {};
+            }),
             messages: mock(async () => ({
                 data: [
                     {
@@ -3430,6 +3516,7 @@ it("rolls back protected-tail drain reservation when publish throws after histor
         currentContextLimit: 8_000,
     });
 
+    expect(reservedAtDispatch).toBe(7);
     expect(loadProtectedTailMeta(db, "ses-drain-rollback").protectedTailDrainTokens).toBe(0);
 });
 

@@ -2,13 +2,14 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
+import { openTestDb } from "../src/test-db";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { closeCompactionMarkerDb, injectCompactionMarker, prepareCompactionMarkerCandidates } from "../../plugin/src/features/magic-context/compaction-marker";
 import { MARKER_SUMMARY_TEXT } from "../../plugin/src/hooks/magic-context/compaction-marker-manager";
 import { stableStringify } from "../../plugin/src/shared/stable-json";
 import { RustTestHarness } from "../src/rust-harness";
-import { assertHermeticStores, FOLD_CONFIG } from "../src/rust-marker-test-support";
+import { assertHermeticStores, driveDeferredMarkerMove, FOLD_CONFIG, markerDiscoveryDeferrals, requestRustCtxFlush } from "../src/rust-marker-test-support";
 import { rustPrereqs } from "../src/rust-scenario-support";
 
 interface SqliteRow {
@@ -26,7 +27,7 @@ function sha256(value: string): string {
 
 /** The session's published compartments, in order. */
 function contextHistoryRows(path: string, sessionId: string): Array<{ sequence: number; title: string }> {
-    const db = new Database(path, { readonly: true });
+    const db = openTestDb(path, { readonly: true });
     try {
         return db
             .query("SELECT sequence, title FROM compartments WHERE session_id = ? ORDER BY sequence")
@@ -135,7 +136,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             // TTL policy freezes on the first model pass, independently of the
             // config file. End the fixture's zero-TTL setup explicitly so the
             // comparison really observes ordinary passes, not repeated idle busts.
-            const contextWriter = new Database(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"));
+            const contextWriter = openTestDb(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"));
             try {
                 contextWriter.exec("PRAGMA busy_timeout=5000");
                 contextWriter.query(`UPDATE session_meta SET cache_ttl='5m',
@@ -316,11 +317,13 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             const oc = new Database(join(h.env.dataDir, "opencode", "opencode.db"));
             const context = new Database(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"));
             let seedBoundaryId = "";
+            let recoveredEndMessageId = "";
             try {
                 oc.exec("PRAGMA busy_timeout=30000");
                 context.exec("PRAGMA busy_timeout=30000");
                 const raw = oc.query("SELECT id,time_created FROM message WHERE session_id=? AND json_extract(data,'$.summary') IS NOT 1 ORDER BY time_created,id").all(sessionId) as Array<{ id: string; time_created: number }>;
                 seedBoundaryId = `${raw[139]!.id}#0`;
+                recoveredEndMessageId = raw[139]!.id;
                 const ranges = [[1,15],[17,28],[30,42],[44,62],[64,74],[76,84],[87,108],[111,140]];
                 const notices = [16,29,43,63,75,85,86,109,110];
                 for (const ordinal of notices) {
@@ -358,6 +361,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             assertHermeticStores(h);
             const before = h.readRustPasses().length;
             const providerRequestsBefore = h.mainRequests().length;
+            const deferralsBefore = markerDiscoveryDeferrals(h, sessionId);
             const recoveringTurn = h.sendPrompt(sessionId, "recover this sparse history on a genuine bust");
             if (realGap) {
                 // OpenCode may return a completed assistant carrying an error or
@@ -381,8 +385,33 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
                 expect(pass.servedFrom).toBe("transform");
                 expect(pass.decision).toMatch(/^(HARD|SOFT|MIGRATE_HARD)$/);
             }
-            const state = (h.contextDb().query("SELECT compaction_marker_state FROM session_meta WHERE session_id=?").get(sessionId) as { compaction_marker_state: string }).compaction_marker_state;
-            const marker = JSON.parse(state) as { boundaryOrdinal: number };
+            const markerState = () => {
+                const state = (h.contextDb().query("SELECT compaction_marker_state FROM session_meta WHERE session_id=?").get(sessionId) as { compaction_marker_state: string }).compaction_marker_state;
+                return JSON.parse(state) as { boundaryOrdinal: number };
+            };
+            // Without the real gap, the recovering pass is the first pass of a
+            // freshly restarted plugin, and the summary discovery a marker move
+            // needs starts on that same pass, in the background. The pass serves
+            // the recovered history without waiting for it and records the 140
+            // target as pending; a later cache-busting pass moves the marker. Both
+            // cases get that later rebuild, so the real-gap case shows the old cut
+            // is still kept at a point where a move could have happened.
+            if (realGap) {
+                const flushedBefore = h.readRustPasses().length;
+                await requestRustCtxFlush(h, sessionId);
+                await h.sendPrompt(sessionId, "a requested rebuild still cannot cover the real gap").catch(() => undefined);
+                const flushed = (await h.waitForRustPasses(flushedBefore + 1)).at(-1)!;
+                expect(flushed.applied).toBe(false);
+                expect(flushed.servedFrom).toBe("refused");
+                expect(h.mainRequests().length).toBe(providerRequestsBefore);
+            } else if (markerState().boundaryOrdinal !== 140) {
+                expect(markerDiscoveryDeferrals(h, sessionId)).toBe(deferralsBefore + 1);
+                const pending = JSON.parse((h.contextDb().query("SELECT pending_compaction_marker_state FROM session_meta WHERE session_id=?").get(sessionId) as { pending_compaction_marker_state: string }).pending_compaction_marker_state) as { ordinal: number; endMessageId: string };
+                expect(pending.ordinal).toBe(140);
+                expect(pending.endMessageId).toBe(recoveredEndMessageId);
+                await driveDeferredMarkerMove(h, sessionId, () => markerState().boundaryOrdinal !== 50, "move the recovered marker on a requested rebuild");
+            }
+            const marker = markerState();
             expect(marker.boundaryOrdinal).toBe(realGap ? 50 : 140);
             console.log(`ALF-like gaps=7, sizes=1,1,1,1,1,2,2, behind-marker=3, real-gap=${realGap}, marker=${marker.boundaryOrdinal}`);
         }
@@ -407,7 +436,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
         const historyBlocks = () => (JSON.parse(h.lastMainWireSerialized()) as Array<{ content: unknown[] }>)[0]!.content.slice(0,2);
         const first = historyBlocks();
         const firstUser = (await h.listMessages(sessionId)).find(message => message.info?.role === "user")!.info!.id!;
-        const context = new Database(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"));
+        const context = openTestDb(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"));
         const pending = { ordinal: 1, endMessageId: firstUser, publishedAt: 1, injectAttempts: 3 };
         try {
             context.query(`UPDATE session_meta SET cache_ttl='5m', trailing_blank_decisions=json_set(trailing_blank_decisions,

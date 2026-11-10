@@ -1,10 +1,12 @@
 // Guards for the OpenCode 2 busy-database replay (the saved last good request
 // served again when Magic Context's database is busy): the replay's tool list
-// in a subagent session, and how the stored message times are read.
+// and its recorded checkpoint head in a subagent session, and how the stored
+// message times are read.
 import { Database as BunDatabase } from "bun:sqlite";
 import { expect, spyOn, test } from "bun:test";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
 import * as models from "../../shared/models-dev-cache";
+import { NativeFoldReplay } from "../fold/native-replay";
 import { messageTimesQuery, V2StoreReader } from "../store-reader";
 import {
     installBusyAdmission,
@@ -100,6 +102,48 @@ for (const busy of ["admission", "admission-exhausted"] as const)
         }
     }, 60000);
 
+// A subagent window has no history head message, so after a fold whose native
+// admission was refused the host's checkpoint is served as the account of
+// earlier history, with the head Magic Context recorded in place of the stored
+// note. A busy-turn replay must serve that same head: the replay keeps it with
+// the saved checkpoint, and without it the note would reach the model.
+test("OC2 replay: a busy turn replays a note checkpoint with its recorded head in a window without a head message", async () => {
+    const admission = installBusyAdmission();
+    const limit = spyOn(models, "getSdkContextLimit").mockReturnValue(1_000_000);
+    const f = await oc2ContextFixture(9203, { area: AREA, instructions: false, temporal: false });
+    const refused = spyOn(NativeFoldReplay.prototype, "supply").mockResolvedValue(false);
+    try {
+        const host = new BunDatabase(process.env.OPENCODE_DB!);
+        host.prepare("UPDATE session_v2 SET parent_id = 'ses-parent' WHERE id = ?").run(f.session);
+        host.close();
+        await f.pass();
+        f.respond();
+        await f.pass();
+        await f.nativeFold(3, 0, "");
+        refused.mockRestore();
+        f.user(`9203 the saved turn: ${prose}`, 120000);
+        const saved = await f.pass();
+        const servedCheckpoint = JSON.stringify(saved.draft.messages[0]);
+        expect(servedCheckpoint).toContain("<conversation-checkpoint>");
+        expect(servedCheckpoint).not.toContain("Magic Context added a compaction marker");
+        f.respond();
+        f.user(`9203 the busy turn: ${prose}`, 120000);
+        expect(getSlot(f.session)).toBeDefined();
+        admission.state.busyNext = true;
+        const replay = await f.attempt();
+        expect(lkgEvents(replay.logs)).toBe("lkg_replay_served");
+        expect(JSON.stringify(replay.draft.messages[0])).toBe(servedCheckpoint);
+        expect(JSON.stringify(replay.draft.messages)).not.toContain(
+            "Magic Context added a compaction marker",
+        );
+    } finally {
+        refused.mockRestore();
+        admission.restore();
+        limit.mockRestore();
+        await f.cleanup();
+    }
+}, 60000);
+
 // The stored-times read filters on session_id and id. On the host's schema
 // (built below) SQLite would rather use the (session_id, time_created, id)
 // index than the primary key, and that index walks every row of the session
@@ -152,12 +196,39 @@ function countTimeReads() {
         this: V2StoreReader,
         sessionID: string,
         ids: readonly string[],
+        versions?: Parameters<V2StoreReader["messageTimes"]>[2],
     ) {
         reads.push([...ids]);
-        return real.call(this, sessionID, ids);
+        return real.call(this, sessionID, ids, versions);
     });
     return { reads, restore: () => spy.mockRestore() };
 }
+
+test("OC2 temporal passes reuse settled times instead of rereading the draft", async () => {
+    const failure = installTransientFailure();
+    const limit = spyOn(models, "getSdkContextLimit").mockReturnValue(1_000_000);
+    const f = await oc2ContextFixture(9204, { area: AREA, instructions: false });
+    const counted = countTimeReads();
+    try {
+        f.raw.exec("UPDATE session_message SET time_updated = time_created");
+        await f.pass();
+        expect(counted.reads.flat().length).toBeGreaterThan(20);
+        counted.reads.length = 0;
+        await f.pass();
+        expect(counted.reads.flat()).toEqual([]);
+        f.respond();
+        f.user(`9204 the next turn: ${prose}`, 120000);
+        f.raw.exec("UPDATE session_message SET time_updated = time_created");
+        counted.reads.length = 0;
+        await f.pass();
+        expect(counted.reads.flat()).toHaveLength(2);
+    } finally {
+        counted.restore();
+        failure.restore();
+        limit.mockRestore();
+        await f.cleanup();
+    }
+}, 60000);
 
 // Temporal awareness off: a pass reads only the times the saved copy's anchor
 // needs (the latest assistant message and the messages after it), not every

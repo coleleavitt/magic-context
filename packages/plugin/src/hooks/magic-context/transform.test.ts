@@ -18,7 +18,11 @@ import {
     __resetMessageIndexAsyncForTests,
     isSessionReconciled,
 } from "../../features/magic-context/message-index-async";
-import { createScheduler, type Scheduler } from "../../features/magic-context/scheduler";
+import {
+    computeHardCacheExpired,
+    createScheduler,
+    type Scheduler,
+} from "../../features/magic-context/scheduler";
 import { readSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
 import {
     clearPendingOps,
@@ -123,6 +127,131 @@ function userFlushSessions(sessionId: string): Set<string> {
 
 const tempDirs: string[] = [];
 
+it("host checkpoint estimates enter the emergency band before scheduling without provider proof", async () => {
+    useTempDataHome("host-checkpoint-estimate-");
+    const db = openDatabase()!;
+    const sessionId = "host-checkpoint-estimate";
+    await refreshModelLimitsFromApi({
+        config: {
+            providers: async () => ({
+                data: {
+                    providers: [
+                        {
+                            id: "anthropic",
+                            models: { "checkpoint-model": { limit: { context: 200000 } } },
+                        },
+                    ],
+                },
+            }),
+        },
+    });
+    const scheduler = createScheduler({ executeThresholdPercentage: 65 });
+    const events: string[] = [];
+    const original = scheduler.shouldExecute.bind(scheduler);
+    const decide = spyOn(scheduler, "shouldExecute").mockImplementation((...args) => {
+        events.push("schedule");
+        return original(...args);
+    });
+    const usage = new Map([
+        [
+            sessionId,
+            {
+                usage: { inputTokens: 100, percentage: 0.05 },
+                hasUsageTokens: true,
+                updatedAt: Date.now(),
+            },
+        ],
+    ]);
+    let permission: boolean | undefined;
+    const transform = createTransform({
+        db,
+        tagger: createTagger(),
+        scheduler,
+        contextUsageMap: usage,
+        liveModelBySession: new Map([
+            [sessionId, { providerID: "anthropic", modelID: "checkpoint-model" }],
+        ]),
+        getModelKey: () => "anthropic/checkpoint-model",
+        historyRefreshSessions: new Set(),
+        pendingMaterializationSessions: new Set(),
+        lastHeuristicsTurnId: new Map(),
+        clearReasoningAge: 50,
+        protectedTokens: 0,
+        hostInputEstimate: () => {
+            events.push("estimate");
+            return { tokens: 240000, pressureTokens: 210000 };
+        },
+        onPassPermission: (_id, value) => {
+            permission = value;
+        },
+    });
+    try {
+        await transform(
+            {},
+            {
+                messages: [
+                    {
+                        info: { id: "u1", role: "user", sessionID: sessionId },
+                        parts: [{ type: "text", text: "Retain this user request." }],
+                    },
+                ],
+            },
+        );
+        expect(events.indexOf("estimate")).toBeLessThan(events.indexOf("schedule"));
+        expect(decide.mock.results.at(-1)?.value).toBe("execute");
+        expect(permission).toBe(true);
+        expect(getOverflowState(db, sessionId).detectedContextLimit).toBe(0);
+        expect(getOverflowState(db, sessionId).needsEmergencyRecovery).toBe(false);
+        for (const reading of usage.values()) expect(reading.usage.inputTokens).toBe(100);
+        expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens ?? 0).toBeLessThanOrEqual(100);
+    } finally {
+        decide.mockRestore();
+    }
+});
+
+it("reports the final read-only pass permission after rendering and before returning to the host", async () => {
+    useTempDataHome("pass-permission-");
+    const db = openDatabase()!;
+    const sessionId = "permission-session";
+    const reports: boolean[] = [];
+    let output: { messages: TestMessage[] };
+    let returned = false;
+    const transform = createTransform({
+        db,
+        tagger: createTagger(),
+        scheduler: createScheduler({ executeThresholdPercentage: 65 }),
+        contextUsageMap: new Map(),
+        liveModelBySession: new Map([[sessionId, { providerID: "anthropic", modelID: "opus" }]]),
+        historyRefreshSessions: new Set(),
+        pendingMaterializationSessions: new Set(),
+        lastHeuristicsTurnId: new Map(),
+        clearReasoningAge: 50,
+        protectedTokens: 0,
+        onPassPermission: (id, permission) => {
+            expect(id).toBe(sessionId);
+            expect(returned).toBe(false);
+            expect(JSON.stringify(output.messages)).toContain("§1§ question");
+            reports.push(permission);
+        },
+    });
+    for (let pass = 0; pass < 2; pass++) {
+        output = {
+            messages: [
+                {
+                    info: { id: "u1", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "question" }],
+                },
+            ],
+        };
+        returned = false;
+        await transform({}, output);
+        returned = true;
+    }
+    expect(reports).toHaveLength(2);
+    expect(typeof reports[0]).toBe("boolean");
+    expect(reports[1]).toBe(false);
+});
+
 for (const generation of ["v1", "v2"] as const) {
     for (const configured of [true, false]) {
         it(`${generation} pass ${configured ? "applies live user TTL edits without a prompt or model change" : "keeps built-in TTL changes frozen"}`, async () => {
@@ -131,7 +260,11 @@ for (const generation of ["v1", "v2"] as const) {
             const sessionId = `ttl-${generation}-${configured}`;
             let ttl = configured ? "1h" : "5m";
             const scheduler = createScheduler({ executeThresholdPercentage: 65 });
-            const decide = spyOn(scheduler, "shouldExecute");
+            // Whether the pass's effective TTL counts the provider cache as expired.
+            const expired = () => {
+                const meta = getOrCreateSessionMeta(db, sessionId);
+                return computeHardCacheExpired(meta.cacheTtl, meta.lastResponseTime, Date.now());
+            };
             const refresh = new Set<string>();
             const materialize = new Set<string>();
             const transform = createTransform({
@@ -163,33 +296,27 @@ for (const generation of ["v1", "v2"] as const) {
                 await transform({}, { messages });
                 return JSON.stringify(messages);
             };
-            try {
+            await pass();
+            updateSessionMeta(db, sessionId, {
+                lastResponseTime: Date.now() - 2 * 60 * 60 * 1000,
+            });
+            ttl = configured ? "13h" : "10m";
+            const served = await pass();
+            expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe(configured ? "13h" : "5m");
+            expect(readSessionCacheTtl(db, sessionId)?.source).toBe(
+                configured ? "config" : "default",
+            );
+            expect(expired()).toBe(!configured);
+            expect(refresh.size).toBe(0);
+            expect(materialize.size).toBe(0);
+            updateSessionMeta(db, sessionId, { lastResponseTime: Date.now() });
+            if (configured) {
+                ttl = "1m";
+                expect(await pass()).toBe(served);
+                expect(expired()).toBe(false);
+                updateSessionMeta(db, sessionId, { lastResponseTime: Date.now() - 120_000 });
                 await pass();
-                updateSessionMeta(db, sessionId, {
-                    lastResponseTime: Date.now() - 2 * 60 * 60 * 1000,
-                });
-                ttl = configured ? "13h" : "10m";
-                const served = await pass();
-                expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe(
-                    configured ? "13h" : "5m",
-                );
-                expect(readSessionCacheTtl(db, sessionId)?.source).toBe(
-                    configured ? "config" : "default",
-                );
-                expect(decide.mock.results.at(-1)?.value).toBe(configured ? "defer" : "execute");
-                expect(refresh.size).toBe(0);
-                expect(materialize.size).toBe(0);
-                updateSessionMeta(db, sessionId, { lastResponseTime: Date.now() });
-                if (configured) {
-                    ttl = "1m";
-                    expect(await pass()).toBe(served);
-                    expect(decide.mock.results.at(-1)?.value).toBe("defer");
-                    updateSessionMeta(db, sessionId, { lastResponseTime: Date.now() - 120_000 });
-                    await pass();
-                    expect(decide.mock.results.at(-1)?.value).toBe("execute");
-                }
-            } finally {
-                decide.mockRestore();
+                expect(expired()).toBe(true);
             }
         });
     }
@@ -930,6 +1057,52 @@ describe("createTransform", () => {
             b.messages.findIndex((m) => m.info.id === "msg_0bedb7d8f001FvFOQdZoGqywkr") + 1,
         );
     });
+    it("logs incomplete final-wire part metadata once in each transform pass", async () => {
+        useTempDataHome("context-transform-incomplete-wire-");
+        const sessionId = "ses-incomplete-wire";
+        const log = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: () => "defer" },
+            contextUsageMap: new Map(),
+            db: openDatabase(),
+            historyRefreshSessions: new Set(),
+            pendingMaterializationSessions: new Set(),
+            lastHeuristicsTurnId: new Map(),
+            clearReasoningAge: 50,
+            protectedTokens: 0,
+            historianRunnable: false,
+            channel1StateBySession: new Map(),
+        });
+        const messages = [
+            {
+                info: { id: "wire-message", role: "user", sessionID: sessionId },
+                parts: [{ type: "audio", id: "wire-part", data: "SECRET AUDIO CONTENT" }],
+            },
+        ] as unknown as TestMessage[];
+        try {
+            for (let pass = 1; pass <= 2; pass++) {
+                await transform({}, { messages: structuredClone(messages) });
+                const lines = log.mock.calls.filter(
+                    (call) =>
+                        call[0] === sessionId &&
+                        String(call[1]).startsWith(
+                            "transform: final-wire untrusted incompleteParts=",
+                        ),
+                );
+                expect(lines).toHaveLength(pass);
+                const text = String(lines[pass - 1]?.[1]);
+                expect(text).toContain('"messageId":"wire-message"');
+                expect(text).toContain('"partId":"wire-part"');
+                expect(text).toContain('"type":"audio"');
+                expect(text).toContain('"missingFields":["supported type"]');
+                expect(text).not.toContain("SECRET");
+            }
+        } finally {
+            log.mockRestore();
+        }
+    });
+
     it("logs stable nudge verdicts and tag-floor fallback only once across TypeScript passes", async () => {
         useTempDataHome("context-transform-nudge-observability-");
         const sessionId = "ses-nudge-observability";
@@ -3901,16 +4074,38 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
             percentage: 58,
             inputTokens: 300_000,
         });
-        await transform({}, { messages: switchTurnMessages("ses-shrink") });
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        const log = spyOn(loggerModule, "sessionLog");
+        try {
+            await transform({}, { messages: switchTurnMessages("ses-shrink") });
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const lines = log.mock.calls.map(([, text]) => String(text));
+            // Armed THIS pass so the existing bump-to-95% compacts before the
+            // oversized request is sent (not one pass late from the provider error).
+            expect(
+                lines.some((line) =>
+                    line.includes("arming overflow recovery proactively for the shrinking switch"),
+                ),
+            ).toBe(true);
+            expect(
+                lines.some((line) => line.includes("bumping percentage to 95% due to overflow")),
+            ).toBe(true);
+            // The request this fixture sends is tiny, so the recovery check
+            // admits it and that ends the proactive recovery on the same pass.
+            expect(
+                lines.some((line) =>
+                    /recovery request admitted: .*; proactive_model_shrink recovery ends/.test(
+                        line,
+                    ),
+                ),
+            ).toBe(true);
+        } finally {
+            log.mockRestore();
+        }
 
         const overflow = getOverflowState(db, "ses-shrink");
-        // Armed THIS pass so the existing bump-to-95% compacts before the
-        // oversized request is sent (not one pass late from the provider error).
-        expect(overflow.needsEmergencyRecovery).toBe(true);
+        expect(overflow.needsEmergencyRecovery).toBe(false);
         // Flag-only: no catalog/auth limit pinned into detected_context_limit.
         expect(overflow.detectedContextLimit).toBe(0);
-        expect(overflow.emergencyRecoveryOrigin).toBe("proactive_model_shrink");
         expect(abort).not.toHaveBeenCalled();
     });
 
@@ -4106,31 +4301,49 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
             percentage: 58,
             inputTokens: 300_000,
         });
-        await transform(
-            {},
-            {
-                messages: [
-                    {
-                        info: {
-                            id: "m-assistant-old",
-                            role: "assistant",
-                            sessionID: "ses-nomodel",
-                            providerID: OLD_MODEL.providerID,
-                            modelID: OLD_MODEL.modelID,
+        const log = spyOn(loggerModule, "sessionLog");
+        try {
+            await transform(
+                {},
+                {
+                    messages: [
+                        {
+                            info: {
+                                id: "m-assistant-old",
+                                role: "assistant",
+                                sessionID: "ses-nomodel",
+                                providerID: OLD_MODEL.providerID,
+                                modelID: OLD_MODEL.modelID,
+                            },
+                            parts: [{ type: "text", text: "old model reply" }],
                         },
-                        parts: [{ type: "text", text: "old model reply" }],
-                    },
-                    {
-                        // newest user, no info.model
-                        info: { id: "m-user-1", role: "user", sessionID: "ses-nomodel" },
-                        parts: [{ type: "text", text: "continue" }],
-                    },
-                ],
-            },
-        );
-        await new Promise((resolve) => setTimeout(resolve, 0));
-
-        expect(getOverflowState(db, "ses-nomodel").needsEmergencyRecovery).toBe(true);
+                        {
+                            // newest user, no info.model
+                            info: { id: "m-user-1", role: "user", sessionID: "ses-nomodel" },
+                            parts: [{ type: "text", text: "continue" }],
+                        },
+                    ],
+                },
+            );
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            // The arm fired; the tiny request this fixture sends is then
+            // admitted, which ends the recovery on the same pass.
+            const lines = log.mock.calls.map(([, text]) => String(text));
+            expect(
+                lines.some((line) =>
+                    line.includes("arming overflow recovery proactively for the shrinking switch"),
+                ),
+            ).toBe(true);
+            expect(
+                lines.some((line) =>
+                    /recovery request admitted: .*; proactive_model_shrink recovery ends/.test(
+                        line,
+                    ),
+                ),
+            ).toBe(true);
+        } finally {
+            log.mockRestore();
+        }
     });
 });
 
@@ -5115,6 +5328,10 @@ for (const generation of ["v1", "v2"] as const) {
 for (const { modelID, prefixBound } of [
     { modelID: "claude-sonnet-5", prefixBound: false },
     { modelID: "claude-sonnet-5-5", prefixBound: true },
+    // Fable 5.2 and Mythos 5.1/5.2 run the same prefix check, so they get the same hold.
+    { modelID: "claude-fable-5-2", prefixBound: true },
+    { modelID: "claude-mythos-5-1", prefixBound: true },
+    { modelID: "claude-mythos-5-2", prefixBound: true },
 ]) {
     it(`primary ${modelID} tool loop applies queued drops only where active-turn thinking stays byte-identical`, async () => {
         useTempDataHome(`latest-turn-primary-${modelID}-`);

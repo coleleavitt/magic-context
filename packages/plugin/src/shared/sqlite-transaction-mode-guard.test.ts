@@ -19,6 +19,8 @@ import ts from "typescript";
  * block every writer for the length of the read.
  */
 const READ_ONLY_DEFERRED_TRANSACTIONS: Record<string, string> = {
+    "packages/plugin/src/v2/store-reader.ts#withOrdinalSequences":
+        "pins data_version, ordinal seq anchors and the requested lookup to one snapshot on a read-only OpenCode 2 connection; never writes",
     "packages/plugin/src/v2/store-reader.ts#window":
         "reads the latest compaction and the rows after it as one consistent snapshot of the OpenCode 2 store; never writes",
     "packages/pi-plugin/src/inject-compartments-pi.ts#readFrozenM0InputsPi":
@@ -27,6 +29,8 @@ const READ_ONLY_DEFERRED_TRANSACTIONS: Record<string, string> = {
         "pins one read snapshot so the session's rowid coverage proof and the filtered message search see the same rows; never writes (read-only connections use it too)",
     "packages/plugin/src/hooks/magic-context/lkg-persist.ts#loadPersistedLkgSlot":
         "reads an LKG slot row and its prefix slices as one consistent snapshot; never writes (a failed verification clears the slot afterwards, outside this transaction)",
+    "packages/plugin/src/hooks/magic-context/compaction-marker-manager.ts#reconcileForkOrphanedCompactionMarkers":
+        "reads publication intent and finalized ownership as one context.db snapshot while host-order probes use the already-open host connection; never writes context.db",
 };
 
 const REPOSITORY_ROOT = resolve(import.meta.dir, "../../../..");

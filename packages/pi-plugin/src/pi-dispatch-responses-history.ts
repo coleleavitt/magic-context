@@ -1,4 +1,6 @@
 import { stripPersistedAssistantText } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
+import { isPiDropPlaceholder } from "./native-replay-pi";
+import { ownsNativeResponseTagStrip } from "./native-replay-tag-provenance-pi";
 import { piOmitsTruncatedAssistant } from "./pi-dispatch-assistant-history";
 import type { PiChatHistoryModel } from "./pi-dispatch-chat-history";
 import type { PiDispatchHost } from "./pi-dispatch-structure";
@@ -87,6 +89,7 @@ export function piResponsesAssistantTexts(
 	model: PiChatHistoryModel | undefined,
 	host?: PiDispatchHost,
 	alternatives?: PiResponsesUnsignedAlternatives,
+	frozenTagStrips?: unknown,
 ): readonly string[] | undefined {
 	const message = object(value);
 	if (!message || !Array.isArray(message.content)) return undefined;
@@ -129,6 +132,22 @@ export function piResponsesAssistantTexts(
 			texts.push(textIdentity(text, undefined));
 			continue;
 		}
+		// Oh My Pi's transformMessages drops these blocks for every Responses
+		// target before it encodes a turn, so they add no row and no text: an
+		// assistant image, an Anthropic server-tool block, a server-side fallback
+		// marker, and redacted thinking from any other model. It keeps redacted
+		// thinking from the target model itself, so that block stays unmodeled.
+		// The rule is the same in every pinned version: transform-messages.ts
+		// 17.1.7:721-775, 18.8.9:928-982, 18.11.3:1109-1159,
+		// 18.12.3-18.13.2:1138-1188, 18.18.0-18.18.1:1200-1250.
+		if (
+			host === "omp" &&
+			(block?.type === "image" ||
+				block?.type === "anthropicServerTool" ||
+				block?.type === "fallback" ||
+				(block?.type === "redactedThinking" && !sameModel))
+		)
+			continue;
 		if (block?.type !== "text" || typeof block.text !== "string")
 			return undefined;
 		units += block.text.length;
@@ -156,6 +175,33 @@ export function piResponsesAssistantTexts(
 		!Array.isArray(payload.items)
 	)
 		return texts;
+	// Codex rejects hidden-only native replay, then sanitizes its block fallback
+	// too. Empty output_text parts need not bind one-to-one to prepared blocks:
+	// neither representation produces a visible row. Include demoted thinking in
+	// the visible check so reasoning converted into text is not treated as blank.
+	if (
+		host === "omp" &&
+		model.api === "openai-codex-responses" &&
+		texts.every((text) => !/\S/u.test(JSON.parse(text)[0])) &&
+		payload.items.every((value) => {
+			const item = object(value);
+			return (
+				item?.type === "reasoning" ||
+				(item?.type === "message" &&
+					item.role === "assistant" &&
+					Array.isArray(item.content) &&
+					item.content.every((value) => {
+						const part = object(value);
+						return (
+							part?.type === "output_text" &&
+							typeof part.text === "string" &&
+							!/\S/u.test(part.text)
+						);
+					}))
+			);
+		})
+	)
+		return [];
 	// Matching API/model/provider selects cached wire items instead of converting
 	// the prepared blocks. The cache's dt flag marks items to append; without it,
 	// replay replaces all preceding input. Allow only append-only text whose v1
@@ -185,6 +231,7 @@ export function piResponsesAssistantTexts(
 		].includes(model?.api ?? "");
 	let unsigned = false;
 	let rewrittenText = false;
+	let allUnsignedFrozen = true;
 	for (const value of payload.items) {
 		const item = object(value);
 		if (item?.type === "reasoning") continue;
@@ -192,12 +239,13 @@ export function piResponsesAssistantTexts(
 			output = true;
 			continue;
 		}
-		if (
-			item?.type !== "message" ||
-			item.role !== "assistant" ||
-			!Array.isArray(item.content)
-		)
-			return texts;
+		// Oh My Pi replays every native item it keeps, and the turn comparison
+		// cannot read any other kind (a generated image's image_generation_call,
+		// a hosted web_search_call). Leave such a turn unmodeled, which skips the
+		// comparison for the request; the native-drop check at dispatch still
+		// covers its dropped parts.
+		if (item?.type !== "message") return undefined;
+		if (item.role !== "assistant" || !Array.isArray(item.content)) return texts;
 		const itemTexts: string[] = [];
 		for (const value of item.content) {
 			const part = object(value);
@@ -228,14 +276,39 @@ export function piResponsesAssistantTexts(
 				// Remove only our current prepared ordinal from the visible side;
 				// unrelated visible edits must not inherit the native text or phase.
 				const stripped = stripPersistedAssistantText(part.text);
+				// A dropped block is sent as the placeholder itself. When the native
+				// item already carries those exact bytes, OMP replays them with the
+				// item's own phase, so bind the block to that item. The hook's cleanup
+				// cannot describe this pair: it would strip the placeholder's tag.
+				const droppedPlaceholder =
+					isPiDropPlaceholder(block.text as string) && part.text === block.text;
 				if (
 					!allowUnsigned ||
 					"textSignature" in block ||
-					stripped !== (block.text as string).replace(/^§\d+§ /u, "")
+					(!droppedPlaceholder &&
+						stripped !== (block.text as string).replace(/^§\d+§ /u, ""))
 				)
 					return texts;
 				unsigned = true;
-				rewrittenText ||= part.text !== stripped && part.text !== block.text;
+				// Clean unsigned text cannot normally establish native phase ownership.
+				// Persisted strip evidence preserves that ownership only for the exact
+				// native identity and body, without restoring a removed text signature.
+				// A matching drop placeholder establishes it for that block alone.
+				allUnsignedFrozen &&=
+					droppedPlaceholder ||
+					(part.text === block.text &&
+						ownsNativeResponseTagStrip(
+							frozenTagStrips,
+							item.id,
+							item.phase,
+							part.text,
+						));
+				// Reapplying the echoed ordinal can restore the original bytes, but
+				// the hook still removed the signature. Native replay owns the phase
+				// even when the prepared text now equals the cached output text.
+				// A placeholder is not evidence of that hook rewrite, so it must not
+				// admit clean unsigned siblings in the same message.
+				rewrittenText ||= !droppedPlaceholder && part.text !== stripped;
 			}
 			bound++;
 			itemTexts.push(part.text);
@@ -247,7 +320,11 @@ export function piResponsesAssistantTexts(
 	}
 	// Every prepared text block must own exactly one cached text, in order. With
 	// no replayable output OMP converts the blocks instead, so keep their texts.
-	if (!output || bound !== blocks.length || (unsigned && !rewrittenText))
+	if (
+		!output ||
+		bound !== blocks.length ||
+		(unsigned && !rewrittenText && !allUnsignedFrozen)
+	)
 		return texts;
 	if (unsigned && alternatives) {
 		alternatives.fallback = texts;

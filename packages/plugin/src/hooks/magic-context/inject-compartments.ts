@@ -26,6 +26,10 @@ import { resolveMuralWire } from "../../features/magic-context/mural/render-trig
 import type { MuralWireOptions } from "../../features/magic-context/mural/resolve-mural";
 import { isNoContentCompartment } from "../../features/magic-context/no-content-compartment";
 import {
+    describeRequestToolDefinitionChange,
+    needsRequestToolIdentityAdoption,
+} from "../../features/magic-context/request-tool-definitions";
+import {
     GLOBAL_USER_PROFILE_PROJECT_PATH,
     getMaxM0MutationId,
     getMaxMemoryMutationId,
@@ -69,10 +73,12 @@ import {
     encodeCachedM0UpgradeIdentity,
     MEMORY_RENDER_FORMAT_EPOCH,
     readCachedM0MemoryIds,
+    readCachedM0ToolDefinitionsHash,
     renderBudgetIdentityChanged,
     renderedBudgetShrinkReason,
     renderedBudgetSnapshot,
     withCachedM0MemoryIds,
+    withCachedM0ToolDefinitionsHash,
 } from "./compartment-render-epoch";
 import { extractM0Block, renderCompartmentAtTier, renderDecayedCompartments } from "./decay-render";
 import { historyLocalBudget } from "./decision-calibration";
@@ -712,12 +718,11 @@ export function prepareCompartmentInjection(
     } else {
         // Degraded: the natural boundary message is not in the visible window.
         const degradedCount = noteDegradedRebuild(sessionId);
-        // Layer A (#263): on the FIRST degraded detection of an episode, run the
-        // fork-orphan marker hygiene pass. If a foreign marker outranks ours this
-        // removes it, so the next pass's window stops at our marker and we
-        // recover. Gated to the degraded trigger so steady state pays nothing.
-        if (degradedCount === 1) {
-            reconcileForkOrphanedCompactionMarkers(db, sessionId);
+        // Remove fork-orphan markers only on a pass already rebuilding.
+        // A cold defer must neither change host rows nor consume the opportunity
+        // for a later rebuilding pass to repair the degraded window.
+        if (isCacheBusting) {
+            reconcileForkOrphanedCompactionMarkers(db, sessionId, isCacheBusting);
         }
 
         let reAnchored = false;
@@ -894,10 +899,11 @@ export interface M0SnapshotMarkers {
     memoryRenderEpoch: string | null;
     // HARD-bust markers are captured from runtime signals at the injectM0M1
     // call site (NOT a pure DB read), so readCurrentM0SnapshotMarkers takes
-    // them as inputs. The tool-set hash is retained for attribution only: its
-    // process-global scope makes it deliberately ineligible to trigger a fold.
+    // them as inputs. The names-only tool-set hash is attribution; the optional
+    // name/description identity comes only from OpenCode 2's context hook.
     systemHash: string;
     toolSetHash: string;
+    toolDefinitionsHash?: string | null;
     modelKey: string;
     projectIdentity?: string | null;
     /** Hash of the image identity folded into this m0 baseline. */
@@ -912,15 +918,22 @@ export interface M0SnapshotMarkers {
  * Runtime cache-eviction signals threaded into the materialization decision.
  * These are NOT derived from durable DB state like the content markers — they
  * come from the current flight (system-prompt hash, tool-set fingerprint,
- * provider/model key) plus the TTL idle window. Tool-set changes are observed
- * for attribution only; they never request a materialization.
+ * provider/model key). Only the session context's
+ * name/description identity can trigger a tool change; the names-only hash is attribution.
  */
 export interface M0HardSignals {
     systemHash: string;
     /** Empty or absent means the provider tool set is not observable this pass. */
     toolSetHash?: string;
+    /** OpenCode 2 only: sorted names/descriptions observed by this session's context hook. */
+    toolDefinitionsHash?: string;
     modelKey: string;
-    /** True when the provider cache TTL has elapsed since lastResponseTime. */
+    /**
+     * True when the provider cache TTL has elapsed since lastResponseTime.
+     * Recorded for logs only: an expired cache never triggers a fold, because
+     * resending the same bytes keeps signed thinking valid and costs the same
+     * re-read as a rebuild.
+     */
     cacheExpired: boolean;
     /** Epoch ms of the last completed assistant response (end-of-turn). */
     lastResponseTime: number;
@@ -1066,6 +1079,7 @@ export interface MaterializeDecision {
      */
     m0ToolSetHashPrev?: string | null;
     m0ToolSetHashNew?: string | null;
+    toolDefinitionsChange?: ReturnType<typeof describeRequestToolDefinitionChange>;
 }
 
 export interface MaterializeM0Result {
@@ -1630,6 +1644,7 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
             memoryRenderEpoch: MEMORY_RENDER_FORMAT_EPOCH,
             systemHash: hard.systemHash,
             toolSetHash: hard.toolSetHash ?? "",
+            toolDefinitionsHash: hard.toolDefinitionsHash ?? null,
             modelKey: piModelRefToCanonical(hard.modelKey),
             projectIdentity: args.projectPath ?? null,
             muralEnabled: args.memoryEnabled !== false && args.muralEnabled === true,
@@ -1656,6 +1671,7 @@ function refreshVolatileMarkerInputs(
         materializedAt: Date.now(),
         systemHash: hard.systemHash,
         toolSetHash: hard.toolSetHash ?? "",
+        toolDefinitionsHash: hard.toolDefinitionsHash ?? null,
         modelKey: hard.modelKey,
         projectIdentity: args.projectPath ?? null,
         muralEnabled: args.memoryEnabled !== false && args.muralEnabled === true,
@@ -1747,6 +1763,7 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
         memoryRenderEpoch: cachedUpgradeIdentity.memoryRenderEpoch,
         systemHash: state.cachedM0SystemHash ?? "",
         toolSetHash: state.cachedM0ToolSetHash ?? "",
+        toolDefinitionsHash: readCachedM0ToolDefinitionsHash(state.cachedM0UpgradeState),
         modelKey: state.cachedM0ModelKey ?? "",
         projectIdentity: state.cachedM0ProjectIdentity ?? null,
         muralHash: state.cachedM0MuralHash ?? null,
@@ -1762,9 +1779,11 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
  *   SOFT+  — defer pass, nothing new: replay m[0] AND m[1] byte-identical.
  *   SOFT   — exec / deferred-consume pass: m[1] re-renders (new compartments,
  *            new memories, new user-profile ride the m[1] delta), m[0] stays.
- *   HARD   — the provider cache is already dead (idle>TTL, model/system/tools
- *            changed) OR a genuine m[0] *content* marker changed: fold m[1] into
- *            m[0], re-run decay, reset m[1].
+ *   HARD   — the bytes before the conversation changed (model, system prompt or
+ *            tools changed, a host compaction) OR a genuine m[0] *content*
+ *            marker changed: fold m[1] into m[0], re-run decay, reset m[1]. An
+ *            expired provider cache (idle past the TTL) is not HARD: the same
+ *            bytes are replayed, as on a warm cache.
  *
  * `mustMaterialize` returns true ONLY for HARD. New compartments and additive
  * user-profile/memory changes are deliberately NOT triggers — they are m[1]
@@ -1880,8 +1899,43 @@ export function mustMaterialize(args: {
             systemHashNew: hard.systemHash,
         };
     }
-    // Tool-set changes are deliberately not HARD-fold triggers: this signal is
-    // process-global, so folding on it would manufacture unrelated session busts.
+    const liveDefinitionsHash = hard.toolDefinitionsHash;
+    if (liveDefinitionsHash) {
+        const cachedDefinitionsHash = readCachedM0ToolDefinitionsHash(
+            args.state.cachedM0UpgradeState,
+        );
+        if (
+            !cachedDefinitionsHash ||
+            needsRequestToolIdentityAdoption(cachedDefinitionsHash, liveDefinitionsHash)
+        ) {
+            // Upgraded baselines cannot tell us what tools they served. Seed the
+            // comparison without rebuilding or changing a single served byte.
+            const previousIdentity = args.state.cachedM0UpgradeState;
+            const adoptedIdentity = withCachedM0ToolDefinitionsHash(
+                previousIdentity,
+                liveDefinitionsHash,
+            );
+            const adopted = args.db
+                .prepare(
+                    "UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ? AND cached_m0_upgrade_state IS ?",
+                )
+                .run(adoptedIdentity, args.sessionId, previousIdentity);
+            // A concurrent fold owns its whole snapshot. Never overwrite its
+            // renderer/budget/selection markers with an older adoption read.
+            if (adopted.changes > 0) args.state.cachedM0UpgradeState = adoptedIdentity;
+        } else if (cachedDefinitionsHash !== liveDefinitionsHash) {
+            return {
+                value: true,
+                reason: "tool_definitions",
+                toolDefinitionsChange: describeRequestToolDefinitionChange(
+                    cachedDefinitionsHash,
+                    liveDefinitionsHash,
+                ),
+            };
+        }
+    }
+    // The names-only hash can be process-global on OpenCode 1. It remains
+    // attribution only so unrelated sessions cannot trigger each other.
     // Preserve the actual operands from this decision site for a later query.
     const liveToolSetHash = hard.toolSetHash ?? "";
     const toolSetHashComparison =
@@ -1893,26 +1947,18 @@ export function mustMaterialize(args: {
             : null;
     const withToolSetHashComparison = (decision: MaterializeDecision): MaterializeDecision =>
         toolSetHashComparison ? { ...decision, ...toolSetHashComparison } : decision;
-    // Idle > TTL: the provider evicted the cache while the user was away. Guard
-    // for idempotence across a multi-pass "came back" turn: cacheExpired stays
-    // true on every pass until lastResponseTime updates at end-of-response, so
-    // fold only when the last completed response is newer than our last
-    // materialization. After the fold, materializedAt = Date.now() exceeds the
-    // pre-expiry lastResponseTime, so subsequent passes this turn skip; the next
-    // idle-after-response re-arms naturally. Self-consuming, no extra column.
-    if (
-        hard.cacheExpired &&
-        hard.lastResponseTime > 0 &&
-        hard.lastResponseTime > (args.state.cachedM0MaterializedAt ?? 0)
-    ) {
-        return withToolSetHashComparison({ value: true, reason: "ttl_idle" });
-    }
+    // An idle expiry (cacheExpired) is deliberately not a trigger. When only the
+    // provider forgot the cache, the bytes before the conversation are unchanged:
+    // resending them keeps every signed thinking block valid, and the provider
+    // re-reads the same prefix whether or not m[0] is re-rendered. Folding there
+    // would only cost the agent its reasoning and land drops early.
+    //
     // A native host compaction replaced the window after the last fold. The host
     // summary now stands in for the history before its retained tail, and the
     // stored baseline boundary still points at a row the host no longer serves.
     // The compaction already changed everything after the cached prefix, so the
-    // re-anchoring fold rides that change. Self-consuming like the idle expiry:
-    // after the fold, materializedAt is newer than the summary.
+    // re-anchoring fold rides that change. Self-consuming: after the fold,
+    // materializedAt is newer than the summary.
     const hostCompaction = hard.hostCompaction;
     if (
         hostCompaction !== undefined &&
@@ -2416,16 +2462,19 @@ function applyMarkersToState(
     state.cachedM0ProjectDocsHash = markers.projectDocsHash;
     state.cachedM0MaterializedAt = markers.materializedAt;
     state.cachedM0SessionFactsVersion = markers.sessionFactsVersion;
-    state.cachedM0UpgradeState = withCachedM0MemoryIds(
-        encodeCachedM0UpgradeIdentity(
-            markers.upgradeState,
-            markers.compartmentRenderEpoch,
-            markers.muralEnabled,
-            markers.renderBudgetIdentity,
-            markers.memoryRenderEpoch,
-            markers.renderedBudgets ?? null,
+    state.cachedM0UpgradeState = withCachedM0ToolDefinitionsHash(
+        withCachedM0MemoryIds(
+            encodeCachedM0UpgradeIdentity(
+                markers.upgradeState,
+                markers.compartmentRenderEpoch,
+                markers.muralEnabled,
+                markers.renderBudgetIdentity,
+                markers.memoryRenderEpoch,
+                markers.renderedBudgets ?? null,
+            ),
+            renderedM0Ids,
         ),
-        renderedM0Ids,
+        markers.toolDefinitionsHash ?? null,
     );
     // Runtime markers must be mirrored into flat state because the next
     // mustMaterialize pass reads cachedM0SystemHash/ToolSetHash/ModelKey directly
@@ -2645,16 +2694,19 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
     options.beforePhase3ForTest?.();
 
     const steps = new WriteTransactionSteps();
-    const upgradeIdentity = withCachedM0MemoryIds(
-        encodeCachedM0UpgradeIdentity(
-            snapshotMarkers.upgradeState,
-            snapshotMarkers.compartmentRenderEpoch,
-            snapshotMarkers.muralEnabled,
-            snapshotMarkers.renderBudgetIdentity,
-            snapshotMarkers.memoryRenderEpoch,
-            snapshotMarkers.renderedBudgets ?? null,
+    const upgradeIdentity = withCachedM0ToolDefinitionsHash(
+        withCachedM0MemoryIds(
+            encodeCachedM0UpgradeIdentity(
+                snapshotMarkers.upgradeState,
+                snapshotMarkers.compartmentRenderEpoch,
+                snapshotMarkers.muralEnabled,
+                snapshotMarkers.renderBudgetIdentity,
+                snapshotMarkers.memoryRenderEpoch,
+                snapshotMarkers.renderedBudgets ?? null,
+            ),
+            renderedMemoryIds,
         ),
-        renderedMemoryIds,
+        snapshotMarkers.toolDefinitionsHash ?? null,
     );
     const baselineEndMessageId = lastCompartmentBoundaryId(compartments);
     steps.mark("pre_metadata");
@@ -2708,6 +2760,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             // so carry the captured values and exclude them from the stale check.
             systemHash: snapshotMarkers.systemHash,
             toolSetHash: snapshotMarkers.toolSetHash,
+            toolDefinitionsHash: snapshotMarkers.toolDefinitionsHash,
             modelKey: snapshotMarkers.modelKey,
             projectIdentity: projectPath ?? null,
             muralEnabled: snapshotMarkers.muralEnabled,
@@ -3165,7 +3218,7 @@ function readCachedM0M1Row(db: Database, sessionId: string): CachedM0M1Row | nul
                     cached_m0_session_facts_version,
                      cached_m0_upgrade_state,
                      cached_m0_system_hash,
-                     cached_m0_tool_set_hash,
+                      cached_m0_tool_set_hash,
                      cached_m0_model_key,
                      cached_m0_project_identity,
                      cached_m0_last_baseline_end_message_id,
@@ -3202,6 +3255,7 @@ function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
         memoryRenderEpoch: cachedUpgradeIdentity.memoryRenderEpoch,
         systemHash: row.cached_m0_system_hash ?? "",
         toolSetHash: row.cached_m0_tool_set_hash ?? "",
+        toolDefinitionsHash: readCachedM0ToolDefinitionsHash(row.cached_m0_upgrade_state),
         modelKey: row.cached_m0_model_key ?? "",
         projectIdentity: row.cached_m0_project_identity ?? null,
         muralHash: row.cached_m0_mural_hash ?? null,
@@ -3257,13 +3311,16 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
     state.cachedM0ProjectDocsHash = markers.projectDocsHash;
     state.cachedM0MaterializedAt = markers.materializedAt;
     state.cachedM0SessionFactsVersion = markers.sessionFactsVersion;
-    state.cachedM0UpgradeState = encodeCachedM0UpgradeIdentity(
-        markers.upgradeState,
-        markers.compartmentRenderEpoch,
-        markers.muralEnabled,
-        markers.renderBudgetIdentity,
-        markers.memoryRenderEpoch,
-        markers.renderedBudgets ?? null,
+    state.cachedM0UpgradeState = withCachedM0ToolDefinitionsHash(
+        encodeCachedM0UpgradeIdentity(
+            markers.upgradeState,
+            markers.compartmentRenderEpoch,
+            markers.muralEnabled,
+            markers.renderBudgetIdentity,
+            markers.memoryRenderEpoch,
+            markers.renderedBudgets ?? null,
+        ),
+        markers.toolDefinitionsHash ?? null,
     );
     state.cachedM0SystemHash = markers.systemHash;
     state.cachedM0ToolSetHash = markers.toolSetHash;
@@ -4083,6 +4140,58 @@ export function prepareCachedM0M1Replay(
     };
 }
 
+/**
+ * The m[0]/m[1] messages a pass will put at the head of its request, so the
+ * request can be sized before the postprocess phase injects them. Nothing is
+ * persisted and `options.state` is left unchanged.
+ *
+ * A pass that folds (`folds`) re-renders m[0] from current state at its own
+ * render budgets and resets m[1], so its head is rendered here the same way the
+ * non-persisting fallback renders it, with the empty m[1] a fresh
+ * materialization serves. So is the head of a session without a complete
+ * persisted pair, which is about to render its first. Any other pass serves the
+ * persisted pair; a history refresh later in the same pass may re-render m[1],
+ * usually at a similar size.
+ */
+export function headMessagesForSizing(options: M0M1RenderOptions, folds = false): MessageLike[] {
+    if (!folds) {
+        const cached = prepareCachedM0M1Replay(options.db, options.sessionId);
+        if (cached?.preparedMessages) return cached.preparedMessages;
+    }
+    // The fallback render records the mural it chose on the state it is given.
+    const state: M0M1State = { ...options.state };
+    const fresh = renderFreshM0NonPersisted({ ...options, state });
+    const head: MessageLike[] = [];
+    prependM0M1Messages(
+        options.sessionId,
+        head,
+        fresh.m0Bytes.toString("utf8"),
+        M1_EMPTY_PLACEHOLDER,
+        state.cachedM0MuralDataUrl
+            ? { enabled: true, supportsVision: true, dataUrl: state.cachedM0MuralDataUrl }
+            : undefined,
+    );
+    return head;
+}
+
+/**
+ * The messages a fold on this pass would keep raw: everything after the end of
+ * the newest compartment that has an end id, the same cut the fold makes. When
+ * that row is not in the array (the host already cut it away, or no compartment
+ * has an end id), the whole array is returned. For counting only.
+ */
+export function rawTailAfterNewestCompartment(
+    db: Database,
+    sessionId: string,
+    messages: readonly MessageLike[],
+): readonly MessageLike[] {
+    const boundary = newestCompartmentEndId(getCompartments(db, sessionId));
+    if (!boundary) return messages;
+    const index = findBoundaryIndex(sessionId, messages, boundary);
+    if (index < 0) return messages;
+    return messages.slice(index + (isPartialCompartmentEnd(db, sessionId, boundary) ? 0 : 1));
+}
+
 export function hasCompleteCachedM0M1(db: Database, sessionId: string): boolean {
     const row = db
         .prepare(
@@ -4280,7 +4389,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
     }
 
     // Pressure backstop refold: the "or we have to due to pressures" half of the
-    // m[0]/m[1] contract. When NO HARD bust (TTL/system/tools/model) has arrived
+    // m[0]/m[1] contract. When NO HARD bust (system/tools/model change) has arrived
     // but the volatile m[1] delta has grown large, fold it into m[0] (re-run
     // decay, reset m[1]) so a marathon active session can't grow m[1] unbounded.
     // Runs only on cache-busting passes where m[1] was freshly recomputed; defer

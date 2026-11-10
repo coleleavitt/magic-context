@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createScheduler } from "../../features/magic-context/scheduler";
+import { computeHardCacheExpired } from "../../features/magic-context/scheduler";
 import {
     closeDatabase,
     getOrCreateSessionMeta,
@@ -14,6 +14,10 @@ import {
 } from "../../features/magic-context/storage";
 import { resolveContextLimit } from "../../hooks/magic-context/event-resolvers";
 import type { TransformDeps } from "../../hooks/magic-context/transform";
+import {
+    recordUsageRefusal,
+    shouldResetRefusedUsage,
+} from "../../hooks/magic-context/transform-context-state";
 import { ABSOLUTE_EMERGENCY_PERCENTAGE } from "../../shared/escalation-bands";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -61,6 +65,152 @@ async function configure272kWindow(): Promise<void> {
 }
 
 describe("persistV2UsageReading", () => {
+    it("records last-iteration pressure instead of billed usage and accepts the next normal reply", () => {
+        process.env.XDG_DATA_HOME = makeTempDir("v2-per-run-usage-");
+        const db = openDatabase();
+        const sessionID = "v2-per-run-usage";
+        const contextUsageMap: TransformDeps["contextUsageMap"] = new Map();
+        const draftModel = { providerID: "anthropic", id: "claude-opus-5-5" };
+        const tokens = { input: 963_300 };
+        const persist = (completed: number, content: unknown) => {
+            const reading = resolveUsageReading({
+                draftModel,
+                tokens,
+                completed,
+                finish: "stop",
+                content,
+                limitFor: () => 872_000,
+            })!;
+            persistV2UsageReading({ db, sessionID, draftModel, reading, contextUsageMap });
+        };
+        persist(1000, [
+            {
+                type: "reasoning",
+                native: {
+                    signature: `cortexkit-server-fallback-usage-v1:${JSON.stringify({
+                        iterations: [
+                            {
+                                type: "message",
+                                model: "primary",
+                                input_tokens: 453_300,
+                                output_tokens: 50,
+                            },
+                            {
+                                type: "fallback_message",
+                                model: "fallback",
+                                input_tokens: 100_000,
+                                output_tokens: 50,
+                                cache_read_input_tokens: 400_000,
+                                cache_creation_input_tokens: 10_000,
+                            },
+                        ],
+                    })}`,
+                },
+            },
+        ]);
+        const meta = getOrCreateSessionMeta(db, sessionID);
+        expect(meta.lastInputTokens).toBe(510_000);
+        expect(meta.lastContextPercentage).toBeCloseTo(58.4862, 3);
+        expect(meta.lastResponseTime).toBe(1000);
+        expect(contextUsageMap.get(sessionID)?.usage.inputTokens).toBe(510_000);
+        expect(contextUsageMap.get(sessionID)?.usage.percentage).toBeCloseTo(58.4862, 3);
+        expect(tokens.input).toBe(963_300);
+        tokens.input = 520_000;
+        persist(2000, []);
+        expect(getOrCreateSessionMeta(db, sessionID).lastInputTokens).toBe(520_000);
+        expect(contextUsageMap.get(sessionID)?.usage.inputTokens).toBe(520_000);
+    });
+
+    it("keeps pressure and the map entry for a server-fallback reply but moves completion time", () => {
+        process.env.XDG_DATA_HOME = makeTempDir("v2-fallback-usage-");
+        const db = openDatabase();
+        const sessionID = "v2-fallback-usage";
+        const contextUsageMap: TransformDeps["contextUsageMap"] = new Map();
+        const draftModel = { providerID: "anthropic", id: "claude-opus-5-5" };
+        const persist = (input: number, completed: number, marked: boolean) => {
+            const reading = resolveUsageReading({
+                draftModel,
+                tokens: { input },
+                completed,
+                finish: "stop",
+                content: marked
+                    ? [
+                          {
+                              type: "reasoning",
+                              text: " ",
+                              native: {
+                                  signature: "cortexkit-server-fallback-v1:primary|fallback",
+                              },
+                          },
+                      ]
+                    : [{ type: "reasoning", native: { signature: "real-signature" } }],
+                limitFor: () => 872_000,
+            })!;
+            persistV2UsageReading({ db, sessionID, draftModel, reading, contextUsageMap });
+        };
+        persist(507_000, 1000, false);
+        const previous = getOrCreateSessionMeta(db, sessionID);
+        const entry = contextUsageMap.get(sessionID);
+        persist(963_300, 2000, true);
+        expect(getOrCreateSessionMeta(db, sessionID)).toEqual({
+            ...previous,
+            lastResponseTime: 2000,
+        });
+        expect(contextUsageMap.get(sessionID)).toBe(entry);
+        persist(510_000, 3000, false);
+        expect(getOrCreateSessionMeta(db, sessionID).lastInputTokens).toBe(510_000);
+        expect(contextUsageMap.get(sessionID)?.usage.inputTokens).toBe(510_000);
+        expect(getOrCreateSessionMeta(db, sessionID).lastResponseTime).toBe(3000);
+    });
+
+    it("dates provider usage by completion when the store is read after a fold", () => {
+        process.env.XDG_DATA_HOME = makeTempDir("v2-usage-age-");
+        const db = openDatabase();
+        const sessionID = "v2-usage-age";
+        const contextUsageMap: TransformDeps["contextUsageMap"] = new Map();
+        getOrCreateSessionMeta(db, sessionID);
+        updateSessionMeta(db, sessionID, { cachedM0MaterializedAt: 2000 });
+        const persist = (inputTokens: number, completed: number) =>
+            persistV2UsageReading({
+                db,
+                sessionID,
+                contextUsageMap,
+                draftModel: { providerID: "test-provider", id: "test-model" },
+                reading: {
+                    inputTokens,
+                    completed,
+                    finish: "stop",
+                    limit: 100_000,
+                    admissionLimit: 100_000,
+                    modelKey: "test-provider/test-model",
+                },
+            });
+        const stale = () =>
+            shouldResetRefusedUsage(
+                db,
+                sessionID,
+                getOrCreateSessionMeta(db, sessionID),
+                contextUsageMap.get(sessionID),
+            );
+        persist(97_000, 1000);
+        expect(contextUsageMap.get(sessionID)?.updatedAt).toBe(1000);
+        expect(stale()).toBe(false);
+        recordUsageRefusal(db, sessionID, 1500);
+        expect(stale()).toBe(true);
+        persist(40_000, 3000);
+        expect(contextUsageMap.get(sessionID)?.updatedAt).toBe(3000);
+        expect(stale()).toBe(false);
+        // A later completion without usage refreshes the idle clock, not the measurement.
+        recordUsageRefusal(db, sessionID, 3200);
+        updateSessionMeta(db, sessionID, { cachedM0MaterializedAt: 3500 });
+        persist(0, 4000);
+        expect(getOrCreateSessionMeta(db, sessionID).lastResponseTime).toBe(4000);
+        expect(contextUsageMap.get(sessionID)?.updatedAt).toBe(3000);
+        expect(stale()).toBe(true);
+        persist(97_000, 5000);
+        expect(stale()).toBe(false);
+    });
+
     it("treats provider usage above the configured window as real pressure on every reading", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("v2-usage-persist-");
         await configure272kWindow();
@@ -217,11 +367,12 @@ describe("persistV2UsageReading", () => {
             },
         });
         updateSessionMeta(db, sessionID, { cacheTtl: "1h" });
-        const scheduler = createScheduler({ executeThresholdPercentage: 90 });
-        const usage = { inputTokens: 1_000, percentage: 1 };
-        expect(scheduler.shouldExecute(getOrCreateSessionMeta(db, sessionID), usage, now)).toBe(
-            "execute",
-        );
+        // The idle clock decides whether the provider cache counts as expired.
+        const expired = (at: number) => {
+            const meta = getOrCreateSessionMeta(db, sessionID);
+            return computeHardCacheExpired(meta.cacheTtl, meta.lastResponseTime, at);
+        };
+        expect(expired(now)).toBe(true);
         for (const error of [{ name: "MessageAbortedError" }, { name: "APIError" }]) {
             const reading = resolveUsageReading({
                 draftModel,
@@ -233,9 +384,7 @@ describe("persistV2UsageReading", () => {
             })!;
             persistV2UsageReading({ db, sessionID, draftModel, contextUsageMap, reading });
         }
-        expect(scheduler.shouldExecute(getOrCreateSessionMeta(db, sessionID), usage, now)).toBe(
-            "execute",
-        );
+        expect(expired(now)).toBe(true);
         const reading = resolveUsageReading({
             draftModel,
             completed: now,
@@ -245,9 +394,7 @@ describe("persistV2UsageReading", () => {
         if (reading) persistV2UsageReading({ db, sessionID, draftModel, contextUsageMap, reading });
         expect(getOrCreateSessionMeta(db, sessionID).lastResponseTime).toBe(now);
         expect(getOrCreateSessionMeta(db, sessionID).lastInputTokens).toBe(1_000);
-        expect(
-            scheduler.shouldExecute(getOrCreateSessionMeta(db, sessionID), usage, now + 1_000),
-        ).toBe("defer");
+        expect(expired(now + 1_000)).toBe(false);
         persistV2UsageReading({
             db,
             sessionID,
@@ -255,9 +402,7 @@ describe("persistV2UsageReading", () => {
             contextUsageMap,
             reading: { ...reading!, completed: now + 2_000 },
         });
-        expect(
-            scheduler.shouldExecute(getOrCreateSessionMeta(db, sessionID), usage, now + 3_000),
-        ).toBe("defer");
+        expect(expired(now + 3_000)).toBe(false);
     });
 
     it("retains rejection-derived usage reading on a subsequent context pass with no new reply", () => {

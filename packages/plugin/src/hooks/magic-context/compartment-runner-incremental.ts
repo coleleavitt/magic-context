@@ -638,7 +638,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         // live messages, so the head can never include a message that now belongs
         // to the current protected tail.
         if (!validation.ok && validation.reason === "stale_snapshot") {
-            const refreshed = deps.refreshBoundarySnapshot
+            const refreshedBoundary = deps.refreshBoundarySnapshot
                 ? deps.refreshBoundarySnapshot(boundarySnapshot, validation)
                 : resolveOpenCodeProtectedTailBoundary({
                       db,
@@ -656,6 +656,12 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                       // the protected tail is still recomputed from live messages.
                       liftLivePromptFloor: boundarySnapshot.liftLivePromptFloor === true,
                   });
+            const refreshed = refreshedBoundary
+                ? {
+                      ...refreshedBoundary,
+                      recovery: boundarySnapshot.recovery || deps.forceDrainQuota,
+                  }
+                : null;
             if (refreshed && hasRunnableCompartmentWindow(refreshed)) {
                 sessionLog(
                     sessionId,
@@ -802,7 +808,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                   db,
                   sessionId,
                   runId: crypto.randomUUID(),
-                  trueRawTokens: boundarySnapshot.trueRawEligibleTokens,
+                  trueRawTokens: boundarySnapshot.summaryRemovedEligibleTokens,
                   usagePercentage: boundarySnapshot.usagePercentage,
                   usable,
                   perRunCap,
@@ -1350,11 +1356,13 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             // Healthy historian progress — clear the drain-failure backoff so the
             // emergency catch-up latch can bypass the budget freely again.
             clearHistorianDrainFailure(db, sessionId);
-            // Normal historian publication resolves overflow recovery. A manual
-            // wrapup can publish several chunks before reaching its keep watermark,
-            // so it leaves the recovery flag armed until the orchestrator finishes.
+            // A publication is progress, not proof that the next request fits:
+            // after a switch to a much smaller model one summary can leave it
+            // several times over the window. The overflow recovery flag stays
+            // armed until a recovery pass counts its request under the line
+            // (transform.ts) or another disarm proves it stale. This floor also
+            // resets the no-eligible-head count, since the run made progress.
             recordProtectedTailPublicationFloor(db, sessionId, lastCompartmentEnd + 1);
-            if (!isWrapupInProgress(db, sessionId)) clearEmergencyRecovery(db, sessionId);
             drainReservation = null;
             if (deferMarkerApplication && lastNewEndMessageId) {
                 (deps.compactionMarkerStrategy?.setPending ?? setPendingCompactionMarkerState)(

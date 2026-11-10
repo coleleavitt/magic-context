@@ -1,6 +1,6 @@
 {
-  "generation": "ad208b282a43a6098e2d6eb68b80cd2bb6dbcdc7c828f6d3c7434e0d26a9e07a",
-  "catalog_digest": "ad208b282a43a6098e2d6eb68b80cd2bb6dbcdc7c828f6d3c7434e0d26a9e07a",
+  "generation": "55deea7eb0374bdfdd52ca19c2fb73977cb8da5379da76ac0085769de0747882",
+  "catalog_digest": "55deea7eb0374bdfdd52ca19c2fb73977cb8da5379da76ac0085769de0747882",
   "tools": [
     {
       "name": "ctx_note",
@@ -25,7 +25,7 @@
               "update",
               "dismiss"
             ],
-            "description": "write | read | update | dismiss. Defaults to write when content is given, else read."
+            "description": "write | read | update | dismiss."
           },
           "content": {
             "type": "string",
@@ -70,7 +70,7 @@
               "minimum": 1,
               "maximum": 9007199254740991
             },
-            "description": "Note ids: one for update, 1–50 for dismiss or read (read returns full bodies). Ignored by write."
+            "description": "Note ids: one for update, 1–50 for dismiss, or 1–50 to read those notes in full. Write and a plain read take an empty list."
           }
         },
         "additionalProperties": false
@@ -105,7 +105,7 @@
           "content": {
             "type": "string",
             "maxLength": 65536,
-            "description": "The memory text — one standalone fact (write, update, merge)."
+            "description": "The memory text — one standalone fact (write, update, merge). Archive and get take an empty string."
           },
           "category": {
             "type": "string",
@@ -116,7 +116,7 @@
               "CONFIG_VALUES",
               "NAMING"
             ],
-            "description": "Kind of fact (required for write; on update/merge optional, omitted keeps the current category)."
+            "description": "Kind of fact: the new fact's kind for write; on update/merge, the memory's current category to keep it. Archive and get ignore it."
           },
           "ids": {
             "type": "array",
@@ -125,7 +125,7 @@
               "type": "integer",
               "minimum": 1
             },
-            "description": "Memory ids from <project-memory>: one for update, one or more for archive, two or more for merge, 1–20 for get."
+            "description": "Memory ids from <project-memory>: one for update, one or more for archive, two or more for merge, 1–20 for get. Write takes an empty list."
           },
           "reason": {
             "type": "string",

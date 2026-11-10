@@ -49,6 +49,7 @@ import {
 } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	clearSessionTracking,
+	scheduleClearAndReindex,
 	scheduleIncrementalIndex,
 	scheduleReconciliation,
 } from "@magic-context/core/features/magic-context/message-index-async";
@@ -57,14 +58,12 @@ import {
 	decodePiContentDecision,
 	encodePiContentDecision,
 } from "@magic-context/core/features/magic-context/pi-content-decisions";
-import {
-	computeProtectionWindow,
-	getProtectionWindowForSession,
-} from "@magic-context/core/features/magic-context/protection-window";
+import { getProtectionWindowForSession } from "@magic-context/core/features/magic-context/protection-window";
 import {
 	protectedToolTagNumbers,
 	protectedToolTokenCount,
 } from "@magic-context/core/features/magic-context/reclaim-protection";
+import type { RequestToolsChange } from "@magic-context/core/features/magic-context/request-tool-definitions";
 import {
 	createScheduler,
 	parseCacheTtl,
@@ -119,6 +118,7 @@ import {
 	getEmergencyInputSample,
 	getHistorianFailureState,
 	getNoteNudgeAnchors,
+	getOverflowState,
 	getPersistedTodoSyntheticAnchor,
 	isProviderOverflowFailClosedProven,
 	type NoteNudgeAnchor,
@@ -161,6 +161,8 @@ import {
 	applyPendingOperations,
 	convertLegacyToolSkeletons,
 	foldBustsServedPrefix,
+	prepareAgedToolSkeletonConversions,
+	prepareFlushedToolRemovals,
 	RECENT_TOOL_SKELETON_WINDOW,
 } from "@magic-context/core/hooks/magic-context/apply-operations";
 import {
@@ -248,6 +250,11 @@ import {
 } from "@magic-context/core/hooks/magic-context/reasoning-budget";
 import { captureOpencodeReasoningBudgetStatus } from "@magic-context/core/hooks/magic-context/reasoning-budget-status";
 import {
+	recoveryAdmissionLimitTokens,
+	recoveryRefusalNotice,
+} from "@magic-context/core/hooks/magic-context/recovery-fit";
+import { evaluateRequestToolsRelease } from "@magic-context/core/hooks/magic-context/request-tools-release";
+import {
 	modelAcceptsEmptyContent,
 	variantChangeBustsProviderCache,
 } from "@magic-context/core/hooks/magic-context/sentinel";
@@ -267,6 +274,10 @@ import {
 	buildSyntheticToolReclaimOps,
 	toolReclaimDistanceEntries,
 } from "@magic-context/core/hooks/magic-context/tool-reclaim";
+import {
+	recordUsageRefusal,
+	shouldResetRefusedUsage,
+} from "@magic-context/core/hooks/magic-context/transform-context-state";
 import {
 	logTransformElapsed as logStageElapsed,
 	withTransformTimingSummary,
@@ -321,6 +332,12 @@ import {
 } from "./ctx-reduce-nudge-pi";
 import { runPiDebugAssertion } from "./debug-assertions-pi";
 import { detectRecentCommit } from "./detect-recent-commit";
+import {
+	cancelPiAbandonedPendingDrops,
+	piDropBranchIds,
+	reconcilePiDropBranches,
+	trackPiDropLeaf,
+} from "./drop-branches-pi";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { hasPiFallbackMessageTags } from "./fallback-tag-probes-pi";
 import {
@@ -354,9 +371,17 @@ import {
 	applyNativeReasoningReplayPi,
 	applyNativeToolInputReplayPi,
 	authorizePiToolRemoval,
+	PiToolRemovalBatchError,
+	preparePiToolRemovalChecks,
 	preparePiToolRemovalMeasurements,
+	withPiToolRemovalBatch,
 } from "./native-replay-state-pi";
+import { applyNativeResponseTagReplayPi } from "./native-replay-tags-pi";
 import { hasVisibleNoteReadCallPi } from "./note-visibility-pi";
+import {
+	projectPiReplayDrops,
+	protectedPiPassTagNumbers,
+} from "./pass-tag-projection-pi";
 import { adaptPiAppendCompaction } from "./pi-append-compaction";
 import { PI_CONTEXT_BUDGET, PiContextDeadlineError } from "./pi-context-budget";
 import {
@@ -412,6 +437,12 @@ import {
 	resolvePiOrdinalAlignmentForContext,
 } from "./pi-ordinal-alignment";
 import {
+	estimatePiOverflowRecoveryInputTokens,
+	piRecoveryFitCalibration,
+	piRecoveryToolImageTokens,
+	resolvePiOverflowRecoveryUsage,
+} from "./pi-overflow-recovery";
+import {
 	clearPiLiveUsageClassification,
 	formatPiPressureForLog,
 	isPiLiveUsageRawBranchEstimate,
@@ -430,6 +461,7 @@ import {
 	PiStorageBusyError,
 	piFallbackRefusal,
 } from "./pi-raw-fallback";
+import { readPiRequestToolsFingerprint } from "./pi-request-tools";
 import {
 	notePiPublicationIssue,
 	PiServedEnvelopeUnavailable,
@@ -459,6 +491,7 @@ import {
 	applyPiThinkingBindingRecovery,
 	frozenBindingEntryIds,
 	hasUnfrozenPiThinking,
+	recordPiBindingStripEndOrder,
 	resolvePiBindingStripOrder,
 	shouldRunPiProactiveThinkingStrip,
 } from "./provider-error-recovery-pi";
@@ -507,7 +540,8 @@ import {
 	cancelPiTagSnapshotSession,
 	ensurePiTagSnapshotReady,
 	getPiActiveTagSnapshotView,
-	getPiTagSnapshotView,
+	getPiPassTagSnapshotView,
+	type PiTagMetadata,
 	prewarmPiTagSnapshot,
 	readPiFallbackTagRows,
 } from "./tag-snapshot-pi";
@@ -649,6 +683,7 @@ function logPiLkgRecovery(sessionId: string, message: string): void {
 }
 
 export const __test = {
+	convertLocatedPiUserEntry,
 	stripMcOwnedPiCompactionSummary,
 	readPiFallbackFingerprintHeaders,
 	setBeforePipelineForTests(fn: (() => Promise<void>) | undefined) {
@@ -800,6 +835,11 @@ const PI_STABLE_ID_SCHEME = 1;
  */
 const lastEmergencyNotificationAtMs = new Map<string, number>();
 const EMERGENCY_NOTIFICATION_COOLDOWN_MS = 60_000;
+/**
+ * Sessions already told that a recovery request went out uncounted because the
+ * fit envelope was untrusted, so the log says it once per session.
+ */
+const untrustedRecoveryCountLoggedSessions = new Set<string>();
 
 /**
  * Per-session "saw a commit on the previous pass" tracker for the
@@ -996,6 +1036,7 @@ interface PiTextIdentityPlan {
 	legacyReminderTagNumbers: Set<number>;
 	reusableMessageIds: Set<string>;
 	sourceCache: Map<number, string>;
+	reusableTextMessageIds: Set<string>;
 }
 
 function buildPiTextIdentityPlan(
@@ -1066,6 +1107,7 @@ function buildPiTextIdentityPlan(
 	}
 
 	const driftedMessageIds = new Set<string>();
+	const reusableTextMessageIds = new Set<string>();
 	const legacyReminderTagNumbers = new Set<number>();
 	for (const [messageId, currentSources] of currentSourcesByMessageId) {
 		const legacyRows = legacyRowsByMessageId.get(messageId) ?? [];
@@ -1099,6 +1141,18 @@ function buildPiTextIdentityPlan(
 				return legacyReminderMatches;
 			});
 		if (!vectorMatches) driftedMessageIds.add(messageId);
+		// Reuse text tags only when every stored source matches the current text
+		// after removing tag prefixes and leading temporal markers. Matches that
+		// strip legacy reminders still need source insertion and reminder repair.
+		else if (
+			!messageId.startsWith("pi-msg-") &&
+			legacyRows.every(
+				(row) =>
+					sourceCache.has(row.tagId) &&
+					!legacyReminderTagNumbers.has(row.tagId),
+			)
+		)
+			reusableTextMessageIds.add(messageId);
 	}
 
 	const reusableMessageIds = new Set<string>();
@@ -1110,6 +1164,7 @@ function buildPiTextIdentityPlan(
 		legacyReminderTagNumbers,
 		reusableMessageIds,
 		sourceCache,
+		reusableTextMessageIds,
 	};
 }
 
@@ -1242,7 +1297,9 @@ function convertLocatedPiUserEntry(
 			).find((message) => message.id === messageId);
 			return converted ? { ...converted, ordinal: rawOrdinal } : null;
 		}
-		pendingToolStart = -1;
+		// System and other non-chat rows take an ordinal above, but only a user
+		// or assistant row consumes the buffered tool results in the raw converter.
+		if (role === "user" || role === "assistant") pendingToolStart = -1;
 	}
 	return null;
 }
@@ -1651,7 +1708,7 @@ export interface PiInjectionOptions {
 	muralEnabled?: boolean;
 }
 
-/** Scheduler config — gates cache-busting stages on TTL + threshold. */
+/** Scheduler config — gates cache-busting stages on the execute threshold. */
 export interface PiSchedulerOptions {
 	executeThresholdPercentage:
 		| number
@@ -1683,8 +1740,9 @@ export interface PiContextHandlerOptions {
 	 */
 	injection?: PiInjectionOptions;
 	/**
-	 * Scheduler config — gates heuristic cleanup on TTL/threshold.
-	 * When omitted, defaults to 65% threshold + 5m TTL behavior.
+	 * Scheduler config — gates heuristic cleanup on the execute threshold.
+	 * When omitted, defaults to a 65% threshold and a 5m TTL (the TTL is read
+	 * for diagnostics only).
 	 */
 	scheduler?: PiSchedulerOptions;
 	/**
@@ -4189,12 +4247,17 @@ function adoptPiFallbackTags(
 interface PiHistorianStateSnapshot {
 	detectedContextLimit: number;
 	needsEmergencyRecovery: boolean;
+	emergencyRecoveryOrigin:
+		| "provider_overflow"
+		| "proactive_model_shrink"
+		| null;
 	historianFailureCount: number;
 }
 
 const EMPTY_PI_HISTORIAN_STATE_SNAPSHOT: PiHistorianStateSnapshot = {
 	detectedContextLimit: 0,
 	needsEmergencyRecovery: false,
+	emergencyRecoveryOrigin: null,
 	historianFailureCount: 0,
 };
 
@@ -4204,7 +4267,7 @@ function loadPiHistorianStateSnapshot(
 ): PiHistorianStateSnapshot {
 	const row = db
 		.prepare(
-			`SELECT detected_context_limit, needs_emergency_recovery,
+			`SELECT detected_context_limit, needs_emergency_recovery, emergency_recovery_origin,
 			        historian_failure_count
 			   FROM session_meta
 			  WHERE session_id = ?`,
@@ -4213,6 +4276,7 @@ function loadPiHistorianStateSnapshot(
 		| {
 				detected_context_limit?: unknown;
 				needs_emergency_recovery?: unknown;
+				emergency_recovery_origin?: unknown;
 				historian_failure_count?: unknown;
 		  }
 		| undefined;
@@ -4225,6 +4289,11 @@ function loadPiHistorianStateSnapshot(
 		needsEmergencyRecovery:
 			typeof row?.needs_emergency_recovery === "number" &&
 			row.needs_emergency_recovery > 0,
+		emergencyRecoveryOrigin:
+			row?.emergency_recovery_origin === "provider_overflow" ||
+			row?.emergency_recovery_origin === "proactive_model_shrink"
+				? row.emergency_recovery_origin
+				: null,
 		historianFailureCount:
 			typeof row?.historian_failure_count === "number" &&
 			row.historian_failure_count >= 0
@@ -4279,6 +4348,48 @@ export function registerPiContextHandler(
 		}
 		return s;
 	};
+
+	pi.on("tool_call", (event, ctx) => {
+		if (event.toolName !== "ctx_reduce") return;
+		const sessionId = resolveSessionId(ctx);
+		if (sessionId)
+			trackPiDropLeaf(
+				baseOptions.db,
+				sessionId,
+				ctx.sessionManager.getLeafId(),
+			);
+	});
+	pi.on("session_tree", (event, ctx) => {
+		if (event.oldLeafId === event.newLeafId) return;
+		const sessionId = resolveSessionId(ctx);
+		if (!sessionId) return;
+		// Pi and Oh My Pi emit session_tree after committing the new leaf. Read
+		// that branch in the background instead of data captured by the previous turn.
+		let entries: readonly unknown[] = [];
+		let offset = 0;
+		scheduleClearAndReindex(baseOptions.db, sessionId, {
+			prepare: async () => {
+				if (resolveSessionId(ctx) !== sessionId) return false;
+				entries = ctx.sessionManager.getBranch();
+				const alignment = resolvePiOrdinalAlignment(
+					baseOptions.db,
+					sessionId,
+					entries,
+				);
+				offset = alignment.offset;
+				return !isPiOrdinalAlignmentUnanchored(alignment);
+			},
+			getCount: () => countPiRawMessages(entries, offset),
+			readPage: (_session, after, limit, watermark) =>
+				convertEntriesToRawMessagePage(
+					entries,
+					after,
+					limit,
+					watermark,
+					offset,
+				),
+		});
+	});
 
 	pi.on("thinking_level_select", async (event, ctx) => {
 		if (event.previousLevel === event.level) return;
@@ -4440,6 +4551,7 @@ export function registerPiContextHandler(
 					options.db,
 					sessionId,
 					budget,
+					"pass",
 				);
 				if (hydration) await guardAwait(hydration);
 			}
@@ -4674,6 +4786,53 @@ export function registerPiContextHandler(
 			const lkgInputIdByRef = new Map<unknown, string>();
 			for (const input of lkgPassSnapshot.inputs)
 				lkgInputIdByRef.set(event.messages[input.messageIndex], input.id);
+			// A prefix-bound model binds every signed thinking block to the request's
+			// tools. Pi builds the request from the session's active tools, so a
+			// change there since the session's last pass on this model makes the
+			// kept thinking invalid: the pipeline releases it (no hold, every signed
+			// block stripped) and rides the cache loss the changed tools cause.
+			const requestToolsRelease = isPrefixBoundThinkingModel(
+				ctx.model?.provider,
+				ctx.model?.id,
+			)
+				? (() => {
+						const fingerprint = readPiRequestToolsFingerprint(
+							pi,
+							toolWireSchema,
+							event.messages as unknown[],
+							{
+								host: getHarness() === "omp" ? "omp" : "pi",
+								model: ctx.model,
+								oauth: (() => {
+									try {
+										const registry = (
+											ctx as {
+												modelRegistry?: {
+													isUsingOAuth?: (model: unknown) => unknown;
+												};
+											}
+										).modelRegistry;
+										return ctx.model &&
+											typeof registry?.isUsingOAuth === "function"
+											? registry.isUsingOAuth(ctx.model) === true
+											: false;
+									} catch {
+										return false;
+									}
+								})(),
+							},
+						);
+						return fingerprint
+							? evaluateRequestToolsRelease({
+									db: options.db,
+									sessionId,
+									modelKey: `${ctx.model?.provider}/${ctx.model?.id}`,
+									fingerprint,
+								})
+							: undefined;
+					})()
+				: undefined;
+			const requestToolsChange = requestToolsRelease?.change ?? null;
 			// Binding-mismatch strips normally run on the final array at the end of
 			// the pass, so every stage sees the same thinking on every pass. A
 			// session whose strips predate that order keeps stripping here, before
@@ -4684,6 +4843,7 @@ export function registerPiContextHandler(
 				messages: event.messages as unknown[],
 				entryIds: lkgEntryIds ?? [],
 				bustPermittedAtStart: hasPendingMaterialization(sessionId),
+				releasesAllThinking: requestToolsChange !== null,
 			});
 			const startOfPassBindingRecovery =
 				bindingStripOrder === "start"
@@ -4879,8 +5039,8 @@ export function registerPiContextHandler(
 			logTransformTiming(sessionId, "modelChangeDetection", tModelDetect);
 			const tPressureResolution = performance.now();
 
-			// Resolve scheduler decision: execute-vs-defer based on TTL
-			// + threshold. Drives whether heuristic cleanup runs on this
+			// Resolve scheduler decision: execute-vs-defer based on the
+			// execute threshold. Drives whether heuristic cleanup runs on this
 			// pass. Read live context usage from Pi (tokens/percent) and
 			// the persisted session-meta record (last_response_time,
 			// cache_ttl).
@@ -4938,6 +5098,11 @@ export function registerPiContextHandler(
 			}
 			// Model change invalidates the safe-token baseline + alert state too
 			// (new model, new limits), so it clears all four pressure fields.
+			const usageResetAfterRefusal = shouldResetRefusedUsage(
+				options.db,
+				sessionId,
+				sessionMetaForUsage,
+			);
 			const usageReset = {
 				lastContextPercentage: 0,
 				lastInputTokens: 0,
@@ -4974,12 +5139,12 @@ export function registerPiContextHandler(
 				sessionMetaForUsage.observedSafeInputTokens = 0;
 				sessionMetaForUsage.cacheAlertSent = false;
 			} else if (
-				isFirstContextPassForSession &&
+				(isFirstContextPassForSession || usageResetAfterRefusal) &&
 				sessionMetaForUsage.lastContextPercentage > 0
 			) {
-				// First pass after restart (same model): clear ONLY the two stale
-				// pressure fields. Gate on lastContextPercentage>0 (matches OpenCode
-				// transform.ts first-pass). historian-failure state and the
+				// A restart, or history landed after a refused turn, invalidates only
+				// the pressure fields, not permission to rebuild the cached prefix.
+				// As on OpenCode, historian-failure state and the
 				// reasoning watermark MUST be preserved — restart recovery uses the
 				// failure backoff, and clearing the reasoning watermark would
 				// resurface previously cleared reasoning (a cache bust + larger
@@ -4989,7 +5154,7 @@ export function registerPiContextHandler(
 				// too — only lastContextPercentage/lastInputTokens are cleared).
 				sessionLog(
 					sessionId,
-					`transform: first pass reset — percentage=${sessionMetaForUsage.lastContextPercentage.toFixed(1)}% tokens=${sessionMetaForUsage.lastInputTokens} — clearing stale usage state`,
+					`transform: ${isFirstContextPassForSession ? "first pass" : "refused turn recovery"} reset — percentage=${sessionMetaForUsage.lastContextPercentage.toFixed(1)}% tokens=${sessionMetaForUsage.lastInputTokens} — clearing stale usage state`,
 				);
 				updateSessionMeta(options.db, sessionId, {
 					lastContextPercentage: 0,
@@ -5013,7 +5178,9 @@ export function registerPiContextHandler(
 				usagePercentage = sessionMetaForUsage.lastContextPercentage;
 				usageInputTokens = sessionMetaForUsage.lastInputTokens;
 				usedPersistedUsage = true;
-			} else {
+			} else if (!usageResetAfterRefusal) {
+				// Pi's live figure still includes the old provider reading until a
+				// reply arrives, so it cannot undo a history-driven reset.
 				usagePercentage =
 					typeof piUsage?.percent === "number" ? piUsage.percent : 0;
 				usageInputTokens =
@@ -5041,8 +5208,9 @@ export function registerPiContextHandler(
 			//      fires regardless of pressure math.
 			//
 			// Mirrors OpenCode's transform.ts wiring. The recovery flag is
-			// cleared by the historian publication path on success (see
-			// signalPiHistoryRefresh), so we won't keep bumping forever.
+			// cleared when a recovery pass's request is counted within its limit
+			// (the recovery check before serving), or by the stale-flag disarms,
+			// so we won't keep bumping forever.
 			const tEmergencyRecovery = performance.now();
 			let needsEmergencyBump = false;
 			let emergencyRecoveryArmed = false;
@@ -5154,6 +5322,7 @@ export function registerPiContextHandler(
 			let fallbackInputTokens: number | undefined;
 			const suspectReading = Math.max(usageInputTokens, piUsage?.tokens ?? 0);
 			if (
+				usageResetAfterRefusal ||
 				suspectReading > providerInputLimit ||
 				piProviderUsageWasRejected(sessionId)
 			) {
@@ -5199,7 +5368,7 @@ export function registerPiContextHandler(
 					persistedFromLive: !usedPersistedUsage,
 					persistedPercentage: usagePercentage,
 					persistedInputTokens: usageInputTokens,
-					liveInputTokens: piUsage?.tokens,
+					liveInputTokens: usageResetAfterRefusal ? undefined : piUsage?.tokens,
 					usableContextLimit: usageContextLimit,
 				}));
 			const realUsagePercentageBeforeEmergencyBump = usagePercentage;
@@ -5574,6 +5743,10 @@ export function registerPiContextHandler(
 				);
 			}
 			const pipelineArgs: RunPipelineArgs = {
+				providerOverflowRecovery:
+					emergencyRecoveryArmed &&
+					historianStateForPass.emergencyRecoveryOrigin === "provider_overflow",
+				dropBranchEntries: branchEntries ?? undefined,
 				recoveryPrefix: recovery.prefix,
 				recoveryRebuildReason: recovery.rebuildReason,
 				assertCurrentPass,
@@ -5636,17 +5809,20 @@ export function registerPiContextHandler(
 				// when the configured force percentage has not been reached.
 				forceMaterialization: forceMaterialization || isEmergency,
 				forceMaterializationPercentage,
-				signedThinkingHold: resolvePiSignedThinkingHold({
-					sessionId,
-					db: options.db,
-					messages: event.messages,
-					prefixBound: isPrefixBoundThinkingModel(
-						ctx.model?.provider,
-						ctx.model?.id,
-					),
-					usagePercentage,
-					executeThresholdPercentage: effectiveExecuteThresholdPercentage,
-				}),
+				signedThinkingHold:
+					requestToolsChange === null &&
+					resolvePiSignedThinkingHold({
+						sessionId,
+						db: options.db,
+						messages: event.messages,
+						prefixBound: isPrefixBoundThinkingModel(
+							ctx.model?.provider,
+							ctx.model?.id,
+						),
+						usagePercentage,
+						executeThresholdPercentage: effectiveExecuteThresholdPercentage,
+					}),
+				requestToolsChange,
 				contextUsage: {
 					percentage: usagePercentage,
 					inputTokens: usageInputTokens,
@@ -6023,6 +6199,26 @@ export function registerPiContextHandler(
 					});
 				}
 			}
+			if (
+				options.autoSearch &&
+				!options.autoSearch.enabled &&
+				!options.compactionOff &&
+				result.prefixMutationAllowed
+			) {
+				await runAutoSearchHintForPi({
+					sessionId,
+					db: options.db,
+					messages: outputMessages,
+					entryIds: strictEntryIds,
+					entryIdByRef: result.postCommitEntryIdByRef,
+					options: {
+						enabled: false,
+						scoreThreshold: options.autoSearch.scoreThreshold,
+						minPromptChars: options.autoSearch.minPromptChars,
+						projectPath: projectIdentity,
+					},
+				});
+			}
 			logTransformTiming(sessionId, "autoSearch", tAutoSearch);
 
 			// Synthetic todowrite injection — Pi parity with OpenCode's
@@ -6199,176 +6395,181 @@ export function registerPiContextHandler(
 					result.syntheticLeadingCount = prefix.length;
 			}
 
-			// Walk Pi's final rendered entry stream once to calculate both nudge-channel
-			// totals. A cache-busting pass replaces the saved baseline; a deferred pass
-			// keeps it and adds only newly appended content and protection-boundary moves.
-			const tChannelAccounting = performance.now();
-			try {
-				const sessionMetaForCh1 = sessionMeta;
-				if (!options.compactionOff && !sessionMetaForCh1.isSubagent) {
-					const { tags, protectedTagNumbers, pendingDropTagNumbers } =
-						result.channelBaselineSnapshot;
-					const stableId = (message: unknown): string | undefined =>
-						message && typeof message === "object"
-							? result.postCommitEntryIdByRef.get(message)
-							: undefined;
-					const hygieneCalibration = sessionDecisionCalibration(
-						options.db,
-						sessionId,
-					);
-					const hygieneUnitsVersion = transitionSessionHygieneUnits(
-						options.db,
-						sessionId,
-						result.bustedThisPass,
-						hygieneCalibration,
-					);
-					const previousBaseline = getPiChannel1Baseline(sessionId);
-					const baseline = refreshPiTailHygieneBaseline({
-						messages: outputMessages,
-						providerApi: ctx.model?.api,
-						tags,
-						tagCacheKey: result.channelBaselineSnapshot.tagCacheKey,
-						protectedTagNumbers,
-						protectedTools: options.protectedTools,
-						pendingDropTagNumbers,
-						stableId,
-						// Only active rows can be protected; the active projection gives
-						// the same numbers without sorting every historical tag.
-						protectedToolTags: protectedToolTagNumbers(
-							result.channelBaselineSnapshot.activeTags,
-							options.protectedTools,
-						),
-						syntheticLeadingCount: result.syntheticLeadingCount,
-						cacheBusting: result.bustedThisPass,
-						previous: previousBaseline,
-						calibration:
-							hygieneUnitsVersion >= HYGIENE_PROVIDER_UNITS_VERSION
-								? hygieneCalibration
-								: undefined,
-						hygieneUnitsVersion,
-					});
-					const effective = effectivePiTailHygiene(baseline);
-					// One line per invalidation event, not one per pass: the baseline
-					// only carries a mismatch on the pass that re-measured because of it.
-					if (baseline.lastPrefixMismatch) {
-						sessionLog(
+			// Only the request that survives recovery may publish nudge baselines or metrics.
+			const publishFinalRequestAccounting = () => {
+				// Walk Pi's final rendered entry stream once to calculate both nudge-channel
+				// totals. A cache-busting pass replaces the saved baseline; a deferred pass
+				// keeps it and adds newly appended content and changes in which tags are protected.
+				const tChannelAccounting = performance.now();
+				try {
+					const sessionMetaForCh1 = sessionMeta;
+					if (!options.compactionOff && !sessionMetaForCh1.isSubagent) {
+						const { tags, protectedTagNumbers, pendingDropTagNumbers } =
+							result.channelBaselineSnapshot;
+						const stableId = (message: unknown): string | undefined =>
+							message && typeof message === "object"
+								? result.postCommitEntryIdByRef.get(message)
+								: undefined;
+						const hygieneCalibration = sessionDecisionCalibration(
+							options.db,
 							sessionId,
-							formatTailHygienePrefixMismatch(
-								baseline.lastPrefixMismatch,
-								baseline.baselineGeneration,
-							),
 						);
-					}
-					const durableGrace =
-						baseline.evaluable && !baseline.generationInvalidated
-							? captureChannel1PostReduceGraceBaseline(
-									options.db,
-									sessionId,
-									effective.u,
-								)
-							: getChannel1NudgeState(options.db, sessionId);
-					baseline.channel1PostReduceGrace =
-						durableGrace.postReduceGracePending ||
-						durableGrace.postReduceGraceBaselineU !== undefined
-							? {
-									pending: durableGrace.postReduceGracePending === true,
-									baselineU: durableGrace.postReduceGraceBaselineU,
-									preReduceLevel:
-										durableGrace.postReduceGracePreLevel ?? durableGrace.level,
-								}
-							: undefined;
-					const oldestReclaimableToolTags = getOldestActiveUnprotectedToolTags(
-						options.db,
-						sessionId,
-						protectedTagNumbers,
-					);
-					const channelState = {
-						...baseline,
-						usableWindow: usageContextLimit ?? 0,
-						realUserTurnCount: baseline.realUserTurnCount,
-						reducedSinceRefresh: false,
-						agentDropsAppliedThisPass: result.agentDropsAppliedThisPass,
-						oldestReclaimableToolTags,
-					};
-					setPiChannel1Baseline(sessionId, channelState);
-
-					const channel2Evaluation = evaluateChannel2(channelState);
-					if (channel2Evaluation.evaluable) {
-						try {
-							rearmChannel2AfterMeasuredCollapse({
-								db: options.db,
-								sessionId,
-								baseline: channelState,
-								rebuilding: result.bustedThisPass,
-								previous: previousBaseline,
-							});
-						} catch (error) {
-							sessionLog(
-								sessionId,
-								`pi channel2 U-collapse reset failed: ${error instanceof Error ? error.message : String(error)}`,
-							);
-						}
-						if (channel2Evaluation.shouldTrigger) {
-							casChannel2NudgeState(options.db, sessionId, "", "pending");
-						} else {
-							casChannel2NudgeState(options.db, sessionId, "pending", "");
-						}
-					}
-
-					assertTailHygieneLastWriter = () =>
-						assertPiTailHygieneContentUnchanged({
+						const hygieneUnitsVersion = transitionSessionHygieneUnits(
+							options.db,
+							sessionId,
+							result.bustedThisPass,
+							hygieneCalibration,
+						);
+						const previousBaseline = getPiChannel1Baseline(sessionId);
+						const baseline = refreshPiTailHygieneBaseline({
 							messages: outputMessages,
+							providerApi: ctx.model?.api,
 							tags,
+							tagCacheKey: result.channelBaselineSnapshot.tagCacheKey,
 							protectedTagNumbers,
+							protectedTools: options.protectedTools,
 							pendingDropTagNumbers,
 							stableId,
+							// Only active rows can be protected; the active projection gives
+							// the same numbers without sorting every historical tag.
+							protectedToolTags: protectedToolTagNumbers(
+								result.channelBaselineSnapshot.activeTags,
+								options.protectedTools,
+							),
 							syntheticLeadingCount: result.syntheticLeadingCount,
-							expectedSignature: baseline.contentSignature,
+							cacheBusting: result.bustedThisPass,
+							previous: previousBaseline,
+							calibration:
+								hygieneUnitsVersion >= HYGIENE_PROVIDER_UNITS_VERSION
+									? hygieneCalibration
+									: undefined,
+							hygieneUnitsVersion,
 						});
-				} else {
-					clearPiChannel1State(sessionId);
-				}
-			} catch (err) {
-				const stale = getPiChannel1Baseline(sessionId);
-				if (stale) {
-					stale.evaluable = false;
-					stale.generationInvalidated = true;
-				}
-				sessionLog(
-					sessionId,
-					`channel1 baseline / channel2 trigger failed: ${err instanceof Error ? err.message : String(err)}`,
-				);
-			}
-			logTransformTiming(
-				sessionId,
-				"channelNudgeAccounting",
-				tChannelAccounting,
-			);
+						const effective = effectivePiTailHygiene(baseline);
+						// One line per invalidation event, not one per pass: the baseline
+						// only carries a mismatch on the pass that re-measured because of it.
+						if (baseline.lastPrefixMismatch) {
+							sessionLog(
+								sessionId,
+								formatTailHygienePrefixMismatch(
+									baseline.lastPrefixMismatch,
+									baseline.baselineGeneration,
+								),
+							);
+						}
+						const durableGrace =
+							baseline.evaluable && !baseline.generationInvalidated
+								? captureChannel1PostReduceGraceBaseline(
+										options.db,
+										sessionId,
+										effective.u,
+									)
+								: getChannel1NudgeState(options.db, sessionId);
+						baseline.channel1PostReduceGrace =
+							durableGrace.postReduceGracePending ||
+							durableGrace.postReduceGraceBaselineU !== undefined
+								? {
+										pending: durableGrace.postReduceGracePending === true,
+										baselineU: durableGrace.postReduceGraceBaselineU,
+										preReduceLevel:
+											durableGrace.postReduceGracePreLevel ??
+											durableGrace.level,
+									}
+								: undefined;
+						const oldestReclaimableToolTags =
+							getOldestActiveUnprotectedToolTags(
+								options.db,
+								sessionId,
+								protectedTagNumbers,
+							);
+						const channelState = {
+							...baseline,
+							usableWindow: usageContextLimit ?? 0,
+							realUserTurnCount: baseline.realUserTurnCount,
+							reducedSinceRefresh: false,
+							agentDropsAppliedThisPass: result.agentDropsAppliedThisPass,
+							oldestReclaimableToolTags,
+						};
+						setPiChannel1Baseline(sessionId, channelState);
 
-			// Work-metrics update runs on EVERY transform pass (not just
-			// execute passes). The Pi compute helper is pure-read on
-			// outputMessages; setSessionWorkMetrics is a pure write to
-			// session_meta (no tag state, no message[0] mutation, no
-			// cache-busting). Gating on executedWorkThisPass would mean
-			// sessions sitting below execute threshold never see populated
-			// values, making Pi's status surface permanently zero.
-			const tWorkMetrics = performance.now();
-			budget.stage = "bookkeeping";
-			try {
-				const metrics = computePiWorkMetrics(outputMessages as unknown[]);
-				setSessionWorkMetrics(
-					options.db,
+						const channel2Evaluation = evaluateChannel2(channelState);
+						if (channel2Evaluation.evaluable) {
+							try {
+								rearmChannel2AfterMeasuredCollapse({
+									db: options.db,
+									sessionId,
+									baseline: channelState,
+									rebuilding: result.bustedThisPass,
+									previous: previousBaseline,
+								});
+							} catch (error) {
+								sessionLog(
+									sessionId,
+									`pi channel2 U-collapse reset failed: ${error instanceof Error ? error.message : String(error)}`,
+								);
+							}
+							if (channel2Evaluation.shouldTrigger) {
+								casChannel2NudgeState(options.db, sessionId, "", "pending");
+							} else {
+								casChannel2NudgeState(options.db, sessionId, "pending", "");
+							}
+						}
+
+						assertTailHygieneLastWriter = () =>
+							assertPiTailHygieneContentUnchanged({
+								messages: outputMessages,
+								tags,
+								protectedTagNumbers,
+								pendingDropTagNumbers,
+								stableId,
+								syntheticLeadingCount: result.syntheticLeadingCount,
+								expectedSignature: baseline.contentSignature,
+							});
+					} else {
+						clearPiChannel1State(sessionId);
+					}
+				} catch (err) {
+					const stale = getPiChannel1Baseline(sessionId);
+					if (stale) {
+						stale.evaluable = false;
+						stale.generationInvalidated = true;
+					}
+					sessionLog(
+						sessionId,
+						`channel1 baseline / channel2 trigger failed: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+				logTransformTiming(
 					sessionId,
-					metrics.newWorkTokens,
-					metrics.totalInputTokens,
+					"channelNudgeAccounting",
+					tChannelAccounting,
 				);
-			} catch (err) {
-				sessionLog(
-					sessionId,
-					`work-metrics update failed: ${err instanceof Error ? err.message : String(err)}`,
-				);
-			}
-			logTransformTiming(sessionId, "workMetrics", tWorkMetrics);
+
+				// Work-metrics update runs on EVERY transform pass (not just
+				// execute passes). The Pi compute helper is pure-read on
+				// outputMessages; setSessionWorkMetrics is a pure write to
+				// session_meta (no tag state, no message[0] mutation, no
+				// cache-busting). Gating on executedWorkThisPass would mean
+				// sessions sitting below execute threshold never see populated
+				// values, making Pi's status surface permanently zero.
+				const tWorkMetrics = performance.now();
+				budget.stage = "bookkeeping";
+				try {
+					const metrics = computePiWorkMetrics(outputMessages as unknown[]);
+					setSessionWorkMetrics(
+						options.db,
+						sessionId,
+						metrics.newWorkTokens,
+						metrics.totalInputTokens,
+					);
+				} catch (err) {
+					sessionLog(
+						sessionId,
+						`work-metrics update failed: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+				logTransformTiming(sessionId, "workMetrics", tWorkMetrics);
+			};
 
 			const tStableIdSchemePersist = performance.now();
 			if (stableIdSchemeCutover && !options.compactionOff) {
@@ -6570,6 +6771,35 @@ export function registerPiContextHandler(
 					);
 				if (getHarness() === "pi") {
 					const fitCase = classifyPiOutgoingFit(estimate, outgoingFitLimit);
+					// Only an already-permitted rebuild may price recovery from the
+					// rendered request. Pi's original message list still contains tool outputs removed
+					// from previous outgoing requests. The provider's last successful
+					// input-token reading also predates the rejected request.
+					const recoverUnknownUsage =
+						usageInputTokens <= 0 &&
+						result.prefixBustPermitted &&
+						emergencyRecoveryArmed &&
+						historianStateForPass.emergencyRecoveryOrigin ===
+							"provider_overflow";
+					let unknownUsageRecovered = false;
+					const recoveryUsage = resolvePiOverflowRecoveryUsage({
+						usage: pipelineArgs.contextUsage,
+						pricedPass: result.prefixBustPermitted,
+						providerOverflow: recoverUnknownUsage,
+						messages: outputMessages,
+						envelope,
+						usableHardLimit: outgoingFitLimit,
+					});
+					if (
+						recoverUnknownUsage &&
+						(!(recoveryUsage.inputTokens > 0) ||
+							!((emergencyCeilingTokens ?? 0) > 0) ||
+							!Number.isFinite(outgoingFitLimit) ||
+							!((outgoingFitLimit ?? 0) > 0))
+					)
+						throw contextRefusalError(
+							"Provider overflow recovery has unknown-usage: a complete outgoing request estimate and context limit are required before retrying",
+						);
 					const currentUpperCursor = () =>
 						piUpperReclaimCursor({
 							sessionId,
@@ -6581,7 +6811,7 @@ export function registerPiContextHandler(
 							input: inputForFitReclaim ?? event.messages,
 						});
 					const upperCursor =
-						fitCase === "upper-estimate-pressure"
+						fitCase === "upper-estimate-pressure" && !recoverUnknownUsage
 							? currentUpperCursor()
 							: undefined;
 					if (fitCase === "over-window-proof") {
@@ -6599,6 +6829,7 @@ export function registerPiContextHandler(
 						forceMaterialization ||
 						isEmergency;
 					const reclaimHeld =
+						!recoverUnknownUsage &&
 						fitCase === "upper-estimate-pressure" &&
 						(result.strictThinkingKept ||
 							!upperPassEligible ||
@@ -6617,7 +6848,7 @@ export function registerPiContextHandler(
 						// Never copy an already-rendered prefix to retry its injection.
 						requestPiFitReclaimInput(sessionId);
 					if (
-						fitCase !== "fits-or-unknown" &&
+						(fitCase !== "fits-or-unknown" || recoverUnknownUsage) &&
 						!reclaimHeld &&
 						!fitReclaimedThisPass &&
 						!inputForFitReclaim
@@ -6627,7 +6858,7 @@ export function registerPiContextHandler(
 							branchEntries,
 						);
 					if (
-						fitCase !== "fits-or-unknown" &&
+						(fitCase !== "fits-or-unknown" || recoverUnknownUsage) &&
 						!reclaimHeld &&
 						!fitReclaimedThisPass &&
 						inputForFitReclaim
@@ -6637,6 +6868,7 @@ export function registerPiContextHandler(
 							: undefined;
 						if (!upperCursor || reservation) {
 							let reclaimCompleted = false;
+							const recoveryRetryStart = performance.now();
 							try {
 								sessionLog(
 									sessionId,
@@ -6702,7 +6934,9 @@ export function registerPiContextHandler(
 										schedulerDecision: "execute",
 										schedulerDeferReason: null,
 										forceMaterialization: true,
-										upperEstimateOnly: fitCase === "upper-estimate-pressure",
+										upperEstimateOnly:
+											!recoverUnknownUsage &&
+											fitCase === "upper-estimate-pressure",
 										forceSignedRebuildForFit: fitCase === "over-window-proof",
 										isCacheBusting:
 											historyRefreshSessions.has(sessionId) ||
@@ -6715,14 +6949,19 @@ export function registerPiContextHandler(
 													sessionMeta: freshMeta,
 												})
 											: undefined,
-										contextUsage: {
-											percentage: usagePercentage,
-											inputTokens: usageInputTokens,
-										},
+										contextUsage: recoverUnknownUsage
+											? recoveryUsage
+											: pipelineArgs.contextUsage,
 									}),
 								);
 								outputMessages = result.messages as PiAgentMessage[];
 								observePipelineResultForTests(sessionId, result);
+								unknownUsageRecovered = recoverUnknownUsage;
+								if (recoverUnknownUsage)
+									sessionLog(
+										sessionId,
+										`overflow unknown-usage recovery: inputTokens=${recoveryUsage.inputTokens} retryMs=${(performance.now() - recoveryRetryStart).toFixed(1)}`,
+									);
 								// Reclaim replaces the postprocessed output with a pristine-input
 								// rebuild. Restore the todo pair before stripping and measuring it.
 								injectTodo();
@@ -6767,6 +7006,10 @@ export function registerPiContextHandler(
 							}
 						}
 					}
+					if (recoverUnknownUsage && !unknownUsageRecovered)
+						throw contextRefusalError(
+							"Provider overflow recovery has unknown-usage: a pristine request is required for emergency reclaim",
+						);
 				}
 				const refusal = outgoingContextRefusal(
 					estimate,
@@ -6785,6 +7028,84 @@ export function registerPiContextHandler(
 				)
 					throw new PiDegradedPassError("outgoing-over-window");
 			}
+			// A pass in overflow recovery whose request is over its limit is not
+			// sent, whatever it reclaimed. The limit is the 95% line of the model's
+			// usable window while a historian run can still summarize older history,
+			// and the whole usable window once none can: the line could not be
+			// reached then, and a request within the window fits. The check above
+			// refuses only a request whose byte count proves it is over the whole
+			// context window, and text with many tokens per byte can be far over
+			// the window without that proof. The count is the served-request count
+			// OpenCode uses: calibrated, neutral for an unseeded model.
+			// The recovery flag is read again here, because this pass may have
+			// cleared it (the no-eligible-history disarm above), and that clear
+			// holds for the rest of the pass.
+			const recoveryWindow = windowGeometry?.usableHard;
+			const recoveryLatch =
+				!options.compactionOff &&
+				isEmergency &&
+				emergencyRecoveryArmed &&
+				typeof recoveryWindow === "number" &&
+				recoveryWindow > 0
+					? getOverflowState(options.db, sessionId)
+					: undefined;
+			if (
+				recoveryLatch?.needsEmergencyRecovery === true &&
+				recoveryLatch.emergencyRecoveryOrigin !== null &&
+				typeof recoveryWindow === "number"
+			) {
+				const served = estimatePiOverflowRecoveryInputTokens(
+					outputMessages,
+					readPiLkgFitEnvelope(
+						ctx,
+						pi,
+						resolvePiContextModelKey(ctx),
+						sessionDecisionCalibration(options.db, sessionId),
+						toolWireSchema,
+					),
+					{ fitEnvelope: false },
+				);
+				// The historian was scheduled earlier in this pass; a run in flight
+				// now is summarizing history this request still carries. With none
+				// in flight there was nothing it could start on.
+				const historyRemains = inFlightHistorian.has(sessionId);
+				const limit = recoveryAdmissionLimitTokens(
+					recoveryWindow,
+					historyRemains,
+				);
+				if (served !== undefined && served > limit) {
+					sessionLog(
+						sessionId,
+						historyRemains
+							? `transform: recovery request still over the window: about ${served} tokens against the 95% line ${limit} of ${recoveryWindow}; not sending it, recovery stays armed for the next turn`
+							: `transform: recovery request still over the window: about ${served} tokens against the whole window ${limit}, with no older history left to summarize; not sending it`,
+					);
+					throw contextRefusalError(recoveryRefusalNotice(historyRemains));
+				}
+				if (served === undefined) {
+					// Sent without this check (only the byte-count check above
+					// applies). Recovery stays armed for the existing disarms, which
+					// need real pressure below the force-materialization threshold
+					// and nothing left to summarize.
+					if (!untrustedRecoveryCountLoggedSessions.has(sessionId)) {
+						untrustedRecoveryCountLoggedSessions.add(sessionId);
+						sessionLog(
+							sessionId,
+							"transform: recovery request not counted: the fit envelope is untrusted (system prompt or tool definitions not measured yet), so only the byte-count check above applies",
+						);
+					}
+				} else {
+					// The request was counted within its limit, so it fits. This is
+					// where a recovery pass ends its recovery; a historian run that
+					// publishes a summary does not.
+					clearEmergencyRecovery(options.db, sessionId);
+					sessionLog(
+						sessionId,
+						`transform: recovery request admitted: about ${served} tokens, within ${limit} of ${recoveryWindow}; ${recoveryLatch.emergencyRecoveryOrigin} recovery ends`,
+					);
+				}
+			}
+			publishFinalRequestAccounting();
 			let serializedOutput: PiLkgSerializedOutput | undefined;
 			let numbersCommitted = false;
 			budget.stage = "LKG/served publication";
@@ -6951,10 +7272,27 @@ export function registerPiContextHandler(
 			}
 			budget.assertOutcome();
 			publishTransformDecision?.();
+			// The pass succeeded, and the pipeline persisted the strip a tools
+			// release required (or refused the pass), so the new tool list becomes
+			// the one later passes compare with. A release pass is served in the end
+			// strip order, which is recorded only now, so a release pass that fails
+			// leaves a start-order session unchanged; if that record cannot be
+			// written, the release is not recorded either and the next pass
+			// releases again.
+			if (
+				requestToolsChange === null ||
+				recordPiBindingStripEndOrder(options.db, sessionId)
+			)
+				requestToolsRelease?.commit();
+			else
+				sessionLog(
+					sessionId,
+					"request tools release not recorded: the end strip order could not be written",
+				);
 			if (
 				!budget.sideTurn &&
-				result.strictThinkingKept &&
-				!result.signedPrefixRewritten &&
+				((result.strictThinkingKept && !result.signedPrefixRewritten) ||
+					result.heldHeadReleasedForSystemChange === true) &&
 				!result.materialized
 			)
 				recordPiHeldSystemHead(sessionId, (ownsHistory) =>
@@ -6972,7 +7310,7 @@ export function registerPiContextHandler(
 				budget.failureReason = err.message;
 				if (sessionIdForError) {
 					try {
-						prewarmPiTagSnapshot(lkgOptions.db, sessionIdForError);
+						prewarmPiTagSnapshot(lkgOptions.db, sessionIdForError, "pass");
 					} catch {}
 				}
 				throw err;
@@ -7092,10 +7430,10 @@ export function registerPiContextHandler(
 							},
 						);
 						assertPiTagSnapshotReady(lkgOptions.db, sessionIdForError);
-						const drops = getPiTagSnapshotView(
-							lkgOptions.db,
-							sessionIdForError,
-						).filter((tag) => tag.status === "dropped");
+						const drops = projectPiReplayDrops(
+							recoveryTranscript,
+							getPiPassTagSnapshotView(lkgOptions.db, sessionIdForError),
+						);
 						const changed = applyFlushedStatuses(
 							sessionIdForError,
 							lkgOptions.db,
@@ -7253,6 +7591,8 @@ export function registerPiContextHandler(
 		onRefusal: (ctx, budget, message, isCurrent) => {
 			const sessionId = resolveSessionId(ctx);
 			if (!sessionId) return;
+			// The guarded hook calls this only for an actual unsent turn, not an LKG replay.
+			if (!budget.sideTurn) recordUsageRefusal(baseOptions.db, sessionId);
 			withoutSqliteTransformPass(() =>
 				setImmediate(() => {
 					if (!isCurrent()) return;
@@ -7479,6 +7819,10 @@ function ensureRunnablePiBoundaryForTests(
 		protectedTailStart: endOrdinal,
 		eligibleEndOrdinal: endOrdinal,
 		trueRawEligibleTokens: Math.max(1, snapshot.trueRawEligibleTokens),
+		summaryRemovedEligibleTokens: Math.max(
+			1,
+			snapshot.summaryRemovedEligibleTokens,
+		),
 		rawRangeFingerprint: "",
 	};
 }
@@ -8043,6 +8387,7 @@ function maybeFireHistorian(args: {
 				providerShapeVersion: "pi-folded-v1",
 				cacheNamespace: `pi:${sessionId}`,
 				emergencyTailScale,
+				recovery: historianStateSnapshot.needsEmergencyRecovery,
 				liftLivePromptFloor,
 			}),
 		);
@@ -8197,7 +8542,6 @@ function maybeFireHistorian(args: {
 				permission: {
 					signedThinkingHold: args.signedThinkingHeld === true,
 					firstRender: false,
-					idleExpiry: false,
 					emergency:
 						usage.percentage >= historianForceMaterializationPercentage,
 				},
@@ -8300,6 +8644,8 @@ function maybeFireHistorian(args: {
 	}
 }
 interface RunPipelineArgs {
+	providerOverflowRecovery?: boolean;
+	dropBranchEntries?: readonly unknown[];
 	evaluateHistorianBeforeReclaim?: (
 		result: Pick<
 			RunPipelineResult,
@@ -8319,6 +8665,12 @@ interface RunPipelineArgs {
 	 * of a prefix-bound model; omitted means not held.
 	 */
 	signedThinkingHold?: boolean;
+	/**
+	 * What changed in the request's tools since the session's last pass on this
+	 * prefix-bound model, or null. Signed thinking is bound to the tools, so the
+	 * pass strips every signed block and the caller passes no hold.
+	 */
+	requestToolsChange?: RequestToolsChange | null;
 	resolvedProviderID?: string;
 	resolvedModelID?: string;
 	providerApi?: string;
@@ -8472,7 +8824,7 @@ interface RunPipelineArgs {
 
 interface PiChannelBaselineSnapshot {
 	tagCacheKey?: object;
-	tags: ReturnType<typeof getTagsBySession>;
+	tags: readonly PiTagMetadata[];
 	/** The rows of `tags` whose status is "active", in the same order. */
 	activeTags: readonly ReturnType<typeof getTagsBySession>[number][];
 	protectedTagNumbers: Set<number>;
@@ -8488,6 +8840,12 @@ interface RunPipelineResult {
 	prefixMutationAllowed: boolean;
 	strictThinkingKept: boolean;
 	signedPrefixRewritten: boolean;
+	/**
+	 * A held turn's system prompt changed: its signed thinking was stripped, but
+	 * the head the hold prepared was served unchanged, so the caller records
+	 * it as delivered with the new prompt, as for a held pass.
+	 */
+	heldHeadReleasedForSystemChange?: boolean;
 	/** A missing or cold cache already costs a rebuild; further eligible edits add no extra bust. */
 	prefixRebuildAlreadyPriced: boolean;
 	identityRebuilt?: boolean;
@@ -8641,8 +8999,10 @@ async function runCompactionOffPipeline(
 		// Compaction-off has no bust permission. An open signed turn on a
 		// prefix-bound model keeps replaying its cached m[0]/m[1] until it ends,
 		// so a fold (a project memory change, for example) cannot re-render the
-		// head in front of its kept thinking.
+		// head in front of its kept thinking. A pass whose request tools changed
+		// strips that thinking anyway (below), so nothing holds the head.
 		const signedTurnHoldsHead =
+			!args.requestToolsChange &&
 			args.reasoningClearing?.prefixBound === true &&
 			hasActiveAnthropicThinkingTurn(
 				args.messages,
@@ -8704,11 +9064,11 @@ async function runCompactionOffPipeline(
 		}
 	}
 	// The head changed in front of signed thinking (an open signed turn's, or
-	// an earlier turn's): strip every signed block on the wire, the open turn's
-	// included (removing every block is always accepted). The entries are
-	// persisted first; the binding-mismatch replay at the end of every pass,
-	// compaction-off included, keeps them stripped.
-	if (headChangedUnderSignedThinking)
+	// an earlier turn's), or the request's tools did: strip every signed block
+	// on the wire, the open turn's included (removing every block is always
+	// accepted). The entries are persisted first; the binding-mismatch replay
+	// at the end of every pass, compaction-off included, keeps them stripped.
+	if (headChangedUnderSignedThinking || args.requestToolsChange)
 		applyPiProactiveThinkingStrip({
 			db: args.db,
 			sessionId: args.sessionId,
@@ -8810,6 +9170,16 @@ function resolvePiSignedThinkingHold(args: {
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	args.assertCurrentPass?.();
 	if (args.compactionOff) return runCompactionOffPipeline(args);
+	const dropBranchEntries = args.dropBranchEntries;
+	const dropBranchIds = dropBranchEntries
+		? piDropBranchIds(dropBranchEntries)
+		: null;
+	trackPiDropLeaf(
+		args.db,
+		args.sessionId,
+		dropBranchIds ? ([...dropBranchIds].at(-1) ?? null) : null,
+	);
+	cancelPiAbandonedPendingDrops(args.db, args.sessionId, dropBranchIds);
 	const thinkingRecovery = prepareLatestThinkingRecovery({
 		db: args.db,
 		sessionId: args.sessionId,
@@ -8907,7 +9277,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			cacheBustingPass: isCacheBustingPass,
 			stripActiveTurn: true,
 			persistOnly: true,
-			requirePersistence: !!args.recoveryRebuildReason,
+			// A tools release records the new tool list once the pass ends, so its
+			// strip must persist or the pass must fail (the compaction-off pipeline
+			// already requires this): an entry without a stable id or a failed
+			// ledger write refuses the pass instead of serving thinking bound to
+			// the old list and recording the new one.
+			requirePersistence:
+				!!args.recoveryRebuildReason || !!args.requestToolsChange,
 		});
 		if (activeThinkingTurn && isCacheBustingPass && !result)
 			throw new Error(
@@ -8923,6 +9299,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		(args.forceSignedRebuildForFit && signedTurnOnPrefixBoundModel)
 	)
 		stripForPrefixRewrite(isCacheBustingPass);
+	// The request's tools changed (the caller logged what changed and passed
+	// no hold). Tools come first in the request, so this pass already loses the
+	// whole provider cache: strip every signed block, completed turns included,
+	// and let queued work ride the rewrite. The m[0] fold decision is unaffected.
+	if (args.requestToolsChange && !rewritingSignedPrefix)
+		stripForPrefixRewrite();
 	// An unheld bust invalidates the signed thinking still kept in the turn.
 	// Strip every block before any lane edits, so latest-turn protection is
 	// lifted and queued drops and cleanup land on this bust as on any other
@@ -9083,7 +9465,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		? (() => {
 				// HARD-bust signals (parity with OpenCode). systemHash + TTL idle
 				// derive from freshly-read session_meta; modelKey from the volatile live
-				// map.
+				// map. The TTL idle flag is recorded only; it never triggers a fold.
 				const hardMeta = args.sessionMeta;
 				let piTtlMs = 5 * 60 * 1000;
 				try {
@@ -9294,6 +9676,26 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			`pi m[0] HARD fold decision: reason=${preFoldInjectionResult?.m0Reason ?? foldDueDecision.reason ?? "soft_refresh"}${mismatch} executed=${foldExecutedThisPass} bustsServedPrefix=${foldBustsServedPrefixThisPass}`,
 		);
 	}
+	// A held signed turn whose system prompt changed (mid-turn, as Pi's
+	// setActiveTools rebuilds it) is invalid behind the new prompt, and the
+	// changed prompt already loses the provider cache. The head stays as the
+	// hold prepared it: it is delivered with the new prompt and acknowledged
+	// once the provider accepts the request (recordPiHeldSystemHead), so no
+	// later fold is needed for this change. But every signed block is
+	// stripped, and queued drops and cleanup ride this pass instead of a
+	// second rewrite later.
+	let heldHeadReleasedForSystemChange = false;
+	if (effectiveSystemChangedThisPass && protectedSignedPrefix) {
+		sessionLog(
+			args.sessionId,
+			"system prompt changed under a held signed turn: releasing signed thinking",
+		);
+		// The hold prepared a replay of the cached head unless this is its first
+		// render, which the fold block above rendered (and stripped for).
+		heldHeadReleasedForSystemChange =
+			!firstRenderBust && piM0State !== undefined;
+		stripForPrefixRewrite();
+	}
 	// Observe candidates before any history cut. Replay only durable decisions
 	// until the independently priced rebuild permission below is known.
 	const temporalCandidates = args.temporalAwareness
@@ -9353,6 +9755,32 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	} catch {
 		/* Invalid native state must retain the whole pair. */
 	}
+	const removalBatch = <T>(edit: (flush: () => void) => T): T =>
+		withPiToolRemovalBatch(
+			{ db: args.db, sessionId: args.sessionId, saved: nativeRemovalInputs },
+			edit,
+		);
+	const applyToolRemovalGroup = <T>(edit: () => T): T => {
+		const savedRemovalInputs = nativeRemovalInputs;
+		nativeRemovalInputs = savedRemovalInputs && new Map(savedRemovalInputs);
+		try {
+			return args.db
+				.transaction(() =>
+					removalBatch((flush) => {
+						const result = edit();
+						flush();
+						return result;
+					}),
+				)
+				.immediate();
+		} catch (cause) {
+			nativeRemovalInputs = savedRemovalInputs;
+			// A failed group cannot expose transcript edits whose tag writes rolled back.
+			throw cause instanceof PiToolRemovalBatchError
+				? cause
+				: new PiToolRemovalBatchError(cause);
+		}
+	};
 	const tTranscriptBuild = performance.now();
 	const transcript = createPiTranscript(
 		args.messages,
@@ -9446,11 +9874,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		!protectedSignedPrefix && hasPendingMaterialization(args.sessionId);
 	// Subagents have no history fold to ride. Their execute pass admits every
 	// eligible cleanup lane together, without rewriting bytes when none acts.
-	// Idle expiry admits eligible edits after kept thinking only while a signed
-	// turn is unfinished. Otherwise, expiry adds no cleanup permission beyond
-	// the existing history rebuild, explicit flush and pressure-relief rules.
-	const heldIdleExpiryRebuild =
-		protectedSignedPrefix && piHardSignals?.cacheExpired === true;
+	// An expired provider cache admits nothing: when only the provider forgot
+	// the cache, the pass replays byte-identically, keeping signed thinking and
+	// queued drops until a real ride.
 	const systemPrefixChangedThisPass =
 		!prefixPreflightContended && effectiveSystemChangedThisPass;
 	// Deferred render requests and native marker retries do not prove that the
@@ -9464,7 +9890,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			foldBustsServedPrefixThisPass ||
 			systemPrefixChangedThisPass ||
 			firstRenderBust ||
-			heldIdleExpiryRebuild ||
 			isCacheBustingPass,
 		force:
 			(args.forceMaterialization === true || emergencyDropEligible) &&
@@ -9480,16 +9905,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				)),
 		publishedHistory: !prefixPreflightContended && publishedM1RefreshedThisPass,
 	};
-	// Warm-cache thinking holds defer every new prefix edit. First render, idle
-	// expiry and pressure relief can admit work, but target guards still forbid
-	// edits before retained signatures. A genuine rewrite omits all signed blocks;
-	// expiry alone leaves them and their preceding bytes intact.
+	// Thinking holds defer every new prefix edit, whether or not the provider
+	// cache is still warm. First render and pressure relief can admit work, but
+	// target guards still forbid edits before retained signatures. A genuine
+	// rewrite omits all signed blocks.
 	// The same predicate as OpenCode's postprocess and the historian's
 	// redundancy skip.
 	const ridePermissionGate = {
 		signedThinkingHold: protectedSignedPrefix,
 		firstRender: firstRenderBust,
-		idleExpiry: heldIdleExpiryRebuild,
 		emergency: emergencyDropEligible,
 	};
 	let prefixMutationAllowed = prefixMutationPermitted(ridePermissionGate);
@@ -9522,7 +9946,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// reductions may ride it without causing an independent bust.
 			foldBustsServedPrefixThisPass ||
 			firstRenderBust ||
-			heldIdleExpiryRebuild ||
 			(args.recoveryRebuildReason !== undefined && isCacheBustingPass) ||
 			rideSignals.subagentExecute ||
 			(args.schedulerDecision === "execute" && !alreadyRanHeuristicsThisTurn));
@@ -9726,9 +10149,18 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const tTag = performance.now();
 	// Part getters build fresh proxy objects. Reuse one view for tagging and
 	// safety coordinates; its proxies still read/write the working messages.
+	const strippedSubagentThinking =
+		args.sessionMeta.isSubagent &&
+		(!thinkingRecovery.restore || rewritingSignedPrefix)
+			? frozenBindingEntryIds(args.db, args.sessionId)
+			: new Set<string>();
 	const mutationView = transcript.messages.map((message) => ({
 		...message,
 		parts: message.parts,
+		// Persisted thinking removals release subagent arcs even when tagging sees raw thinking.
+		requiresToolArcSkeleton: strippedSubagentThinking.has(message.info.id ?? "")
+			? false
+			: message.requiresToolArcSkeleton,
 	}));
 	// Storage recovery sent these messages without the §N§ message-number markers.
 	// Adding markers changes cached bytes, so wait for permission to rewrite the
@@ -9773,6 +10205,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					preserveTagOnlyAssistantText: true,
 					entryFingerprintByMessageId,
 					reuseMessageIds: textIdentityPlan.reusableMessageIds,
+					reuseTextMessageIds: textIdentityPlan.reusableTextMessageIds,
 					textIdentityDriftMessageIds: textIdentityPlan.driftedMessageIds,
 					textIdentitySourceCache: textIdentityPlan.sourceCache,
 					textTokenCache: tagTextTokenCache,
@@ -9915,43 +10348,114 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// crash between the two leaves the tags legacy until the next HARD fold.
 	// Either way the next served request already carries the fold's new cached
 	// prefix, so it is a cache bust regardless of the tool bytes.
-	if (foldBustsServedPrefixThisPass) {
-		try {
-			let converted = 0;
-			args.db
-				.transaction(() => {
-					converted = convertLegacyToolSkeletons(
-						args.db,
+	// Delay both conversion paths until branch reconciliation has restored any
+	// abandoned drops; their target methods can change the outgoing tool pairs.
+	const applyExistingToolConversions = () => {
+		const tLegacyToolConversion = performance.now();
+		if (foldBustsServedPrefixThisPass) {
+			const savedRemovalInputs = nativeRemovalInputs;
+			try {
+				// Marker writes share the conversion transaction. Publish their in-memory
+				// view only with that commit, not with a nested savepoint that may roll back.
+				nativeRemovalInputs = savedRemovalInputs && new Map(savedRemovalInputs);
+				let converted = 0;
+				args.db
+					.transaction(() =>
+						removalBatch((flush) => {
+							converted = convertLegacyToolSkeletons(
+								args.db,
+								args.sessionId,
+								targets,
+								{
+									prepareRemovals: (rows) =>
+										preparePiToolRemovalChecks({
+											db: args.db,
+											rows,
+											targets,
+											messages: args.messages,
+											prepare: transcript.prepareToolRemovalMeasurements,
+										}),
+									// A full drop with a recorded tool-pair removal was removed, not
+									// served as a marker. Keep it full even when this pass's model
+									// must keep tool pairs, so passes that can remove it still do
+									// and the placeholder strip never sees its call come back.
+									// Unreadable removal records keep every full drop as it is.
+									keepFullDrop: (callId) =>
+										nativeRemovalInputs === undefined ||
+										(callId !== null &&
+											authorizePiToolRemoval({
+												db: args.db,
+												sessionId: args.sessionId,
+												callId,
+												saved: nativeRemovalInputs,
+												canApply: false,
+											}) === true),
+								},
+							).size;
+							flush();
+						}),
+					)
+					.immediate();
+				if (converted > 0) {
+					sessionLog(
 						args.sessionId,
-						targets,
-						{
-							// A full drop whose arc removal is recorded was removed, not
-							// served as a marker. Keep it full even when this pass's model
-							// must keep tool pairs, so passes that can remove it still do
-							// and the placeholder strip never sees its call come back.
-							// Unreadable removal records keep every full drop as it is.
-							keepFullDrop: (callId) =>
-								nativeRemovalInputs === undefined ||
-								(callId !== null &&
-									nativeRemovalInputs.get(callId) ===
-										NATIVE_TOOL_REMOVAL_MARKER),
-						},
-					).size;
-				})
-				.immediate();
-			if (converted > 0) {
+						`pi HARD fold converted ${converted} legacy dropped-tool skeleton(s) to real-or-absent`,
+					);
+				}
+			} catch (error) {
+				nativeRemovalInputs = savedRemovalInputs;
 				sessionLog(
 					args.sessionId,
-					`pi HARD fold converted ${converted} legacy dropped-tool skeleton(s) to real-or-absent`,
+					`pi legacy dropped-tool skeleton conversion failed (kept legacy bytes): ${error instanceof Error ? error.message : String(error)}`,
 				);
 			}
-		} catch (error) {
-			sessionLog(
-				args.sessionId,
-				`pi legacy dropped-tool skeleton conversion failed (kept legacy bytes): ${error instanceof Error ? error.message : String(error)}`,
-			);
 		}
-	}
+
+		logTransformTiming(
+			args.sessionId,
+			"convertLegacyToolSkeletons",
+			tLegacyToolConversion,
+		);
+		if (
+			args.sessionMeta.isSubagent &&
+			isCacheBustingPass &&
+			!protectedSignedPrefix &&
+			!args.compactionOff
+		) {
+			const savedRemovalInputs = nativeRemovalInputs;
+			try {
+				nativeRemovalInputs = savedRemovalInputs && new Map(savedRemovalInputs);
+				const converted = args.db
+					.transaction(() =>
+						removalBatch((flush) => {
+							const conversions = prepareAgedToolSkeletonConversions(
+								args.db,
+								args.sessionId,
+								newTargets,
+								{
+									prepareRemovals: (rows) =>
+										preparePiToolRemovalChecks({
+											db: args.db,
+											rows,
+											targets: newTargets,
+											messages: args.messages,
+											prepare: transcript.prepareToolRemovalMeasurements,
+										}),
+								},
+							);
+							conversions.persist(args.db);
+							flush();
+							return conversions.converted.size;
+						}),
+					)
+					.immediate();
+				if (converted > 0) recordFirstApplicationWireEdit(true);
+			} catch (error) {
+				nativeRemovalInputs = savedRemovalInputs;
+				throw error;
+			}
+		}
+	};
 
 	// 1b. Note-nudge `commit_detected` trigger. Mirrors OpenCode's logic
 	// in `tag-messages.ts` + `transform.ts:677-690`: only fire on the
@@ -10013,39 +10517,46 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			hasPendingMaterializeSignal ||
 			foldExecutedThisPass ||
 			firstRenderBust);
-	const pendingOps = shouldReadPendingOps
-		? getPendingOps(args.db, args.sessionId)
-		: [];
-	const reclaimDistance = isCacheBustingPass
-		? toolReclaimDistanceEntries(mutationView, targets)
-		: [];
-	const protectedToolTags = protectedToolTagNumbers(
-		getActiveTagsBySession(args.db, args.sessionId),
-		args.protectedTools,
-	);
-	for (const number of identityAdoption.protectedTagNumbers)
-		protectedToolTags.add(number);
-	const protectionWindowForPass = getProtectionWindowForSession(
-		args.db,
-		args.sessionId,
-		protectionFloorResolution.floor,
-	);
-	const protectedTagNumbersForPass = usesTokenProtection
-		? protectionWindowForPass.protectedTagNumbers
-		: newestActiveTagNumbersByCount(
-				getActiveTagsBySession(args.db, args.sessionId),
-				args.protectedTags,
-			);
-	const pendingOperationTags =
-		pendingOps.length > 0
-			? getTagsForPendingOperations(
-					args.db,
-					args.sessionId,
-					pendingOps.map((operation) => operation.tagId),
-					usesTokenProtection ? 0 : args.protectedTags,
-					RECENT_TOOL_SKELETON_WINDOW,
-				)
+	const readPendingDropState = () => {
+		const pendingOps = shouldReadPendingOps
+			? getPendingOps(args.db, args.sessionId)
 			: [];
+		const protectedToolTags = protectedToolTagNumbers(
+			getActiveTagsBySession(args.db, args.sessionId),
+			args.protectedTools,
+		);
+		for (const number of identityAdoption.protectedTagNumbers)
+			protectedToolTags.add(number);
+		const protectionWindowForPass = getProtectionWindowForSession(
+			args.db,
+			args.sessionId,
+			protectionFloorResolution.floor,
+		);
+		const protectedTagNumbersForPass = usesTokenProtection
+			? protectionWindowForPass.protectedTagNumbers
+			: newestActiveTagNumbersByCount(
+					getActiveTagsBySession(args.db, args.sessionId),
+					args.protectedTags,
+				);
+		const pendingOperationTags =
+			pendingOps.length > 0
+				? getTagsForPendingOperations(
+						args.db,
+						args.sessionId,
+						pendingOps.map((operation) => operation.tagId),
+						usesTokenProtection ? 0 : args.protectedTags,
+						RECENT_TOOL_SKELETON_WINDOW,
+					)
+				: [];
+		return {
+			pendingOps,
+			protectedToolTags,
+			protectionWindowForPass,
+			protectedTagNumbersForPass,
+			pendingOperationTags,
+		};
+	};
+	const executeReclaimSnapshot = readPendingDropState();
 	if (!args.sessionMeta.isSubagent && args.schedulerDecision === "execute") {
 		args.evaluateHistorianBeforeReclaim?.({
 			activeTags: getActiveTagsBySession(args.db, args.sessionId),
@@ -10072,12 +10583,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		reclaimableTokens: estimateExecuteReclaimTokens({
 			db: args.db,
 			sessionId: args.sessionId,
-			pendingOps,
-			tags: pendingOperationTags,
+			pendingOps: executeReclaimSnapshot.pendingOps,
+			tags: executeReclaimSnapshot.pendingOperationTags,
 			targets: newTargets,
 			protectedTagIds: new Set([
-				...protectedTagNumbersForPass,
-				...protectedToolTags,
+				...executeReclaimSnapshot.protectedTagNumbersForPass,
+				...executeReclaimSnapshot.protectedToolTags,
 			]),
 			probePreparation: (targets) => {
 				const saved = nativeRemovalInputs;
@@ -10089,12 +10600,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					nativeRemovalInputs = saved && new Map(saved);
 					probingExecuteRemoval = true;
 					args.db
-						.transaction(() => {
-							for (const [number, target] of targets) {
-								if (target.prepareDrop?.() !== false) allowed.add(number);
-							}
-							throw rollback;
-						})
+						.transaction(() =>
+							removalBatch((flush) => {
+								for (const [number, target] of targets) {
+									if (target.prepareDrop?.() !== false) allowed.add(number);
+								}
+								flush();
+								throw rollback;
+							}),
+						)
 						.immediate();
 				} catch (error) {
 					if (error !== rollback) allowed.clear();
@@ -10116,6 +10630,42 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		stripUnheldSignedTurnOnBust();
 		applyTemporalOnRide();
 	}
+	// Branch restoration rides the final permission, including late execute and
+	// signed-prefix rebuilds. Refresh the drain's tag and protection snapshots to
+	// include restored content; abandoned queued drops were cancelled before pricing.
+	if (
+		reconcilePiDropBranches(
+			args.db,
+			args.sessionId,
+			dropBranchIds,
+			isCacheBustingPass && !protectedSignedPrefix,
+		)
+	) {
+		args.tagger.cleanup(args.sessionId);
+		args.tagger.initFromDb(args.sessionId, args.db);
+		nativeRemovalInputs = getNativeReplayState(
+			args.db,
+			args.sessionId,
+		).toolInputs;
+		recordFirstApplicationWireEdit(true);
+	}
+	applyExistingToolConversions();
+	const {
+		pendingOps,
+		protectedToolTags,
+		protectionWindowForPass,
+		protectedTagNumbersForPass,
+		pendingOperationTags,
+	} = readPendingDropState();
+	const tReclaimDistance = performance.now();
+	const reclaimDistance = isCacheBustingPass
+		? toolReclaimDistanceEntries(mutationView, targets)
+		: [];
+	logTransformTiming(
+		args.sessionId,
+		"toolReclaimDistanceEntries",
+		tReclaimDistance,
+	);
 
 	const deferredMaterialize =
 		canConsumeDeferredLate && deferredMaterializationWasPending;
@@ -10148,26 +10698,28 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		pendingDecisionLogObserverForTests?.(pendingDecisionLog);
 		try {
 			const tApplyPending = performance.now();
-			pendingOpsDidMutate = applyPendingOperations(
-				args.sessionId,
-				args.db,
-				newTargets,
-				new Set([
-					...(args.contextUsage.percentage >= 95
-						? []
-						: protectedTagNumbersForPass),
-					...protectedToolTags,
-					...identityAdoption.protectedTagNumbers,
-				]),
-				pendingOperationTags,
-				pendingOps,
-				[],
-				new Set(),
-				(reduction) => droppedTokenReductions.push(reduction),
-				undefined,
-				(eligible) => {
-					eligiblePendingDropTagIds = eligible;
-				},
+			pendingOpsDidMutate = applyToolRemovalGroup(() =>
+				applyPendingOperations(
+					args.sessionId,
+					args.db,
+					newTargets,
+					new Set([
+						...(args.contextUsage.percentage >= 95
+							? []
+							: protectedTagNumbersForPass),
+						...protectedToolTags,
+						...identityAdoption.protectedTagNumbers,
+					]),
+					pendingOperationTags,
+					pendingOps,
+					[],
+					new Set(),
+					(reduction) => droppedTokenReductions.push(reduction),
+					undefined,
+					(eligible) => {
+						eligiblePendingDropTagIds = eligible;
+					},
+				),
 			);
 			if (pendingOpsDidMutate) {
 				droppedCount += pendingOps.length;
@@ -10241,9 +10793,45 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		`targets=${targetTagNumbers.length} fetched=${flushedDroppedTags.length}`,
 	);
 	const tFlushed = performance.now();
-	runPersistedReplayStage("flushed-status-failure", undefined, () =>
-		applyFlushedStatuses(args.sessionId, args.db, targets, flushedDroppedTags),
-	);
+	runPersistedReplayStage("flushed-status-failure", undefined, () => {
+		const render = () =>
+			applyFlushedStatuses(
+				args.sessionId,
+				args.db,
+				targets,
+				flushedDroppedTags,
+			);
+		const savedRemovalInputs = nativeRemovalInputs;
+		const needsRemovalPreparation =
+			savedRemovalInputs !== undefined &&
+			flushedDroppedTags.some(
+				(tag) =>
+					tag.type === "tool" &&
+					tag.dropMode === "full" &&
+					savedRemovalInputs.get(tag.messageId) !== NATIVE_TOOL_REMOVAL_MARKER,
+			);
+		// Replaying existing permissions does not need a new write transaction.
+		if (!isCacheBustingPass || !needsRemovalPreparation) return render();
+		try {
+			// Eager markers and rendering have one failure boundary. A failed render
+			// must not publish durable or in-memory permission for unvisited calls.
+			nativeRemovalInputs = savedRemovalInputs && new Map(savedRemovalInputs);
+			return args.db
+				.transaction(() =>
+					removalBatch((flush) => {
+						prepareFlushedToolRemovals(targets, flushedDroppedTags);
+						flush();
+						return render();
+					}),
+				)
+				.immediate();
+		} catch (error) {
+			nativeRemovalInputs = savedRemovalInputs;
+			// Publication failed before rendering; retain the legacy per-call fallback.
+			if (error instanceof PiToolRemovalBatchError) return render();
+			throw error;
+		}
+	});
 	logTransformTiming(args.sessionId, "applyFlushedStatuses", tFlushed);
 	logTransformTiming(args.sessionId, "batchFinalize:flushed", tFlushed);
 
@@ -10354,9 +10942,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	let routineCleanupApplied = false;
 	let heuristicsResult: PiHeuristicCleanupResult | null = null;
 	const tActiveTags = performance.now();
-	// Load the canonical tag set once after pending operations. Heuristics use its
-	// active projection; Channel-1 baseline construction reuses the full set.
-	const allTagsForPass = getPiTagSnapshotView(args.db, args.sessionId);
+	// Read one immutable snapshot of the session's tags before heuristics change
+	// their statuses. Active tags have full rows; other tags keep only the identity
+	// and size/token fields needed to protect tags and match them to request parts.
+	const allTagsForPass = getPiPassTagSnapshotView(args.db, args.sessionId);
 	// Same rows as filtering allTagsForPass by status, kept current from changed
 	// rows instead of walking every tag the session ever had.
 	const activeTags = getPiActiveTagSnapshotView(
@@ -10396,14 +10985,18 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (shouldRunHeuristics && args.heuristics) {
 		try {
 			const tHeuristic = performance.now();
+			const providerOverflow = args.providerOverflowRecovery === true;
+			const recoveryCalibration = sessionDecisionCalibration(
+				args.db,
+				args.sessionId,
+			);
 			const independentMutationBeforeHeuristics =
 				pendingOpsDidMutate ||
 				systemPrefixChangedThisPass ||
 				foldBustsServedPrefixThisPass ||
 				identityRebuild ||
-				firstRenderBust ||
-				heldIdleExpiryRebuild;
-			// Applied work, new identity numbers or a missing/cold cache already
+				firstRenderBust;
+			// Applied work, new identity numbers or a missing cache already
 			// cost a rebuild. Under force pressure, reset the saved emergency
 			// sample so accumulated cleanup joins this pass. Restoring previously
 			// served drops is not new work and must not start another batch.
@@ -10426,63 +11019,73 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				rideSignals.explicitFlush ||
 				deferredMaterialize ||
 				independentMutationBeforeHeuristics;
-			heuristicsResult = applyPiHeuristicCleanup(
-				args.sessionId,
-				args.db,
-				newTargets,
-				args.messages,
-				{
-					protectedTags: args.protectedTags,
-					prepareToolRemovalMeasurements:
-						transcript.prepareToolRemovalMeasurements,
-					protectedToolTags,
-					protectedCutoff: usesTokenProtection
-						? protectionWindowForPass.cutoff
-						: undefined,
-					routine: routineCleanupApplied,
-					staleReduceStripEnabled: true,
-					onStaleReduceEdit: recordStaleReduceEdit,
-					// Tiered emergency drop fires only at the derived force band AND when the
-					// ceiling is known. forceMaterialization already incorporates
-					// the derived force-band / emergency condition for Pi (primary-equivalent).
-					emergency:
-						args.forceMaterialization === true &&
-						args.emergencyCeilingTokens !== undefined &&
-						args.emergencyCeilingTokens > 0
-							? {
-									currentTotalInputTokens: args.contextUsage.inputTokens,
-									ceilingTokens: args.emergencyCeilingTokens,
-									usagePercentage: args.contextUsage.percentage,
-									passAlreadyPriced: independentMutationBeforeHeuristics,
-								}
-							: undefined,
-					caveman: args.isSubagent ? undefined : args.heuristics.caveman,
-				},
-				activeTags,
-				stableIdResolver,
-			);
-			if (
-				!routineCleanupApplied &&
-				heuristicsResult.emergencyDroppedTools > 0
-			) {
-				const ridingCleanup = applyPiHeuristicCleanup(
+			heuristicsResult = applyToolRemovalGroup(() =>
+				applyPiHeuristicCleanup(
 					args.sessionId,
 					args.db,
 					newTargets,
 					args.messages,
 					{
 						protectedTags: args.protectedTags,
+						prepareToolRemovalMeasurements:
+							transcript.prepareToolRemovalMeasurements,
 						protectedToolTags,
 						protectedCutoff: usesTokenProtection
 							? protectionWindowForPass.cutoff
 							: undefined,
-						routine: true,
+						routine: routineCleanupApplied,
 						staleReduceStripEnabled: true,
 						onStaleReduceEdit: recordStaleReduceEdit,
-						caveman: args.isSubagent ? undefined : args.heuristics.caveman,
+						// Tiered emergency drop fires only at the derived force band AND when the
+						// ceiling is known. For Pi, forceMaterialization already includes
+						// the derived force-band and emergency conditions.
+						emergency:
+							args.forceMaterialization === true &&
+							args.emergencyCeilingTokens !== undefined &&
+							args.emergencyCeilingTokens > 0
+								? {
+										currentTotalInputTokens: args.contextUsage.inputTokens,
+										ceilingTokens: args.emergencyCeilingTokens,
+										usagePercentage: args.contextUsage.percentage,
+										passAlreadyPriced: independentMutationBeforeHeuristics,
+										serializedImageTokens: providerOverflow
+											? piRecoveryToolImageTokens(workingMessages)
+											: undefined,
+										fitCalibration: providerOverflow
+											? piRecoveryFitCalibration(recoveryCalibration)
+											: undefined,
+									}
+								: undefined,
+						caveman: args.isSubagent ? undefined : args.heuristics?.caveman,
 					},
-					getActiveTagsBySession(args.db, args.sessionId),
+					activeTags,
 					stableIdResolver,
+				),
+			);
+			if (
+				!routineCleanupApplied &&
+				heuristicsResult.emergencyDroppedTools > 0
+			) {
+				const ridingCleanup = applyToolRemovalGroup(() =>
+					applyPiHeuristicCleanup(
+						args.sessionId,
+						args.db,
+						newTargets,
+						args.messages,
+						{
+							protectedTags: args.protectedTags,
+							protectedToolTags,
+							protectedCutoff: usesTokenProtection
+								? protectionWindowForPass.cutoff
+								: undefined,
+							routine: true,
+							staleReduceStripEnabled: true,
+							onStaleReduceEdit: recordStaleReduceEdit,
+							caveman: args.isSubagent ? undefined : args.heuristics?.caveman,
+						},
+						getActiveTagsBySession(args.db, args.sessionId),
+						stableIdResolver,
+					),
 				);
 				heuristicsResult = {
 					droppedTools:
@@ -10555,6 +11158,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				`droppedTools=${heuristicsResult.droppedTools} deduplicatedTools=${heuristicsResult.deduplicatedTools} droppedInjections=${heuristicsResult.droppedInjections} staleReduce=${heuristicsResult.droppedStaleReduceCalls} compressedTextTags=${heuristicsResult.compressedTextTags} mutatedTextTags=${heuristicsResult.mutatedTextTags}`,
 			);
 		} catch (err) {
+			if (err instanceof PiToolRemovalBatchError) throw err;
 			sessionLog(
 				args.sessionId,
 				`heuristic cleanup failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
@@ -10789,16 +11393,18 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		}
 		autoReclaimTargetCount = syntheticPendingOps.length;
 		if (syntheticPendingOps.length > 0) {
-			autoReclaimDidMutate = applyPendingOperations(
-				args.sessionId,
-				args.db,
-				newTargets,
-				protectedTagNumbersForPass,
-				undefined,
-				[],
-				syntheticPendingOps,
-				editMarkerTagIds,
-				(reduction) => droppedTokenReductions.push(reduction),
+			autoReclaimDidMutate = applyToolRemovalGroup(() =>
+				applyPendingOperations(
+					args.sessionId,
+					args.db,
+					newTargets,
+					protectedTagNumbersForPass,
+					undefined,
+					[],
+					syntheticPendingOps,
+					editMarkerTagIds,
+					(reduction) => droppedTokenReductions.push(reduction),
+				),
 			);
 			if (autoReclaimDidMutate) {
 				droppedCount += syntheticPendingOps.length;
@@ -10832,14 +11438,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			}
 			// Transcript user rows can contain several results and a later user's
 			// text. Associate tool tags with their native occurrences, never that row.
-			const imageToolTags = new Map(
-				allTagsForPass
-					.filter((tag) => tag.type === "tool")
-					.map((tag) => [
-						`${tag.toolOwnerMessageId ?? ""}\0${tag.messageId}`,
-						tag.tagNumber,
-					]),
-			);
+			const imageToolCoordinates: Array<{
+				id: string | undefined;
+				key: string;
+			}> = [];
 			const imageToolOwners = new Map<string, string>();
 			for (let index = 0; index < workingMessages.length; index++) {
 				const message = workingMessages[index];
@@ -10848,20 +11450,26 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					for (const part of message.content) {
 						if (part.type !== "toolCall") continue;
 						imageToolOwners.set(part.id, id ?? "");
-						noteImagePosition(
-							id,
-							imageToolTags.get(`${id ?? ""}\0${part.id}`) ?? 0,
-						);
+						imageToolCoordinates.push({ id, key: `${id ?? ""}\0${part.id}` });
 					}
 				} else if (message.role === "toolResult") {
-					noteImagePosition(
+					imageToolCoordinates.push({
 						id,
-						imageToolTags.get(
-							`${imageToolOwners.get(message.toolCallId) ?? ""}\0${message.toolCallId}`,
-						) ?? 0,
-					);
+						key: `${imageToolOwners.get(message.toolCallId) ?? ""}\0${message.toolCallId}`,
+					});
 				}
 			}
+			// Index only owners/calls this rendered pass can ask about. Keep the
+			// pinned historical rows and canonical last-row-wins semantics intact.
+			const imageToolKeys = new Set(imageToolCoordinates.map(({ key }) => key));
+			const imageToolTags = new Map<string, number>();
+			for (const tag of allTagsForPass) {
+				if (tag.type !== "tool") continue;
+				const key = `${tag.toolOwnerMessageId ?? ""}\0${tag.messageId}`;
+				if (imageToolKeys.has(key)) imageToolTags.set(key, tag.tagNumber);
+			}
+			for (const { id, key } of imageToolCoordinates)
+				noteImagePosition(id, imageToolTags.get(key) ?? 0);
 			const protectedImageToolKeys = new Set(
 				activeTags
 					.filter(
@@ -10929,6 +11537,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const tTranscriptCommit = performance.now();
 	transcript.commit();
 	logTransformTiming(args.sessionId, "transcriptCommit", tTranscriptCommit);
+	if (
+		applyNativeResponseTagReplayPi({
+			db: args.db,
+			sessionId: args.sessionId,
+			messages: args.messages,
+			canApply: isCacheBustingPass,
+		}) > 0
+	)
+		recordFirstApplicationWireEdit(true);
 
 	// Legacy drop/watermark state does not authorize first native activation.
 	// Use committed canonical inputs, then publish only persisted native decisions.
@@ -11121,12 +11738,16 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// retries the rebuild. Deferred-history is NOT drained
 			// here; Pi-native compaction marker application happens at
 			// the end of runPipeline after materializing work succeeds.
-			if (args.isCacheBusting && prefixMutationAllowed) {
-				historyRefreshSessions.delete(args.sessionId);
-				historyWasConsumedThisPass = true;
-			}
-			if (deferredHistoryRefresh && prefixMutationAllowed) {
-				historyWasConsumedThisPass = true;
+			// A head held for signed thinking and then released for a system
+			// change was replayed, not rebuilt, so it consumes no refresh.
+			if (!heldHeadReleasedForSystemChange) {
+				if (args.isCacheBusting && prefixMutationAllowed) {
+					historyRefreshSessions.delete(args.sessionId);
+					historyWasConsumedThisPass = true;
+				}
+				if (deferredHistoryRefresh && prefixMutationAllowed) {
+					historyWasConsumedThisPass = true;
+				}
 			}
 			logTransformTiming(
 				args.sessionId,
@@ -11562,11 +12183,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	);
 	protectionFloorResolution = resolveProtectionFloor();
 	const protectedTagNumbers = usesTokenProtection
-		? computeProtectionWindow(
+		? protectedPiPassTagNumbers(
 				allTagsForPass,
 				protectionFloorResolution.floor,
 				activeCalibration.toolsRatio,
-			).protectedTagNumbers
+			)
 		: newestActiveTagNumbersByCount(activeTags, args.protectedTags);
 	// A defer pass cannot consume queue rows, so preserve the snapshot loaded at
 	// pass start. Execute passes may remove only a subset (protected/incomplete
@@ -11633,11 +12254,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		prefixBustPermitted: isCacheBustingPass,
 		prefixMutationAllowed,
 		strictThinkingKept: protectedSignedPrefix,
+		heldHeadReleasedForSystemChange,
 		signedPrefixRewritten: rewritingSignedPrefix,
 		prefixRebuildAlreadyPriced:
-			firstRenderBust ||
-			heldIdleExpiryRebuild ||
-			(!!args.recoveryRebuildReason && isCacheBustingPass),
+			firstRenderBust || (!!args.recoveryRebuildReason && isCacheBustingPass),
 		identityRebuilt: identityRebuild,
 		servedTagNumbers,
 		heuristicsExecuted,
@@ -12246,6 +12866,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	activeContextHandlerSessions.delete(sessionId);
 	clearAutoSearchForPiSession(sessionId);
 	lastEmergencyNotificationAtMs.delete(sessionId);
+	untrustedRecoveryCountLoggedSessions.delete(sessionId);
 	historyRefreshSessions.delete(sessionId);
 	clearPendingMaterialization(pendingMaterializationSessions, sessionId);
 	systemPromptRefreshSessions.delete(sessionId);

@@ -32,6 +32,7 @@ import {
     normalizeVerificationFiles,
     readGitHead,
     recordMemoryVerifications,
+    updateMemoryVerification,
 } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
@@ -70,6 +71,7 @@ import {
     type VerifyPromptMemory,
     validateVerifyManifest,
 } from "./verify-prompt";
+import { recordVerificationVerdict, verificationFilesFingerprint } from "./verify-state";
 
 /**
  * verify / verify-broad: check file-mapped memories against the CURRENT source
@@ -93,21 +95,15 @@ export const VERIFY_BATCH_SIZE = 5;
 export const VERIFY_TOKENS_PER_MEMORY = 100_000;
 export const VERIFY_RUN_TOKEN_BUDGET = 2_500_000;
 /**
- * Run deadline for starting batches. No new batch starts once this much time
- * has passed since the run began, and no single batch gets a longer time slice.
+ * Default batch window, not a run deadline. On 2026-10-20 live data, five-memory
+ * batches finished in 64 s at the median, 90 s at the 90th percentile and 96 s at
+ * worst. Batches spending at most 500k prompt tokens across all requests in one
+ * verifier child session (including cache reads and writes) finished in 103 s at
+ * the 95th percentile. Four minutes leaves headroom for those batches, while a
+ * longer configured timeout can give slower models more time through
+ * computeVerifyBatchSliceMs.
  */
-export const VERIFY_RUN_SLICE_MS = 240_000;
-/**
- * Extra time a batch that is already running at the run deadline may take to
- * finish. Cutting such a batch off throws away the tokens it already spent, and
- * finishing it costs little more. On 2026-10-20 live data, five-memory batches
- * finished in 64 s at the median, 90 s at p90 and 96 s at worst. Batches under
- * the 500k token envelope finished in 103 s at p95. The slowest full batch
- * consumed about 4.6k prompt tokens per second, so its token budget runs out
- * after roughly 110 s. 120 s therefore covers nearly every batch that can still
- * finish, and the slice timer stops a runaway batch at deadline + 120 s.
- */
-export const VERIFY_IN_FLIGHT_GRACE_MS = 120_000;
+export const VERIFY_BATCH_DEFAULT_MS = 240_000;
 
 export function verifyBatchTokenBudget(size: number, configured?: number): number {
     return Math.min(configured ?? Number.MAX_SAFE_INTEGER, size * VERIFY_TOKENS_PER_MEMORY);
@@ -173,11 +169,16 @@ const IDENTICAL_PROVIDER_FAILURE_BATCH_LIMIT = 2;
 export const VERIFY_BATCH_FLOOR_MS = 30_000;
 
 /**
- * Cap each batch at VERIFY_RUN_SLICE_MS, even when the run has more time left.
- * `remainingMs` is measured to the hard stop (run deadline plus in-flight grace).
+ * Give each batch the larger of the default window or an equal share of the
+ * remaining task time across the batches left, never past the task deadline.
+ * The default avoids tiny slices on large backlogs; the equal share lets slower
+ * models use a longer configured timeout without allocating it all up front.
  */
-export function computeVerifyBatchSliceMs(remainingMs: number, _batchesRemaining: number): number {
-    return Math.min(remainingMs, VERIFY_RUN_SLICE_MS);
+export function computeVerifyBatchSliceMs(remainingMs: number, batchesRemaining: number): number {
+    return Math.min(
+        remainingMs,
+        Math.max(VERIFY_BATCH_DEFAULT_MS, remainingMs / Math.max(1, batchesRemaining)),
+    );
 }
 
 export interface VerifyVerdictCounts {
@@ -263,7 +264,6 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
 
 async function runVerifyWithCooldown(args: VerifyArgs): Promise<VerifyResult> {
     const runStartedAt = Date.now();
-    const sliceDeadline = runStartedAt + VERIFY_RUN_SLICE_MS;
     const result: VerifyResult = {
         verified: 0,
         updated: 0,
@@ -329,16 +329,13 @@ async function runVerifyWithCooldown(args: VerifyArgs): Promise<VerifyResult> {
     try {
         for (let i = 0; i < batches.length; i += 1) {
             const now = Date.now();
-            // The run deadline only stops new batches from starting. A batch that
-            // starts before it may run on to the hard stop, which adds the
-            // in-flight grace but never passes the task's own deadline.
-            const startCutoff = Math.min(args.deadline, sliceDeadline);
-            const hardStop = Math.min(args.deadline, sliceDeadline + VERIFY_IN_FLIGHT_GRACE_MS);
-            const remainingMs = Math.max(0, hardStop - now);
-            if (now >= startCutoff) {
+            // The configured task deadline bounds both new starts and each
+            // batch's slice; there is no separate run window or in-flight grace.
+            const remainingMs = Math.max(0, args.deadline - now);
+            if (now >= args.deadline) {
                 result.stopReason = "deadline";
                 log(
-                    `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"}: stopping before batch ${i + 1}/${batches.length} — the run deadline passed ${now - startCutoff}ms ago`,
+                    `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"}: stopping before batch ${i + 1}/${batches.length} — the run deadline passed ${now - args.deadline}ms ago`,
                 );
                 break;
             }
@@ -397,9 +394,8 @@ async function runVerifyWithCooldown(args: VerifyArgs): Promise<VerifyResult> {
             }
 
             if (counts.timedOut) {
-                // Every later batch gets the same or a smaller share of the deadline,
-                // so starting one would repeat this timeout. Keep what earlier
-                // batches committed and stop.
+                // Stop rather than spending more of the task budget after a batch
+                // timeout. Keep the verdicts that earlier batches committed.
                 result.stopReason = "batch-timeout";
                 log(
                     `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"}: batch ${i + 1}/${batches.length} timed out after its ${sliceMs}ms slice; stopping with ${result.remaining} remaining`,
@@ -466,6 +462,7 @@ async function verifyOneBatch(
     let budgetFinalized = false;
     let failedCompletion: HiddenCompletion | undefined;
     let headAtPrompt: string | null = null;
+    const skipSnapshots = new Map<number, string | null>();
     const onBudgetUpdate: NonNullable<VerifyArgs["onBudgetUpdate"]> = (state) => {
         budgetFinalized ||= state.finalizeFired;
         args.onBudgetUpdate?.({
@@ -482,6 +479,17 @@ async function verifyOneBatch(
         });
     };
     try {
+        if (!args.moduleRoute) {
+            for (const memory of batch) {
+                skipSnapshots.set(
+                    memory.id,
+                    await shared.raceWithSignal(
+                        verificationFilesFingerprint(args.sessionDirectory, memory.mappedFiles),
+                        batchSignal,
+                    ),
+                );
+            }
+        }
         headAtPrompt = await shared.raceWithSignal(readGitHead(args.sessionDirectory), batchSignal);
         const evidence =
             !args.forceBroad && batch.every((m) => m.verifiedAt)
@@ -554,6 +562,7 @@ async function verifyOneBatch(
                 run.validated,
                 evidence?.head ?? headAtPrompt,
                 budgetFinalized,
+                skipSnapshots,
             );
         }
         const client = args.client;
@@ -634,6 +643,7 @@ async function verifyOneBatch(
             run.validated,
             evidence?.head ?? headAtPrompt,
             budgetFinalized,
+            skipSnapshots,
         );
     } catch (error) {
         const desc = describeError(error);
@@ -676,6 +686,7 @@ async function verifyOneBatch(
                 recovered,
                 headAtPrompt,
                 true,
+                skipSnapshots,
             );
             return {
                 ...counts,
@@ -730,7 +741,8 @@ async function verifyOneBatch(
  * - archive: archive + queue an archive mutation (m[1] delta). Skipped when the
  *   memory is no longer primary-mutable (already archived/superseded), so a stale
  *   manifest can't fight a concurrent change.
- * - skip/refusal: count the verdict for progress without changing the memory.
+ * - skip: remember the backing-file snapshot without claiming content verification.
+ * - refusal: count the refusal without changing the memory.
  * Directive-shaped PROJECT_RULES and unsafe content-loss rewrites are refused
  * before either the local or MODULE authority write path is built.
  * All writes happen under ONE lease-guarded transaction.
@@ -749,6 +761,7 @@ async function applyParsedVerifyManifest(
     parsed: ParsedVerifyManifest,
     headAtPrompt?: string | null,
     budgetFinalized = false,
+    skipSnapshots?: Map<number, string | null>,
 ): Promise<VerifyVerdictCounts> {
     const batchIds = new Set(batch.map((m) => m.id));
     const batchById = new Map(batch.map((memory) => [memory.id, memory]));
@@ -799,6 +812,7 @@ async function applyParsedVerifyManifest(
     type VerifyWrite =
         | { kind: "verify"; id: number; files: string[] }
         | { kind: "update"; id: number; files: string[]; content: string; hash: string }
+        | { kind: "skip"; id: number; fingerprint: string | null }
         | { kind: "archive"; id: number; reason: string };
     const writes: VerifyWrite[] = [];
     let refused = 0;
@@ -856,6 +870,18 @@ async function applyParsedVerifyManifest(
             continue;
         }
         writes.push({ kind: "archive", id: a.id, reason: a.reason });
+    }
+    // Module-owned memories keep their existing authority path; local skip
+    // snapshots must not bypass the module's memory command contract.
+    if (!args.moduleRoute) {
+        for (const entry of valid.skipped) {
+            const original = batchById.get(entry.id);
+            if (!original) continue;
+            const fingerprint = skipSnapshots
+                ? (skipSnapshots.get(entry.id) ?? null)
+                : await verificationFilesFingerprint(args.sessionDirectory, original.mappedFiles);
+            writes.push({ kind: "skip", id: entry.id, fingerprint });
+        }
     }
 
     let verified = 0;
@@ -930,8 +956,16 @@ async function applyParsedVerifyManifest(
             if (!isPrimaryMutable(memory)) continue;
             if (w.kind === "verify") {
                 recordMemoryVerifications(args.db, w.id, w.files, now);
-                if (verifiedHead) recordVerifiedCommit(args.db, memory, now, verifiedHead);
+                updateMemoryVerification(args.db, w.id, "verified");
+                recordVerificationVerdict(args.db, memory, "verified", now);
+                const verifiedMemory = getMemoryById(args.db, w.id);
+                if (verifiedHead && verifiedMemory)
+                    recordVerifiedCommit(args.db, verifiedMemory, now, verifiedHead);
                 verified += 1;
+            } else if (w.kind === "skip") {
+                if (memory.content !== batchById.get(w.id)?.content) continue;
+                updateMemoryVerification(args.db, w.id, "unverified");
+                recordVerificationVerdict(args.db, memory, "skip", now, w.fingerprint);
             } else if (w.kind === "update") {
                 // memories has UNIQUE(project_path, category, normalized_hash).
                 // A rewrite that lands on another memory's exact content would
@@ -952,6 +986,8 @@ async function applyParsedVerifyManifest(
                     continue;
                 }
                 rewriteMemoryContent(args.db, memory, w.content, w.hash);
+                updateMemoryVerification(args.db, w.id, "unverified");
+                recordVerificationVerdict(args.db, memory, "update", now);
                 queueMemoryMutation(args.db, {
                     projectPath: args.projectIdentity,
                     mutationType: "update",
@@ -962,6 +998,8 @@ async function applyParsedVerifyManifest(
                 updated += 1;
             } else {
                 archiveMemory(args.db, w.id, w.reason);
+                updateMemoryVerification(args.db, w.id, "stale");
+                recordVerificationVerdict(args.db, memory, "archive", now);
                 queueMemoryMutation(args.db, {
                     projectPath: args.projectIdentity,
                     mutationType: "archive",

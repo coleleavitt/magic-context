@@ -174,12 +174,10 @@ const QUERY_STATEMENTS: Readonly<Record<string, string>> = {
         "SELECT id, session_id, type, seq, time_created, data FROM session_message WHERE session_id = ? AND id = ? AND type IN (?) LIMIT 1",
     messageExistsById:
         "SELECT 1 FROM session_message WHERE id = ? AND session_id = ? AND type IN (?) LIMIT 1",
-    messageOrdinalById: `WITH target AS (
-    SELECT seq FROM session_message WHERE session_id = ? AND id = ? AND type IN (?) LIMIT 1
-)
-SELECT (SELECT COUNT(*) FROM session_message WHERE session_id = ? AND type IN (?) AND seq <= target.seq) AS ordinal FROM target`,
+    messageOrdinalById:
+        "SELECT seq FROM session_message WHERE session_id = ? AND id = ? AND type IN (?) LIMIT 1",
     messageIdOrdinals:
-        "SELECT id FROM session_message WHERE session_id = ? AND type IN (?) ORDER BY seq ASC LIMIT ? OFFSET ?",
+        "SELECT id FROM session_message WHERE session_id = ? AND seq >= ? AND type IN (?) ORDER BY seq ASC LIMIT ?",
     messageOrdinalPage:
         "SELECT id, type, seq, json_valid(data) AS valid FROM session_message WHERE session_id = ? AND seq > ? ORDER BY seq ASC, id ASC LIMIT ?",
     rawRowsThrough:
@@ -295,6 +293,10 @@ interface ReaderConnection {
     identity: string;
     leases: number;
     retired: boolean;
+    ordinalVersion?: number;
+    ordinalSequences: Map<string, number[]>;
+    /** Whether this database has OpenCode's `session_part` table (2.2.2 and later). */
+    partTable?: boolean;
 }
 
 function connect(path: string, identity = ""): ReaderConnection {
@@ -311,7 +313,14 @@ function connect(path: string, identity = ""): ReaderConnection {
     counters.openReaders += 1;
     counters.readersOpened += 1;
     counters.maxOpenReaders = Math.max(counters.maxOpenReaders, counters.openReaders);
-    return { db, statements: new Map(), identity: acquiredIdentity, leases: 0, retired: false };
+    return {
+        db,
+        statements: new Map(),
+        identity: acquiredIdentity,
+        leases: 0,
+        retired: false,
+        ordinalSequences: new Map(),
+    };
 }
 
 function closeConnection(connection: ReaderConnection): void {
@@ -326,7 +335,7 @@ function closeConnection(connection: ReaderConnection): void {
 }
 
 /** Boot-scoped read-only handles. Each lease still closes in the caller's finally block.
- * Statements, not results, are cached: WAL updates are visible on the next query.
+ * Statements and revision-checked ordinal anchors are cached; WAL commits invalidate anchors.
  * A replaced/missing file cannot reuse the old inode, and disposal releases all handles.
  *
  * Work that opens readers over a long time (a hidden run polls the store for its whole
@@ -457,10 +466,19 @@ export class V2StoreReaderPool {
  * row of the session for each batch of ids. The session is still checked on
  * each row found.
  */
-export function messageTimesQuery(count: number): string {
+export function messageTimesQuery(count: number, withVersions = false): string {
     return `SELECT id, COALESCE(time_created, json_extract(data, '$.time.created')) AS created,
                    json_extract(data, '$.time.completed') AS completed
+                   ${withVersions ? ", type, seq, time_created AS version_created, time_updated AS version_updated" : ""}
             FROM session_message WHERE +session_id = ? AND id IN (${Array.from({ length: count }, () => "?").join(",")})`;
+}
+
+export interface V2MessageTimeVersion {
+    id: string;
+    type: string;
+    seq: number;
+    created: number | null;
+    updated: number | null;
 }
 
 /** Opens an existing store read-only; missing/corrupt stores propagate errors, never an empty history. */
@@ -502,6 +520,70 @@ export class V2StoreReader {
         }
         return statement;
     }
+
+    /** Whether this database has OpenCode's `session_part` table. Checked once per
+     * connection: the host creates it in a schema migration before plugins load. */
+    private hasPartTable(): boolean {
+        this.connection.partTable ??= Boolean(
+            this.prepare(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_part'",
+            ).get(),
+        );
+        return this.connection.partTable;
+    }
+
+    /**
+     * Give assistant rows the content OpenCode itself reads. With
+     * `experimental.part_rows` (OpenCode 2.2.6) an assistant message's content is
+     * stored in `session_part`, one row per part, and its `session_message` row
+     * keeps `content: []`. OpenCode reads a row with part rows as those parts, in
+     * ordinal order, followed by any inline content, or the parts alone when the
+     * row has no content array (`withParts` in `@opencode/core` 2.2.6), so this
+     * reader composes it the same way. A row without part rows is returned
+     * unchanged, so sessions that never used part rows read exactly the bytes
+     * they did before.
+     */
+    private withParts(rows: StoreRow[]): StoreRow[] {
+        const ids = rows.flatMap((row) => (row.type === "assistant" ? [row.id] : []));
+        if (ids.length === 0 || !this.hasPartTable()) return rows;
+        const parts = new Map<string, unknown[]>();
+        for (let offset = 0; offset < ids.length; offset += 500) {
+            const chunk = ids.slice(offset, offset + 500);
+            const partRows = this.prepare(
+                `SELECT message_id, ordinal, data FROM session_part
+                     WHERE message_id IN (${chunk.map(() => "?").join(", ")})
+                     ORDER BY message_id ASC, ordinal ASC`,
+            ).all(...chunk) as Array<{ message_id: string; ordinal: number; data: string }>;
+            for (const part of partRows) {
+                let data: unknown;
+                try {
+                    data = JSON.parse(part.data);
+                } catch {
+                    throw new Error(
+                        `Invalid session_part data for ${part.message_id} at ordinal ${part.ordinal}`,
+                    );
+                }
+                const list = parts.get(part.message_id);
+                if (list) list.push(data);
+                else parts.set(part.message_id, [data]);
+            }
+        }
+        if (parts.size === 0) return rows;
+        return rows.map((row) => {
+            const content = parts.get(row.id);
+            if (!content) return row;
+            const inline = (row.data as { content?: unknown }).content;
+            return {
+                ...row,
+                data: {
+                    ...row.data,
+                    content: (Array.isArray(inline)
+                        ? [...content, ...inline]
+                        : content) as MessageData["content"],
+                },
+            };
+        });
+    }
     close(): void {
         if (this.closed) return;
         this.closed = true;
@@ -537,11 +619,13 @@ export class V2StoreReader {
                 predicates.push("type = ?");
                 parameters.push(options.type);
             }
-            const rows = (
-                this.prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
+            const rows = this.withParts(
+                (
+                    this.prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
                         WHERE ${predicates.join(" AND ")}
                         ORDER BY seq ASC LIMIT ?`).all(...parameters, limit) as RawRow[]
-            ).map(decode);
+                ).map(decode),
+            );
             return { rows, cursor: rows.at(-1)?.seq };
         });
     }
@@ -574,16 +658,18 @@ export class V2StoreReader {
                     "SELECT seq FROM session_message WHERE session_id = ? AND id = ?",
                 ).get(sessionID, after.id) as { seq: number } | undefined;
                 if (anchor) {
-                    return (
-                        this.prepare(`SELECT id, session_id, type, seq, time_created, data
+                    return this.withParts(
+                        (
+                            this.prepare(`SELECT id, session_id, type, seq, time_created, data
                         FROM session_message WHERE session_id = ? AND seq > ?
                         AND type IN (${RAW_MESSAGE_TYPE_PARAMETERS}) ORDER BY seq ASC LIMIT ?`).all(
-                            sessionID,
-                            anchor.seq,
-                            ...RAW_MESSAGE_TYPES,
-                            pageSize,
-                        ) as RawRow[]
-                    ).map(decode);
+                                sessionID,
+                                anchor.seq,
+                                ...RAW_MESSAGE_TYPES,
+                                pageSize,
+                            ) as RawRow[]
+                        ).map(decode),
+                    );
                 }
             }
             const maximumSeq = Number.MAX_SAFE_INTEGER;
@@ -603,7 +689,7 @@ export class V2StoreReader {
                 ...RAW_MESSAGE_TYPES,
                 pageSize,
             ) as RawRow[];
-            return rows.map(decode);
+            return this.withParts(rows.map(decode));
         });
     }
 
@@ -836,32 +922,84 @@ export class V2StoreReader {
                 `SELECT id, session_id, type, seq, time_created, data FROM session_message
                      WHERE session_id = ? AND id = ? AND type IN (${rawTypes}) LIMIT 1`,
             ).get(sessionID, id, ...RAW_MESSAGE_TYPES) as RawRow | undefined;
-            return row ? decode(row) : null;
+            return row ? (this.withParts([decode(row)])[0] ?? null) : null;
         });
+    }
+
+    /** Check membership and row revisions without loading or parsing message data. */
+    messageTimeVersions(
+        sessionID: string,
+        ids: readonly string[],
+        span?: { first: number; last: number },
+    ): Map<string, V2MessageTimeVersion> {
+        const versions = new Map<string, V2MessageTimeVersion>();
+        // A dense retained window is cheaper to read in sequence order than as
+        // thousands of primary-key probes. Sparse anchor reads still use ids.
+        if (ids.length > 0 && span && span.last - span.first < ids.length * 2) {
+            const wanted = new Set(ids);
+            const rows =
+                this.prepare(`SELECT id, type, seq, time_created AS created, time_updated AS updated
+                FROM session_message WHERE session_id = ? AND seq >= ? AND seq <= ?`).all(
+                    sessionID,
+                    span.first,
+                    span.last,
+                ) as V2MessageTimeVersion[];
+            for (const row of rows) if (wanted.has(row.id)) versions.set(row.id, row);
+            for (const [id, version] of this.messageTimeVersions(
+                sessionID,
+                ids.filter((id) => !versions.has(id)),
+            ))
+                versions.set(id, version);
+            return versions;
+        }
+        for (let offset = 0; offset < ids.length; offset += 500) {
+            const batch = ids.slice(offset, offset + 500);
+            const rows =
+                this.prepare(`SELECT id, type, seq, time_created AS created, time_updated AS updated
+                FROM session_message WHERE +session_id = ? AND id IN (${batch.map(() => "?").join(",")})`).all(
+                    sessionID,
+                    ...batch,
+                ) as V2MessageTimeVersion[];
+            for (const row of rows) versions.set(row.id, row);
+        }
+        return versions;
     }
 
     messageTimes(
         sessionID: string,
         ids: readonly string[],
+        versions?: Map<string, V2MessageTimeVersion>,
     ): Map<string, { created?: number; completed?: number }> {
         const times = new Map<string, { created?: number; completed?: number }>();
         // Read only timing metadata for the served draft, not full stored content
         // or the session's archived history. Bound each query's parameter count.
         for (let offset = 0; offset < ids.length; offset += 500) {
             const batch = ids.slice(offset, offset + 500);
-            const rows = this.prepare(messageTimesQuery(batch.length)).all(
+            const rows = this.prepare(messageTimesQuery(batch.length, versions !== undefined)).all(
                 sessionID,
                 ...batch,
             ) as Array<{
                 id: string;
                 created: number | null;
                 completed: number | null;
+                type: string;
+                seq: number;
+                version_created: number | null;
+                version_updated: number | null;
             }>;
-            for (const row of rows)
+            for (const row of rows) {
                 times.set(row.id, {
                     created: typeof row.created === "number" ? row.created : undefined,
                     completed: typeof row.completed === "number" ? row.completed : undefined,
                 });
+                versions?.set(row.id, {
+                    id: row.id,
+                    type: row.type,
+                    seq: row.seq,
+                    created: row.version_created,
+                    updated: row.version_updated,
+                });
+            }
         }
         return times;
     }
@@ -877,27 +1015,61 @@ export class V2StoreReader {
         });
     }
 
+    /** Keep exact seq anchors on the read-only connection. Any external commit,
+     * including a revert or a type edit with an unchanged tail, drops the memo.
+     * A read transaction pins the revision and both lookups to the same snapshot.
+     * Cold construction reads seq only; warm ranges never walk an earlier prefix. */
+    private withOrdinalSequences<T>(sessionID: string, read: (sequences: number[]) => T): T {
+        return this.db
+            .transaction(() => {
+                // Establish the snapshot before reading its data_version.
+                this.prepare(
+                    "SELECT seq FROM session_message WHERE session_id = ? ORDER BY seq DESC LIMIT 1",
+                ).get(sessionID);
+                const { data_version: version } = this.prepare("PRAGMA data_version").get() as {
+                    data_version: number;
+                };
+                if (version !== this.connection.ordinalVersion) {
+                    this.connection.ordinalSequences.clear();
+                    this.connection.ordinalVersion = version;
+                }
+                let sequences = this.connection.ordinalSequences.get(sessionID);
+                if (!sequences) {
+                    const rows = this.prepare(`SELECT seq FROM session_message
+                    WHERE session_id = ? AND type IN (${RAW_MESSAGE_TYPE_PARAMETERS}) ORDER BY seq ASC`).all(
+                        sessionID,
+                        ...RAW_MESSAGE_TYPES,
+                    ) as { seq: number }[];
+                    sequences = rows.map((row) => row.seq);
+                    if (this.connection.ordinalSequences.size >= 8)
+                        this.connection.ordinalSequences.clear();
+                    this.connection.ordinalSequences.set(sessionID, sequences);
+                }
+                return read(sequences);
+            })
+            .deferred();
+    }
+
     messageOrdinalById(sessionID: string, id: string): number | null {
-        return trackDecodeOperation("messageOrdinalById", () => {
-            const rawTypes = RAW_MESSAGE_TYPES.map(() => "?").join(", ");
-            const row = this.prepare(
-                `WITH target AS (
-                        SELECT seq FROM session_message
-                        WHERE session_id = ? AND id = ? AND type IN (${rawTypes})
-                        LIMIT 1
-                    )
-                    SELECT (
-                        SELECT COUNT(*) FROM session_message
-                        WHERE session_id = ?
-                          AND type IN (${rawTypes})
-                          AND seq <= target.seq
-                    ) AS ordinal
-                    FROM target`,
-            ).get(sessionID, id, ...RAW_MESSAGE_TYPES, sessionID, ...RAW_MESSAGE_TYPES) as
-                | { ordinal?: number }
-                | undefined;
-            return typeof row?.ordinal === "number" ? row.ordinal : null;
-        });
+        return trackDecodeOperation("messageOrdinalById", () =>
+            this.withOrdinalSequences(sessionID, (sequences) => {
+                const row = this.prepare(`SELECT seq FROM session_message
+                WHERE session_id = ? AND id = ? AND type IN (${RAW_MESSAGE_TYPE_PARAMETERS}) LIMIT 1`).get(
+                    sessionID,
+                    id,
+                    ...RAW_MESSAGE_TYPES,
+                ) as { seq: number } | undefined;
+                if (!row) return null;
+                let low = 0;
+                let high = sequences.length;
+                while (low < high) {
+                    const middle = (low + high) >>> 1;
+                    if (sequences[middle] < row.seq) low = middle + 1;
+                    else high = middle;
+                }
+                return sequences[low] === row.seq ? low + 1 : null;
+            }),
+        );
     }
 
     messageIdOrdinals(
@@ -910,18 +1082,19 @@ export class V2StoreReader {
                 throw new Error("Invalid raw-message range start");
             if (!Number.isSafeInteger(toOrdinal) || toOrdinal < fromOrdinal)
                 throw new Error("Invalid raw-message range end");
-            const rawTypes = RAW_MESSAGE_TYPES.map(() => "?").join(", ");
-            const rows = this.prepare(
-                `SELECT id FROM session_message
-                     WHERE session_id = ? AND type IN (${rawTypes})
-                     ORDER BY seq ASC LIMIT ? OFFSET ?`,
-            ).all(
-                sessionID,
-                ...RAW_MESSAGE_TYPES,
-                toOrdinal - fromOrdinal + 1,
-                fromOrdinal - 1,
-            ) as Array<{ id: string }>;
-            return new Map(rows.map((row, index) => [row.id, fromOrdinal + index]));
+            return this.withOrdinalSequences(sessionID, (sequences) => {
+                const anchor = sequences[fromOrdinal - 1];
+                if (anchor === undefined) return new Map<string, number>();
+                const rows = this.prepare(`SELECT id FROM session_message
+                    WHERE session_id = ? AND seq >= ? AND type IN (${RAW_MESSAGE_TYPE_PARAMETERS})
+                    ORDER BY seq ASC LIMIT ?`).all(
+                    sessionID,
+                    anchor,
+                    ...RAW_MESSAGE_TYPES,
+                    toOrdinal - fromOrdinal + 1,
+                ) as { id: string }[];
+                return new Map(rows.map((row, index) => [row.id, fromOrdinal + index]));
+            });
         });
     }
 
@@ -969,24 +1142,57 @@ export class V2StoreReader {
      * decoding any row: the row id, its update time and the byte length of its data.
      * A row deleted, added, or rewritten in place to a different size or with a new
      * update time changes its stamp; comparing stamps row by row, not an aggregate,
-     * means two such changes cannot cancel out.
+     * means two such changes cannot cancel out. An assistant whose content OpenCode
+     * keeps in `session_part` (see withParts) also stamps its part rows: their
+     * count, newest update time and total size. An edit to a part rewrites only
+     * its part row, so the message row alone would not show it. Rows without part
+     * rows keep the stamp they had before part rows existed.
      */
     spanRowStamps(sessionID: string, after: number, through: number): Map<number, string> {
         if (!Number.isSafeInteger(after) || !Number.isSafeInteger(through))
             throw new Error("Invalid seq span");
+        const partJoin = this.hasPartTable()
+            ? `LEFT JOIN (SELECT p.message_id AS message_id, COUNT(*) AS parts,
+                       MAX(p.time_updated) AS partsUpdated,
+                       SUM(length(CAST(p.data AS BLOB))) AS partsBytes
+                    FROM session_message s JOIN session_part p ON p.message_id = s.id
+                    WHERE s.session_id = ? AND s.seq > ? AND s.seq <= ?
+                    GROUP BY p.message_id) g ON g.message_id = m.id`
+            : "";
         const rows = this.prepare(
-            `SELECT seq, id, time_updated AS updated, length(CAST(data AS BLOB)) AS bytes
-                 FROM session_message WHERE session_id = ? AND seq > ? AND seq <= ?
-                 ORDER BY seq ASC`,
-        ).all(sessionID, after, through) as Array<{
+            `SELECT m.seq AS seq, m.id AS id, m.time_updated AS updated,
+                    length(CAST(m.data AS BLOB)) AS bytes${
+                        partJoin
+                            ? ", g.parts AS parts, g.partsUpdated AS partsUpdated, g.partsBytes AS partsBytes"
+                            : ""
+                    }
+                 FROM session_message m ${partJoin}
+                 WHERE m.session_id = ? AND m.seq > ? AND m.seq <= ?
+                 ORDER BY m.seq ASC`,
+        ).all(
+            ...(partJoin ? [sessionID, after, through] : []),
+            sessionID,
+            after,
+            through,
+        ) as Array<{
             seq: number;
             id: string;
             updated: number | null;
             bytes: number | null;
+            parts?: number;
+            partsUpdated?: number | null;
+            partsBytes?: number | null;
         }>;
         const stamps = new Map<number, string>();
         for (const row of rows)
-            stamps.set(row.seq, `${row.id}\u0000${row.updated ?? ""}\u0000${row.bytes ?? ""}`);
+            stamps.set(
+                row.seq,
+                `${row.id}\u0000${row.updated ?? ""}\u0000${row.bytes ?? ""}${
+                    row.parts
+                        ? `\u0000${row.parts}\u0000${row.partsUpdated ?? ""}\u0000${row.partsBytes ?? ""}`
+                        : ""
+                }`,
+            );
         return stamps;
     }
 
@@ -997,13 +1203,15 @@ export class V2StoreReader {
             if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10000)
                 throw new Error("Invalid page limit");
             const rawTypes = RAW_MESSAGE_TYPES.map(() => "?").join(", ");
-            return (
-                this.prepare(
-                    `SELECT id, session_id, type, seq, time_created, data FROM session_message
+            return this.withParts(
+                (
+                    this.prepare(
+                        `SELECT id, session_id, type, seq, time_created, data FROM session_message
                          WHERE session_id = ? AND type IN (${rawTypes}) AND seq <= ?
                          ORDER BY seq DESC LIMIT ?`,
-                ).all(sessionID, ...RAW_MESSAGE_TYPES, throughSeq, limit) as RawRow[]
-            ).map(decode);
+                    ).all(sessionID, ...RAW_MESSAGE_TYPES, throughSeq, limit) as RawRow[]
+                ).map(decode),
+            );
         });
     }
 
@@ -1089,7 +1297,12 @@ export class V2StoreReader {
      * Identity columns of every row of a session up to and including `throughSeq`,
      * in seq order, without decoding any message body.
      */
-    rowStampsThrough(sessionID: string, throughSeq: number): V2RowStamp[] {
+    rowStampsThrough(sessionID: string, throughSeq: number, after?: number): V2RowStamp[] {
+        if (after !== undefined)
+            return this.prepare(
+                `SELECT id, type, seq, time_created FROM session_message
+                     WHERE session_id = ? AND seq > ? AND seq <= ? ORDER BY seq ASC`,
+            ).all(sessionID, after, throughSeq) as V2RowStamp[];
         return this.prepare(
             `SELECT id, type, seq, time_created FROM session_message
                  WHERE session_id = ? AND seq <= ? ORDER BY seq ASC`,
@@ -1162,7 +1375,7 @@ export class V2StoreReader {
                 this.prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
                     WHERE session_id = ? AND type = 'assistant' AND seq > ?
                     ORDER BY seq ASC`).all(sessionID, afterSeq) as RawRow[];
-            return rows.map((row) => decode(row) as StoreRow<"assistant">);
+            return this.withParts(rows.map(decode)) as StoreRow<"assistant">[];
         });
     }
 
@@ -1172,7 +1385,7 @@ export class V2StoreReader {
                 this.prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
                     WHERE session_id = ? AND type = 'assistant'
                     ORDER BY seq DESC LIMIT 1`).get(sessionID) as RawRow | undefined;
-            return row ? (decode(row) as StoreRow<"assistant">) : undefined;
+            return row ? (this.withParts([decode(row)])[0] as StoreRow<"assistant">) : undefined;
         });
     }
 

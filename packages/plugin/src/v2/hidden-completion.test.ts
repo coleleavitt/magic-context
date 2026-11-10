@@ -955,6 +955,35 @@ describe("OpenCode 2 hidden child completion", () => {
         }
     });
 
+    for (const keepSubagents of [false, true]) {
+        for (const identity of [run, dreamerRun]) {
+            test(`logs one retirement decision for ${identity.kind} with keep_subagents=${keepSubagents}`, async () => {
+                const logs: string[] = [];
+                const state = await setup("host-generation-1", { keepSubagents, logs });
+                try {
+                    state.setProviderError({ message: "provider unavailable" });
+                    const handle = await state.executor.open(identity);
+                    await expect(state.executor.attempt(handle, request())).rejects.toThrow(
+                        "Hidden completion provider error: ",
+                    );
+                    await close(state.executor, handle, false);
+                    const role = identity.kind === "dreamer-task" ? "dreamer" : "historian";
+                    expect(logs.filter((line) => line.includes("hidden child child-1 "))).toEqual([
+                        `[magic-context] hidden child child-1 created role=${role} parent=none keep_subagents=${keepSubagents}`,
+                        ...(keepSubagents && role === "historian"
+                            ? ["[magic-context] hidden child child-1 kept (keep_subagents)"]
+                            : [
+                                  "[magic-context] hidden child child-1 removing",
+                                  "[magic-context] hidden child child-1 removed",
+                              ]),
+                    ]);
+                } finally {
+                    state.db.close();
+                }
+            });
+        }
+    }
+
     test("reopens a fresh child when a fallback retries a retired run", async () => {
         const state = await setup();
         try {
@@ -1541,7 +1570,73 @@ for (const failure of ["prompt timed out after 30000ms", "provider unavailable"]
     });
 }
 
-test("hidden tool-loop hard-stops at soft prompt budget when the host has no pre-tool hook", async () => {
+test("hidden tool-loop charges settled usage once across polls and the final completion", async () => {
+    const fixture = await setup();
+    const originalPrompt = fixture.host.prompt;
+    let release!: () => void;
+    fixture.host.wait = () =>
+        new Promise<void>((resolve) => {
+            release = resolve;
+        });
+    fixture.host.prompt = async (input) => {
+        await originalPrompt(input);
+        const row = fixture.rows.latestAssistant(input.sessionID)!;
+        delete row.data.finish;
+        delete row.data.tokens;
+    };
+    const reads = spyOn(fixture.rows, "assistantSince");
+    const spent: number[] = [];
+    const handle = await fixture.executor.open({
+        ...dreamerRun,
+        agent: HIDDEN_CURATE_AGENT,
+        metadata: {
+            tokenBudget: 1000,
+            onBudgetUpdate: (state: { spent: number }) => spent.push(state.spent),
+        },
+    });
+    try {
+        const attempt = fixture.executor.attempt(handle, request());
+        await eventually(() => reads.mock.calls.length >= 2);
+        expect(spent).toEqual([]);
+        const row = fixture.rows.latestAssistant(handle.id)!;
+        row.data.tokens = { input: 101, output: 11, cache: { read: 7, write: 5 } };
+        row.data.finish = "tool-calls";
+        await eventually(() => spent.length === 1);
+        const readCount = reads.mock.calls.length;
+        await eventually(() => reads.mock.calls.length > readCount);
+        expect(spent).toEqual([113]);
+        fixture.rows.append(handle.id, "done");
+        release();
+        await attempt;
+        expect(spent).toEqual([113, 226]);
+    } finally {
+        reads.mockRestore();
+        await close(fixture.executor, handle, true);
+        fixture.db.close();
+    }
+});
+
+test("hidden tool-loop accounts for a final answer that settles before the first budget poll", async () => {
+    const fixture = await setup();
+    const spent: number[] = [];
+    const handle = await fixture.executor.open({
+        ...dreamerRun,
+        agent: HIDDEN_CURATE_AGENT,
+        metadata: {
+            tokenBudget: 1000,
+            onBudgetUpdate: (state: { spent: number }) => spent.push(state.spent),
+        },
+    });
+    try {
+        await fixture.executor.attempt(handle, request());
+        expect(spent).toEqual([113]);
+    } finally {
+        await close(fixture.executor, handle, true);
+        fixture.db.close();
+    }
+});
+
+test("hidden tool-loop hard-stops when an in-flight row receives final usage", async () => {
     const fixture = await setup();
     fixture.setDelayRow(1200);
     const executor = fixture.executor;
@@ -1560,11 +1655,16 @@ test("hidden tool-loop hard-stops at soft prompt budget when the host has no pre
     const attempt = executor.attempt(handle, request());
     await eventually(() => fixture.requests.length > 0);
     // The fixture's assistant reports 101 input, 7 cache read and 5 cache write tokens.
-    fixture.rows.append(handle.id, "", { finish: "tool-calls" });
+    const row = fixture.rows.append(handle.id, "", { omitFinish: true, usage: false });
+    const reads = spyOn(fixture.rows, "assistantSince");
+    await eventually(() => reads.mock.calls.length >= 2);
+    row.data.tokens = { input: 101, output: 11, cache: { read: 7, write: 5 } };
+    row.data.finish = "tool-calls";
     await expect(attempt).rejects.toMatchObject({ name: "DreamTokenBudgetExceeded" });
     expect(fixture.interrupts).toContain(handle.id);
     expect(fixture.requests).toHaveLength(1);
     expect(finalized).toBe(false);
+    reads.mockRestore();
     await executor.close(handle, {
         promptSettled: false,
         privacySensitive: true,

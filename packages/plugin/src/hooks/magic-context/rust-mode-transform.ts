@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
-import { prepareCompactionMarkerCandidates } from "../../features/magic-context/compaction-marker";
+import { startCompactionMarkerCandidatePreparation } from "../../features/magic-context/compaction-marker";
 import {
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
@@ -1282,7 +1282,11 @@ function transformGeometryForWire(
     if (!geometry) return undefined;
     const { window, reserve } = geometry.derivation;
     let derivation: string;
-    if (geometry.geometry === "separate" && geometry.usableSoft < geometry.usableHard) {
+    // A separate-geometry model whose usable window is smaller than its full
+    // window has a pre-carved input limit. Compare against the window, not the
+    // hard wall: the hard wall is capped at the input limit as well, so in that
+    // case it equals the usable window.
+    if (geometry.geometry === "separate" && geometry.usableSoft < window) {
         derivation = `s1-pre-carve/input=${geometry.usableSoft}`;
     } else if (geometry.geometry === "separate") {
         derivation = `s1-separate/context=${window}`;
@@ -4637,6 +4641,15 @@ export function createRustModeTransform(
                 // reasoning recovery. Keep that basis unmodified, including nested parts;
                 // a postprocessed prefix can silently discard a message at the next splice.
                 pendingWireCache.nativeOutput = moduleMessages;
+                // Start summary discovery without waiting, on frozen replays too: it
+                // reads the whole session on a worker and changes no served bytes, and
+                // the marker drain defers until it is ready.
+                if (
+                    (materializedBoundary ||
+                        getPendingCompactionMarkerState(deps.db, sessionId) !== null) &&
+                    !deps.compactionOff
+                )
+                    startCompactionMarkerCandidatePreparation(sessionId);
                 // LKG captures postprocessed output, so running postprocess again would stop the
                 // fallback artifact from being an exact replay.
                 if (!replayedFrozenRepresentation) {
@@ -4645,7 +4658,6 @@ export function createRustModeTransform(
                             getPendingCompactionMarkerState(deps.db, sessionId) !== null) &&
                         !deps.compactionOff
                     ) {
-                        await prepareCompactionMarkerCandidates(sessionId);
                         try {
                             await withAsyncPrivilegedWriter(deps.db, () => undefined);
                         } catch (error) {

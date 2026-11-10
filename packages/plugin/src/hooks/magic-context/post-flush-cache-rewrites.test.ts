@@ -2,6 +2,10 @@ import { afterEach, expect, it, spyOn } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+    isCompactionMarkerDiscoveryReady,
+    prepareCompactionMarkerCandidates,
+} from "../../features/magic-context/compaction-marker";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import {
     closeDatabase,
@@ -442,7 +446,14 @@ for (const contentChange of [false, true]) {
                     index * 1000,
                     JSON.stringify({
                         role,
-                        ...(id === oldSummary ? { summary: true } : {}),
+                        ...(id === oldSummary
+                            ? {
+                                  summary: true,
+                                  parentID: oldBoundary,
+                                  providerID: "magic-context",
+                                  modelID: "magic-context",
+                              }
+                            : {}),
                         ...(role === "assistant" ? { finish: "stop" } : {}),
                     }),
                 );
@@ -645,6 +656,11 @@ for (const contentChange of [false, true]) {
                     { system: [`Changed instructions\n${prompt("2026-10-13")}`] },
                 );
             else {
+                // The fold below is the first pass to see this target in a fresh
+                // process, so no earlier pass could start discovery and production
+                // would defer the marker once. This branch is about the fold that
+                // moves it, so discovery has already finished.
+                expect(await prepareCompactionMarkerCandidates(sessionId)).toBe(true);
                 // A real user ends the protected tool loop; published history can now fold.
                 usage.set(sessionId, {
                     usage: { percentage: 75.4, inputTokens: 657_477 },
@@ -718,6 +734,11 @@ for (const contentChange of [false, true]) {
             expect(getPersistedCompactionMarkerState(db, sessionId)?.summaryMessageId).toBe(
                 oldSummary,
             );
+            // The held pass saw the pending target and started marker discovery
+            // without waiting for it; give it the time a turn would.
+            const deadline = Date.now() + 5_000;
+            while (!isCompactionMarkerDiscoveryReady(sessionId) && Date.now() < deadline)
+                await Bun.sleep(10);
             const released = [...signedSource(), message("msg_07", "user")];
             await transform({}, { messages: released });
             expect(signals.pendingMaterializationSessions.has(sessionId)).toBe(false);

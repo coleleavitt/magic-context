@@ -8,11 +8,7 @@ import { MagicContextConfigSchema } from "../../config/schema/magic-context";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import * as embedding from "../../features/magic-context/memory/embedding";
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
-import {
-    closeDatabase,
-    getTagsBySession,
-    openDatabase,
-} from "../../features/magic-context/storage";
+import { closeDatabase, getTagsBySession } from "../../features/magic-context/storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
 import { replayHint } from "../../hooks/magic-context/auto-search-replay.fixture";
@@ -27,9 +23,11 @@ import * as logger from "../../shared/logger";
 import * as models from "../../shared/models-dev-cache";
 import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import { scaleTest } from "../../shared/slow-test";
-import { Database } from "../../shared/sqlite";
+import { openTestDatabase, openTestDb } from "../../shared/test-db";
 import { cleanupTestTempDir, createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { rememberHostMedia, resetHostMediaForTests } from "../fold/host-media";
+import type { FoldIdentity } from "../fold/owner";
+import { CHECKPOINT_NOTE } from "../fold/summary";
 import { registerContext } from "./context";
 import * as storageGate from "./storage-gate";
 import type { SessionContext, V2Context, V2Message } from "./types";
@@ -69,24 +67,21 @@ async function fixture(
         "MAGIC_CONTEXT_STORAGE_DIR",
         "MAGIC_CONTEXT_LOG_PATH",
         "OPENCODE_DB",
-        "MC_OC2_INVISIBLE_FOLD",
     ];
     const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
-    for (const key of keys.filter((key) => key !== "MC_OC2_INVISIBLE_FOLD"))
-        process.env[key] = join(root, key);
-    delete process.env.MC_OC2_INVISIBLE_FOLD;
+    for (const key of keys) process.env[key] = join(root, key);
     let nowClock = 1770000000000 + seed * 10000000;
     const clock = spyOn(Date, "now").mockImplementation(() => nowClock);
     for (const key of keys.filter(
-        (key) => !["MAGIC_CONTEXT_LOG_PATH", "OPENCODE_DB", "MC_OC2_INVISIBLE_FOLD"].includes(key),
+        (key) => !["MAGIC_CONTEXT_LOG_PATH", "OPENCODE_DB"].includes(key),
     ))
         mkdirSync(process.env[key]!, { recursive: true });
     resetOpenCodeDbPathStateForTesting();
-    const raw = new Database(process.env.OPENCODE_DB!);
+    const raw = openTestDb(process.env.OPENCODE_DB!);
     raw.exec(
         "CREATE TABLE IF NOT EXISTS session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT); CREATE TABLE IF NOT EXISTS session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, parent_id TEXT, fork_session_id TEXT, fork_boundary TEXT);",
     );
-    const db = openDatabase();
+    const db = await openTestDatabase();
     if (!db) throw new Error("isolated review database unavailable");
     const opened = db.prepare("PRAGMA database_list").all() as Array<{ file: string }>;
     // SQLite reports the resolved path, so on macOS a root under /var reads back
@@ -466,7 +461,10 @@ async function fixture(
                 role: "user",
                 content: [{ type: "text", text: `<summary>\n${draft.result.summary}\n</summary>` }],
             };
-            return draft.result.summary;
+            // The host stores the fixed checkpoint note; the history head this fold
+            // answered with is in Magic Context's own fold record.
+            const owned = storage.get(`fold/v1/${session}`) as FoldIdentity | undefined;
+            return owned?.head ?? draft.result.summary;
         },
         freshTurn() {
             const n = source.length;
@@ -547,7 +545,9 @@ scaleTest(
                             seed,
                             hard: first.logs.filter((line) => /HARD.*executed=true/.test(line)),
                         });
-                    if (previous && ![5, 7, 9, 11].includes(step)) {
+                    // An idle expiry (step 7) replays the previous bytes like any
+                    // warm pass: only the provider forgot the cache.
+                    if (previous && ![5, 9, 11].includes(step)) {
                         if (!fresh)
                             expect(first.bytes, `same input seed ${seed} step ${step}`).toBe(
                                 previous.bytes,
@@ -571,7 +571,7 @@ scaleTest(
                         expect(
                             first.logs.some(
                                 (line) =>
-                                    /first_render|ttl_idle|bustsServedPrefix=true/.test(line) ||
+                                    /first_render|bustsServedPrefix=true/.test(line) ||
                                     (step === 11 && line.includes("HARD reason=boot_recovery")),
                             ),
                             `compression first-apply seed ${seed} step ${step}: ${JSON.stringify({ newCompression, hard: first.logs.filter((line) => line.includes("HARD")) })}`,
@@ -597,14 +597,13 @@ scaleTest(
                     expect(f.tags().map((t) => [t.messageId, t.cavemanDepth ?? 0])).toEqual(
                         depthsBeforeReplay,
                     );
-                    if (step !== 7)
-                        expect(
-                            second.logs.some((line) =>
-                                /transform scheduler: .*decision=defer/.test(line),
-                            ),
-                            `seed ${seed} step ${step}: ${second.logs.join("\n")}`,
-                        ).toBe(true);
-                    if (step === 7) expect(first.logs.join("\n")).toContain("ttl_idle");
+                    expect(
+                        second.logs.some((line) =>
+                            /transform scheduler: .*decision=defer/.test(line),
+                        ),
+                        `seed ${seed} step ${step}: ${second.logs.join("\n")}`,
+                    ).toBe(true);
+                    if (step === 7) expect(first.logs.join("\n")).not.toContain("ttl_idle");
                     if (second.bytes !== first.bytes)
                         changes.push({ seed, step, logs: second.logs });
                     previous = second;
@@ -811,6 +810,9 @@ test("issue 709 witness: OC2 compaction honors inject_docs=false", async () => {
         const before = await f.pass();
         expect(before.bytes.includes("Isolated architecture")).toBe(false);
         const summary = await f.fold();
+        // The fold returns the head from Magic Context's own record; the stored
+        // note would make the assertion below pass without checking anything.
+        expect(summary).not.toBe(CHECKPOINT_NOTE);
         expect(summary.includes("Isolated architecture")).toBe(false);
     } finally {
         await f.cleanup();
@@ -1146,6 +1148,7 @@ test("OC2 fold memory policy: memory-off summaries omit project memory without a
             try {
                 await f.pass();
                 const summary = await f.fold();
+                expect(summary).not.toBe(CHECKPOINT_NOTE);
                 const after = await f.pass();
                 const replay = await f.pass();
                 const hard = after.logs.filter((line) => /HARD.*executed=true/.test(line));

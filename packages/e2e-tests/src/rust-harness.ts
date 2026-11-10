@@ -23,6 +23,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { openTestDb } from "./test-db";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
@@ -260,7 +261,7 @@ export class RustTestHarness {
             copyFileSync(options.seedModuleStorePath, moduleStorePath);
             // The copied database retains the source writer's fence epoch, while the isolated
             // lease starts at epoch one. Reset only lease metadata so ck-mc can claim the copy.
-            const seededStore = new Database(moduleStorePath);
+            const seededStore = openTestDb(moduleStorePath);
             try {
                 seededStore.run("UPDATE cortexkit_fence SET epoch = 0 WHERE id = 0");
             } finally {
@@ -968,7 +969,7 @@ export class RustTestHarness {
         if (!existsSync(dbPath)) {
             throw new Error(`context.db not found at ${dbPath} — plugin may not have initialized yet.`);
         }
-        this.contextDbCached = new Database(dbPath, { readonly: true });
+        this.contextDbCached = openTestDb(dbPath, { readonly: true });
         return this.contextDbCached;
     }
 
@@ -1005,6 +1006,13 @@ export class RustTestHarness {
         const dbPath = this.contextDbPath();
         const db = new Database(dbPath);
         try {
+            // The plugin keeps writing context.db as a turn settles: it records the
+            // finished reply's token usage from OpenCode's message.updated event,
+            // which can arrive just after the prompt call returns. Each write holds
+            // the lock for about a millisecond, but bun:sqlite gives up at once on a
+            // held lock by default. Wait for the writer, as the other write
+            // helpers here do.
+            db.exec("PRAGMA busy_timeout = 30000");
             const result = db
                 .prepare("UPDATE session_meta SET cache_ttl = ? WHERE session_id = ?")
                 .run(cacheTtl, sessionId) as { changes?: number };

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import {
     closeDatabase,
     getOrCreateSessionMeta,
@@ -15,9 +16,12 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { computeHardCacheExpired } from "./transform";
 import {
     contextUsagePassSnapshot,
+    firstPassExecuteReading,
     loadContextUsage,
+    recordUsageRefusal,
     resolveUnknownUsageFromWireEstimate,
     savedProviderReadingForPass,
+    shouldResetRefusedUsage,
 } from "./transform-context-state";
 
 const tempDirs: string[] = [];
@@ -55,7 +59,7 @@ describe("resolveUnknownUsageFromWireEstimate", () => {
                 usage: { percentage: 95, inputTokens: 0 },
                 pricedPass: true,
                 wireEstimateTokens: 1_087_566,
-                usableHardLimit: 1_048_576,
+                windowTokens: 1_048_576,
             }),
         ).toEqual({ percentage: (1_087_566 / 1_048_576) * 100, inputTokens: 1_087_566 });
     });
@@ -69,7 +73,7 @@ describe("resolveUnknownUsageFromWireEstimate", () => {
                 wireEstimateTrusted: false,
                 providerProvenInputTokens: 1_091_002,
                 providerProvenLimitTokens: 1_048_576,
-                usableHardLimit: 1_048_576,
+                windowTokens: 1_048_576,
             }),
         ).toEqual({ percentage: (1_091_002 / 1_048_576) * 100, inputTokens: 1_091_002 });
     });
@@ -80,7 +84,7 @@ describe("resolveUnknownUsageFromWireEstimate", () => {
                 usage: { percentage: 50, inputTokens: 500_000 },
                 pricedPass: true,
                 wireEstimateTokens: 1_087_566,
-                usableHardLimit: 1_048_576,
+                windowTokens: 1_048_576,
             }),
         ).toEqual({ percentage: 50, inputTokens: 500_000 });
         expect(
@@ -88,7 +92,7 @@ describe("resolveUnknownUsageFromWireEstimate", () => {
                 usage: { percentage: 0, inputTokens: 0 },
                 pricedPass: false,
                 wireEstimateTokens: 1_087_566,
-                usableHardLimit: 1_048_576,
+                windowTokens: 1_048_576,
             }),
         ).toEqual({ percentage: 0, inputTokens: 0 });
     });
@@ -106,17 +110,25 @@ describe("savedProviderReadingForPass", () => {
         currentModelKey: "mock/model-a",
         contextLimit: 91_808,
         lastResponseTime: 1_000,
-        cacheExpired: false,
     };
 
-    it("returns the saved reading for the same model and limit inside the cache window", () => {
+    it("returns the saved reading for the same model and limit, however old the last response is", () => {
         expect(savedProviderReadingForPass(qualifying)).toEqual({
             percentage: 59.9,
             inputTokens: 55_000,
         });
+        // A provider cache that expired three hours ago does not make the
+        // reading stale: it still describes the last request this model was
+        // sent, so a pass that rebuilds after a restart prices from it.
+        expect(
+            savedProviderReadingForPass({
+                ...qualifying,
+                lastResponseTime: Date.now() - 3 * 60 * 60 * 1000,
+            }),
+        ).toEqual({ percentage: 59.9, inputTokens: 55_000 });
     });
 
-    it("refuses a reading for another model, another or unknown limit, or an expired cache", () => {
+    it("refuses a reading for another model, another or unknown limit, or no served response", () => {
         expect(
             savedProviderReadingForPass({ ...qualifying, currentModelKey: "mock/model-b" }),
         ).toBeNull();
@@ -137,7 +149,6 @@ describe("savedProviderReadingForPass", () => {
                 persisted: { ...persisted, lastUsageContextLimit: 0 },
             }),
         ).toBeNull();
-        expect(savedProviderReadingForPass({ ...qualifying, cacheExpired: true })).toBeNull();
         expect(savedProviderReadingForPass({ ...qualifying, lastResponseTime: 0 })).toBeNull();
     });
 
@@ -149,6 +160,83 @@ describe("savedProviderReadingForPass", () => {
                 persisted: { ...persisted, usage: { percentage: 59.9, inputTokens: 0 } },
             }),
         ).toBeNull();
+    });
+});
+
+describe("firstPassExecuteReading", () => {
+    const persisted = {
+        usage: { percentage: 70.2, inputTokens: 64_450 },
+        updatedAt: 1_000,
+        lastObservedModelKey: "mock/model-a",
+        lastUsageContextLimit: 91_808,
+    };
+    // A saved reading at or above the 65% threshold, for this model and limit,
+    // on a pass whose own (cleared) reading is below it.
+    const qualifying = {
+        persisted,
+        currentModelKey: "mock/model-a",
+        contextLimit: 91_808,
+        lastResponseTime: 1_000,
+        executeThresholdPercentage: 65,
+        passPercentage: 0,
+    };
+
+    it("returns a saved reading at or above the threshold for the same model and limit", () => {
+        expect(firstPassExecuteReading(qualifying)).toEqual({
+            percentage: 70.2,
+            inputTokens: 64_450,
+        });
+        expect(
+            firstPassExecuteReading({
+                ...qualifying,
+                persisted: { ...persisted, usage: { percentage: 65, inputTokens: 59_675 } },
+            }),
+        ).toEqual({ percentage: 65, inputTokens: 59_675 });
+    });
+
+    it("refuses a reading with no recorded provider reply", () => {
+        expect(firstPassExecuteReading({ ...qualifying, lastResponseTime: 0 })).toBeNull();
+    });
+
+    it("refuses a reading whose saved model key is null", () => {
+        expect(
+            firstPassExecuteReading({
+                ...qualifying,
+                persisted: { ...persisted, lastObservedModelKey: null },
+            }),
+        ).toBeNull();
+    });
+
+    it("refuses a reading when the pass's context limit is unknown", () => {
+        expect(firstPassExecuteReading({ ...qualifying, contextLimit: undefined })).toBeNull();
+        // A zero limit never matches either, even against a zero saved limit.
+        expect(
+            firstPassExecuteReading({
+                ...qualifying,
+                contextLimit: 0,
+                persisted: { ...persisted, lastUsageContextLimit: 0 },
+            }),
+        ).toBeNull();
+    });
+
+    it("refuses a reading with no input tokens", () => {
+        expect(
+            firstPassExecuteReading({
+                ...qualifying,
+                persisted: { ...persisted, usage: { percentage: 70.2, inputTokens: 0 } },
+            }),
+        ).toBeNull();
+    });
+
+    it("refuses a reading below the threshold, or when the pass already reaches it", () => {
+        expect(
+            firstPassExecuteReading({
+                ...qualifying,
+                persisted: { ...persisted, usage: { percentage: 64.9, inputTokens: 59_583 } },
+            }),
+        ).toBeNull();
+        expect(firstPassExecuteReading({ ...qualifying, passPercentage: 65 })).toBeNull();
+        expect(firstPassExecuteReading({ ...qualifying, persisted: null })).toBeNull();
     });
 });
 
@@ -392,4 +480,88 @@ describe("computeHardCacheExpired finite boundary parity", () => {
         expect(computeHardCacheExpired("5m", now - ttl, now)).toBe(false);
         expect(computeHardCacheExpired("5m", now - ttl - 1, now)).toBe(true);
     });
+});
+
+it("keeps ordinary provider readings trusted after publications and folds", () => {
+    useTempDataHome("usage-healthy-");
+    const db = openDatabase()!;
+    const id = "usage-healthy";
+    const now = Date.now();
+    const meta = {
+        ...getOrCreateSessionMeta(db, id),
+        lastResponseTime: now - 3000,
+        cachedM0MaterializedAt: now - 2000,
+    };
+    expect(shouldResetRefusedUsage(db, id, meta)).toBe(false);
+    appendCompartments(db, id, [
+        {
+            sequence: 0,
+            startMessage: 1,
+            endMessage: 2,
+            startMessageId: "m1",
+            endMessageId: "m2",
+            title: "Published",
+            content: "History published after the provider reading.",
+        },
+    ]);
+    expect(shouldResetRefusedUsage(db, id, { ...meta, cachedM0MaterializedAt: null })).toBe(false);
+    // A later refusal cannot retroactively turn that earlier publication into recovery.
+    recordUsageRefusal(db, id);
+    expect(shouldResetRefusedUsage(db, id, { ...meta, cachedM0MaterializedAt: null })).toBe(false);
+});
+
+it("requires reading then refusal then landed history, and retires the latch on a new reading", () => {
+    useTempDataHome("usage-refused-");
+    const db = openDatabase()!;
+    const id = "usage-refused";
+    const now = Date.now();
+    const meta = {
+        ...getOrCreateSessionMeta(db, id),
+        lastResponseTime: now - 5000,
+        cachedM0MaterializedAt: now - 4500,
+    };
+    recordUsageRefusal(db, id, now - 4000);
+    expect(shouldResetRefusedUsage(db, id, meta)).toBe(false);
+    expect(shouldResetRefusedUsage(db, id, { ...meta, cachedM0MaterializedAt: now + 60_000 })).toBe(
+        false,
+    );
+    const recovered = { ...meta, cachedM0MaterializedAt: now - 3000 };
+    expect(shouldResetRefusedUsage(db, id, recovered)).toBe(true);
+    expect(shouldResetRefusedUsage(db, "other-session", recovered)).toBe(false);
+    // A retry must not move the refusal boundary past a recovery fold.
+    recordUsageRefusal(db, id, now - 2000);
+    expect(shouldResetRefusedUsage(db, id, recovered)).toBe(true);
+    const newReading = { ...recovered, lastResponseTime: now - 1000 };
+    expect(shouldResetRefusedUsage(db, id, newReading)).toBe(false);
+    expect(shouldResetRefusedUsage(db, id, { ...newReading, cachedM0MaterializedAt: now })).toBe(
+        false,
+    );
+});
+
+it("uses the live provider timestamp rather than an independently moving idle clock", () => {
+    useTempDataHome("usage-live-refused-");
+    const db = openDatabase()!;
+    const id = "usage-live-refused";
+    const now = Date.now();
+    const meta = {
+        ...getOrCreateSessionMeta(db, id),
+        lastResponseTime: now - 5000,
+        cachedM0MaterializedAt: now - 3000,
+    };
+    const live = {
+        usage: { percentage: 97, inputTokens: 97_000 },
+        updatedAt: now - 2000,
+        hasUsageTokens: true,
+    };
+    recordUsageRefusal(db, id, now - 4000);
+    expect(shouldResetRefusedUsage(db, id, meta, live)).toBe(false);
+    recordUsageRefusal(db, id, now - 1000);
+    expect(
+        shouldResetRefusedUsage(
+            db,
+            id,
+            { ...meta, lastResponseTime: now, cachedM0MaterializedAt: now - 500 },
+            live,
+        ),
+    ).toBe(true);
 });

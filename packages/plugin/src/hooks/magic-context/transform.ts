@@ -10,6 +10,7 @@ import {
 } from "../../features/magic-context/message-index-async";
 import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
 import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
+import type { RequestToolsFingerprint } from "../../features/magic-context/request-tool-definitions";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import { computeHardCacheExpired } from "../../features/magic-context/scheduler";
 import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
@@ -64,7 +65,7 @@ import {
     noteOpenCodeUnbustedPass,
     recordPendingTransformDecision,
 } from "../../features/magic-context/transform-decision-log";
-import type { ContextUsage } from "../../features/magic-context/types";
+import type { ContextUsage, SessionMeta } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
@@ -114,6 +115,7 @@ import {
 } from "./event-resolvers";
 import { maintainExecuteFloorMark } from "./execute-reclaim";
 import { omitIncompleteFileTokenTotals } from "./file-token-coverage";
+import { createFinalWireIncompleteLogger } from "./final-wire-completeness";
 import {
     createFinalWireUsageTracker,
     describeFinalWireTail,
@@ -123,15 +125,21 @@ import {
 import type { ForeignTextParts } from "./foreign-text-parts";
 import { isHistorianDrainBudgetSpent } from "./historian-drain-gate";
 import type { LiveModelBySession } from "./hook-handlers";
+import { forgetHostCheckpointPass, revertHostCheckpointPass } from "./host-checkpoint-ride";
+import type { HostRowReclaim } from "./host-served-rows";
 import { takeCoveredInstructionRows } from "./host-served-rows";
 import { assertNoInheritedMagicContextMarker } from "./inherited-compaction-marker-guard";
 import {
     capturePrefixTrimSourceOrder,
     findHostCompactionWindow,
     type HostCompactionWindow,
+    hasCompleteCachedM0M1,
+    type M0HardSignals,
+    type M0M1State,
     mustMaterialize,
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
+    rawTailAfterNewestCompartment,
     selectHiddenMessagesAtCompactionSeam,
 } from "./inject-compartments";
 import {
@@ -159,6 +167,7 @@ import {
 } from "./lkg-recovery-prefix";
 import { captureLkgSlot, createLkgEntryProjector, resolveLkgModelKeys } from "./lkg-replay";
 import { beginLkgPass, dropSlot, getInMemorySlot, lkgInputIdentity } from "./lkg-slot";
+import { createLocalWireReadings } from "./local-wire-reading";
 import { onNoteTrigger } from "./note-nudger";
 import { logNudgeEvaluation } from "./nudge-evaluation-log";
 import {
@@ -176,6 +185,17 @@ import {
     requestPendingMaterialization,
 } from "./pending-materialization";
 import {
+    type PricedPassPlan,
+    type PricedPassPlanInput,
+    type PricedPassSizingInput,
+    planPricedPass,
+    protectedThinkingMessagesForSizing,
+    sameSizingPlan,
+    servedRequestForSizing,
+    WIDEST_PRICED_PASS_PLAN,
+} from "./priced-pass-sizing";
+import { prepareStructuralSentinelChoices } from "./project-structural-sentinels";
+import {
     createDefaultBoundarySnapshotForTests,
     hasRunnableCompartmentWindow,
     type ProtectedTailBoundarySnapshot,
@@ -192,7 +212,17 @@ import {
     projectOpencodeReasoningBudgetCutoff,
     resolveKeepReasoningTokens,
 } from "./reasoning-budget";
+import {
+    type RecoveryFitProjection,
+    type RecoveryServedRequest,
+    recoveryAdmissionLimitTokens,
+    recoveryLineTokens,
+    recoveryRefusalNotice,
+} from "./recovery-fit";
+import { releaseRecoveryPrefix, snapshotRecoveryMessages } from "./release-recovery-prefix";
 import { createM0RenderOptions } from "./render-options";
+import { evaluateRequestToolsRelease, type RequestToolsRelease } from "./request-tools-release";
+import { heuristicsAlreadyRanThisTurn } from "./routine-cleanup-decision";
 import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
 import { sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute, modelAcceptsEmptyContent } from "./sentinel";
@@ -212,10 +242,13 @@ import { createPreAdoptionToolSweepResolver, useScopedToolSweep } from "./tool-s
 import { historianJoinFailClosedMessage, runCompartmentPhase } from "./transform-compartment-phase";
 import {
     contextUsagePassSnapshot,
+    firstPassExecuteReading,
     loadContextUsage,
+    recordUsageRefusal,
     resolveSchedulerDecision,
     resolveUnknownUsageFromWireEstimate,
     savedProviderReadingForPass,
+    shouldResetRefusedUsage,
 } from "./transform-context-state";
 import { findLastUserMessageId, findSessionId } from "./transform-message-helpers";
 import {
@@ -629,6 +662,15 @@ export interface TransformDeps {
      * telemetry only: a change is recorded but never asks m[0] to fold.
      */
     getToolSetHash?: (sessionId: string) => string;
+    getToolDefinitionsHash?: (sessionId: string) => string | undefined;
+    /**
+     * The fingerprint of the tools this session's request sends (names,
+     * descriptions and schemas), when the host can see them per request. On a
+     * prefix-bound model a change releases signed thinking (see
+     * request-tools-release.ts). Only OpenCode 2 supplies it: OpenCode 1's tool
+     * hook is shared by every session on a route.
+     */
+    getRequestToolsFingerprint?: (sessionId: string) => RequestToolsFingerprint | undefined;
     getFallbackModelId?: (sessionId: string) => string | undefined;
     projectPath?: string;
     experimentalUserMemories?: boolean;
@@ -697,6 +739,29 @@ export interface TransformDeps {
      * host's input messages: the request these messages belong to is being built.
      */
     onMessagesPassStarted?: (sessionId: string, messages: readonly MessageLike[]) => void;
+    /**
+     * Final host request estimate, including text added after this transform. Never provider usage.
+     * `hostAddedTokens` is the part of it the host adds around the transform's
+     * output (OpenCode 2's checkpoint message in place of the history head),
+     * which a recovery pass adds to its own count before sending.
+     */
+    hostInputEstimate?: (
+        sessionId: string,
+    ) => { tokens: number; pressureTokens: number; hostAddedTokens?: number } | undefined;
+    /**
+     * Read-only report of the single per-pass mutation permission, after the
+     * transform finishes. Host mutation code must use this report rather than
+     * derive its own permission.
+     */
+    onPassPermission?: (sessionId: string, prefixMutationPermitted: boolean) => void;
+    /** Stage host-owned row edits on shared permission; commit after dependent thinking omissions. */
+    reclaimHostRows?: (
+        sessionId: string,
+        messages: MessageLike[],
+        permitted: boolean,
+        /** Covered host instruction rows this pass serves ahead of `messages`. */
+        covered: MessageLike[],
+    ) => HostRowReclaim;
     /** Resolved project mode. Rust mode bypasses every TS mutation below. */
     transformMode?: "ts" | "rust";
     /** Prompt-surface routing and USER description overrides forwarded to Rust mode. */
@@ -780,6 +845,9 @@ export function createTransform(deps: TransformDeps) {
     // window, because the usage reading such a pass sees is not this request's:
     // it is missing, or on an OpenCode 2 fork it is the parent's last reply.
     const unmanagedOverWindowSessions = new Set<string>();
+    // The local count of the last served request, for the execute decision of
+    // a session whose provider reports no usage (see local-wire-reading.ts).
+    const localWireReadings = createLocalWireReadings();
     const rustModeTransform =
         deps.transformMode === "rust" && deps.rustModeModuleClient
             ? createRustModeTransform(deps, {
@@ -953,6 +1021,13 @@ export function createTransform(deps: TransformDeps) {
             if (deps.compactionOff === true) return;
             throw degradedPassError(site, error);
         };
+
+        const structuralSentinelUpgradeFailed =
+            deps.storeGeneration === "v1" &&
+            !deps.compactionOff &&
+            deps.transformMode !== "rust" &&
+            prepareStructuralSentinelChoices({ db, sessionId, messages })
+                .structuralSentinelUpgrade === undefined;
 
         // Runs before anything reads a saved coordinate. Every ordinal this
         // session stored is a position in the message list some host served; if
@@ -1486,21 +1561,34 @@ export function createTransform(deps: TransformDeps) {
         logTransformTiming(sessionId, "modelChangeDetection", tModelDetect);
         logTransformTiming(sessionId, "schedulerAndUsage", tModelDetect);
         const tFirstPass = performance.now();
-        // First-pass reset MUST run BEFORE loadContextUsage so threshold checks
-        // (95% blocking, 80% emergency nudge) don't fire on stale data from a
-        // different model, reverted message, or previous session state.
+        // A refused turn cannot refresh provider usage. Reset only after new
+        // history lands after that refusal; a healthy session keeps its reading.
+        // Publishing a summary does not itself allow rewriting the cached prefix.
         // `persistedUsageBeforeResets` (captured above, before the model-change
         // clear too) holds the pre-reset usage that restart recovery and
         // protected-tail boundary sizing rely on.
         const earlyStateSnapshot = loadTransformPassStateSnapshot(db, sessionId);
         const historianFailureState = earlyStateSnapshot.historianFailure;
 
-        if (isFirstTransformPassForSession && sessionMeta) {
+        const liveUsageBeforeReset = deps.contextUsageMap.get(sessionId);
+        const usageResetAfterRefusal = shouldResetRefusedUsage(
+            db,
+            sessionId,
+            sessionMeta,
+            liveUsageBeforeReset,
+        );
+        if ((isFirstTransformPassForSession || usageResetAfterRefusal) && sessionMeta) {
             const persistedPct = sessionMeta.lastContextPercentage ?? 0;
-            if (persistedPct > 0) {
+            // Another process can reset stored counters while this process retains its provider sample.
+            if (
+                persistedPct > 0 ||
+                (usageResetAfterRefusal &&
+                    (sessionMeta.lastInputTokens > 0 || deps.contextUsageMap.has(sessionId)))
+            ) {
+                const resetPct = persistedPct || liveUsageBeforeReset?.usage.percentage || 0;
                 sessionLog(
                     sessionId,
-                    `transform: first pass reset — percentage=${persistedPct.toFixed(1)}% — clearing stale usage state`,
+                    `transform: ${isFirstTransformPassForSession ? "first pass" : "refused turn recovery"} reset — percentage=${resetPct.toFixed(1)}% — clearing stale usage state`,
                 );
                 updateSessionMeta(db, sessionId, {
                     lastContextPercentage: 0,
@@ -1517,14 +1605,16 @@ export function createTransform(deps: TransformDeps) {
             }
         }
 
-        // Compute context usage AFTER first-pass reset so threshold checks use
-        // clean state (0%) instead of stale values from a previous model/session.
+        // Compute usage after the reset, falling back to the estimated size of
+        // the outgoing request until a new provider reading arrives.
         let contextUsageEarly = loadContextUsage(
             deps.contextUsageMap,
             db,
             sessionId,
             contextUsagePassSnapshot(sessionMeta),
         );
+        const providerReadingMissing =
+            !(contextUsageEarly.inputTokens > 0) && !(contextUsageEarly.percentage > 0);
 
         let recoveryNoHeadEscapeActive = false;
         let emergencyRecoveryArmed = false;
@@ -1734,6 +1824,39 @@ export function createTransform(deps: TransformDeps) {
                   sessionID: sessionId,
               })
             : undefined;
+        const hostEstimate = deps.hostInputEstimate?.(sessionId);
+        // Text an OpenCode 2 host adds after this transform (its checkpoint
+        // message wraps the history head); a recovery pass counts it too.
+        const recoveryHostAddedTokens =
+            typeof hostEstimate?.hostAddedTokens === "number" &&
+            Number.isFinite(hostEstimate.hostAddedTokens) &&
+            hostEstimate.hostAddedTokens > 0
+                ? hostEstimate.hostAddedTokens
+                : 0;
+        const hostOverWindow =
+            fullFeatureMode &&
+            !compactionOff &&
+            resolvedContextLimit !== undefined &&
+            resolvedContextLimit > 0 &&
+            hostEstimate !== undefined &&
+            Number.isFinite(hostEstimate.tokens) &&
+            Number.isFinite(hostEstimate.pressureTokens) &&
+            hostEstimate.tokens > resolvedContextLimit;
+        if (hostOverWindow) {
+            // A host can add checkpoint text after this transform. Mark an
+            // estimated over-window request as at least 100% pressure before
+            // scheduling so it is reduced or refused, without treating the
+            // estimate as provider-proven usage.
+            contextUsageEarly = {
+                inputTokens: Math.max(contextUsageEarly.inputTokens, hostEstimate.pressureTokens),
+                percentage: Math.max(
+                    100,
+                    contextUsageEarly.percentage,
+                    (hostEstimate.pressureTokens / resolvedContextLimit) * 100,
+                ),
+            };
+            usagePercentageSynthetic = true;
+        }
         // A session Magic Context holds no state for (no compartment and no
         // dropped tag yet) sends its raw history as is, so on its first pass in
         // this process the incoming messages are the request. Nothing else
@@ -1864,13 +1987,35 @@ export function createTransform(deps: TransformDeps) {
                   },
               })
             : null;
+        // A prefix-bound model binds every signed thinking block to the request's
+        // tools. When they changed since the session's last pass on this model,
+        // the kept thinking is invalid: the pass releases it (no hold, every
+        // signed block stripped in postprocess) and rides the cache loss the
+        // changed tools already cause.
+        const requestToolsFingerprint =
+            modelForBudget &&
+            isPrefixBoundThinkingModel(modelForBudget.providerID, modelForBudget.modelID)
+                ? deps.getRequestToolsFingerprint?.(sessionId)
+                : undefined;
+        const requestToolsRelease: RequestToolsRelease | undefined =
+            modelForBudget && requestToolsFingerprint
+                ? evaluateRequestToolsRelease({
+                      db,
+                      sessionId,
+                      modelKey: `${modelForBudget.providerID}/${modelForBudget.modelID}`,
+                      fingerprint: requestToolsFingerprint,
+                  })
+                : undefined;
+        const requestToolsChanged = requestToolsRelease?.change != null;
         // Compaction-off has no bust permission, so nothing could strip a turn
-        // whose prefix changes (an idle-expiry or memory fold still re-renders
+        // whose prefix changes (a memory fold still re-renders
         // m[0] there). It keeps the blanket hold for every open signed turn, as
         // before the hold was bounded; it has no history reclaim for the hold to
         // delay.
         activeThinkingPrefixHold =
-            signedThinkingPrefixBound && (compactionOff || signedThinkingHold?.held === true);
+            !requestToolsChanged &&
+            signedThinkingPrefixBound &&
+            (compactionOff || signedThinkingHold?.held === true);
         freezeM0M1 ||= activeThinkingPrefixHold;
         const originalForThinkingFit = takeSignedThinkingFitSnapshot({
             sessionId,
@@ -1956,20 +2101,107 @@ export function createTransform(deps: TransformDeps) {
             Number.isFinite(emergencyCeilingLimit) && emergencyCeilingLimit > 0
                 ? Math.floor(emergencyCeilingLimit * (effectiveExecuteThresholdPercentage / 100))
                 : undefined;
+        // A session whose provider reports no usage has no reading here, so its
+        // execute decision reads the local count of the last request it served.
+        // The count is a percentage of the same limit a provider reading uses
+        // (the trusted context limit, which reserves room for output), so such a
+        // session reaches the execute threshold at the same request size as one
+        // that reports usage.
+        //
+        // Only the scheduler reads this count, but an execute decision has a
+        // further effect: with no provider reading, the priced-pass sizing below
+        // counts this pass's own request, and every later pressure check on the
+        // pass reads that sized reading. A reading that only a local count
+        // produced takes the force ride, runs the tiered emergency tool drop and
+        // lifts the signed-thinking hold only at 95% or more. Below 95% the
+        // execute pass keeps its own bounded rebuild (see the postprocess
+        // phase), so queued drops are not stranded until then.
+        const localReadingWindow = resolvedContextLimit ?? windowGeometry?.usableSoft;
+        const localReadingModelKey = modelForBudget
+            ? `${modelForBudget.providerID}/${modelForBudget.modelID}`
+            : undefined;
+        const schedulerUsage = localWireReadings.schedulerUsage({
+            sessionId,
+            providerUsage: contextUsageEarly,
+            providerReadingMissing,
+            modelKey: localReadingModelKey,
+            usableWindow: localReadingWindow,
+        });
+        if (schedulerUsage !== contextUsageEarly && !compactionOff) {
+            sessionLog(
+                sessionId,
+                `transform: no provider usage reading; the execute decision reads the local count of the last served request percentage=${schedulerUsage.percentage.toFixed(1)} inputTokens=${schedulerUsage.inputTokens}`,
+            );
+        }
         // Compaction-off: drop scheduling is gated off — the scheduler never
         // approves an execute pass, so no pending-op drain, heuristic cleanup,
         // age sweep or smart drop can fire, and the execute-only
         // lastResponseTime watermark write below stays quiet too.
+        //
+        // The first pass after a process restart cleared the saved reading
+        // above. When that reading was taken on this model and window and is at
+        // or above the execute threshold, the scheduler decides from it instead:
+        // the work is already owed (see firstPassExecuteReading). Only the
+        // scheduler sees it; every other check on this pass keeps the cleared
+        // reading, and the priced-pass sizing below does not adopt it.
+        const liveModelForSavedReading = deps.liveModelBySession?.get(sessionId);
+        const savedReadingForExecute =
+            isFirstTransformPassForSession && !usageResetAfterRefusal && !compactionOff
+                ? firstPassExecuteReading({
+                      persisted: persistedUsageBeforeResets,
+                      currentModelKey:
+                          currentModelKeyForBoundary ??
+                          (liveModelForSavedReading
+                              ? `${liveModelForSavedReading.providerID}/${liveModelForSavedReading.modelID}`
+                              : undefined),
+                      contextLimit: resolvedContextLimit,
+                      lastResponseTime: sessionMeta.lastResponseTime,
+                      executeThresholdPercentage: effectiveExecuteThresholdPercentage,
+                      passPercentage: contextUsageEarly.percentage,
+                  })
+                : null;
+        // The saved reading is needed only when the reading the scheduler would
+        // otherwise see defers. When that reading already executes, the pass is
+        // an ordinary execute pass, decided and logged exactly as before. This
+        // extra call is unlogged; an error here leaves the saved reading unused,
+        // and the call below logs it.
+        let clearedReadingDefers = false;
+        if (savedReadingForExecute) {
+            try {
+                clearedReadingDefers =
+                    deps.scheduler.shouldExecute(
+                        sessionMeta,
+                        schedulerUsage,
+                        undefined,
+                        sessionId,
+                        deps.getModelKey?.(sessionId),
+                        resolvedContextLimit,
+                    ) === "defer";
+            } catch {
+                clearedReadingDefers = false;
+            }
+        }
+        const schedulerReadsSavedReading = savedReadingForExecute !== null && clearedReadingDefers;
+        if (schedulerReadsSavedReading) {
+            sessionLog(
+                sessionId,
+                `transform: first pass after restart: saved reading ${savedReadingForExecute.percentage.toFixed(1)}% is at or above the ${effectiveExecuteThresholdPercentage}% execute threshold; the scheduler decides from it, every other pressure check keeps the cleared reading`,
+            );
+        }
         const schedulerDecision = compactionOff
             ? ("defer" as const)
             : resolveSchedulerDecision(
                   deps.scheduler,
                   sessionMeta,
-                  contextUsageEarly,
+                  schedulerReadsSavedReading ? savedReadingForExecute : schedulerUsage,
                   sessionId,
                   deps.getModelKey?.(sessionId),
                   resolvedContextLimit,
               );
+        // True only when the saved reading turned a deferred pass into an
+        // execute pass.
+        const executeFromSavedReading =
+            schedulerReadsSavedReading && schedulerDecision === "execute";
         const schedulerDeferReason =
             schedulerDecision === "defer" ? ("scheduler_defer" as const) : null;
         // Capture explicit history refresh immediately before the first
@@ -2044,6 +2276,7 @@ export function createTransform(deps: TransformDeps) {
                     usage: boundaryUsageForProtectedTail,
                     usageSource: boundaryUsageSource,
                     emergencyTailScale,
+                    recovery: emergencyRecoveryArmed,
                     protectedTailMeta: earlyStateSnapshot.protectedTail,
                 });
                 if (emergencyTailScale) return snapshot;
@@ -2080,9 +2313,21 @@ export function createTransform(deps: TransformDeps) {
                 return false;
             const prepareRecoveryBoundary = (): ProtectedTailBoundarySnapshot | null => {
                 const scale = emergencyUsagePercentageEarly >= 95 ? 0.25 : 0.5;
-                let boundarySnapshot = getRunnableBoundaryForCompartment();
+                const recoveryBoundary = (
+                    scale?: 0.5 | 0.25,
+                ): ProtectedTailBoundarySnapshot | null => {
+                    const snapshot = getRunnableBoundaryForCompartment(scale);
+                    return snapshot
+                        ? {
+                              ...snapshot,
+                              recovery:
+                                  emergencyRecoveryArmed || emergencyUsagePercentageEarly >= 95,
+                          }
+                        : null;
+                };
+                let boundarySnapshot = recoveryBoundary();
                 if (!boundarySnapshot || !hasRunnableCompartmentWindow(boundarySnapshot)) {
-                    boundarySnapshot = getRunnableBoundaryForCompartment(scale);
+                    boundarySnapshot = recoveryBoundary(scale);
                 }
                 if (
                     process.env.NODE_ENV === "test" &&
@@ -2403,13 +2648,12 @@ export function createTransform(deps: TransformDeps) {
                             "user_flush",
                         ),
                         publishedHistory: isCacheBusting,
-                        // The same gate postprocess applies. First render and idle
-                        // expiry are not known yet, so a held pass is credited no
-                        // ride here unless it is under emergency pressure.
+                        // The same gate postprocess applies. First render is not
+                        // known yet, so a held pass is credited no ride here
+                        // unless it is under emergency pressure.
                         permission: {
                             signedThinkingHold: activeThinkingPrefixHold,
                             firstRender: false,
-                            idleExpiry: false,
                             emergency:
                                 contextUsageEarly.percentage >= forceMaterializationPercentage,
                         },
@@ -2536,15 +2780,20 @@ export function createTransform(deps: TransformDeps) {
         let taggingSucceeded = false;
         let recoveryBatch: { finalize: () => void } | null = null;
         let recoveryNormalized = false;
-        // A recovery prefix is always normalized once a pass may rewrite it,
-        // even with nothing untagged: until then every pass re-serves its bytes.
+        let recoveryReleased = false;
         const untaggedReplayTailServed =
             !!recovery.prefix ||
             (untaggedReplayIds.size > 0 &&
                 messages.some((message) => untaggedReplayIds.has(message.info.id ?? "")));
+        const releaseRecoveryReplay = untaggedReplayTailServed
+            ? () => {
+                  recoveryReleased = true;
+              }
+            : undefined;
         const normalizeRecoveryTail = untaggedReplayTailServed
             ? () => {
                   if (recoveryNormalized) return;
+                  recoveryReleased = true;
                   const tail = messages.filter((message) =>
                       untaggedReplayIds.has(message.info.id ?? ""),
                   );
@@ -2702,6 +2951,9 @@ export function createTransform(deps: TransformDeps) {
             `targets=${targetTagNumbers.length} fetched=${targetsSliceTags.length}`,
         );
 
+        const recoveryBeforePostprocess = recovery.prefix
+            ? snapshotRecoveryMessages(messages)
+            : undefined;
         let didMutateFromFlushedStatuses = false;
         // Only run mutation stages when tagging succeeded. With targets={}
         // applyFlushedStatuses can't drive any of the persisted drops/
@@ -2813,6 +3065,101 @@ export function createTransform(deps: TransformDeps) {
 
         let contextUsage = contextUsageEarly;
         const rawGetNotifParams = runNotificationParams;
+        // The sizing input for the request this pass will serve, for counting
+        // only, before the postprocess phase builds the real one (see
+        // servedRequestForSizing). Two callers use it: the sizing of a pass the
+        // provider has not measured (below the compartment phase) and the
+        // recovery chain's fit check.
+        const pricedPassSizingInputFor = (
+            messagesToSize: readonly MessageLike[],
+            options: {
+                meta: SessionMeta;
+                hardSignals?: M0HardSignals;
+                headFolds: boolean;
+                reasoning: PricedPassSizingInput["reasoning"];
+            },
+        ): PricedPassSizingInput => {
+            const servesHead =
+                (!!projectIdentity || !!sessionDirectory) && (fullFeatureMode || compactionOff);
+            const prefixBoundModel = isPrefixBoundThinkingModel(
+                modelForBudget?.providerID,
+                modelForBudget?.modelID,
+            );
+            return {
+                db,
+                sessionId,
+                messages: messagesToSize,
+                messageTagNumbers,
+                head: servesHead
+                    ? {
+                          db,
+                          sessionId,
+                          state: options.meta as M0M1State,
+                          projectDirectory: sessionDirectory,
+                          ...renderOptions,
+                          hardSignals: options.hardSignals,
+                          compactionOff,
+                      }
+                    : undefined,
+                headFolds: options.headFolds,
+                coveredInstructions:
+                    deps.storeGeneration === "v2" && servesHead && !compactionOff
+                        ? coveredHostInstructions
+                        : [],
+                replayedRemovals: {
+                    providerID: resolvedProviderID,
+                    wholePartRemoval: (!canUseEmptySentinels || prefixBoundModel) && !compactionOff,
+                    bindingStrips: !compactionOff,
+                },
+                reasoning: options.reasoning,
+            };
+        };
+        // On a pass in overflow or model-shrink recovery, the compartment phase
+        // asks after each historian publication whether the request a fold would
+        // now send fits under the 95% line of this model's window, and keeps
+        // summarizing while it does not. The count is the served-request count
+        // of that fold: the head it renders from the compartments published so
+        // far, the history after the newest compartment as the raw tail, plus
+        // the text an OpenCode 2 host adds after this transform. Reasoning the
+        // pass may clear is counted in, so the count can read high and the
+        // chain run one more chunk, never low. It never decides whether the
+        // request is sent: the final check before sending counts the real
+        // request.
+        const recoveryChainWindow = windowGeometry?.usableHard ?? resolvedContextLimit;
+        // The compartment phase does not replace the session record it reads.
+        const recoveryChainMeta = sessionMeta;
+        const projectRecoveryRequest =
+            fullFeatureMode &&
+            !compactionOff &&
+            emergencyRecoveryArmed &&
+            emergencyRecoveryOrigin !== null &&
+            typeof recoveryChainWindow === "number" &&
+            recoveryChainWindow > 0
+                ? (): RecoveryFitProjection => {
+                      const served = servedRequestForSizing(
+                          pricedPassSizingInputFor(
+                              rawTailAfterNewestCompartment(db, sessionId, messages),
+                              { meta: recoveryChainMeta, headFolds: true, reasoning: undefined },
+                          ),
+                          // A recovery pass is at 95%, so it may rewrite its prefix.
+                          { editsWholePrefix: !activeThinkingPrefixHold, clearsReasoning: false },
+                      );
+                      const estimate = estimateFinalWireInputTokens({
+                          messages: served,
+                          systemPromptTokens: recoveryChainMeta.systemPromptTokens,
+                          providerID: modelForBudget?.providerID,
+                          modelID: modelForBudget?.modelID,
+                          agentName: notificationParams.agent,
+                          sessionId,
+                      });
+                      return {
+                          tokens:
+                              (estimate.pressureTokens ?? estimate.tokens) +
+                              recoveryHostAddedTokens,
+                          lineTokens: recoveryLineTokens(recoveryChainWindow),
+                      };
+                  }
+                : undefined;
         const tCompartmentPhase = performance.now();
         const compartmentPhase = await runCompartmentPhase({
             hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
@@ -2828,6 +3175,18 @@ export function createTransform(deps: TransformDeps) {
             boundaryUsage: boundaryUsageForProtectedTail,
             boundaryUsageSource,
             preResolvedBoundarySnapshot: triggerBoundarySnapshot,
+            projectRecoveryRequest,
+            resolveRecoveryBoundary: (emergencyTailScale) =>
+                host.hostProtectedTailBoundary({
+                    db,
+                    sessionId: resolvedSessionId,
+                    mode: "transform-force",
+                    contextLimit: boundaryContextLimit,
+                    executeThresholdPercentage: boundaryExecuteThreshold,
+                    usage: boundaryUsageForProtectedTail,
+                    usageSource: boundaryUsageSource,
+                    emergencyTailScale,
+                }),
             client: deps.client,
             db,
             sessionId,
@@ -2900,9 +3259,10 @@ export function createTransform(deps: TransformDeps) {
 
         // HARD-bust signals for the m[0]/m[1] materialization decision capture
         // provider-side cache eviction, such as a model switch or system-block
-        // change, plus the TTL idle window. The tool-set fingerprint is observed
-        // alongside them but never folds m[0] because its process-global scope
-        // would create false-positive folds across sessions. When system.transform
+        // change. The TTL idle window is passed along for logs only: an expired
+        // cache with unchanged bytes never folds. Only OpenCode 2 supplies a definition
+        // hash from the session's request; the process-global names fingerprint
+        // stays attribution-only on OpenCode 1. When system.transform
         // follows messages.transform (OpenCode 1), systemHash is the persisted
         // last-turn hash. The system hook then adopts a change on the request that
         // first carries it (see system-prompt-hash.ts), so the next pass does not
@@ -2924,6 +3284,7 @@ export function createTransform(deps: TransformDeps) {
         const m0HardSignals = {
             systemHash: hardSystemHash,
             toolSetHash: hardToolSetHash,
+            toolDefinitionsHash: deps.getToolDefinitionsHash?.(sessionId),
             modelKey: hardModelKey,
             cacheExpired: hardCacheExpired,
             lastResponseTime: sessionMeta.lastResponseTime,
@@ -2959,14 +3320,31 @@ export function createTransform(deps: TransformDeps) {
                 ...renderOptions,
                 hardSignals: m0HardSignals,
             }).value;
+        const pricedBeyondExecute = (canConsumeDeferred: boolean) =>
+            isCacheBusting ||
+            contextUsage.percentage >= forceMaterializationPercentage ||
+            deps.pendingMaterializationSessions.has(sessionId) ||
+            (canConsumeDeferred && deferredMaterializationSessions.has(sessionId)) ||
+            protectionFoldWillBust;
         const protectionCacheBustingPass =
             !compactionOff &&
-            (schedulerDecision === "execute" ||
-                isCacheBusting ||
-                contextUsage.percentage >= forceMaterializationPercentage ||
-                deps.pendingMaterializationSessions.has(sessionId) ||
-                (canConsumeDeferredLate && deferredMaterializationSessions.has(sessionId)) ||
-                protectionFoldWillBust);
+            (schedulerDecision === "execute" || pricedBeyondExecute(canConsumeDeferredLate));
+        // An execute decision that only the first pass's saved reading produced
+        // prices this pass like any execute pass, but the pass is not sized from
+        // that reading below: the sizing feeds the force band and the emergency
+        // drop, which must not act on a reading taken before the restart. A pass
+        // also priced for another reason is sized exactly as before.
+        const sizeAsPricedPass = executeFromSavedReading
+            ? pricedBeyondExecute(
+                  canConsumeDeferredOnThisPass({
+                      schedulerDecision: "defer",
+                      contextPercentage: contextUsageEarly.percentage,
+                      justAwaitedPublication: compartmentPhase.justAwaitedPublication,
+                      activeRunBlocksMaterialization: lateActiveRunBlocksMaterialization,
+                      forceMaterializationPercentage,
+                  }),
+              )
+            : protectionCacheBustingPass;
         const calibrationBustReason = protectionFoldWillBust
             ? "fold"
             : contextUsage.percentage >= forceMaterializationPercentage
@@ -2985,11 +3363,12 @@ export function createTransform(deps: TransformDeps) {
             onAdopt: (message) => sessionLog(sessionId, message),
         });
         // A cache-busting pass can lack input-token usage for the selected model:
-        // the first pass after a process restart resets the reading, and a model
-        // switch clears it. Emergency tool-output reclaim needs a reading, so
-        // size the pass here. This is a pressure reading, not a fit check: the
-        // over-window first-pass check, the overflow-recovery bump and the final
-        // refusal check stay the fit guards.
+        // the first pass after a process restart resets the reading, a model
+        // switch clears it, and a provider that reports no usage never sends
+        // one. Emergency tool-output reclaim needs a reading, so size the pass
+        // here. This is a pressure reading, not a fit check: the over-window
+        // first-pass check, the overflow-recovery bump and the final refusal
+        // check stay the fit guards.
         //
         // The request is counted with calibrated ratios (`pressureTokens`): an
         // unseeded model counts neutrally. The fit envelope (`tokens`) doubles
@@ -2997,70 +3376,189 @@ export function createTransform(deps: TransformDeps) {
         // in the force band after a restart.
         //
         // The provider's own last reading, saved in session_meta, is preferred
-        // when it is for this model and limit and the cache is still warm. The
+        // when it is for this model and limit, however long ago it was taken. The
         // one exception is a count at or past the 95% emergency line while the
         // saved reading is lower: the request grew after that reading was taken
         // (a long paste or tool output while the host was down), and waiting for
         // the provider would send a request that may not fit.
-        let contextUsageFromEstimate = false;
-        if (contextUsage.inputTokens <= 0 && protectionCacheBustingPass) {
+        let contextUsageFromEstimate = hostOverWindow;
+        if (contextUsage.inputTokens <= 0 && sizeAsPricedPass) {
             // Overflow recovery sizes the request the provider just rejected, so
             // the saved reading (the last accepted request, which predates it) is
             // never used here, and the request is counted with the fit envelope
             // as before: recovery is a fit decision, and the emergency planner
             // must plan its reclaim against the whole rejected request.
             const overflowRecoveryPass = usagePercentageSynthetic || emergencyRecoveryArmed;
-            const savedProviderReading = overflowRecoveryPass
-                ? null
-                : savedProviderReadingForPass({
-                      persisted: persistedUsageBeforeResets,
-                      currentModelKey: currentModelKeyForBoundary ?? (hardModelKey || undefined),
-                      contextLimit: resolvedContextLimit,
-                      lastResponseTime: sessionMeta.lastResponseTime,
-                      cacheExpired: hardCacheExpired,
-                  });
-            let pressureEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
+            const savedProviderReading =
+                overflowRecoveryPass || usageResetAfterRefusal
+                    ? null
+                    : savedProviderReadingForPass({
+                          persisted: persistedUsageBeforeResets,
+                          currentModelKey:
+                              currentModelKeyForBoundary ?? (hardModelKey || undefined),
+                          contextLimit: resolvedContextLimit,
+                          lastResponseTime: sessionMeta.lastResponseTime,
+                      });
+            // Count the request this pass will serve, not the array as it stands:
+            // the postprocess phase below adds the history head and the covered
+            // instruction rows, removes the reasoning earlier passes removed and
+            // may clear old reasoning (see servedRequestForSizing). Should that
+            // projection fail, the array as it stands is counted.
+            const servesHead =
+                (!!projectIdentity || !!sessionDirectory) && (fullFeatureMode || compactionOff);
+            const prefixBoundModel = isPrefixBoundThinkingModel(
+                modelForBudget?.providerID,
+                modelForBudget?.modelID,
+            );
+            let sizingInput: PricedPassSizingInput | undefined;
+            let planInput: PricedPassPlanInput | undefined;
             try {
-                pressureEstimate = estimateFinalWireInputTokens({
-                    messages,
-                    systemPromptTokens: sessionMeta.systemPromptTokens,
-                    providerID: modelForBudget?.providerID,
-                    modelID: modelForBudget?.modelID,
-                    agentName: notificationParams.agent,
-                    sessionId,
+                sizingInput = pricedPassSizingInputFor(messages, {
+                    meta: sessionMeta,
+                    hardSignals: m0HardSignals,
+                    // A fold re-renders m[0] at this pass's render budgets, which a
+                    // model switch changes.
+                    headFolds: protectionFoldWillBust,
+                    // Reasoning is cleared only for a resolved provider, never on
+                    // a pass held for signed thinking, and never partially on a
+                    // prefix-bound model.
+                    reasoning:
+                        !compactionOff &&
+                        !activeThinkingPrefixHold &&
+                        resolvedProviderID !== undefined &&
+                        !prefixBoundModel
+                            ? {
+                                  keepTokens: resolveKeepReasoningTokens(
+                                      deps.keepReasoningTokens,
+                                      currentModelKeyForBoundary,
+                                  ),
+                                  clearedThroughTag: sessionMeta.clearedReasoningThroughTag,
+                                  proseRatio: sessionDecisionCalibration(db, sessionId).proseRatio,
+                                  protectedThinkingMessages: protectedThinkingMessagesForSizing({
+                                      db,
+                                      sessionId,
+                                      messages,
+                                      activeThinkingTurn,
+                                      providerID: resolvedProviderID,
+                                      modelID: modelForBudget?.modelID,
+                                  }),
+                              }
+                            : undefined,
                 });
+                planInput = {
+                    db,
+                    sessionId,
+                    compactionOff,
+                    fullFeatureMode,
+                    schedulerDecision,
+                    forceMaterializationPercentage,
+                    signedThinkingHold: activeThinkingPrefixHold,
+                    firstRender:
+                        servesHead &&
+                        !(sessionMeta.cachedM0Bytes != null && sessionMeta.cachedM1Bytes != null) &&
+                        !hasCompleteCachedM0M1(db, sessionId),
+                    folds: protectionFoldWillBust,
+                    explicitFlush: hasPendingMaterializationOrigin(
+                        deps.pendingMaterializationSessions,
+                        sessionId,
+                        "user_flush",
+                    ),
+                    materializationRequested:
+                        deps.pendingMaterializationSessions.has(sessionId) ||
+                        (canConsumeDeferredLate && deferredMaterializationSessions.has(sessionId)),
+                    historyRebuilt:
+                        historyRebuiltThisPass ||
+                        pendingCompartmentInjection?.rebuiltFromDb === true ||
+                        rebuiltHistoryFromInitialPrepare,
+                    alreadyRanThisTurn: heuristicsAlreadyRanThisTurn(
+                        deps.lastHeuristicsTurnId,
+                        sessionId,
+                        currentTurnId,
+                    ),
+                };
             } catch (error) {
+                sizingInput = undefined;
                 sessionLog(
                     sessionId,
-                    `transform: wire-estimate pressure fallback unavailable: ${getErrorMessage(error)}`,
+                    `transform: priced-pass sizing counts the array without the parts the pass adds: ${getErrorMessage(error)}`,
                 );
             }
-            const usableHard = windowGeometry?.usableHard;
-            const countPercentage =
-                pressureEstimate?.pressureTokens !== undefined &&
-                Number.isFinite(pressureEstimate.pressureTokens) &&
-                typeof usableHard === "number" &&
-                usableHard > 0
-                    ? (pressureEstimate.pressureTokens / usableHard) * 100
-                    : 0;
-            const grewPastSavedReading =
-                savedProviderReading !== null &&
-                countPercentage >= 95 &&
-                countPercentage > savedProviderReading.percentage;
-            if (savedProviderReading && !grewPastSavedReading) {
-                // Never lower a reading this pass already raised (the overflow-recovery bump).
-                contextUsage = {
-                    inputTokens: savedProviderReading.inputTokens,
-                    percentage: Math.max(contextUsage.percentage, savedProviderReading.percentage),
+            const countRequest = (plan: PricedPassPlan) => {
+                let sizingMessages: MessageLike[] = messages;
+                if (sizingInput) {
+                    try {
+                        sizingMessages = servedRequestForSizing(sizingInput, plan);
+                    } catch (error) {
+                        sessionLog(
+                            sessionId,
+                            `transform: priced-pass sizing counts the array without the parts the pass adds: ${getErrorMessage(error)}`,
+                        );
+                    }
+                }
+                try {
+                    return estimateFinalWireInputTokens({
+                        messages: sizingMessages,
+                        systemPromptTokens: sessionMeta.systemPromptTokens,
+                        providerID: modelForBudget?.providerID,
+                        modelID: modelForBudget?.modelID,
+                        agentName: notificationParams.agent,
+                        sessionId,
+                    });
+                } catch (error) {
+                    sessionLog(
+                        sessionId,
+                        `transform: wire-estimate pressure fallback unavailable: ${getErrorMessage(error)}`,
+                    );
+                    return undefined;
+                }
+            };
+            const usageBeforeSizing = contextUsage;
+            // The reading a count gives this pass, without applying it.
+            const readingFrom = (
+                pressureEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined,
+            ) => {
+                // Read against the window a provider reading of the same request is
+                // a share of (the scheduler's local reading uses it too), so the
+                // count reads the percentage that reading would. The two 95%
+                // emergency lines read the hard wall instead.
+                const countPercentage =
+                    pressureEstimate?.pressureTokens !== undefined &&
+                    Number.isFinite(pressureEstimate.pressureTokens) &&
+                    typeof localReadingWindow === "number" &&
+                    localReadingWindow > 0
+                        ? (pressureEstimate.pressureTokens / localReadingWindow) * 100
+                        : 0;
+                const grewPastSavedReading =
+                    savedProviderReading !== null &&
+                    countPercentage >= 95 &&
+                    countPercentage > savedProviderReading.percentage;
+                const unchanged = {
+                    source: "none" as const,
+                    usage: usageBeforeSizing,
+                    fromEstimate: hostOverWindow,
+                    countPercentage,
+                    grewPastSavedReading,
+                    pressureEstimate,
+                    usedProviderInput: false,
                 };
-                sessionLog(
-                    sessionId,
-                    `transform: unknown provider usage; using saved provider reading for priced pass inputTokens=${contextUsage.inputTokens} percentage=${contextUsage.percentage.toFixed(1)} countPercentage=${countPercentage.toFixed(1)}`,
-                );
-            } else if (pressureEstimate) {
-                const percentageBeforeEstimate = contextUsage.percentage;
-                contextUsage = resolveUnknownUsageFromWireEstimate({
-                    usage: contextUsage,
+                if (savedProviderReading && !grewPastSavedReading) {
+                    return {
+                        ...unchanged,
+                        source: "saved" as const,
+                        // Never lower a reading this pass already raised (the
+                        // overflow-recovery bump).
+                        usage: {
+                            inputTokens: savedProviderReading.inputTokens,
+                            percentage: Math.max(
+                                usageBeforeSizing.percentage,
+                                savedProviderReading.percentage,
+                            ),
+                        },
+                    };
+                }
+                if (!pressureEstimate) return unchanged;
+                const usage = resolveUnknownUsageFromWireEstimate({
+                    usage: usageBeforeSizing,
                     pricedPass: true,
                     wireEstimateTokens: overflowRecoveryPass
                         ? pressureEstimate.tokens
@@ -3068,26 +3566,80 @@ export function createTransform(deps: TransformDeps) {
                     wireEstimateTrusted: pressureEstimate.trusted,
                     providerProvenInputTokens: providerProvenInputForRecovery,
                     providerProvenLimitTokens: providerProvenLimitForRecovery,
-                    usableHardLimit: usableHard,
+                    windowTokens: localReadingWindow,
                 });
-                if (contextUsage.inputTokens > 0) {
-                    const usedProviderInput =
-                        !pressureEstimate.trusted &&
-                        providerProvenLimitForRecovery !== undefined &&
-                        providerProvenInputForRecovery !== undefined &&
-                        contextUsage.inputTokens >= providerProvenInputForRecovery;
+                if (usage.inputTokens <= 0) return { ...unchanged, usage };
+                const usedProviderInput =
+                    !pressureEstimate.trusted &&
+                    providerProvenLimitForRecovery !== undefined &&
+                    providerProvenInputForRecovery !== undefined &&
+                    usage.inputTokens >= providerProvenInputForRecovery;
+                return {
+                    ...unchanged,
+                    source: "estimate" as const,
+                    usage,
+                    usedProviderInput,
                     // A reading raised only by the local count, with no provider
                     // measurement and no overflow latch behind it.
-                    contextUsageFromEstimate =
+                    fromEstimate:
                         !overflowRecoveryPass &&
                         !usedProviderInput &&
                         !usagePercentageSynthetic &&
-                        contextUsage.percentage > percentageBeforeEstimate;
+                        usage.percentage > usageBeforeSizing.percentage,
+                };
+            };
+            // Whether the pass clears reasoning and starts serving covered rows
+            // depends on its rides, and the force ride on the reading this sizing
+            // gives. Plan the pass from the reading it has before sizing, count
+            // the request that plan serves, and keep the count when the plan
+            // holds at the reading the count gives. Otherwise plan again from that
+            // reading. Should the second plan not hold either, count the widest
+            // request (nothing of the pass's own clearing, every row it may add),
+            // which reads at least as high as the request any plan serves.
+            const planAt = (usage: {
+                percentage: number;
+                fromEstimate: boolean;
+            }): PricedPassPlan | undefined => {
+                if (!sizingInput || !planInput) return undefined;
+                try {
+                    return planPricedPass(planInput, usage);
+                } catch (error) {
                     sessionLog(
                         sessionId,
-                        `transform: unknown provider usage; using ${usedProviderInput ? "provider-proven input" : "wire estimate"} for priced pass inputTokens=${contextUsage.inputTokens} percentage=${contextUsage.percentage.toFixed(1)} trusted=${pressureEstimate.trusted} wireTokens=${pressureEstimate.tokens} pressureTokens=${pressureEstimate.pressureTokens}${grewPastSavedReading ? ` grewPastSavedReading=${savedProviderReading?.percentage.toFixed(1)}` : ""}`,
+                        `transform: priced-pass sizing counts the widest request: ${getErrorMessage(error)}`,
                     );
+                    return undefined;
                 }
+            };
+            let plan =
+                planAt({
+                    percentage: usageBeforeSizing.percentage,
+                    fromEstimate: hostOverWindow,
+                }) ?? WIDEST_PRICED_PASS_PLAN;
+            let reading = readingFrom(countRequest(plan));
+            for (let attempt = 0; sizingInput && plan !== WIDEST_PRICED_PASS_PLAN; attempt++) {
+                const next = planAt({
+                    percentage: reading.usage.percentage,
+                    fromEstimate: reading.fromEstimate,
+                });
+                if (next && sameSizingPlan(sizingInput, next, plan)) break;
+                plan = next && attempt === 0 ? next : WIDEST_PRICED_PASS_PLAN;
+                reading = readingFrom(countRequest(plan));
+            }
+            const sizedPlan = `sizedPlan=${plan.clearsReasoning ? "clears_reasoning" : "keeps_reasoning"}${plan.editsWholePrefix ? "+covered_rows" : ""}`;
+            contextUsage = reading.usage;
+            if (reading.source === "saved") {
+                sessionLog(
+                    sessionId,
+                    `transform: unknown provider usage; using saved provider reading for priced pass inputTokens=${contextUsage.inputTokens} percentage=${contextUsage.percentage.toFixed(1)} countPercentage=${reading.countPercentage.toFixed(1)} ${sizedPlan}`,
+                );
+            } else if (reading.source === "estimate" && reading.pressureEstimate) {
+                const pressureEstimate = reading.pressureEstimate;
+                contextUsageFromEstimate = reading.fromEstimate;
+                sessionLog(
+                    sessionId,
+                    `transform: unknown provider usage; using ${reading.usedProviderInput ? "provider-proven input" : "wire estimate"} for priced pass inputTokens=${contextUsage.inputTokens} percentage=${contextUsage.percentage.toFixed(1)} trusted=${pressureEstimate.trusted} wireTokens=${pressureEstimate.tokens} pressureTokens=${pressureEstimate.pressureTokens}${reading.grewPastSavedReading ? ` grewPastSavedReading=${savedProviderReading?.percentage.toFixed(1)}` : ""} ${sizedPlan}`,
+                );
             }
         }
         const protectionUsableSoft = windowGeometry?.usableSoft ?? boundaryContextLimit;
@@ -3122,13 +3674,17 @@ export function createTransform(deps: TransformDeps) {
         const tPostProcess = performance.now();
         dropProjectionEmergency = contextUsage.percentage >= 95;
         const postTransformResult = await runPostTransformPhase({
+            opencode1: deps.storeGeneration === "v1",
             opencode2: deps.storeGeneration === "v2",
+            structuralSentinelUpgradeFailed,
+            releaseRecoveryPrefix: releaseRecoveryReplay,
             normalizeRecoveryTail,
             compactionMarkerStrategy:
                 deps.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy,
             sessionId,
             db,
             messages,
+            reclaimHostRows: deps.reclaimHostRows,
             // P0 perf: pass active-only tags. The downstream consumers
             // (applyHeuristicCleanup, nudger) both filter on
             // status === "active" and short-circuit otherwise — feeding
@@ -3171,6 +3727,7 @@ export function createTransform(deps: TransformDeps) {
             directoryPrefixHold: unresolvedDirectoryHold,
             forceSignedRebuildForFit: thinkingFitRetries.has(sessionId) || !!recovery.rebuildReason,
             compactionModeTransition: compactionModeTransitionPending.has(sessionId),
+            requestToolsChange: requestToolsRelease?.change ?? null,
             readLastServedMessages: () => {
                 const slot = getInMemorySlot(sessionId) ?? loadPersistedLkgSlot(db, sessionId);
                 try {
@@ -3259,7 +3816,20 @@ export function createTransform(deps: TransformDeps) {
         // The pass recorded any strip the mode switch required; later passes
         // replay it from the persisted ledger.
         compactionModeTransitionPending.delete(sessionId);
-        if (recovery.prefix && !recoveryNormalized) {
+        // Likewise for a request-tools release: its strip is persisted, so the
+        // new tool list becomes the one later passes compare with.
+        requestToolsRelease?.commit();
+        if (recovery.prefix && recoveryReleased && !recoveryNormalized) {
+            if (!recoveryBeforePostprocess)
+                throw new Error("Cannot release recovery without its pre-edit snapshot");
+            const released = releaseRecoveryPrefix({
+                frozen: JSON.parse(recovery.prefix.json),
+                before: recoveryBeforePostprocess,
+                after: messages,
+            });
+            messages.splice(0, messages.length, ...released);
+        }
+        if (recovery.prefix && !recoveryReleased) {
             const renderedById = new Map<string, MessageLike[]>();
             for (const message of messages) {
                 if (!message.info.id) continue;
@@ -3273,7 +3843,12 @@ export function createTransform(deps: TransformDeps) {
             messages.splice(0, messages.length, ...JSON.parse(recovery.prefix.json), ...suffix);
         }
         const recoveryReleaseReason =
-            recovery.rebuildReason ?? (recoveryNormalized ? "recovery_tail_normalized" : undefined);
+            recovery.rebuildReason ??
+            (recoveryNormalized
+                ? "recovery_tail_normalized"
+                : recoveryReleased
+                  ? "recovery_prefix_released"
+                  : undefined);
         if (recoveryReleaseReason) postTransformResult.bustedThisPass = true;
         passOutcome.markFinalized();
 
@@ -3282,6 +3857,7 @@ export function createTransform(deps: TransformDeps) {
         // A persisted latch is cleared by the off-transition, never consumed
         // here; overflow propagates to native compaction instead of blocking.
         const finalWireTail = describeFinalWireTail(messages);
+        const logIncompleteFinalWire = createFinalWireIncompleteLogger(sessionId);
         // The durable refusal marker remembers, across restarts, that a held
         // signed turn could not be made to fit. It applies only to a held pass:
         // an unheld pass strips and drains like any model without prefix-bound
@@ -3341,11 +3917,65 @@ export function createTransform(deps: TransformDeps) {
                       )
                     : undefined);
             if (finalWireEstimate) {
+                logIncompleteFinalWire(finalWireEstimate, messages);
                 sessionLog(
                     sessionId,
                     `transform: final-wire telemetry estimate=${finalWireEstimate.tokens} trusted=${finalWireEstimate.trusted} conversation=${finalWireEstimate.messageTokens.conversation} tools=${finalWireEstimate.messageTokens.toolCall} system=${finalWireEstimate.systemTokens} toolDefinitions=${finalWireEstimate.toolDefinitionTokens ?? "unknown"} tail=${finalWireTail}`,
                 );
             }
+            // Count the request this pass serves, for the next pass's execute
+            // decision while the provider still reports no usage. A pass with a
+            // provider reading records no count and clears any saved one. A pass
+            // in overflow or model-shrink recovery also counts it, to check it
+            // against the model's 95% line before it is sent (see
+            // evaluateEmergencyFailClosed).
+            const recoveryAdmissionPass =
+                emergencyRecoveryArmed &&
+                emergencyRecoveryOrigin !== null &&
+                emergencyUsagePercentage >= 95;
+            let servedPressureTokens: number | undefined;
+            if (providerReadingMissing || recoveryAdmissionPass) {
+                servedPressureTokens = finalWireEstimate?.pressureTokens;
+                if (servedPressureTokens === undefined) {
+                    try {
+                        servedPressureTokens = estimateFinalWireInputTokens({
+                            messages,
+                            systemPromptTokens: sessionMeta.systemPromptTokens,
+                            providerID: modelForBudget?.providerID,
+                            modelID: modelForBudget?.modelID,
+                            agentName: notificationParams.agent,
+                            sessionId,
+                        }).pressureTokens;
+                    } catch (error) {
+                        sessionLog(
+                            sessionId,
+                            `transform: local count of the served request unavailable: ${getErrorMessage(error)}`,
+                        );
+                    }
+                }
+            }
+            // What the recovery check counts: the request above, plus the text
+            // an OpenCode 2 host adds after this transform.
+            // Two inputs come from the previous turn and are accepted as they
+            // are. The system prompt size is the last one measured: OpenCode 1
+            // builds the system prompt after this transform, so on a model
+            // switch it is the previous model's prompt (and 0 on a session's
+            // first pass). The tool definitions of a route not yet measured
+            // borrow the previous route's size. Both differ between models of
+            // one agent by the provider-specific prompt and tool variants,
+            // which is small next to the history a recovery pass summarizes,
+            // and the next pass counts with the new model's own sizes.
+            const recoveryAdmissionTokens =
+                recoveryAdmissionPass && servedPressureTokens !== undefined
+                    ? servedPressureTokens + recoveryHostAddedTokens
+                    : undefined;
+            localWireReadings.record({
+                sessionId,
+                providerReadingMissing,
+                modelKey: localReadingModelKey,
+                usableWindow: localReadingWindow,
+                pressureTokens: providerReadingMissing ? servedPressureTokens : undefined,
+            });
             if (
                 (finalWireEstimate?.refusalGrade ||
                     (finalWireEstimate?.refusalBasis === "byte-bound" &&
@@ -3479,6 +4109,33 @@ export function createTransform(deps: TransformDeps) {
                     `over-window first pass reduced: the request is about ${servedTokens} tokens (history started at ${unmanagedOverWindowPass.tokens}), under the ${unmanagedOverWindowPass.limit}-token window`,
                 );
             }
+            const currentModelKeyForRecovery = deps.getModelKey?.(sessionId);
+            // A recovery pass that is not sent leaves recovery armed, so the next
+            // turn continues it; only a recovery pass whose request fits clears
+            // it (below). Something this pass ran may have cleared it already (a
+            // historian run that found nothing to summarize at low real
+            // pressure), so a refusing pass arms it again with its own origin.
+            const keepRecoveryArmed = (): void => {
+                if (!emergencyRecoveryArmed || emergencyRecoveryOrigin === null) return;
+                try {
+                    if (getOverflowState(db, sessionId).needsEmergencyRecovery) return;
+                    recordOverflowDetected(
+                        db,
+                        sessionId,
+                        undefined,
+                        currentModelKeyForRecovery,
+                        emergencyRecoveryOrigin,
+                    );
+                } catch (error) {
+                    throw new EmergencyFailClosedError("Emergency recovery re-arm failed", {
+                        cause: error,
+                    });
+                }
+                sessionLog(
+                    sessionId,
+                    `transform: recovery was cleared during a pass that is not sent; armed again (${emergencyRecoveryOrigin}) for the next turn`,
+                );
+            };
             const timedOutHistorianFailure = compartmentPhase.historianJoinTimedOut
                 ? historianJoinFailClosedMessage({
                       timedOut: true,
@@ -3493,6 +4150,7 @@ export function createTransform(deps: TransformDeps) {
                     sessionId,
                     `transform: ${timedOutHistorianFailure}; finalEstimate=${finalWireEstimate?.tokens ?? "unavailable"} estimateTrusted=${finalWireEstimate?.trusted ?? false} contextLimit=${boundaryContextLimit} emergencyReclaimed=${postTransformResult.emergencyReclaimedTokens}`,
                 );
+                keepRecoveryArmed();
                 throw new EmergencyFailClosedError(timedOutHistorianFailure);
             }
             if (compartmentPhase.historianJoinTimedOut) {
@@ -3501,7 +4159,6 @@ export function createTransform(deps: TransformDeps) {
                     `transform: proceeding after bounded historian join; trusted final-wire ${finalWireEstimate?.tokens} fits context limit ${boundaryContextLimit} after emergency reclaim=${postTransformResult.emergencyReclaimedTokens}`,
                 );
             }
-            const currentModelKeyForRecovery = deps.getModelKey?.(sessionId);
             const overflowStateForFinalWire = getOverflowState(
                 db,
                 sessionId,
@@ -3519,6 +4176,24 @@ export function createTransform(deps: TransformDeps) {
                 ) === piModelRefToCanonical(currentModelKeyForRecovery)
                     ? overflowStateForFinalWire.detectedContextLimit
                     : undefined;
+            // The window the emergency band is measured against. A recovery
+            // request is held to its 95% line while the historian can still
+            // summarize older history, and to the whole window once it cannot.
+            const recoveryWindowTokens = windowGeometry?.usableHard ?? resolvedContextLimit;
+            const recoveryHistoryRemains = compartmentPhase.recoveryHistoryRemains;
+            const recoveryServedRequest: RecoveryServedRequest | undefined =
+                recoveryAdmissionTokens !== undefined &&
+                typeof recoveryWindowTokens === "number" &&
+                recoveryWindowTokens > 0
+                    ? {
+                          tokens: recoveryAdmissionTokens,
+                          lineTokens: recoveryAdmissionLimitTokens(
+                              recoveryWindowTokens,
+                              recoveryHistoryRemains,
+                          ),
+                          historyRemains: recoveryHistoryRemains,
+                      }
+                    : undefined;
             const emergencyFailClosed = evaluateEmergencyFailClosed({
                 usagePercentage: emergencyUsagePercentage,
                 emergencyRecoveryArmed,
@@ -3532,6 +4207,7 @@ export function createTransform(deps: TransformDeps) {
                     deps.protectedTools,
                     resolveDecisionCalibration(modelForBudget?.providerID, modelForBudget?.modelID),
                 ),
+                recoveryServedRequest,
             });
             if (emergencyFailClosed.disarm) {
                 clearEmergencyRecovery(db, sessionId);
@@ -3539,17 +4215,50 @@ export function createTransform(deps: TransformDeps) {
                     sessionId,
                     `emergency disarm: trusted final-wire ${emergencyFailClosed.disarm.finalWireTokens} under limit ${emergencyFailClosed.disarm.provenLimitTokens}`,
                 );
+            } else if (
+                recoveryAdmissionPass &&
+                !emergencyFailClosed.shouldAbort &&
+                recoveryServedRequest !== undefined
+            ) {
+                // The recovery check counted this request within its limit, so
+                // it fits. This is the one place a recovery pass ends its
+                // recovery; a historian run that publishes a summary does not.
+                // A request nothing could count (no window known, or the count
+                // failed) is still sent, and recovery is left to the existing
+                // disarms.
+                clearEmergencyRecovery(db, sessionId);
+                sessionLog(
+                    sessionId,
+                    `transform: recovery request admitted: about ${recoveryServedRequest.tokens} tokens, within ${recoveryServedRequest.lineTokens} of ${recoveryWindowTokens}; ${emergencyRecoveryOrigin} recovery ends`,
+                );
             }
             if (emergencyFailClosed.shouldAbort) {
+                keepRecoveryArmed();
                 if (emergencyFailClosed.refusalMessage) {
                     throw contextRefusalError(emergencyFailClosed.refusalMessage);
+                }
+                const recoveryOverLimit =
+                    emergencyFailClosed.reason === "recovery-request-over-limit" &&
+                    recoveryServedRequest !== undefined;
+                if (recoveryOverLimit) {
+                    sessionLog(
+                        sessionId,
+                        recoveryServedRequest.historyRemains
+                            ? `transform: recovery request still over the window: about ${recoveryServedRequest.tokens} tokens against the 95% line ${recoveryServedRequest.lineTokens} of ${recoveryWindowTokens}; not sending it, recovery stays armed for the next turn`
+                            : `transform: recovery request still over the window: about ${recoveryServedRequest.tokens} tokens against the whole window ${recoveryServedRequest.lineTokens}, with no older history left to summarize; not sending it`,
+                    );
                 }
                 // The notice must finish before host refusal so recovery instructions survive interruption.
                 try {
                     await host.hostRefusalNotice(
                         deps.client,
                         sessionId,
-                        EMERGENCY_REFUSAL_NOTICE,
+                        // Recovery stays armed for the next turn, so a recovery
+                        // refusal never tells the person to run /ctx-flush or
+                        // /clear, as the emergency notice does.
+                        recoveryOverLimit
+                            ? recoveryRefusalNotice(recoveryServedRequest.historyRemains)
+                            : EMERGENCY_REFUSAL_NOTICE,
                         notificationParams,
                     );
                 } catch (error) {
@@ -3560,6 +4269,7 @@ export function createTransform(deps: TransformDeps) {
                 try {
                     // OpenCode 2 supplies a refusal callback because it has no v1 client abort method.
                     await host.hostRefuse(deps.client, sessionId);
+                    recordUsageRefusal(db, sessionId);
                 } catch (error) {
                     sessionLog(
                         sessionId,
@@ -3637,6 +4347,7 @@ export function createTransform(deps: TransformDeps) {
                 }
             }
         }
+        logIncompleteFinalWire(finalWireEstimate, messages);
         if (!finalWireEstimate) {
             sessionLog(
                 sessionId,
@@ -3663,8 +4374,8 @@ export function createTransform(deps: TransformDeps) {
         // system prompt in front of it, whether the bust kept it (it edited
         // nothing in front of it) or a hold did. The served array, after every
         // strip and any recovered prefix, is what decides. The last argument
-        // carries the same fact to an idle-expired request, whose date would
-        // otherwise advance without asking for permission.
+        // reports that fact to the system hook as well, which keeps the date
+        // frozen on a permitted pass that still serves signed thinking.
         const signedThinkingServed =
             isPrefixBoundThinkingModel(modelForBudget?.providerID, modelForBudget?.modelID) &&
             servesThinkingBlock(messages, modelForBudget?.providerID, modelForBudget?.modelID);
@@ -3789,9 +4500,9 @@ export function createTransform(deps: TransformDeps) {
             );
         }
 
-        // An idle-expired retry can replay a fold prepared by an aborted attempt.
-        // The provider still rebuilds the whole prefix, so record the expiry on
-        // the retry's own assistant even when this pass changed no message bytes.
+        // An idle-expired request makes the provider re-read the whole prefix
+        // even when this pass changed no message bytes, so record the expiry on
+        // its own assistant for the cache diagnostics.
         if (postTransformResult.bustedThisPass || hardCacheExpired) {
             recordPendingTransformDecision(sessionId, {
                 tsMs: Date.now(),
@@ -4034,10 +4745,27 @@ export function createTransform(deps: TransformDeps) {
                 sessionId,
                 systemPromptHash: sessionMeta.systemPromptHash,
             });
+        deps.onPassPermission?.(sessionId, postTransformResult.prefixMutationPermitted);
     };
 
     const timedTransform: typeof transform = (input, output) =>
-        withTransformTimingSummary(() => transform(input, output));
+        withTransformTimingSummary(async () => {
+            const sessionId = findSessionId(output.messages as MessageLike[]);
+            if (sessionId) forgetHostCheckpointPass(sessionId);
+            try {
+                await transform(input, output);
+                if (sessionId) forgetHostCheckpointPass(sessionId);
+            } catch (error) {
+                // A refused pass served nothing: a host checkpoint request it
+                // settled must stay pending for the retry.
+                if (sessionId)
+                    revertHostCheckpointPass(sessionId, deps.pendingMaterializationSessions);
+                // These refusals propagate; the wrapper does not replay a previously prepared request.
+                if (sessionId && !deps.compactionOff && error instanceof EmergencyFailClosedError)
+                    recordUsageRefusal(deps.db, sessionId);
+                throw error;
+            }
+        });
     return Object.assign(timedTransform, {
         clearSessionLogState,
         invalidateRustWireState(sessionId: string): void {

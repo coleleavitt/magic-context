@@ -67,20 +67,28 @@ export function hasReclaimRide(signals: ReclaimRideSignals): boolean {
 
 /**
  * What decides whether a pass held for recent signed thinking may still take a
- * ride. Such a pass keeps its prefix unchanged, so only the rides that rebuild
- * the prefix anyway admit work on it: a first render, an idle cache expiry and
- * emergency pressure.
+ * ride. Such a pass keeps its prefix unchanged, so only a first render (which
+ * rebuilds the prefix anyway), a history head that a host checkpoint already
+ * replaced outside the pass (host-checkpoint-ride.ts) and emergency pressure
+ * admit work on it. An expired provider cache does not: resending the same
+ * bytes keeps the signed thinking valid, so the hold stands.
  */
 export interface ReclaimRidePermissionGate {
     signedThinkingHold: boolean;
     firstRender: boolean;
-    idleExpiry: boolean;
+    /** A proven head change committed outside the pass (OpenCode 2's compaction hook). */
+    hostCheckpointHead?: boolean;
     emergency: boolean;
 }
 
 /** Whether the pass may change its prefix at all, before any ride is considered. */
 export function prefixMutationPermitted(gate: ReclaimRidePermissionGate): boolean {
-    return !gate.signedThinkingHold || gate.firstRender || gate.idleExpiry || gate.emergency;
+    return (
+        !gate.signedThinkingHold ||
+        gate.firstRender ||
+        gate.hostCheckpointHead === true ||
+        gate.emergency
+    );
 }
 
 /**

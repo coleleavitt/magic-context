@@ -463,6 +463,7 @@ describe("runCompartmentAgent wrapup controls", () => {
                     eligibleEndMessageId: "m-8",
                     rawRangeFingerprint: "",
                     trueRawEligibleTokens: 1_000,
+                    summaryRemovedEligibleTokens: 1_000,
                 };
                 const chunk = readSessionChunk(sessionId, 220, 1, snapshot.eligibleEndOrdinal);
                 expect(chunk.hasMore).toBe(true);
@@ -507,6 +508,7 @@ describe("runCompartmentAgent wrapup controls", () => {
                     eligibleEndMessageId: "m-4",
                     rawRangeFingerprint: "",
                     trueRawEligibleTokens: 1_000,
+                    summaryRemovedEligibleTokens: 1_000,
                 };
                 const chunk = readSessionChunk(sessionId, 10_000, 1, 5);
                 expect(chunk.completedToolArcs).toEqual([{ start: 2, end: 3 }]);
@@ -644,6 +646,7 @@ describe("runCompartmentAgent wrapup controls", () => {
                 createdAt: Date.now(),
                 rawRangeFingerprint: "",
                 trueRawEligibleTokens: 10_000,
+                summaryRemovedEligibleTokens: 10_000,
                 oversizeAtomicUnit: false,
                 boundaryReason: "test",
             };
@@ -736,6 +739,30 @@ describe("runCompartmentAgent wrapup controls", () => {
             closeQuietly(store);
             closeQuietly(db);
             rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps the manual quota override when a stale force-band head refreshes below the minimum", async () => {
+        const db = createDb();
+        const sessionId = "ses-refresh-small-manual-boundary";
+        try {
+            await withProvider(sessionId, 3, async () => {
+                const fresh = {
+                    ...wrapupSnapshot(db, sessionId, 87),
+                    mode: "incremental-runner" as const,
+                    summaryRemovedEligibleTokens: 0,
+                };
+                await runWithLease({
+                    db,
+                    sessionId,
+                    snapshot: { ...fresh, rawRangeFingerprint: "stale-fingerprint" },
+                    forceDrainQuota: true,
+                    refreshBoundarySnapshot: () => fresh,
+                });
+            });
+            expect(getCompartments(db, sessionId)[0]?.endMessage).toBe(1);
+        } finally {
+            closeQuietly(db);
         }
     });
 

@@ -1,8 +1,15 @@
-import { Database } from "bun:sqlite";
+import { openTestDb } from "../../src/test-db";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+	evaluateTaskGate,
+	getDreamTaskBacklog,
+} from "../../../plugin/src/features/magic-context/dreamer/task-gates";
+import { runMigrations } from "../../../plugin/src/features/magic-context/migrations";
+import { initializeDatabase } from "../../../plugin/src/features/magic-context/storage-db";
+import { Database as ContextDatabase } from "../../../plugin/src/shared/sqlite";
 import {
 	getRawSessionTagKeysThrough,
 	readSessionChunk,
@@ -24,6 +31,55 @@ import {
 import rows from "../../src/opencode2-runner/host-rows.json";
 import golden from "../../src/opencode2-runner/reader-s4-golden.json";
 import { isolation } from "../../src/opencode2-runner/spawn";
+import { cleanupE2ETempDir } from "../../src/temp-dir";
+
+test("OpenCode 2 runner scopes retrospective probes to its root sessions", () => {
+	const fixture = isolation();
+	const db = new ContextDatabase(":memory:");
+	try {
+		initializeDatabase(db);
+		runMigrations(db);
+		const project = "git:opencode2-retrospective-gate";
+		for (const [session, harness, subagent, activity] of [
+			["root", "opencode2", 0, 100],
+			["second-root", "opencode2", 0, 100],
+			["child", "opencode2", 1, 900],
+			["other-opencode", "opencode", 0, 900],
+			["other-pi", "pi", 0, 900],
+			["other-omp", "omp", 0, 900],
+		] as const) {
+			db.prepare(
+				"INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
+			).run(session, harness, project, activity);
+			db.prepare(
+				"INSERT INTO session_meta (session_id, harness, is_subagent) VALUES (?, ?, ?)",
+			).run(session, harness, subagent);
+			db.prepare(
+				"INSERT INTO message_history_index (session_id, harness, last_indexed_ordinal, updated_at) VALUES (?, ?, 1, ?)",
+			).run(session, harness, activity);
+		}
+		for (const watermark of [null, 0, 100]) {
+			const pending = watermark === 100 ? 0 : 2;
+			expect(
+				getDreamTaskBacklog(db, project, "retrospective", {
+					retrospectiveWatermarkMs: watermark,
+				}),
+			).toEqual({ pending, total: pending });
+			expect(
+				evaluateTaskGate("retrospective", {
+					db,
+					projectIdentity: project,
+					lastRunAt: null,
+					retrospectiveWatermarkMs: watermark,
+					promotionThreshold: 3,
+				}),
+			).toBe(pending > 0);
+		}
+	} finally {
+		db.close();
+		cleanupE2ETempDir(fixture.root);
+	}
+});
 
 // R16's owner ruling removes invalid characters; the audit's older source replaced them with '-'.
 // OPENCODE_DB is source rule AND observed honoured by the GA CLI real-host placement test.
@@ -53,7 +109,7 @@ test("R16 source filename table covers every channel and override branch", () =>
 test("session_message_reader seq pages idle boundaries and checkpoint window", () => {
 	const { root } = isolation();
 	const path = join(root, "fixture.db");
-	const writer = new Database(path);
+	const writer = openTestDb(path);
 	writer.exec(
 		"CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER DEFAULT 0, data TEXT)",
 	);
@@ -134,7 +190,7 @@ test("session_message_reader seq pages idle boundaries and checkpoint window", (
 test("10,000-row raw read pages decode only the requested page and count decodes none", () => {
 	const { root } = isolation();
 	const path = join(root, "bounded-reader.db");
-	const writer = new Database(path);
+	const writer = openTestDb(path);
 	writer.exec(
 		"CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER DEFAULT 0, data TEXT)",
 	);
@@ -226,7 +282,7 @@ test("10,000-row raw read pages decode only the requested page and count decodes
 test("post-historian drop-key collection decodes only the published chunk", async () => {
 	const { root } = isolation();
 	const path = join(root, "post-historian-bounded-reader.db");
-	const writer = new Database(path);
+	const writer = openTestDb(path);
 	writer.exec(`
 		CREATE TABLE session_message(
 			id TEXT PRIMARY KEY,
@@ -296,7 +352,7 @@ test("post-historian drop-key collection decodes only the published chunk", asyn
 test("latestAssistant selects the newest assistant row by seq and ignores other types", () => {
 	const { root } = isolation();
 	const path = join(root, "latest-assistant.db");
-	const writer = new Database(path);
+	const writer = openTestDb(path);
 	writer.exec(
 		"CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER DEFAULT 0, data TEXT)",
 	);
@@ -342,8 +398,8 @@ test("I11 v1/v2 readers feed the same transform core with pinned host difference
 	const sessionID = "ses-golden";
 	const v1Path = join(root, "golden-v1.db");
 	const v2Path = join(root, "golden-v2.db");
-	const v1 = new Database(v1Path);
-	const v2 = new Database(v2Path);
+	const v1 = openTestDb(v1Path);
+	const v2 = openTestDb(v2Path);
 	v1.exec(`
 		CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
 		CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
@@ -417,7 +473,7 @@ test("I11 v1/v2 readers feed the same transform core with pinned host difference
 test("host-aware dispatch refuses a v1 store before a v2 query", () => {
 	const { root } = isolation();
 	const path = join(root, "v1.db");
-	const db = new Database(path);
+	const db = openTestDb(path);
 	db.exec("CREATE TABLE message(id TEXT); CREATE TABLE part(id TEXT)");
 	db.close();
 	expect(() => new V2StoreReader(path)).toThrow("expected v2, found v1");

@@ -801,6 +801,15 @@ const BaseEmbeddingConfigSchema = z
             .describe(
                 "Optional truncate mode sent in the embedding request body (e.g. NVIDIA NIM accepts 'NONE' | 'START' | 'END'). Omitted from the request when unset.",
             ),
+        dimensions: z
+            .number()
+            .int()
+            .min(1)
+            .max(8192)
+            .optional()
+            .describe(
+                "Optional output width for Matryoshka embedding models (e.g. Qwen3-Embedding-8B accepts 768 | 1024 | 2048 | 4096; OpenAI text-embedding-3-* accept smaller widths than native). Sent as the OpenAI-compatible `dimensions` request field. Omitted from the request when unset, so the endpoint default applies. Changing it changes the produced vectors and folds into the embedding model identity, so switching widths re-embeds rather than mixing vector spaces. Not supported for the local provider, and ignored from project config like the other embedding fields (a repository cannot choose how private text is embedded).",
+            ),
         max_input_tokens: z
             .number()
             .int()
@@ -870,6 +879,12 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
             ...(model ? { model } : {}),
             ...(endpoint ? { endpoint } : {}),
             ...(apiKey ? { api_key: apiKey } : {}),
+            // dimensions is carried on the synapse block ONLY so it survives to
+            // the openai-compatible fallback lane (fallbackConfig rebuilds that
+            // provider from this object). Synapse's own lane ignores it — its
+            // width is pinned from the first embed response, and a static width
+            // here would fight that.
+            ...(data.dimensions ? { dimensions: data.dimensions } : {}),
             ...(inputType ? { input_type: inputType } : {}),
             ...(queryInputType ? { query_input_type: queryInputType } : {}),
             ...(data.query_instruction !== undefined
@@ -908,6 +923,10 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
             provider: "openai-compatible" as const,
             model: data.model?.trim() ?? "",
             endpoint: data.endpoint?.trim() ?? "",
+            // dimensions is spread CONDITIONALLY (mirrors truncate/local_dtype):
+            // omitting it when unset keeps the identity byte-identical for every
+            // existing config, so adding this field forces no global re-embed.
+            ...(data.dimensions ? { dimensions: data.dimensions } : {}),
             ...(apiKey ? { api_key: apiKey } : {}),
             ...(inputType ? { input_type: inputType } : {}),
             ...(queryInputType ? { query_input_type: queryInputType } : {}),
@@ -1281,7 +1300,7 @@ export const MagicContextConfigSchema = z
             .union([z.string(), z.object({ default: z.string() }).catchall(z.string())])
             .default("5m")
             .describe(
-                'How long Magic Context assumes the provider\'s cached prefix stays valid. This is MC\'s own deferral gate — it does not change the provider\'s actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard, then default). User and project settings, including an explicit "5m" or object default, apply on the next pass. Only built-in defaults are frozen per session, including across restarts: when unset, GPT-5.6 and later (including gpt-6*, through any provider prefix) use 30m, other models use 5m. /ctx-status shows the effective TTL and whether it comes from your config or a frozen built-in default. Editing the TTL does not itself rewrite prompt bytes; a lowered TTL rebuilds only after normal idle expiry. OpenAI documents at least 30 minutes since the latest write or reuse: https://developers.openai.com/api/docs/guides/prompt-caching (Cache lifetime and Summary of model differences). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
+                'How long Magic Context assumes the provider\'s cached prefix stays valid. It does not change the provider\'s actual cache lifetime, and it triggers no rebuild or fold: after an expiry the next request replays the same bytes. Magic Context uses it for diagnostics and, on OpenCode 2, to time an idle checkpoint in the host\'s session store (the experimental Rust transform still rebuilds on it). String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard, then default). User and project settings, including an explicit "5m" or object default, apply on the next pass. Only built-in defaults are frozen per session, including across restarts: when unset, GPT-5.6 and later (including gpt-6*, through any provider prefix) use 30m, other models use 5m. /ctx-status shows the effective TTL and whether it comes from your config or a frozen built-in default. Editing the TTL never rewrites prompt bytes. OpenAI documents at least 30 minutes since the latest write or reuse: https://developers.openai.com/api/docs/guides/prompt-caching (Cache lifetime and Summary of model differences). Set to "never" to mean MC never assumes expiry (for a provider cache that an external cache-keep tool keeps warm). Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
             ),
         prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe(
             "Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. OpenCode 1.x, Pi, and OMP register tool descriptions once per process (they follow the default preset). OpenCode 2 rewrites the five ctx_* descriptions per request from the draft model.",

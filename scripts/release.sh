@@ -138,6 +138,33 @@ if [[ ! -s "$NOTES_FILE" ]]; then
   echo "Error: draft public release notes in .cortexkit/release-notes/$TAG.md before releasing."
   exit 1
 fi
+
+# Hosts load the checkout's dists live. Build and test HEAD elsewhere so a
+# release cannot replace the bundles those hosts will load on their next start.
+BUILD_TMP=$(mktemp -d "${TMPDIR:-/tmp}/magic-context-release.XXXXXX")
+BUILD_ROOT="$BUILD_TMP/checkout"
+cleanup_release_build() {
+  local status=$?
+  trap - EXIT
+  if [[ -d "$BUILD_ROOT" ]]; then
+    git -C "$REPO_ROOT" worktree remove --force "$BUILD_ROOT" || status=1
+  fi
+  rm -rf -- "$BUILD_TMP" || status=1
+  exit "$status"
+}
+trap cleanup_release_build EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+git -C "$REPO_ROOT" worktree add --detach "$BUILD_ROOT" HEAD
+
+# Keep all gates and artifact consumers in the detached tree, including helpers
+# that resolve their checkout from their own script path. Release edits below
+# the subshell still run in the original checkout.
+(
+REPO_ROOT="$BUILD_ROOT"
+SCRIPT_DIR="$REPO_ROOT/scripts"
+cd "$REPO_ROOT"
+bun install --frozen-lockfile
 PLUGIN_DIR="$REPO_ROOT/packages/plugin"
 PI_DIR="$REPO_ROOT/packages/pi-plugin"
 CLI_DIR="$REPO_ROOT/packages/cli"
@@ -411,6 +438,7 @@ else
   run_host_e2e
   "$SCRIPT_DIR/run-rust-hermetic-e2e.sh"
 fi
+)
 
 echo "  ✓ All checks passed"
 echo ""
@@ -451,6 +479,7 @@ generate_release_artifacts
 # only fail in CI after the tag is cut. Lint the regenerated files here so any
 # formatting drift fails locally.
 echo "→ Linting generated artifacts..."
+PLUGIN_DIR="$REPO_ROOT/packages/plugin"
 bun run --cwd "$PLUGIN_DIR" lint 2>&1 || { echo "Error: Generated artifacts failed lint (regenerated schema/seeds not repo-style)"; exit 1; }
 echo ""
 fi
@@ -569,12 +598,15 @@ echo "  ✓ Released $TAG — CI publish completed"
 # (2026-09-13: @cortexkit/pi-magic-context@0.42.2). The publish job's exit
 # status therefore proves nothing about installability; the packument is the
 # only signal that tells the truth. Poll it for each package before calling the
-# release shipped.
+# release shipped. Since November 2026 npm keeps some publishes "being
+# processed" for 15 to 35 minutes before they appear, then publishes them
+# normally, so each package gets up to an hour; only a version still missing
+# after that is treated as lost.
 echo "  → Verifying registry visibility for $VERSION..."
 MISSING=""
 for pkg in @cortexkit/opencode-magic-context @cortexkit/pi-magic-context @cortexkit/magic-context; do
     seen=""
-    for attempt in $(seq 1 20); do
+    for attempt in $(seq 1 120); do
         if curl -fsS "https://registry.npmjs.org/${pkg/\//%2F}" -H 'Cache-Control: no-cache' 2>/dev/null \
             | grep -q "\"$VERSION\":\"[0-9]"; then
             seen=1; break
@@ -584,7 +616,7 @@ for pkg in @cortexkit/opencode-magic-context @cortexkit/pi-magic-context @cortex
     if [ -n "$seen" ]; then
         echo "    ✓ $pkg@$VERSION visible on the registry"
     else
-        echo "    ✗ $pkg@$VERSION NOT visible after 10 minutes (publish acknowledged but staged?)" >&2
+        echo "    ✗ $pkg@$VERSION NOT visible after 60 minutes (publish acknowledged but staged?)" >&2
         MISSING="$MISSING $pkg"
     fi
 done

@@ -5,7 +5,6 @@ import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
     closeDatabase,
     getTagsBySession,
-    openDatabase,
     queuePendingOp,
 } from "../../features/magic-context/storage";
 import {
@@ -17,6 +16,7 @@ import {
 import { markTagDropped } from "../../features/magic-context/storage-tags";
 import { createTagger } from "../../features/magic-context/tagger";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
+import { openTestDatabase } from "../../shared/test-db";
 import { cleanupTestTempDir, createTestTempDir } from "../../shared/test-temp-dir";
 import { applyPendingOperations, renderDroppedText } from "./apply-operations";
 import { DegradedPassRefusalError } from "./degraded-pass-refusal";
@@ -46,7 +46,7 @@ afterEach(() => {
 async function fixture(parts: Message["parts"], anchored = false, hideReduce = false) {
     tempDir = createTestTempDir("lkg-annotations-independent-").dir;
     process.env.XDG_DATA_HOME = tempDir;
-    const db = openDatabase();
+    const db = await openTestDatabase();
     const sessionId = `independent-annotations-${++fixtureNumber}`;
     const raw = (): Message[] => [
         {

@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterAll, beforeAll, expect, it } from "bun:test";
+import { isCheckpointNote } from '../../plugin/src/v2/fold/summary';
 import { V2StoreReader, gaDatabasePath } from '../../plugin/src/v2/store-reader';
 import { TestHarness } from "../src/harness";
 import { OpenCode2TestHarness } from '../src/opencode2-harness';
@@ -11,6 +12,7 @@ import {
     type ScenarioHarness,
 } from "../src/scenario-hosts";
 import { buildMockHistorianPayload, findHistorianOrdinalRange } from "../src/mock-historian";
+import { expectNativeAdmission } from "./opencode2/helpers/native-admission";
 
 /**
  * Plan v6: deferred compaction marker — publish-time persistence and
@@ -197,10 +199,18 @@ forEachHost(import.meta.url, "deferred compaction marker (plan v6)", (host) => {
             try {
                 const checkpoint = reader.latestCompaction(sessionId);
                 expect(checkpoint?.data.status).toBe("completed");
-                expect(checkpoint?.data.summary).toContain("<session-history>");
+                // The host stores a short note; Magic Context keeps the history
+                // head itself and still sends it (checked on the next request).
+                expect(isCheckpointNote(checkpoint?.data.summary)).toBe(true);
+                expect(checkpoint?.data.summary).not.toContain("<session-history>");
             } finally { reader.close(); }
+            expectNativeAdmission(h, sessionId);
             await h.sendPrompt(sessionId, "small defer turn — native checkpoint remains visible");
-            expect(JSON.stringify(h.mock.lastRequest()?.body)).toContain("<conversation-checkpoint>");
+            const sent = JSON.stringify(h.mock.lastRequest()?.body);
+            expect(sent).toContain("<session-history>");
+            expect(sent).toContain("small defer turn — native checkpoint remains visible");
+            expect(sent).not.toContain("<conversation-checkpoint>");
+            expect(sent).not.toContain("<recent-context>");
         } else if (RUST_MODE) {
             // a5b7d61d moved Rust publication and its pending delta into the
             // module transaction. `pending_m1_delta` is the authority-level

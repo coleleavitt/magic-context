@@ -194,6 +194,7 @@ function makeBoundarySnapshot(
 		createdAt: 1,
 		rawRangeFingerprint: "",
 		trueRawEligibleTokens: 1000,
+		summaryRemovedEligibleTokens: 1000,
 		oversizeAtomicUnit: false,
 		boundaryReason: "test",
 		...overrides,
@@ -259,6 +260,7 @@ async function runHistorianWith(args: {
 	refreshBoundarySnapshot?: () => ProtectedTailBoundarySnapshot;
 	providerMessages?: RawMessage[];
 	forceKeepLastCompartment?: boolean;
+	forceDrainQuota?: boolean;
 	historianChunkTokens?: number;
 	historianContextLimit?: number;
 	producerContextLimits?: ReadonlyMap<string, number>;
@@ -322,6 +324,7 @@ async function runHistorianWith(args: {
 		compartmentLeaseHolderId: holderId,
 		ensureProjectRegistered: args.ensureProjectRegistered,
 		forceKeepLastCompartment: args.forceKeepLastCompartment,
+		forceDrainQuota: args.forceDrainQuota,
 	});
 	return { db, runner };
 }
@@ -558,6 +561,24 @@ describe("runPiHistorian", () => {
 		}
 	});
 
+	it("reserves summary-removed tokens rather than the full eligible history", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: [successXml()],
+			boundarySnapshot: makeBoundarySnapshot({
+				trueRawEligibleTokens: 1000,
+				summaryRemovedEligibleTokens: 10,
+			}),
+		});
+		try {
+			expect(runner.run).toHaveBeenCalled();
+			expect(
+				loadProtectedTailMeta(db, "ses-historian").protectedTailDrainTokens,
+			).toBe(10);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("rolls back reserved drain tokens when the Pi chunk is empty", async () => {
 		const emptyMessages = rawMessages(4).map((message) => ({
 			...message,
@@ -618,6 +639,56 @@ describe("runPiHistorian", () => {
 		}
 	});
 
+	it.each([
+		{
+			name: "routine force pressure",
+			recovery: false,
+			forceDrainQuota: false,
+			runs: 0,
+		},
+		{
+			name: "overflow recovery",
+			recovery: true,
+			forceDrainQuota: false,
+			runs: 1,
+		},
+		{
+			name: "manual quota override",
+			recovery: false,
+			forceDrainQuota: true,
+			runs: 1,
+		},
+	])("preserves small-head admission on stale refresh for $name", async ({
+		recovery,
+		forceDrainQuota,
+		runs,
+	}) => {
+		const { db, runner } = await runHistorianWith({
+			outputs: [successXml()],
+			boundarySnapshot: makeBoundarySnapshot({
+				recovery,
+				usagePercentage: 87,
+				rawLastMessageIdAtTrigger: "old-m12",
+				rawRangeFingerprint: "stale-fingerprint",
+			}),
+			refreshBoundarySnapshot: () =>
+				makeBoundarySnapshot({
+					protectedTailStart: 3,
+					eligibleEndOrdinal: 3,
+					eligibleEndMessageId: "m2",
+					usagePercentage: 87,
+					summaryRemovedEligibleTokens: 1,
+				}),
+			forceDrainQuota,
+		});
+		try {
+			expect(runner.run).toHaveBeenCalledTimes(runs);
+			expect(getCompartments(db, "ses-historian")).toHaveLength(runs);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("keeps the stale-snapshot no-op fallback when the refreshed boundary is not runnable", async () => {
 		const staleBoundary = makeBoundarySnapshot({
 			rawLastMessageIdAtTrigger: "old-m12",
@@ -630,6 +701,7 @@ describe("runPiHistorian", () => {
 				eligibleEndOrdinal: 1,
 				eligibleEndMessageId: null,
 				trueRawEligibleTokens: 0,
+				summaryRemovedEligibleTokens: 0,
 			}),
 		);
 		const { db, runner } = await runHistorianWith({
@@ -1427,6 +1499,35 @@ describe("runPiHistorian", () => {
 				"Initial Pi slice",
 				"Provisional Pi slice",
 			]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("leaves overflow recovery armed after a publication", async () => {
+		// A publication is progress, not proof that the next request fits; only
+		// a recovery pass that counts its request within its limit ends recovery
+		// (issue 889).
+		const { db } = await runHistorianWith({
+			outputs: [twoCompartmentSuccessXml()],
+			providerMessages: rawMessages(5),
+			boundarySnapshot: makeBoundarySnapshot({
+				protectedTailStart: 5,
+				protectedTailStartMessageId: "m5",
+				eligibleEndOrdinal: 5,
+				eligibleEndMessageId: "m4",
+				rawMessageCountAtTrigger: 5,
+				rawLastMessageIdAtTrigger: "m5",
+			}),
+			beforeRun: (database) => {
+				recordOverflowDetected(database, "ses-historian", 100_000);
+			},
+		});
+		try {
+			expect(getCompartments(db, "ses-historian").length).toBeGreaterThan(0);
+			const overflow = getOverflowState(db, "ses-historian");
+			expect(overflow.needsEmergencyRecovery).toBe(true);
+			expect(overflow.emergencyRecoveryOrigin).toBe("provider_overflow");
 		} finally {
 			closeQuietly(db);
 		}

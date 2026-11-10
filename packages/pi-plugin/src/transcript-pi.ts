@@ -247,10 +247,11 @@ export function createPiTranscript(
 			message.requiresToolArcSkeleton = false;
 	}
 	let committed = false;
+	const harness = resolvePiHarnessKind();
 
 	return {
 		messages: transcriptMessages,
-		harness: resolvePiHarnessKind(),
+		harness,
 		prepareToolRemovalMeasurements(callIds): void {
 			if (!options.authorizeToolRemovals || callIds.length === 0) return;
 			const requested = new Set(callIds);
@@ -277,7 +278,11 @@ export function createPiTranscript(
 			if (committed) return;
 			committed = true;
 			for (const index of dirtyMessages) {
-				rewriteNativeAssistantTexts(working[index], source[index], sessionId);
+				// Only Oh My Pi's assistant-message hook leaves unsigned text over an
+				// unchanged native item, and only its dispatch check pairs them.
+				rewriteNativeAssistantTexts(working[index], source[index], sessionId, {
+					unsignedDrops: harness === "omp",
+				});
 			}
 			for (const [index, parts] of removals) {
 				const message = working[index];
@@ -816,7 +821,7 @@ function createPiAssistantPart(
 			// part is always a programming error.
 			throw new Error("setToolOutput on assistant part");
 		},
-		getToolMetadata(): {
+		getToolMetadata(options?: { skipInputTokenCount?: boolean }): {
 			toolName: string | undefined;
 			inputByteSize: number;
 			inputTokenCount: number;
@@ -831,7 +836,10 @@ function createPiAssistantPart(
 			try {
 				const serialized = JSON.stringify(p.arguments);
 				inputByteSize = serialized.length;
-				inputTokenCount = serialized ? estimateTokens(serialized) : 0;
+				inputTokenCount =
+					serialized && !options?.skipInputTokenCount
+						? estimateTokens(serialized)
+						: 0;
 			} catch {
 				inputByteSize = 0;
 				inputTokenCount = 0;

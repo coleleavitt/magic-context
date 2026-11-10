@@ -3,6 +3,22 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh; tag releases run the same Rust invocation. Cargo.lock pins the Rust dependency versions and git revisions. CI mc-module daemon tests and push/release builders use the locked subconscious source to build ck-subc; the scheduled CI builder intentionally probes default-branch HEAD as drift, while test shards consume its prebuilt artifact.",
     "entries": [
         {
+            "path": "tests/opencode2/issue-889-model-switch.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 2 shrinking-model recovery with a context-enforcing fake provider; passing trace guards and an assertion that no smaller-model request exceeds the provider window. PID lsof proves throwaway stores.",
+            "contract_refs": ["OC2-S1", "FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/opencode2/overflow-terminal-errors.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 2 HTTP and streaming OpenAI overflow errors arm recovery through the HTTP and terminal-event carriers; isolated host PID lsof guards all stores.",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
             "path": "tests/pi-child-tool-boundary.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
@@ -59,10 +75,26 @@
             "hosts": ["opencode2"]
         },
         {
+            "path": "tests/opencode2/oc2-manual-fold-ride.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real host manual /compact with published history: the request after it serves a rebuilt history head, every row between the history coverage and the host cut comes back once, and work queued for the next rebuild must land on that request. With experimental part_rows (OpenCode 2.2.6+), restored rows must keep their assistant replies.",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
             "path": "tests/opencode2/native-fold-provenance.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
             "rationale": "Real host plugin KV stores digest-only fold provenance and removes it on deletion before any post-restart context pass; PID lsof proves throwaway containment.",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/opencode2/checkpoint-note.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real host automatic and manual checkpoints store the fixed note, and every provider request matches a no-checkpoint control byte for byte across the fold and a host restart.",
             "contract_refs": ["OC2-S1"],
             "hosts": ["opencode2"]
         },
@@ -150,7 +182,7 @@
             "path": "tests/cache-ttl-live-config.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
-            "rationale": "Issue 624: real OpenCode 1 reloads edited user TTL before the next idle decision, preserves provider prefix bytes on a raise, and lowers only through ttl_idle; PID lsof proves throwaway-store containment",
+            "rationale": "Issue 624, revised for the rule that an expired provider cache is not a rebuild reason: real OpenCode 1 reloads an edited user TTL live; raising it above the idle or lowering it below changes neither the provider prefix bytes nor the scheduler's defer, and the expiry shows only as the ttl_idle diagnostic row; PID lsof proves throwaway-store containment",
             "contract_refs": ["FOLD-UNDER-PRESSURE"],
             "hosts": ["opencode"]
         },
@@ -198,7 +230,7 @@
             "path": "tests/idle-ttl-restart.test.ts",
             "tier": "both-modes",
             "invocation": { "ts": true, "rust": true },
-            "rationale": "Shared served-completion idle clock and OpenCode 1 late-system abort/resend byte replay, including Rust module frozen identity, consumed-fold watermark and idle attribution; Pi/OMP and native OpenCode 2 cover the TS portable idle behavior (v2 lacks the v1 decision-row binding)",
+            "rationale": "Shared served-completion idle clock and OpenCode 1 late-system abort/resend byte replay: the request after an idle gap replays the one before it, queued drops and the frozen system date wait for /ctx-flush, which lands them; Rust mode still folds the expired head and keeps the module's frozen identity, consumed-fold watermark and idle attribution; Pi/OMP and native OpenCode 2 cover the TS portable idle behavior (v2 lacks the v1 decision-row binding)",
             "contract_refs": ["S2-MIGRATION"],
             "hosts": ["opencode", "pi", "omp", "opencode2"],
             "behavior": true
@@ -708,7 +740,7 @@
                 "ts": true,
                 "rust": false
             },
-            "rationale": "the idle clock is stamped by each host's own event delivery (Pi message_end for prompts, tool results and failed requests; OpenCode message.updated for assistant messages); the scenario waits past a short cache TTL on a real host and checks that queued drops apply on the next pass, including after a refused request",
+            "rationale": "the idle clock is stamped by each host's own event delivery (Pi message_end for prompts, tool results and failed requests; OpenCode message.updated for assistant messages); the scenario waits past a short cache TTL on a real host and checks that the next request replays the previous one with the queued drop still pending, that a refused request leaves the idle clock alone, and that the drop lands on /ctx-flush",
             "contract_refs": [
                 "TS-HARNESS"
             ],
@@ -3039,6 +3071,14 @@
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
             "rationale": "Real OpenCode 2 thinking loop past the execute threshold: the prefix before kept signed thinking stays byte-identical through the loop, and queued work lands in one rebuild on the next user turn",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/opencode2/tool-definition-cache-loss.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Session request tool definitions change the provider prefix: one HARD fold drains held drops, an upgraded baseline adopts without folding, subsequent prefixes replay identically, and a second session stays isolated",
             "contract_refs": ["OC2-S1"],
             "hosts": ["opencode2"]
         },

@@ -13,7 +13,7 @@ import {
     __resetMessageIndexAsyncForTests,
     isSessionReconciled,
 } from "../../features/magic-context/message-index-async";
-import { createScheduler } from "../../features/magic-context/scheduler";
+import { computeHardCacheExpired, createScheduler } from "../../features/magic-context/scheduler";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
     seedRetainedSession,
@@ -276,6 +276,12 @@ describe("createEventHandler", () => {
         ["google-vertex-anthropic", "claude-sonnet-5-5@20260930"],
         ["amazon-bedrock", "anthropic.claude-opus-5-5-v1:0"],
         ["vertex-eu-anthropic", "claude-fable-5-1"],
+        // Fable 5.2 and Mythos 5.1/5.2 return the same binding 400 as Fable 5.1.
+        ["anthropic", "claude-fable-5-2"],
+        ["amazon-bedrock", "us.anthropic.claude-fable-5-2-v1:0"],
+        ["openrouter", "anthropic/claude-fable-5.2"],
+        ["anthropic", "claude-mythos-5-1"],
+        ["google-vertex-anthropic", "claude-mythos-5-2@20261109"],
     ]) {
         it(`arms binding recovery via ${providerID}/${modelID}`, async () => {
             useTempDataHome("context-event-cloud-binding-");
@@ -1261,27 +1267,24 @@ describe("createEventHandler", () => {
             },
         ])
             await emit(info);
-        const scheduler = createScheduler({ executeThresholdPercentage: 90 });
-        const usage = { inputTokens: 1_000, percentage: 1 };
+        // The idle clock decides whether the provider cache counts as expired.
+        const expired = (at: number) => {
+            const meta = getOrCreateSessionMeta(deps.db, sessionID);
+            return computeHardCacheExpired(meta.cacheTtl, meta.lastResponseTime, at);
+        };
         expect(getOrCreateSessionMeta(deps.db, sessionID).lastResponseTime).toBe(previous);
-        expect(
-            scheduler.shouldExecute(getOrCreateSessionMeta(deps.db, sessionID), usage, now),
-        ).toBe("execute");
+        expect(expired(now)).toBe(true);
         await emit({ id: "msg_05", finish: "stop", time: { completed: now } });
         expect(getOrCreateSessionMeta(deps.db, sessionID).lastResponseTime).toBe(now);
         expect(getOrCreateSessionMeta(deps.db, sessionID).lastInputTokens).toBe(1_000);
-        expect(
-            scheduler.shouldExecute(getOrCreateSessionMeta(deps.db, sessionID), usage, now + 1_000),
-        ).toBe("defer");
+        expect(expired(now + 1_000)).toBe(false);
         await emit({
             id: "msg_06",
             finish: "stop",
             time: { completed: now + 2_000 },
             tokens: { input: 0 },
         });
-        expect(
-            scheduler.shouldExecute(getOrCreateSessionMeta(deps.db, sessionID), usage, now + 3_000),
-        ).toBe("defer");
+        expect(expired(now + 3_000)).toBe(false);
         await emit({
             id: "msg_01",
             modelID: "usage-bearing",

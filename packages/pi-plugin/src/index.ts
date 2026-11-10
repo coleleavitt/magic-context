@@ -119,7 +119,10 @@ import { setHarness } from "@magic-context/core/shared/harness";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { setKeepSubagents } from "@magic-context/core/shared/keep-subagents";
 import { flushLogger, log } from "@magic-context/core/shared/logger";
-import { resolveHistorianModel } from "@magic-context/core/shared/model-resolution";
+import {
+	type ModelInput,
+	resolveHistorianModel,
+} from "@magic-context/core/shared/model-resolution";
 import {
 	createPromptSurfaceGuidanceEpochCache,
 	createPromptSurfaceRuntime,
@@ -276,6 +279,8 @@ import {
 	registerTodoStateLifecycle,
 	rememberTodowriteToolCallTodos,
 	setTodoSnapshot,
+	TODO_PRIORITIES,
+	TODO_STATUSES,
 } from "./tools/todo-view-pi";
 
 registerStandalonePluginMarker(packageMetadata.version);
@@ -462,15 +467,39 @@ type CompatiblePiTodoCapture = {
 	todos: Exclude<ReturnType<typeof parseTodos>, null>;
 };
 
+/**
+ * Some Pi users disable Magic Context's built-in `todowrite` and install a
+ * third-party tool with the same name. Capture stays interoperable when that
+ * tool emits Magic Context's exact todo shape, but it must fail closed for any
+ * other status or priority values so bad state never reaches synthetic replay.
+ *
+ * The shared normalizer keeps any status or priority string, as OpenCode's todo
+ * schema does, so Pi checks its own tool's enums here. Magic Context's Pi
+ * `todowrite` refuses a call outside them when it validates the arguments,
+ * which happens after both capture points see the call, so the agent's list
+ * did not change and the previous snapshot stays.
+ */
 function getCompatiblePiTodoCapture(
 	todos: unknown,
 ): CompatiblePiTodoCapture | null {
 	if (!Array.isArray(todos)) return null;
+	if (!todos.every(hasPiTodowriteEnumValues)) return null;
 	const normalized = normalizeTodoStateJson(todos);
 	if (normalized === null) return null;
 	const parsed = parseTodos(todos);
 	if (parsed === null) return null;
 	return { normalized, todos: parsed };
+}
+
+/** True when an item's status and priority are values Pi's `todowrite` schema allows. */
+function hasPiTodowriteEnumValues(todo: unknown): boolean {
+	if (todo === null || typeof todo !== "object") return false;
+	const { status, priority } = todo as { status?: unknown; priority?: unknown };
+	return (
+		(TODO_STATUSES as readonly unknown[]).includes(status) &&
+		(priority === undefined ||
+			(TODO_PRIORITIES as readonly unknown[]).includes(priority))
+	);
 }
 
 function applyCompatiblePiTodoCapture(args: {
@@ -861,14 +890,14 @@ export async function persistPiPressureFromMessageEnd(args: {
 		cacheAlertSent: boolean;
 	}> = {};
 	// last_response_time is the idle clock for the provider cache: the
-	// scheduler's TTL execute and the ttl_idle HARD fold both measure from it.
+	// cache-expiry status and the system date refresh measure from it.
 	// Usage or successful terminal completion proves a served response. Pi's
 	// timestamp is the message start, so stamp at message_end, not at that start.
 	// Pi also emits message_end for the user's own prompt (before that
 	// prompt's context pass), for tool results, and for failed requests (a
 	// quota error arrives as an assistant message with zero usage). Stamping
 	// on those made a pass after a long idle look like it followed a fresh
-	// response, so it deferred and queued drops never applied.
+	// response.
 	const assistant =
 		args.message && typeof args.message === "object"
 			? (args.message as {
@@ -1813,7 +1842,7 @@ async function startPiMagicContextRuntime(
 			}
 			const emptyHistorian = empty.find((chain) => chain.owner === "historian");
 			const historianLine = historian
-				? `registered historian trigger (model=${historian.model}${historian.fallbackModels?.length ? `, fallbacks=${historian.fallbackModels.join(",")}` : ""}, executeThreshold=${formatExecuteThresholdForLog(historian.executeThresholdPercentage)})`
+				? `registered historian trigger (model=${historian.model}${historian.fallbackModels?.length ? `, fallbacks=${historian.fallbackModels.map(formatPiModelForLog).join(",")}` : ""}, executeThreshold=${formatExecuteThresholdForLog(historian.executeThresholdPercentage)})`
 				: emptyHistorian
 					? `registered historian trigger: DISABLED (no configured model is registered in Pi: ${formatEmptyPiModelChain(emptyHistorian)})`
 					: undefined;
@@ -2020,7 +2049,7 @@ async function startPiMagicContextRuntime(
 		{
 			db,
 			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
-			onInherited: (sessionId) => prewarmPiTagSnapshot(db, sessionId),
+			onInherited: (sessionId) => prewarmPiTagSnapshot(db, sessionId, "pass"),
 		},
 	);
 	pi.on("session_start", async (event, ctx) => {
@@ -2056,7 +2085,7 @@ async function startPiMagicContextRuntime(
 		await handlePiCloneSessionStart(event, ctx, {
 			db,
 			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
-			onInherited: (sessionId) => prewarmPiTagSnapshot(db, sessionId),
+			onInherited: (sessionId) => prewarmPiTagSnapshot(db, sessionId, "pass"),
 		});
 		const sessionId = resolveSessionId(ctx);
 		if (
@@ -2076,7 +2105,7 @@ async function startPiMagicContextRuntime(
 				modelKey: canonicalPiModelKey(model.provider, model.id),
 			});
 		}
-		if (sessionId) prewarmPiTagSnapshot(db, sessionId);
+		if (sessionId) prewarmPiTagSnapshot(db, sessionId, "pass");
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
@@ -3290,7 +3319,7 @@ async function startPiMagicContextRuntime(
 				incomingSessionId &&
 				(_event as { reason?: unknown })?.reason !== "fork"
 			)
-				prewarmPiTagSnapshot(db, incomingSessionId);
+				prewarmPiTagSnapshot(db, incomingSessionId, "pass");
 			if (!outgoingSessionId || outgoingSessionId === readSessionId(ctx))
 				return;
 			clearPiSystemPromptSession(outgoingSessionId);
@@ -3324,4 +3353,9 @@ function formatExecuteThresholdForLog(
 		.map(([key, pct]) => `${key}=${pct}%`);
 	const base = `${value.default}%`;
 	return overrides.length > 0 ? `${base} (${overrides.join(", ")})` : base;
+}
+
+function formatPiModelForLog(entry: ModelInput): string {
+	if (typeof entry === "string") return entry;
+	return `${entry.model}${entry.qualifier ? ` (thinking_level=${entry.qualifier})` : ""}`;
 }

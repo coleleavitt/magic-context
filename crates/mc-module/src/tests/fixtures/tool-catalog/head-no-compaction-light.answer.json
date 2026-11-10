@@ -1,6 +1,6 @@
 {
-  "generation": "9de5b6d68b0e5205019f4dfaf11af3bd62f366dc057ec56b50c2ffcca2d8bce0",
-  "catalog_digest": "9de5b6d68b0e5205019f4dfaf11af3bd62f366dc057ec56b50c2ffcca2d8bce0",
+  "generation": "eb6c3e5035703837e44727d59a04bb2f3f746b4d0585bd9eaed5f0378f9531ef",
+  "catalog_digest": "eb6c3e5035703837e44727d59a04bb2f3f746b4d0585bd9eaed5f0378f9531ef",
   "composition_digest": "4f419cf9a5a1a35380ef9ce2dbf1452e9e1f8f137218053ac076174a389df77e",
   "tools": [
     {
@@ -26,7 +26,7 @@
               "update",
               "dismiss"
             ],
-            "description": "write | read | update | dismiss (default: write with content, else read)."
+            "description": "write | read | update | dismiss."
           },
           "content": {
             "type": "string",
@@ -71,7 +71,7 @@
               "minimum": 1,
               "maximum": 9007199254740991
             },
-            "description": "One id for update, 1–50 for dismiss or read (full bodies). Ignored by write."
+            "description": "One id for update, 1–50 for dismiss, or 1–50 to read those notes in full. Write and a plain read take an empty list."
           }
         },
         "additionalProperties": false
@@ -106,7 +106,7 @@
           "content": {
             "type": "string",
             "maxLength": 65536,
-            "description": "One standalone fact (write, update, merge)."
+            "description": "One standalone fact (write, update, merge). Archive and get: empty string."
           },
           "category": {
             "type": "string",
@@ -117,7 +117,7 @@
               "CONFIG_VALUES",
               "NAMING"
             ],
-            "description": "Kind of fact (required for write; optional on update/merge)."
+            "description": "Kind of fact (write; on update/merge pass the current category to keep it). Archive and get ignore it."
           },
           "ids": {
             "type": "array",
@@ -126,7 +126,7 @@
               "type": "integer",
               "minimum": 1
             },
-            "description": "Ids from <project-memory>: one for update, 1+ for archive, 2+ for merge, 1–20 for get."
+            "description": "Ids from <project-memory>: one for update, 1+ for archive, 2+ for merge, 1–20 for get. Write: empty list."
           },
           "reason": {
             "type": "string",
@@ -197,7 +197,7 @@
   "system_text": {
     "text": "## Magic Context\n\n`ctx_search` searches this project's archive — what earlier sessions said and decided, commits and notes; ask it before asking the user anything that may already be recorded, phrased as a question with the exact names in it. `ctx_memory` pins facts that stay true for the months this work lasts, for you and every agent on the project: what must not have to be found again, especially what cost you turns. They are not shown to you automatically; recall them with `ctx_search`. `ctx_note` is the tray for work you intend to return to, with its findings attached; findings without an intention are not a note; \"take a note\" from the user always goes there.",
     "item_digest": "7ab356879bd31a5af7b0899ff5c41c2d85ea663f35ec05f032a94db23e934726",
-    "preflight_digest": "293f232cc8357835948b41a3586fed656b1675ec4d3638c5ba7ba50d7be9d7a3",
+    "preflight_digest": "f427e20309a562a48858b9129cbe833006c315018957cd84cfab2d7ca57ab8d0",
     "tool_names": [
       "ctx_memory",
       "ctx_note",

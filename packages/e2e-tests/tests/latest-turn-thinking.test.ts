@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { openTestDb } from "../src/test-db";
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
@@ -192,15 +192,21 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 				writeFileSync(join(proof, "lsof-proof.txt"), lsof.stdout);
 			};
 			contain();
-			for (const name of ["a", "b", "c"])
-				writeFileSync(
-					join(h.workdir, `${name}.txt`),
+			const spentCommands = ["a", "b", "c"].map((name) => {
+				const content =
 					`SPENT-${name}\n` +
-						Array.from(
-							{ length: 2000 },
-							(_, n) => `${n * 7919}:${n * 3571}!`,
-						).join(" "),
-				);
+					Array.from(
+						{ length: 2000 },
+						(_, n) => `${n * 7919}:${n * 3571}!`,
+					).join(" ");
+				writeFileSync(join(h.workdir, `${name}.txt`), content);
+				// Test queued-drop reclaim without background summarization. Its per-run
+				// cap counts tool inputs, not outputs, so use large write inputs to
+				// leave only a tiny, ineligible history fragment before the cap.
+				return mode === "primary" && band === 76
+					? `cat > ${name}.txt <<'SPENT_EOF'\n${content}\nSPENT_EOF\ncat ${name}.txt`
+					: `cat ${name}.txt`;
+			});
 			h.mock.addMatcher((body) => {
 				const usage = {
 					input_tokens: 0,
@@ -247,10 +253,10 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 				wire.push(structuredClone(body.messages as unknown[]));
 				if (pass <= 2)
 					return tool("bash", {
-						command: `cat ${pass === 1 ? "a" : "b"}.txt`,
+						command: spentCommands[pass - 1],
 						description: "Read spent output",
 					});
-				if (pass === 3 && (mode === "drops" || mode === "primary")) return tool("bash", { command: "cat c.txt", description: "Displace the protected output floor" });
+				if (pass === 3 && (mode === "drops" || mode === "primary")) return tool("bash", { command: spentCommands[2], description: "Displace the protected output floor" });
 				if (mode === "primary" && pass > 3 && pass < reducePass)
 					return tool("bash", {
 						command: `printf step-${pass}`,
@@ -330,7 +336,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
                     contain();
                     return;
                 }
-                const hostDb = new Database(join(h.dataDir, "opencode", "opencode.db"), { readonly: true });
+                const hostDb = openTestDb(join(h.dataDir, "opencode", "opencode.db"), { readonly: true });
                 let prompt: { id: string }; let parts: Array<{ id: string; type: "text"; text: string }>;
                 try {
                     prompt = hostDb.query("SELECT id FROM message WHERE session_id = ? AND json_extract(data, '$.role') = 'user' ORDER BY id LIMIT 1").get(childId) as { id: string };
@@ -465,7 +471,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 					.all(childId),
 			).toHaveLength(0);
         } finally {
-            const hostProofDb = new Database(join(h.dataDir, "opencode", "opencode.db"), { readonly: true });
+            const hostProofDb = openTestDb(join(h.dataDir, "opencode", "opencode.db"), { readonly: true });
             try { writeFileSync(join(proof, "original-thinking-parts.json"), JSON.stringify(hostProofDb.query("SELECT message_id, data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'reasoning'").all(childId), null, 2)); } finally { hostProofDb.close(); }
             writeFileSync(join(proof, "recovery-state.json"), JSON.stringify(h.contextDb().query("SELECT thinking_binding_recovery_target, merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?").get(childId), null, 2));
 			writeFileSync(
